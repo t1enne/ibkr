@@ -115,6 +115,7 @@ def run_backtest(
     benchmark_curves: Optional[Mapping[str, pd.Series]] = None,
     ta: Optional[TaContext] = None,
     strategy_state: Optional[dict] = None,
+    signal_observer: Optional[Callable] = None,
 ) -> Tuple[BacktestResults, BacktestState]:
     """Run backtest with the given candle generator and handlers.
 
@@ -207,6 +208,7 @@ def run_backtest(
             last_symbol,
             can_trade,
             rows,
+            signal_observer=signal_observer,
         )
 
         # Stage 6: execute signals generated this tick (skip fill_at_next_open
@@ -404,8 +406,16 @@ def _generate_signals(
     last_symbol: Optional[str],
     can_trade: bool,
     rows: CandleRows,
+    signal_observer: Optional[Callable] = None,
 ) -> BacktestState:
-    """Run strategy on last symbol per timestamp, bucket signals by symbol."""
+    """Run strategy on last symbol per timestamp, bucket signals by symbol.
+
+    When ``signal_observer`` is set, it is invoked once per freshly-generated
+    ``TradeSignal`` (before bucketing/finalize) so a caller — e.g. the screen
+    driver — captures the strategy's current-bar intent that ``_finalize``
+    would otherwise discard. ``None`` (default) keeps behavior byte-for-byte
+    identical to earlier builds.
+    """
     if not (can_trade and strategy_fn and candle.symbol == last_symbol):
         return state
 
@@ -415,6 +425,10 @@ def _generate_signals(
     new_signals = strategy_fn(state, candle, resolved_params)
     if not new_signals:
         return state
+
+    if signal_observer is not None:
+        for sig in new_signals:
+            signal_observer(sig)
 
     # Merge into existing pending dict — signals for same symbol accumulate
     pending = dict(state.pending_signals)
@@ -565,6 +579,7 @@ def run(
     data: pd.DataFrame,
     strat_mod,
     benchmark_curves: Optional[Mapping[str, pd.Series]] = None,
+    signal_observer: Optional[Callable] = None,
 ) -> BacktestResults:
     """Convenience function for running backtest with defaults.
 
@@ -606,5 +621,6 @@ def run(
         benchmark_curves=benchmark_curves,
         ta=ta,
         strategy_state=strategy_state,
+        signal_observer=signal_observer,
     )
     return results

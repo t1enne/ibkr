@@ -16,7 +16,7 @@ from src.bt.types import StrategyConfig
 def _fix_cfg() -> StrategyConfig:
     return StrategyConfig(
         name="test",
-        strategy_type="ema_cross",
+        strategy_type="momentum_compression_breakout_dsl",
         symbols=["A"],
         initial_capital=100000.0,
         commission=0.05,
@@ -185,7 +185,7 @@ def test_sweep_pooled_matches_sequential_engine(monkeypatch):
 
     cfg = StrategyConfig(
         name="test",
-        strategy_type="ema_cross",
+        strategy_type="momentum_compression_breakout_dsl",
         symbols=["A"],
         initial_capital=100000.0,
         commission=0.05,

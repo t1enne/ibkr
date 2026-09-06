@@ -1,202 +1,94 @@
-"""`bt screen` command — score a universe for manual trading signals."""
+"""`bt screen` command — score a universe by running a real strategy through
+the engine and showing its current-bar (manual-trade) intent.
+
+A screen is a backtest whose *intent* is surfaced, not whose fills matter: the
+strategy's own ``on_candle`` runs over the configured feed, the engine's signal
+observer captures every fresh emission before ``_finalize`` discards it, and the
+driver projects per-symbol posture into a ranked table. Same config a ``bt run``
+consumes; no separate screen vocabulary.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 import click
-import pandas as pd
 
-from src.bt.cmds._shared import cli_ts, parse_param_grid
 from src.bt.table import render_from_dicts
 
 if TYPE_CHECKING:
-    from src.bt.screen.types import ScreenResult, ScreenState
-
-#: Common per-symbol metrics shown as extra table columns, uniform across screens.
-COMMON_COLS = ["ema_50", "ema_100", "atr_14", "rsi_14", "hi_52w", "lo_52w"]
-
+    from src.bt.engine.candle_store import CandleStore
 
 #: Column order for the printed table (common metrics appended after the core).
-TABLE_COLS = [
-    "interval",
-    "symbol",
-    "action",
-    "score",
-    "signals",
-    "timestamp",
-    *COMMON_COLS,
-]
-
-
-def _fmt(v: object) -> str:
-    """Format a metric value; NaN/None renders as empty."""
-    if v is None:
-        return ""
-    if not isinstance(v, (int, float, str)):
-        return ""
-    try:
-        f = float(v)
-    except ValueError:
-        return ""
-    if not pd.isna(f):
-        return f"{f:.2f}"
-    return ""
-
-
-def _common_metrics_for(
-    r: "ScreenResult", states: dict[str, "ScreenState"]
-) -> dict[str, str]:
-    """Pull the common metrics for ``r`` into ``{key: formatted}``.
-
-    Single-interval results already carry them in ``model_features``. The
-    multi-interval (TF-merged) results do not, so we fall back to computing
-    them from the first per-interval state that holds a frame for ``r.symbol``.
-    """
-    feats = getattr(r, "model_features", {}) or {}
-    if all(k in feats for k in COMMON_COLS):
-        return {k: _fmt(feats.get(k)) for k in COMMON_COLS}
-    for state in states.values():
-        frame = state.frame(r.symbol)
-        if frame is not None:
-            from src.bt.screen.metrics import common_metrics
-
-            m = common_metrics(frame)
-            return {k: _fmt(m.get(k)) for k in COMMON_COLS}
-    return {k: "" for k in COMMON_COLS}
+TABLE_COLS = ["symbol", "action", "score", "signals", "timestamp"]
 
 
 @click.command(name="screen")
-@click.argument("screen_name")
-@click.option("--symbols", "-s", multiple=True, help="Symbols to score")
-@click.option(
-    "--universe",
-    "-U",
-    help="Universe file path (e.g. 'universes/nsdq.json'). Overrides --symbols.",
-)
-@click.option(
-    "--interval",
-    "-i",
-    multiple=True,
-    default=("1d",),
-    help="Bar interval to score (1h, 4h, 1d, ...); repeatable for multiple TFs",
-)
-@click.option(
-    "--from",
-    "-f",
-    "lookback_days",
-    type=int,
-    default=365,
-    show_default=True,
-    help="Load this many days of history (in place of a start date)",
-)
-@click.option("--to", "to_dt", type=click.DateTime(), help="End date")
-@click.option(
-    "--params",
-    "-p",
-    default="{}",
-    help="Screen params as JSON, e.g. '{fast: 20, slow: 50}'",
-)
-@click.option("--top", type=int, default=None, help="Limit to top-N ranked rows")
-def screen(
-    screen_name: str,
-    symbols: tuple[str, ...],
-    universe: str | None,
-    interval: tuple[str, ...],
-    lookback_days: int,
-    to_dt: datetime | None,
-    params: str,
-    top: int | None,
-):
-    """Score a universe and print a ranked table of signals.
+@click.argument("strategy_file", type=click.Path(exists=True, dir_okay=False))
+def screen(strategy_file: str) -> None:
+    """Score a universe by running its strategy through the real engine.
 
-    Output is a rank only, sorted by score desc. A high score means the entry
-    condition fired — it is NOT a profit expectation (pre-cost by design).
+    STRATEGY_FILE: the same JSON strategy config a ``bt run`` consumes. The
+    strategy module runs over its configured feed; each symbol's latest emitted
+    intent is projected as an action + score (1.0 = fresh open on the newest
+    bar, 0.8 = an older/held setup). Ranked by score desc.
+
+    Output is an intent rank only — screens never trade, so a high score means
+    "the entry condition fired", not "expected profit" (pre-cost by design).
     """
-    parsed_params = parse_param_grid(params) if isinstance(params, str) else {}
-    from_ts: pd.Timestamp = cli_ts(
-        pd.Timestamp.now() - pd.Timedelta(days=lookback_days)
+    from src.bt.screen.run_strategy import (
+        COMMON_COLS,
+        common_metrics,
+        run_screen_from_strategy,
     )
-    to_ts: pd.Timestamp = cli_ts(to_dt) if to_dt else cli_ts(pd.Timestamp.now())
 
-    from src.bt.screen.screens import init_screen, resolve_screen_params
-    from src.bt.screen import run_screen
-    from src.bt.screen.adapter import state_per_interval
-    from src.bt.screen.runner import DivergenceParams, rank_divergence
+    rows, state = run_screen_from_strategy(strategy_file)
 
-    # Fail fast on an unknown screen before touching the feed.
-    init_screen(screen_name)
-
-    # Resolve the screen's typed params (defaults included) so a reference
-    # default such as ``relative_strength.benchmark = QQQ`` is honoured even
-    # when the user did not pass an explicit value.
-    resolved = resolve_screen_params(screen_name, parsed_params)
-    benchmark = str(getattr(resolved, "benchmark", "")).upper().strip()
-    benchmarks = [benchmark] if benchmark else None
-
-    from src.data import load_universe_config
-
-    syms: list[str]
-    if universe:
-        syms = list(load_universe_config(universe).symbols)
-    elif symbols:
-        syms = list(symbols)
-    else:
-        raise click.UsageError("provide --symbols or --universe/-U")
-
-    # The adapter clips the benchmark to the traded universe's latest bar to
-    # avoid lookahead. (For the RS screen the embedded benchmark frame is purely
-    # a reference — ``on_state`` never scores it.) The history window is bounded
-    # by ``--from/-f`` (default 365 days), applied uniformly to symbols +
-    # benchmarks.
-    states = state_per_interval(
-        syms, from_ts, to_ts, sorted(set(interval)), benchmarks=benchmarks
-    )
-    # Multi-interval: merge per-TF states into a cross-timeframe consensus rank
-    # so each symbol appears ONCE, ranked by trend alignment (TF divergence).
-    # Single-interval: fall back to the per-state screen rank.
-    if len(states) > 1:
-        merged = rank_divergence(
-            states, DivergenceParams(alignment_threshold=0.5), top=top
-        )
-        rows = [
+    table_rows: list[dict[str, str]] = []
+    for r in rows:
+        frame = _symbol_frame(state.candles, r.symbol)
+        feats = common_metrics(frame) if frame is not None else {}
+        table_rows.append(
             {
-                "interval": ", ".join(sorted(states)),
                 "symbol": r.symbol,
                 "action": r.action,
                 "score": f"{r.score:.3f}",
                 "signals": ", ".join(r.signals),
-                "timestamp": str(r.timestamp),
-                **_common_metrics_for(r, states),
+                "timestamp": str(r.ts),
+                **{k: _fmt(feats.get(k)) for k in COMMON_COLS},
             }
-            for r in merged
-        ]
-    else:
-        rows = []
-        for iv, state in states.items():
-            for r in run_screen(state, screen_name, parsed_params):
-                feats = r.model_features or {}
-                rows.append(
-                    {
-                        "interval": iv,
-                        "symbol": r.symbol,
-                        "action": r.action,
-                        "score": f"{r.score:.3f}",
-                        "signals": ", ".join(r.signals),
-                        "timestamp": str(r.timestamp),
-                        **{k: _fmt(feats.get(k)) for k in COMMON_COLS},
-                    }
-                )
-        if top is not None:
-            rows = sorted(rows, key=lambda x: float(x["score"]), reverse=True)[:top]
+        )
 
-    if not rows:
+    if not table_rows:
         click.echo("No signals.")
         return
 
-    for line in render_from_dicts(TABLE_COLS, rows, align="<"):
+    for line in render_from_dicts(
+        TABLE_COLS + list(COMMON_COLS), table_rows, align="<"
+    ):
         click.echo(line)
+
+
+def _symbol_frame(candles: "CandleStore", symbol: str):
+    """:return: the symbol's base-interval frame from the store, or ``None``."""
+    base_iv = next((iv for (_, iv) in candles.keys()), "1d")
+    try:
+        return candles.get((symbol, base_iv))
+    except KeyError:
+        return None
+
+
+def _fmt(v: float | None) -> str:
+    """Format a metric float; None/NaN renders as empty."""
+    if v is None or _isna(v):
+        return ""
+    return f"{v:.2f}"
+
+
+def _isna(f: float) -> bool:
+    import pandas as pd
+
+    return bool(pd.isna(f))
 
 
 def register(group: click.Group) -> None:
