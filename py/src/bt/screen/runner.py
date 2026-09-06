@@ -14,7 +14,7 @@ import pandas as pd
 
 from src.bt.regime.tf_consensus import weighted_align
 from src.bt.screen.screens import init_screen, resolve_screen_params
-from src.bt.screen.screens.momentum import _trend_label, _vol_label
+from src.bt.screen.screens.momentum_spy_gate import _trend_label, _vol_label
 from src.bt.screen.types import (
     Action,
     ScreenResult,
