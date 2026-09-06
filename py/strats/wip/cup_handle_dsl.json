@@ -18,7 +18,7 @@
     "max_handle_bars": 40,
     "max_handle_drop_pct": 0.12,
     "handle_width_scale": 0.25,
-    "handle_depth_scale": 0.15,
+    "handle_depth_scale": 0.12,
     "handle_width_floor": 3,
     "volume_confirm_breakout": true,
     "per_symbol_size": 0.15,
