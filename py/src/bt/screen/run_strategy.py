@@ -16,8 +16,8 @@ this driver only hands it an observer so intent survives ``_finalize``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, cast
+from dataclasses import dataclass, replace
+from typing import Literal, Mapping, cast
 
 import numpy as np
 import pandas as pd
@@ -28,7 +28,29 @@ from src.bt.state import ActionType, BacktestState, TradeSignal
 from src.bt.types import StrategyConfig
 
 #: Common metrics shown as extra table columns, uniform with the old screen.
-COMMON_COLS = ["ema_50", "ema_100", "atr_14", "rsi_14", "hi_52w", "lo_52w"]
+#: ``rsi_14`` was replaced by ``mfi_14`` (money-flow index — blends volume into
+#: its value), and the two raw volume stats were collapsed into one ``obv_z``:
+#: the direct cumulative-flow channel a trader can actually weight (sign =
+#: flow direction, magnitude = strength vs the name's own recent pattern).
+COMMON_COLS = [
+    "ema_50",
+    "ema_100",
+    "atr_14",
+    "mfi_14",
+    "obv_z",
+    "hi_52w",
+    "lo_52w",
+]
+
+#: Default trailing lookback loaded for a screen (calendar days). Bounds the
+#: warm-up feed to what a screen actually needs to compute the latest-bar
+#: decision: every DSL warm-up window (momentum big_lookback=63, SMAs <= 20,
+#: AE entropy ~40) plus the widest display indicator (ema_200 / 52-week,
+#: ~200-250 1d bars) fits well inside ~550 calendar days (~370 trading days),
+#: leaving headroom for weekends and exchange holidays. Overridable via the
+#: screen command's -w/--warmup. A screen never trades, so it deliberately
+#: does NOT load (or replay) a config's full multi-year train->test backtest.
+WARMUP_DAYS: int = 550
 
 Action = Literal["long", "short", "flat"]
 
@@ -39,7 +61,8 @@ class ScreenRow:
     action: Action
     score: float  # >0 iff actionable; 1.0 fresh open, <1.0 retained
     signals: tuple[str, ...]  # human reasons from TradeSignal.reason strings
-    ts: pd.Timestamp
+    ts: pd.Timestamp  # newest loaded data bar for this symbol
+    sig_ts: pd.Timestamp | None = None  # bar on which the live posture was set
 
 
 @dataclass(frozen=True)
@@ -70,20 +93,37 @@ class SignalCollector:
 def run_screen_from_strategy(
     config_path: str,
     posture: Posture = Posture(),
+    warmup_days: int = WARMUP_DAYS,
 ) -> tuple[tuple[ScreenRow, ...], BacktestState]:
     """Score a universe by running its strategy through the real engine.
 
-    Loads the config exactly as ``bt run`` does, drives ``Backtest.run`` with a
-    ``SignalCollector`` observer, and projects each symbol's captured intent
-    into ranked ``ScreenRow``s.
+    Runs over a **trailing warm-up window ending at the newest available data**
+    (not the config's multi-year backtest span — a screen only needs enough
+    history to compute the latest-bar decision). ``warmup_days`` bounds the
+    lookback; the decision bar is always the last bar present in the feed, so
+    the reported posture is current tape, never the config's (possibly stale)
+    ``trading_end``.
 
     Returns ``(rows, final_state)``: rows carry the per-symbol posture, and
     ``final_state`` is the engine's post-``_finalize`` state (book flattened).
     """
-    config = load_strategy(config_path)
+    cfg = load_strategy(config_path)
+    data_end = _data_end(cfg)
+    warm_start = cast(pd.Timestamp, data_end - pd.Timedelta(days=warmup_days))
+
+    # A screen does not trade and has no train/test split: collapse the config's
+    # (irrelevant, multi-year) window onto the warm tail so (a) we load only
+    # what we score and (b) the engine's can_trade gate (test<=ts<=test_end)
+    # covers the whole tail — letting signals fire through the final bar, whose
+    # timestamp is data_end, so fresh-vs-held attribution stays correct.
+    config = replace(
+        cfg,
+        training_start=_iso(warm_start),
+        training_end=_iso(data_end),
+        trading_start=_iso(warm_start),
+        trading_end=_iso(data_end),
+    )
     bt = Backtest(config)
-    # Feed equals what a stock backtest loads — train start -> test end so the
-    # DSL's TaContext/indicators warm up over full history, scored over test.
     df = _load_feed(config)
     strat_mod = init_strat(config.strategy_type)
 
@@ -94,8 +134,14 @@ def run_screen_from_strategy(
         strat_mod=strat_mod,
         signal_observer=collector.on_signal,
     )
-    rows = _project(collector, tuple(config.symbols), posture, _latest_ts(df))
-    return rows, results.final_state
+    final = results.final_state
+    # Freshness bar is each symbol's OWN last loaded bar (stale/delisted names
+    # end early; a shared feed-last would misrank shorter-calendar winners).
+    latest = _last_bar_by_symbol(final, tuple(config.symbols), config.bars[0]) or {
+        s: _latest_ts(df) for s in config.symbols
+    }
+    rows = _project(collector, tuple(config.symbols), posture, latest)
+    return rows, final
 
 
 def _load_feed(config: StrategyConfig) -> pd.DataFrame:
@@ -109,6 +155,45 @@ def _load_feed(config: StrategyConfig) -> pd.DataFrame:
     )
 
 
+def _screen_symbols(config: StrategyConfig) -> tuple[str, ...]:
+    """Traded universe plus benchmark references that must also be loaded."""
+    bms = list(getattr(config, "benchmark_symbols", None) or [])
+    return tuple(dict.fromkeys(list(config.symbols) + bms))
+
+
+def _data_end(config: StrategyConfig) -> pd.Timestamp:
+    """Newest bar timestamp available in the local DB for this config's universe.
+
+    Probes the candle table directly (one aggregate query, no OHLCV materialised)
+    so the screen anchors to *current tape* regardless of a stale ``trading_end``
+    in the config. Falls back to ``trading_end`` if the universe has no rows
+    (never crashes the command on an empty probe). Returns a **naive** local
+    timestamp (the clock the engine/DB share).
+    """
+    from src.data.db import get_connection  # lazy: avoid pkg-init cycle
+    from src.utils import parse_timestamp
+
+    symbols = _screen_symbols(config)
+    con = get_connection()
+    try:
+        ph = ",".join("?" * len(symbols))
+        row = con.execute(
+            f"SELECT MAX(timestamp) FROM candle WHERE ticker IN ({ph})", symbols
+        ).fetchone()
+    finally:
+        con.close()
+    ms = row[0] if row else None
+    if ms is None:
+        return parse_timestamp(config.trading_end)
+    # Guarded non-null above; ms is an epoch-millis int (candle.timestamp is ms).
+    return cast(pd.Timestamp, pd.Timestamp(int(ms), unit="ms"))
+
+
+def _iso(ts: pd.Timestamp) -> str:
+    """Encode a Timestamp as the naive-ISO string ``StrategyConfig`` parses back."""
+    return str(ts)
+
+
 def _latest_ts(df: pd.DataFrame) -> pd.Timestamp:
     """Timestamp of the newest scored (decision) bar in the feed."""
     idx = df.index
@@ -117,17 +202,58 @@ def _latest_ts(df: pd.DataFrame) -> pd.Timestamp:
     return pd.Timestamp.now()
 
 
+#: Signal-freshness bar: per symbol, or a single shared one (simple tests).
+LatestTs = pd.Timestamp | Mapping[str, pd.Timestamp]
+
+
+def _last_bar_by_symbol(
+    state: BacktestState,
+    symbols: tuple[str, ...],
+    base_iv: str,
+) -> dict[str, pd.Timestamp]:
+    """Each symbol's own newest loaded bar (its signal-freshness bar).
+
+    Per-symbol, never global: after re-anchoring to current data (decision B)
+    a universe's listings end on *different* days (a stale/delisted name can
+    stop months early). Judging freshness off one shared feed-last timestamp
+    would mislabel every same-day winner on a shorter calendar as ``held``, so
+    each symbol's own last bar is its true decision bar.
+    """
+    out: dict[str, pd.Timestamp] = {}
+    for sym in symbols:
+        frame = state.candles.get((sym, base_iv))
+        if frame is not None and len(frame):
+            out[sym] = cast(pd.Timestamp, pd.Timestamp(frame.index[-1]))
+    return out
+
+
+def _resolve_latest(latest: LatestTs, sym: str) -> pd.Timestamp:
+    """Per-symbol freshness bar, with a shared fallback when given one ts."""
+    if isinstance(latest, pd.Timestamp):
+        return latest
+    ts = latest.get(sym)
+    if ts is not None:
+        return ts
+    return max(latest.values(), default=pd.Timestamp.now())
+
+
 def _project(
     collector: SignalCollector,
     symbols: tuple[str, ...],
     posture: Posture,
-    latest_ts: pd.Timestamp,
+    latest_ts: LatestTs,
 ) -> tuple[ScreenRow, ...]:
-    """Derive one ranked row per symbol from its collected intent feed."""
+    """Derive one ranked row per symbol from its collected intent feed.
+
+    ``latest_ts`` is a per-symbol freshness bar (preferred — listings end on
+    different days) or a single shared timestamp (kept for simple callers).
+    Each row is timestamped by its own symbol's latest bar.
+    """
     rows: list[ScreenRow] = []
     for sym in symbols:
-        action, score, reasons = _resolve_posture(
-            collector._feed.get(sym, ()), posture, latest_ts
+        own = _resolve_latest(latest_ts, sym)
+        action, score, reasons, sig_ts = _resolve_posture(
+            collector._feed.get(sym, ()), posture, own
         )
         if action == "flat" and not posture.include_flat:
             continue
@@ -137,7 +263,8 @@ def _project(
                 action=action,
                 score=score,
                 signals=reasons,
-                ts=latest_ts,
+                ts=own,
+                sig_ts=sig_ts,
             )
         )
     # Ranked by score desc (actionable first), then symbol — deterministic.
@@ -149,14 +276,17 @@ def _resolve_posture(
     feed: tuple[TradeSignal, ...],
     posture: Posture,
     latest_ts: pd.Timestamp,
-) -> tuple[Action, float, tuple[str, ...]]:
-    """Replay a symbol's chronological intents -> (action, score, signals).
+) -> tuple[Action, float, tuple[str, ...], pd.Timestamp | None]:
+    """Replay a symbol's chronological intents -> (action, score, signals, sig_ts).
 
     Latest-wins over the run (posture, never fills): a fresh ``long``/``short``
     orients the symbol to that side; a ``close`` reverts to flat; a rebalance
     leaves the incumbent side. A side (re)established on the newest scored bar
     is a fresh open (``base_score_open``); a side decided earlier (nothing
     newer this window) is a retained setup (``base_score_held``). Flat -> 0.0.
+    ``sig_ts`` is the bar that set the live posture; a 0.8-retained row whose
+    ``sig_ts`` trails ``latest_ts`` by weeks is a stale setup, not a fresh
+    signal — the reason string is emission-time, not current tape.
     """
     action: Action | None = None
     reasons: tuple[str, ...] = ()
@@ -171,11 +301,11 @@ def _resolve_posture(
         decided_ts = sig.timestamp
 
     if action in (None, "flat"):
-        return ("flat", 0.0, reasons)
+        return ("flat", 0.0, reasons, decided_ts)
 
     fresh = decided_ts is not None and decided_ts == latest_ts
     score = posture.base_score_open if fresh else posture.base_score_held
-    return (action, score, reasons)
+    return (action, score, reasons, decided_ts)
 
 
 def _side_of(sig: TradeSignal) -> Action | None:
@@ -234,15 +364,49 @@ def _ta_atr(frame: pd.DataFrame) -> float:
     return v if np.isfinite(v) else float("nan")
 
 
-def _ta_rsi(closes: pd.Series) -> float:
-    """RSI(14)."""
-    from src.indicators.ta import rsi
+def _ta_mfi(frame: pd.DataFrame) -> float:
+    """MFI(14) — money-flow index; volume-weighted, distinct from the plain
+    volume reads below."""
+
+    def _col(name: str) -> pd.Series:
+        return frame[name] if name in frame.columns else frame["close"]
+
+    from src.indicators.ta import mfi
 
     try:
-        v = float(rsi(closes, window=14).iloc[-1])
+        v = float(
+            mfi(_col("high"), _col("low"), _col("close"), _col("volume")).iloc[-1]
+        )
     except IndexError, ValueError:
         return float("nan")
     return v if np.isfinite(v) else float("nan")
+
+
+def _obv_z(frame: pd.DataFrame) -> float:
+    """Cumulative-flow channel, single column. OBV over the frame, then its
+    current level expressed as a z-score against its own trailing-40 pattern
+    (rolling mean/std of the OBV level). Sign = money-flow direction; |value|
+    = strength off the name's own noise floor (~+1.5/-1.5 starts to be
+    notable). A long printing while this sits near/below zero is unconfirmed
+    flow — the price/OBV divergence tell. Nan without enough bars to warm the
+    OBV z-window."""
+    if "volume" not in frame.columns or len(frame) < 41:
+        return float("nan")
+    from src.indicators.ta import obv
+
+    try:
+        obv_series = obv(frame["close"], frame["volume"])
+    except IndexError, ValueError:
+        return float("nan")
+    if len(obv_series) < 41:
+        return float("nan")
+    win = obv_series.rolling(window=40)
+    m = float(win.mean().iloc[-1])
+    s = float(win.std().iloc[-1])
+    if not np.isfinite(m) or not np.isfinite(s) or s == 0:
+        return float("nan")
+    last = float(obv_series.iloc[-1])
+    return (last - m) / s if np.isfinite(last) else float("nan")
 
 
 def common_metrics(frame: pd.DataFrame) -> dict[str, float]:
@@ -263,7 +427,8 @@ def common_metrics(frame: pd.DataFrame) -> dict[str, float]:
         "ema_50": _ta_ema(closes, 50),
         "ema_100": _ta_ema(closes, 100),
         "atr_14": _ta_atr(frame),
-        "rsi_14": _ta_rsi(closes),
+        "mfi_14": _ta_mfi(frame),
+        "obv_z": _obv_z(frame),
         "hi_52w": hi_52w,
         "lo_52w": lo_52w,
     }

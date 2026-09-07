@@ -9,23 +9,33 @@ consumes; no separate screen vocabulary.
 """
 
 from __future__ import annotations
-
 from typing import TYPE_CHECKING
-
 import click
-
 from src.bt.table import render_from_dicts
 
 if TYPE_CHECKING:
     from src.bt.engine.candle_store import CandleStore
 
 #: Column order for the printed table (common metrics appended after the core).
-TABLE_COLS = ["symbol", "action", "score", "signals", "timestamp"]
+#: ``date`` shows the bar the live posture came from (the signal's generation
+#: date), so a stale/retained setup is instantly visible as an old date next
+#: to current price context. Blank when a symbol has no posture (flat).
+TABLE_COLS = ["symbol", "action", "score", "signals", "date"]
 
 
 @click.command(name="screen")
 @click.argument("strategy_file", type=click.Path(exists=True, dir_okay=False))
-def screen(strategy_file: str) -> None:
+@click.option(
+    "--warmup",
+    "-w",
+    type=int,
+    default=None,
+    show_default=False,
+    help="Trailing history to load in days (default: driver's WARMUP_DAYS). "
+    "A screen only needs enough bars to warm the strategy + display indicators, "
+    "never the config's multi-year backtest span.",
+)
+def screen(strategy_file: str, warmup: int | None) -> None:
     """Score a universe by running its strategy through the real engine.
 
     STRATEGY_FILE: the same JSON strategy config a ``bt run`` consumes. The
@@ -42,19 +52,27 @@ def screen(strategy_file: str) -> None:
         run_screen_from_strategy,
     )
 
-    rows, state = run_screen_from_strategy(strategy_file)
+    rows, state = (
+        run_screen_from_strategy(strategy_file)
+        if warmup is None
+        else run_screen_from_strategy(strategy_file, warmup_days=warmup)
+    )
 
     table_rows: list[dict[str, str]] = []
     for r in rows:
         frame = _symbol_frame(state.candles, r.symbol)
         feats = common_metrics(frame) if frame is not None else {}
+        # Posture-stale on purpose: ``date`` shows the LAST posture-setting
+        # bar (where the signal actually fired), not newest tape, so retained
+        # reason strings can't be read as fresh signals.
+        shown = str(r.sig_ts) if r.sig_ts is not None else str(r.ts)
         table_rows.append(
             {
                 "symbol": r.symbol,
                 "action": r.action,
                 "score": f"{r.score:.3f}",
                 "signals": ", ".join(r.signals),
-                "timestamp": str(r.ts),
+                "date": shown,
                 **{k: _fmt(feats.get(k)) for k in COMMON_COLS},
             }
         )
