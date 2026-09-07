@@ -192,6 +192,66 @@ def _find_swings(highs: pd.Series, lows: pd.Series, lookback: int) -> list[Swing
     return swings
 
 
+def _swings_incremental(
+    highs: pd.Series,
+    lows: pd.Series,
+    lookback: int,
+    entry: tuple[int, list[Swing]] | None,
+) -> tuple[int, list[Swing]]:
+    """Swing list for the current series, re-derived incrementally from an
+    earlier result for a shorter (or equal-length) series.
+
+    Returns ``(series_len, swings)`` describing the *current* series so the
+    caller can feed it back on the next bar. Output is guaranteed identical to
+    a cold ``_find_swings(highs, lows, lookback)`` over the current series.
+
+    Fractal invariant that makes this exact: ``_find_swings`` only decides a
+    swing at index ``i`` once its full window ``[i - lookback, i + lookback]``
+    lies inside the series (loop runs to ``n - lookback``). Once a swing with
+    right edge ``i + lookback <= n_prev - 1`` is decided it can never change
+    when bars are appended — no later bar enters that window. So an earlier
+    result computed for ``n_prev`` bars is immutable up to index
+    ``n_prev - lookback - 1``; everything from index ``max(lookback, n_prev -
+    lookback)`` onward is re-derived (only the frontier actually needs it —
+    appending adds exactly one decidable index per bar). ``None`` (no prior)
+    falls back to a cold full scan.
+    """
+    n = len(highs)
+    if n < 2 * lookback + 1:
+        return (n, [])
+    if entry is not None:
+        prev_n, prev = entry
+        if prev_n == n:
+            return (n, list(prev))  # exact repeat within the same bar
+        if prev_n < 2 * lookback + 1 or n < prev_n:
+            return (n, _find_swings(highs, lows, lookback))
+        kept = [s for s in prev if s.idx < prev_n - lookback]
+        start = max(lookback, prev_n - lookback)
+    else:
+        kept = []
+        start = lookback
+    out = list(kept)
+    highs_np = highs.to_numpy()
+    lows_np = lows.to_numpy()
+    for i in range(start, n - lookback):
+        lo, hi = i - lookback, i + lookback
+        hi_max = float(highs_np[lo:i].max()) if lo < i else float(highs_np[i])
+        hi_max = max(
+            hi_max,
+            float(highs_np[i + 1 : hi + 1].max()) if i + 1 <= hi else -float("inf"),
+        )
+        lo_min = float(lows_np[lo:i].min()) if lo < i else float(lows_np[i])
+        lo_min = min(
+            lo_min,
+            float(lows_np[i + 1 : hi + 1].min()) if i + 1 <= hi else float("inf"),
+        )
+        if highs_np[i] > hi_max:
+            out.append(Swing(i, True, float(highs_np[i])))
+        elif lows_np[i] < lo_min:
+            out.append(Swing(i, False, float(lows_np[i])))
+    return (n, out)
+
+
 def _check_cup(
     swings: Sequence[Swing],
     left: Swing,
@@ -311,6 +371,11 @@ def detect_cup_and_handle(
     handle_depth_scale: float = 0.0,  # cap handle retrace as frac of cup depth
     handle_width_floor: int = 3,
     volume_confirm_breakout: bool = True,
+    # Incremental hook: precomputed swing list for the FULL history ``highs``
+    # (valid at this exact length). When supplied the O(n) re-fractal scan is
+    # skipped; when omitted the detector falls back to a fresh ``_find_swings``
+    # so its pure-function contract is unchanged.
+    swings: Optional[Sequence[Swing]] = None,
 ) -> CupHandleResult:
     """Detect a cup-and-handle formation ending at (breaking on) the last bar."""
     n = len(highs)
@@ -321,7 +386,8 @@ def detect_cup_and_handle(
     if n < 2 * swing_lookback + 1:
         return CupHandleResult(False, False, False, None, "insufficient data")
 
-    swings = _find_swings(highs, lows, swing_lookback)
+    if swings is None:
+        swings = _find_swings(highs, lows, swing_lookback)
     closes_np = closes.to_numpy()
     last_close = float(closes_np[-1])
 
@@ -487,6 +553,18 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
     if len(closes) < params.warmup_bars:
         return
 
+    # Incremental swing maintenance: the fractal list for this symbol only
+    # gains at most one decidable index per appended bar, so re-use the prior
+    # bar's swings instead of re-fractaling the whole history. ``detect`` then
+    # skips its internal cold ``_find_swings``. ``ctx.shared`` is per-run, so
+    # warm-up across bars is safe and nothing bleeds between split/sweep runs.
+    cache = ctx.shared.setdefault("_cup_swings", {})
+    entry = cache.get(sym)
+    _, swings = _swings_incremental(
+        arr["high"], arr["low"], params.swing_lookback, entry
+    )
+    cache[sym] = (len(arr["high"]), swings)
+
     result = detect_cup_and_handle(
         arr["high"],
         arr["low"],
@@ -504,6 +582,7 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
         handle_depth_scale=params.handle_depth_scale,
         handle_width_floor=params.handle_width_floor,
         volume_confirm_breakout=params.volume_confirm_breakout,
+        swings=swings,
     )
     if not result.entry_ok or result.handle is None:
         return
@@ -566,7 +645,7 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
         sl=sl_pct,
         tp=tp_pct,
         reason=(
-            f"[cup&handle] breakout above {handle.breakout_level:.2f} "
+            f"breakout above {handle.breakout_level:.2f} "
             f"(depth={handle.cup_depth:.2f} · {result.reason})"
         ),
     )
@@ -615,10 +694,7 @@ def _manage_position(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) 
     ctx.shared["cooldowns"][sym] = params.cooldown_bars
     ctx.close(
         sym,
-        reason=(
-            f"[cup&handle] ratchet trail hit "
-            f"(close {close_price:.2f} <= {trail_stop:.2f})"
-        ),
+        reason=(f"ratchet trail hit (close {close_price:.2f} <= {trail_stop:.2f})"),
     )
 
 
