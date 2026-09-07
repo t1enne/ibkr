@@ -1,17 +1,22 @@
-"""Pine-flavoured declarative strategy framework (Option A of prompt2.md).
+"""Pine-flavoured declarative strategy framework.
 
 A decorated strategy is a tiny pure function of a :class:`StrategyContext` --
 it describes *what* to do per candle, not *how* the engine delivers data. The
-framework owns the plumbing the raw ``on_candle`` style re-invents everywhere:
+framework owns the plumbing a hand-rolled strategy would re-invent everywhere:
 
 * candle iteration, cursor advancement, per-symbol signal bucketing,
 * OHLCV + indicator prefetch into a cursor-safe ``ctx.ta`` (``TaContext``),
-* the ``GLOBAL``/``reset_global`` lifecycle via an implicit ``ctx.state``,
+* cross-call state via ``ctx.shared`` (when declared ``stateful=True``),
 * signal construction from ``ctx.long/close/...``.
 
 A decorated strategy still exposes ``on_candle(state, candle, params)`` +
-``STRATEGY_TYPE`` + a generated ``reset_global``, so it plugs straight into the
-existing auto-discovery, ``bt split`` and ``bt sweep`` -- no engine fork.
+``STRATEGY_TYPE`` + a no-op ``reset_global`` shim, so it plugs straight into
+auto-discovery, ``bt split`` and ``bt sweep`` -- no engine fork.
+
+The DSL is the **only** authoring surface. ``@strategy`` is the universal entry
+point; a strategy that needs arbitrary per-candle behavior beyond the ``ctx``
+shortcuts reads ``BacktestState`` / ``state.candles`` directly through
+``ctx.state`` rather than dropping into a second, parallel authoring style.
 
 Shape::
 
@@ -29,7 +34,7 @@ Shape::
 The decorator is a pure adapter: it wraps the plain decision function in an
 ``on_candle(state, candle, params)`` that builds a ``StrategyContext``,
 collects the signals the user's ``ctx.long/close`` calls emit, and returns
-them. The raw ``on_candle`` hook stays intact for non-DSL power users.
+them.
 """
 
 from __future__ import annotations
@@ -49,9 +54,10 @@ class StrategyContext:
 
     Every data access is cursor-safe: ``ctx.ohlcv`` and ``ctx.ta`` read through
     the engine's ``TaContext``, which shares the ``CandleStore`` cursor and can
-    never expose a future bar. ``ctx.state`` is the raw ``BacktestState`` for
-    power users (portfolio / position lookup) -- the DSL does not forbid it, it
-    just makes the common path safe by construction.
+    never expose a future bar. ``ctx.state`` is the raw
+    ``BacktestState`` for power needs (portfolio / position lookup) the DSL
+    shortcuts don't cover -- the DSL allows it, it just makes the common path
+    safe by construction.
 
     Sizing: ``size`` is a 0..1 fraction of *initial* capital converted to an
     absolute share count (``size * initial_capital / close``) — a fixed-percent
@@ -523,8 +529,7 @@ def strategy(bars: str = "1d", stateful: bool = False):
 
     Returns an adapter (callable ``on_candle(state, candle, params) ->
     list[TradeSignal]``) wrapping the plain decision function with a
-    ``StrategyContext``. The raw ``on_candle`` hook stays intact for non-DSL
-    power users.
+    ``StrategyContext``.
 
     Cross-candle state (``stateful=True``) is **per-run**: the engine mints a
     fresh holder for every ``run``/window and the adapter reads it from

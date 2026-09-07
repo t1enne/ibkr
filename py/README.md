@@ -45,12 +45,15 @@ append_candle → execute_pending → generate_signals
 
 ### Composition
 
-Strategies are authored two ways: on the **strategy DSL** (`@strategy()`-decorated
-functions of a `StrategyContext` — the default; see `src/bt/strategies/dsl.py`)
-or as raw `on_candle(state, candle, params) → list[TradeSignal]` modules. Both
-compile to the same auto-discovered hook. Handlers (`ExecutionHandler`,
-`RiskHandler`) are dataclasses wrapping injectable functions. Auto-discovery
-scans `src/bt/strategies/` — any module exposing `STRATEGY_TYPE` is registered.
+Strategies are authored on the **strategy DSL** (`@strategy()`-decorated functions
+of a `StrategyContext`; see `src/bt/strategies/dsl.py`). Decoration produces an
+adapter that plugs into auto-discovery — every module exposing `STRATEGY_TYPE`
+is registered. The DSL owns cursor-safe indicator prefetch, per-symbol signal
+bucketing, and (for `stateful` strategies) a per-run `ctx.shared` holder. The
+engine core still takes a callable `on_candle(state, candle, params)` — the DSL
+adapter satisfies that shape, and test doubles / programmatic `run()` callers
+may too — but authoring surface is DSL-only. Handlers (`ExecutionHandler`,
+`RiskHandler`) are dataclasses wrapping injectable functions.
 
 ### Multi-Symbol & Multi-Interval Data Flow
 
@@ -106,40 +109,55 @@ iteration) truncates rows beyond the cursor. Fast-path methods (`latest`,
 
 #### `candle.interval` — which bar is this?
 
-`candle.interval` is `"1h"` for base bars, `"4h"` for HTF bars, etc. Multi-interval
-strategies use this to gate logic:
+`ctx.candle.interval` is `"1h"` for base bars, `"4h"` for HTF bars, etc. The
+engine fires the strategy only on base-interval candles, so ``ctx.candle.interval``
+is the signal interval at every call. Multi-interval strategies that also read
+HTF structure reach the accumulated store via ``ctx.state.candles`` (cursor-
+truncated):
 
 ```python
-def on_candle(state, candle, params):
-    if candle.interval != params.signal_interval:
-        return []           # only act on the interval that matters
-
-    # Read HTF data from the store
-    htf_df = state.candles.get((candle.symbol, "4h"))
+@strategy(bars="1h")
+def on_candle(ctx):
+    # HTF trend read straight from the store (ctx.ta serves only the base interval)
+    htf_df = ctx.state.candles.get((ctx.candle.symbol, "4h"))
     if htf_df is not None and len(htf_df) > 0:
         htf_close = htf_df["close"].iloc[-1]
+    ...
 ```
 
 #### Multi-symbol strategy pattern
 
-Read all symbols from `state.candles`, emit signals for any symbol. Returned
-signals are bucketed by `signal.symbol` into a dict — the engine drains each
-symbol's queue when its candle iteration reaches the execution stage:
+The engine has already accumulated every symbol up to the current timestamp
+when the strategy runs (fires on the last symbol), so cross-sectional reads are
+complete. Read any symbol from ``ctx.state.candles``, then emit signals per
+target symbol with ``ctx.long/close``. Returned signals are bucketed by
+``signal.symbol`` — the engine drains each symbol's queue when its candle
+iteration reaches the execution stage. Prefer a typed ``Params`` dataclass
+(fields reachable as attributes on ``ctx.params``; see ``StrategyParams``):
 
 ```python
-def on_candle(state, candle, params):
-    # Rank all symbols by momentum
+from dataclasses import dataclass
+from src.bt.strategies.types import StrategyParams
+from src.bt.strategies.dsl import strategy
+
+STRATEGY_TYPE = "momentum_top"
+
+@dataclass(frozen=True)
+class Params(StrategyParams):
+    warmup: int = 20
+    top_n: int = 1
+    size: float = 0.05
+
+@strategy(bars="1h")
+def on_candle(ctx):
+    params: Params = ctx.params
     closes = {}
-    for sym in params.symbols:
-        df = state.candles.get((sym, candle.interval or "1h"))
+    for sym in ctx.symbols:
+        df = ctx.state.candles.get((sym, ctx.interval))
         if df is not None and len(df) >= params.warmup:
             closes[sym] = df["close"].iloc[-1]
-
-    # Emit signals for any symbol — engine routes by signal.symbol
-    signals = []
-    for sym in sorted(closes, key=lambda s: closes[s])[:params.top_n]:
-        signals.append(open(candle, ActionType.long, "[sector] top rank"))
-    return signals
+    for sym in sorted(closes, key=lambda s: closes[s])[: params.top_n]:
+        ctx.long(sym, size=params.size)   # engine routes this signal to sym's bucket
 ```
 
 Signals carry `signal.symbol` — the engine routes each signal to its

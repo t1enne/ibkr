@@ -32,10 +32,6 @@ class _StrategyModule(Protocol):
 
     def reset_global(self) -> None: ...
 
-    # Optional pf_* hook; NotImplemented stubs keep type-checks happy for
-    # strategies that don't define it (only pf_* modules provide a real one).
-    def runtime_stats(self, cost_bps: float | None = None) -> dict: ...
-
 
 _strategy_registry: dict[str, _StrategyModule] | None = None
 

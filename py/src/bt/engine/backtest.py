@@ -128,7 +128,9 @@ def run_backtest(
         exec_handler: Execution handler with execute_signal, execute_risk_event, apply_fill
         risk_handler: Risk handler with check_risk
         initial_state: Optional initial state (default: create from config)
-        strategy_mod: Optional strategy module (must have on_candle(state, candle, params))
+        strategy_mod: Optional strategy module — must be a ``@strategy`` adapter;
+            plain ``on_candle`` modules are rejected by ``_assert_dsl_strategy``.
+            ``None`` is a legal no-strategy (data-only) run.
         benchmark_curves: Optional pre-sliced benchmark curves to reuse across
             windows (avoids a per-window benchmark DB reload). When omitted,
             benchmarks are loaded+drawn here from config.
@@ -143,6 +145,7 @@ def run_backtest(
         Tuple of (BacktestResults, final BacktestState)
     """
     config = bt.config
+    _assert_dsl_strategy(strategy_mod, allow_none=True)
     symbols = config.symbols
     strategy_fn = strategy_mod.on_candle if strategy_mod else None
     last_symbol = symbols[-1] if symbols else None
@@ -574,6 +577,33 @@ def _finalize(
     )
 
 
+def _assert_dsl_strategy(strategy_mod: Any, *, allow_none: bool = True) -> None:
+    """Require a strategy handed to the engine be a ``@strategy`` product.
+
+    ``allow_none=False`` (used by ``run()``, whose ``strat_mod`` is a required
+    positional with no None meaning) rejects a missing/absent module outright;
+    ``allow_none=True`` (used by ``run_backtest``, where ``strategy_mod=None``
+    is a legal no-strategy loop) only checks non-None values.
+
+    ``@strategy`` decorates a plain decision fn into a ``_StrategyAdapter`` whose
+    ``__call__`` exposes ``ctx_fn`` (the decorated source fn). Only such adapters
+    are backed by the cursor-safe ``TaContext`` prefetch the DSL needs; a raw
+    ``on_candle(state, candle, params)`` module or hand-rolled class cannot be
+    surfaced safely (no ``ctx.ta``, no per-run state holder). Raise rather than
+    silently degrade — the DSL is the only authoring surface.
+    """
+    if strategy_mod is None:
+        return  # no-strategy loop remains legal (data-only runs)
+    on_candle = getattr(strategy_mod, "on_candle", None)
+    if on_candle is None or getattr(on_candle, "ctx_fn", None) is None:
+        what = type(strategy_mod).__name__
+        raise TypeError(
+            f"{what}.on_candle is not a @strategy adapter; the engine only runs "
+            "decorated strategies. Wrap it with `from src.bt.strategies.dsl "
+            "import strategy; @strategy(...)`."
+        )
+
+
 def run(
     bt: Backtest,
     data: pd.DataFrame,
@@ -588,29 +618,26 @@ def run(
     """
     from src.bt.engine.handlers import default_execution_handler, default_risk_handler
 
+    # Enforce the DSL-only contract: ``strat_mod`` must be a ``@strategy``
+    # adapter (required positional — every live caller passes ``init_strat``).
+    _assert_dsl_strategy(strat_mod, allow_none=False)
+
     gen = candle_generator(data, bt.config)
     exec_handler = default_execution_handler()
     risk_handler = default_risk_handler()
 
-    # Prefetch the cursor-safe TaContext ONLY for DSL strategies (identified by
-    # the marker exposed on the adapter produced by ``@strategy``). Raw
-    # ``on_candle`` power users skip the build entirely (no wasted work). The
-    # DSL computes every indicator it reads ONCE over the full feed, then does
-    # O(1) cursor-truncated reads per candle -- no per-candle recompute, no
-    # per-access DataFrame rebuild.
-    ta = None
-    strategy_state = None
-    on_candle = getattr(strat_mod, "on_candle", None)
-    if getattr(on_candle, "ctx_fn", None) is not None:
-        from src.bt.strategies.ta_context import init_ta
+    # Every strategy here is a ``@strategy`` adapter, so a TaContext is always
+    # built and minted per-run (never a module singleton): the DSL computes
+    # every indicator it reads ONCE over the full feed, then does O(1)
+    # cursor-truncated reads per candle -- no per-candle recompute, no
+    # per-access DataFrame rebuild. A stateful adapter additionally gets a
+    # fresh cross-candle state holder for every run/window so concurrent
+    # split/sweep/optimize workers can't share or race on strategy state.
+    on_candle = strat_mod.on_candle
+    from src.bt.strategies.ta_context import init_ta
 
-        ta = init_ta(data, bt.config.symbols, bt.config.bars[0])
-        # Mint a FRESH cross-candle state holder for every run/window when the
-        # DSL strategy is stateful. Bound to this run's store (never a module
-        # singleton) so concurrent split/sweep/optimize workers can't share or
-        # race on strategy state.
-        if getattr(on_candle, "stateful", False):
-            strategy_state = {}
+    ta = init_ta(data, bt.config.symbols, bt.config.bars[0])
+    strategy_state = {} if getattr(on_candle, "stateful", False) else None
 
     results, _ = run_backtest(
         bt,

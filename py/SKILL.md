@@ -46,12 +46,11 @@ cd /home/nasrt/Documents/code/dev/ibkr/py
 
 ### Step 1: Pick or Write a Strategy Module
 
-Strategies live in `src/bt/strategies/`. Two authoring styles, both auto-discovered
-(any module exposing `STRATEGY_TYPE` is registered; nothing to wire):
-
-**DSL (default).** Decorate a function of a `StrategyContext` with `@strategy(...)`.
-The framework owns candle iteration, cursor-safe indicator prefetch, and signal
-construction, so you write *what* to do, not *how* data reaches you:
+Strategies live in `src/bt/strategies/`. Authoring is **DSL-only** — decorate a
+function of a `StrategyContext` with `@strategy(...)`; the module is
+auto-discovered (any module exposing `STRATEGY_TYPE` is registered; nothing to
+wire). The DSL owns candle iteration, cursor-safe indicator prefetch, and
+signal construction, so you write *what* to do, not *how* data reaches you:
 
 ```python
 # src/bt/strategies/my_strategy.py
@@ -89,28 +88,10 @@ Surface (all cursor-safe, no future bars):
 Cross-timeframe reads (base bar vs HTF) go through `ctx.ta.<indicator>(sym, interval=...)`
 or `state.candles.get((sym, interval))` — both cursor-truncated.
 
-**Raw `on_candle` (power path).** The engine contract underneath: a plain module
-function `on_candle(state, candle, params) -> list[TradeSignal]`, plus `STRATEGY_TYPE`.
-Use this when the DSL's shape doesn't fit (event/multi-lot bookkeeping outside the
-`ctx` helpers, direct `CandleStore` access, etc.):
-
-```python
-# src/bt/strategies/my_raw.py
-STRATEGY_TYPE = "my_raw"
-
-def on_candle(state, candle, params) -> list[TradeSignal]:
-    """Return signals to open/close positions. candle fires on the last symbol."""
-    ...
-```
-
-The raw surface: `state.portfolio` (`PortfolioState` `.cash`/`.positions`/`.trades`),
-`state.candles` (`CandleStore`, `Mapping[(sym, interval)] -> DataFrame`, plus
-`.latest(sym, interval)`/`.count(sym, interval)` O(1) fast paths), `state.timestamp`, and the
-global indicators in `src.indicators.ta` (`ema`, `sma`, `rsi`, `atr`, `macd`, `adx`, `obv`, `mfi`, …).
-
-Either style: register by dropping the file in `src/bt/strategies/` — the import path is
-`src.bt.strategies.<module_name>`. Optional typed `Params` dataclass (subclass of
-`StrategyParams`, see `types.py`) and the engine instantiates it from `strategy_params` instead of a dict.
+Register a strategy by dropping the file in `src/bt/strategies/` — the import
+path is `src.bt.strategies.<module_name>`. Optional typed `Params` dataclass
+(subclass of `StrategyParams`, see `types.py`) and the engine instantiates it
+from `strategy_params` instead of a dict.
 
 ### Step 2: Write the JSON Config
 

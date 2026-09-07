@@ -4,9 +4,10 @@
 drawn from a shared candle feed. This module owns the per-window mechanics so
 the two entry points stay in sync:
 
-- `run_window` slices the feed to the window's tradable end (no look-ahead),
-  reuses pre-loaded benchmark candles, and resets strategy state before each
-  run.
+- `run_window` slices the feed to the window's tradable end (no look-ahead) and
+  reuses pre-loaded benchmark candles. Strategy isolation is per-run: the engine
+  mints a fresh ``ctx.shared`` for every ``run`` / window, so no cross-window
+  state reset is needed.
 - `window_has_data` guards against windows that fall entirely in a data gap.
 
 Pure window math lives here (test-friendly); fold builders live in `split.py`
@@ -20,21 +21,6 @@ from dataclasses import replace
 import pandas as pd
 
 from src.bt.types import StrategyConfig, PortfolioResult
-
-
-def reset_strategy_state(strat_mod) -> None:
-    """Reset a strategy's cross-run mutable state via its reset_global() hook.
-
-    Convention: every strategy with runtime state holds it in one module-level
-    `GLOBAL: dict` and exposes `reset_global()` which rebinds `GLOBAL` to a
-    fresh dict with correct defaults. The engine never resets these, so without
-    an explicit reset (re-importing won't restore the original empty dicts)
-    state bleeds silently across folds — a real bug in prior sweeps. Stateless
-    strategies do not need the hook; this is a no-op for them.
-    """
-    reset = getattr(strat_mod, "reset_global", None)
-    if reset is not None:
-        reset()
 
 
 def window_df(
@@ -91,7 +77,6 @@ def run_window(
         trading_end=trading_end.isoformat(),
     )
     bt = Backtest(window_cfg)
-    reset_strategy_state(strat_mod)
     bm_curves = (
         build_benchmark_curves(bm_df, cfg, trading_start, trading_end)
         if bm_df is not None

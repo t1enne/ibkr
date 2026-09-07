@@ -15,7 +15,6 @@ from src.bt.split import (
 )
 from src.bt.state import PortfolioResult
 from src.bt.types import StrategyConfig
-from src.bt.window import reset_strategy_state
 from src.utils import parse_timestamp
 
 
@@ -314,13 +313,6 @@ def test_split_report_to_dict_counts_only_closed_trades() -> None:
         "win_rate",
         "trade_count",
     }
-
-
-def test_reset_strategy_state_noop_without_hook() -> None:
-    import types as types_mod
-
-    stateless = types_mod.ModuleType("fake")  # no reset_global attr
-    reset_strategy_state(stateless)  # should not raise
 
 
 def _candle_df(

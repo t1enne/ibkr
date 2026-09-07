@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Dict, List, Optional, Protocol, Tuple, Union
 import pandas as pd
 
 from src.bt.state import (  # noqa: F401
@@ -63,17 +63,6 @@ class StrategyConfig:
 
 
 RiskEvent = Union[StopLossEvent, TakeProfitEvent]
-
-
-class StrategyFn(Protocol):
-    """Protocol for strategy signal generation function."""
-
-    def __call__(
-        self,
-        state: BacktestState,
-        tick: Candle,
-        params: Dict[str, Any],
-    ) -> List[TradeSignal]: ...
 
 
 class ExecutionFn(Protocol):

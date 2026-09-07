@@ -1,11 +1,23 @@
 """Tests for backtest engine — critical paths only."""
 
+from dataclasses import dataclass
 import pandas as pd
 import pytest
-from src.bt.engine.backtest import Backtest, run_backtest, candle_generator
+from src.bt.engine.backtest import Backtest, run_backtest, candle_generator, run
 from src.bt.engine.handlers import default_execution_handler, default_risk_handler
 from src.bt.types import StrategyConfig
 from src.utils import parse_timestamp
+from src.bt.strategies.dsl import StrategyContext, strategy
+
+
+@dataclass
+class _FixtureMod:
+    """Mirrors a real strategy module's engine-facing surface: ``.on_candle``
+    is the ``@strategy`` adapter (carrying ``ctx_fn``). Strat passed straight to
+    ``run``/``run_backtest`` as this holder, exactly as ``init_strat`` does for
+    production modules."""
+
+    on_candle: object
 
 
 def _make_multi_idx_df(symbols: list[str], n: int = 5) -> pd.DataFrame:
@@ -26,36 +38,37 @@ def _make_multi_idx_df(symbols: list[str], n: int = 5) -> pd.DataFrame:
     return df
 
 
+@strategy(bars="1d", stateful=True)
+def _fixture_dsl_on_candle(ctx: StrategyContext):
+    """Real ``@strategy`` fixture — DSL replacement for the removed plain
+    ``_stub_strategy``. Fires one long on the 3rd on_candle dispatch using a
+    stateful ``ctx.shared`` counter. Does NOT read ``ctx.params`` (the engine
+    resolves params off ``config.strategy_type``'s registered type, not this
+    fixture's), so observer/cash tests sidestep that mismatch entirely."""
+    assert ctx.shared is not None  # stateful adapter binds a per-run holder
+    n = ctx.shared.setdefault("_n", 0)
+    ctx.shared["_n"] = n + 1
+    if n == 2:  # 3rd dispatch (0-indexed counter)
+        ctx.long(ctx.candle.symbol, size=0.05, reason="test long")
+
+
+def _fixture_dsl():
+    """DSL strategy_mod for the engine: the ``@strategy`` adapter wrapped in the
+    module-shaped holder the engine consumes (``.on_candle`` = adapter)."""
+    return _FixtureMod(_fixture_dsl_on_candle)
+
+
+def _kit(cfg=None):
+    """A ready-to-run ``Backtest`` over a 1-daily-bar AAPL feed."""
+    cfg = cfg or _cfg(["AAPL"])
+    return Backtest(cfg), _daily_df(["AAPL"])
+
+
 def test_candle_generator_multi_symbol():
     df = _make_multi_idx_df(["AAPL", "GOOGL"])
     candles = list(candle_generator(df, ["AAPL", "GOOGL"]))
     assert len([c for c in candles if c.symbol == "AAPL"]) == 5
     assert len([c for c in candles if c.symbol == "GOOGL"]) == 5
-
-
-def _stub_strategy():
-    """Power-user (non-DSL) strategy_mod; fires one long on the 3rd on_candle."""
-    from src.bt.state import ActionType, TradeSignal
-
-    class _Mod:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def on_candle(self, state, candle, params):
-            self.calls += 1
-            if self.calls == 3:
-                return [
-                    TradeSignal(
-                        action=ActionType.long,
-                        symbol=candle.symbol,
-                        timestamp=candle.timestamp,
-                        price=candle.close,
-                        reason="test long",
-                    )
-                ]
-            return []
-
-    return _Mod()
 
 
 def _daily_df(symbols: list[str], n: int = 5) -> pd.DataFrame:
@@ -98,22 +111,15 @@ def _cfg(symbols):
 def test_signal_observer_fires_once_per_fresh_signal():
     """The observer (screen hook) must capture each fresh strategy emission
     exactly once — never doubled by _execute_pending re-draining pending buckets."""
-    cfg = _cfg(["AAPL"])
-    bt = Backtest(cfg)
-    # Config-object generator (daily bars) so the engine treats candles as base.
-    gen = candle_generator(_daily_df(["AAPL"]), bt.config)
-
-    mod = _stub_strategy()
+    bt, data = _kit()
     seen = []
-    results, state = run_backtest(
+    run(
         bt,
-        gen,
-        default_execution_handler(),
-        default_risk_handler(),
-        strategy_mod=mod,
+        data,
+        _fixture_dsl(),
         signal_observer=lambda sig: seen.append(sig),
     )
-    # Exactly the single emission the stub produced mid-run.
+    # Exactly the single emission the fixture produced mid-run.
     assert len(seen) == 1
     assert seen[0].reason == "test long"
 
@@ -121,24 +127,47 @@ def test_signal_observer_fires_once_per_fresh_signal():
 def test_signal_observer_none_is_behavior_neutral():
     """Default (no observer) must behave identically to an idle observer — the
     optional hook adds no branch to engine behavior when not collecting."""
-    cfg = _cfg(["AAPL"])
 
     def _run(observer):
-        bt = Backtest(cfg)
-        gen = candle_generator(_daily_df(["AAPL"]), bt.config)
-        _, st = run_backtest(
+        bt, data = _kit()
+        return run(
             bt,
-            gen,
-            default_execution_handler(),
-            default_risk_handler(),
-            strategy_mod=_stub_strategy(),
+            data,
+            _fixture_dsl(),
             signal_observer=observer,
-        )
-        return st.portfolio.cash
+        ).final_state.portfolio.cash
 
     base = _run(None)
     idle = _run(lambda _: None)
     assert idle == base
+
+
+def test_dsl_fixture_runs_stateful():
+    """A real stateful DSL fixture runs to completion through run() without
+    hand-rolled Ta wiring; the 3rd-candle long lands in the book."""
+    bt, data = _kit()
+    results = run(bt, data, _fixture_dsl())
+    trades = results.final_state.portfolio.trades
+    assert len(trades) == 1  # the single mid-run long, closed at finalize
+
+
+def test_run_backtest_rejects_plain_strategy_mod():
+    """A hand-rolled (non-@strategy) module handed to run_backtest raises;
+    None stays a legal no-strategy loop."""
+    from pytest import raises
+
+    cfg = _cfg(["AAPL"])
+    bt = Backtest(cfg)
+    gen = candle_generator(_daily_df(["AAPL"]), bt.config)
+    cl = type("_Mod", (object,), {"on_candle": lambda self, s, c, p: []})()
+    with raises(TypeError):
+        run_backtest(
+            bt,
+            gen,
+            default_execution_handler(),
+            default_risk_handler(),
+            strategy_mod=cl,
+        )
 
 
 def test_run_backtest_no_crash():

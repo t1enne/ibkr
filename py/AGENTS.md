@@ -185,7 +185,7 @@ def process(data: Any) -> Any: ...
 
 #### Rules
 
-- **Use `Protocol` for dependency injection** — the codebase uses `StrategyFn`, `ExecutionFn`, `RiskCheckFn`, `DataLoaderFn`. Follow this pattern. Never pass raw `Callable` when a Protocol exists or should exist.
+- **Use `Protocol` for dependency injection** — the codebase uses `ExecutionFn`, `RiskCheckFn`, `PositionSizerFn`, `DataLoaderFn` for engine-handler seams. Follow this pattern. Never pass raw `Callable` when a Protocol exists or should exist. (Strategy *authoring* has its own seam: a ``@strategy``-produced callable of ``StrategyContext`` — not a raw ``StrategyFn`` Protocol; see §4.)
 - **Use `@dataclass(frozen=True)` for state.** Immutable state makes backtesting deterministic and testable. See `Tick`, `PortfolioState`, `BacktestState`, `FillEvent`, etc.
 - **Use `Literal` for enums of strings.** Prefer `Literal["long", "short", "close"]` over bare `str`.
 - **Use `TypedDict`** for structured dicts when a dataclass would be overkill.
@@ -277,7 +277,7 @@ def apply_fill(portfolio: PortfolioState, fill: FillEvent) -> None:
 - **`replace()` for state updates.** Use `dataclasses.replace()` when modifying frozen dataclasses.
 - **Return new state, never mutate.** Every function in the pipeline takes state in, returns new state out.
 - **Compose functions,** don't chain methods. The backtest engine composes `strategy_fn → exec_handler → risk_handler`.
-- **Protocol-based injection** over class inheritance. Strategy logic is a plain module with `on_candle()`. The engine type-annotates it as `StrategyFn`.
+- **Protocol-based injection** over class inheritance. Engine-handler seams are Protocols (`ExecutionFn`, `RiskCheckFn`, …); strategy *authoring* is the stateful DSL (a ``@strategy``-decorated pure function of ``StrategyContext``) — the only supported authoring surface. See §9 for how the engine feeds a decorated strategy's ``on_candle``.
 - **No side effects in pure functions.** I/O (DB, HTTP, file) belongs at the edges.
 - **Use `merge_bt_state`** for partial state updates — it's the established pattern.
 
@@ -340,12 +340,12 @@ src/bt/
 Use assertions instead of early returns where it improves clarity.
 
 ```python
-# ✅ Assert preconditions
-def on_candle(state: BacktestState, candle: Candle, params: dict) -> list[TradeSignal]:
-    close = state.candles.latest(candle.symbol, candle.interval or "1d")
+# ✅ Assert preconditions (DSL surface)
+def on_candle(ctx: StrategyContext):
+    close = ctx.ta.close(ctx.candle.symbol)[-1]
     assert close is not None, "price must be available before signal generation"
-    assert candle.symbol in params["symbols"], f"Unexpected symbol: {candle.symbol}"
-    # ... logic
+    assert ctx.candle.symbol in ctx.params.symbols, f"Unexpected symbol: {ctx.candle.symbol}"
+    ...
 ```
 
 Assertions document invariants. They're also free runtime checks during tests.
@@ -366,15 +366,17 @@ Strategies are defined in JSON files loaded via `load_strategy()` → `StrategyC
 
 ### 9. Engine Data Flow to `on_candle`
 
-Understanding how the engine feeds data to strategies is critical for writing
-correct multi-symbol and multi-interval strategies.
+How the engine feeds data to a decorated strategy's ``on_candle(ctx)``. The DSL
+adapter exposes the engine state via ``ctx``: ``ctx.state`` (the BacktestState / CandleStore
+below), ``ctx.candle`` (the current Candle), and ``ctx.params`` (typed ``Params`` subclass or
+raw dict). Read the engine-internal names below with that mapping.
 
 #### `on_candle` fires once per timestamp
 
-The engine calls `on_candle(state, candle, params)` **only when `candle.symbol`
+The engine calls the strategy's ``on_candle`` **only when ``ctx.candle.symbol``
 is the last symbol** in `config.symbols`. With `["AAPL", "GOOGL", "MSFT"]`,
 the generator yields → AAPL → GOOGL → MSFT per timestamp before moving to the
-next timestamp. `on_candle` fires on MSFT.
+next timestamp. ``on_candle`` fires on MSFT.
 
 **Why:** At that point `state.candles` contains all symbols' data up to the
 current timestamp. If the engine fired on every symbol, the first symbol's
@@ -418,20 +420,20 @@ See section 4 for the full convention.
 
 #### HTF (higher-timeframe) access pattern
 
-HTF candles accumulate in `state.candles` keyed by their interval string.
-The candle generator interleaves HTF candles (e.g. `"4h"`) at boundaries
-after all base candles for that timestamp. Use the same CandleStore interface:
+HTF candles accumulate in `state.candles` keyed by their interval string (reachable
+in DSL as `ctx.state.candles`). The candle generator interleaves HTF candles
+(e.g. `"4h"`) at boundaries after all base candles for that timestamp, and the
+engine fires the strategy only on base-interval candles — HTF-only candles are
+merely accumulated and never trigger signal generation. A strategy reads HTF
+structure from the store (``ctx.ta`` serves only the base/signal interval):
 
 ```python
-def on_candle(state, candle, params):
-    # Only act on signal-interval bars
-    if candle.interval != params.signal_interval:
-        return []
-
-    # Read HTF trend from the store
-    htf_df = state.candles.get((candle.symbol, "4h"))
+@strategy(bars="1h")
+def on_candle(ctx):
+    htf_df = ctx.state.candles.get((ctx.candle.symbol, "4h"))
     if htf_df is not None and len(htf_df) >= 2:
         htf_trend = htf_df["close"].iloc[-1] > htf_df["close"].iloc[-2]
+    ...
 ```
 
 HTF-only candles (where `candle.interval != base_interval`) **skip the
@@ -440,7 +442,7 @@ pipeline** — they are appended to the accumulator but never trigger
 
 #### Multi-symbol strategy pattern
 
-Read cross-sectional data from `state.candles` and emit signals for any symbol.
+Read cross-sectional data from `ctx.state.candles` and emit signals for any symbol.
 Returned signals are bucketed by `signal.symbol` into `state.pending_signals`
 (a `dict[str, tuple[TradeSignal, ...]]`). The engine drains each symbol's bucket
 when that symbol's candle iteration reaches Stage 4.
@@ -448,22 +450,30 @@ when that symbol's candle iteration reaches Stage 4.
 Key rules:
 
 - Signals for any symbol are valid — the engine dispatches fills by `signal.symbol`.
-- Use `candle.interval` to gate logic when multiple intervals are configured.
+- The engine fires only on the last symbol per timestamp, so a cross-sectional read
+  via `ctx.state.candles` is always complete for every configured symbol. (No manual
+  interval gating needed — HTF-only candles never trigger the strategy.)
 - `_execute_pending` (Stage 4/6) reads directly from `state.pending_signals[symbol]`.
   No O(N) scan over all pending signals — routing is explicit and O(1).
 - **Same-bar execution:** Signals emitted during `on_candle` for non-current
   symbols will fill in the same bar cycle — the corresponding symbol's
   `_execute_pending` stage runs immediately before its `_generate_signals`.
 
-#### `qty` in TradeSignal — two modes
+#### `qty` in TradeSignal — two sizing modes
 
-- **`qty = 0` (default):** For `ActionType.long`/`short`, quantity is computed
-  from `config.position_size * portfolio.cash / candle.close`. For `close`,
-  the full position is closed.
-- **`qty > 0`:** When set explicitly (e.g. from `config.position_size` in
-  `sector_mean_reversion`), the execution handler scales it:
-  `qty * portfolio.cash / candle.close`. This is the **base position size**
-  (0.0–1.0), not an absolute share count.
+Authoring is the DSL, so sizing flows through the DSL + engine `SizingParams`
+(config-level `position_size` was removed — sizing/sl/tp are strategy-owned via
+`strategy_params` and per-trade `ctx.long(..., size=, sl=, tp=)`).
+
+- **`qty = 0` (engine-sized):** `ctx.long(sym)` with no `size` emits `qty=0`;
+  the engine's shared sizing layer derives the share count from `SizingParams`
+  (`equity`/`cash`/`fixed` base + `size` fraction, per-symbol + cash caps). A
+  `close` always flattens the targeted lot.
+- **`qty > 0` (explicit):** `ctx.long(sym, size=0.1)` converts the 0–1 fraction
+  of the capital base (`size_mode="capital"` = initial capital, `"equity"` = live
+  MTM equity) to an absolute share count before the signal is emitted. Either way,
+  `qty` on the emitted `TradeSignal` is an absolute share count, not a fraction —
+  the engine never rescales a DSL-emitted `qty`.
 
 ## Quick Checklist Before Committing Code
 
