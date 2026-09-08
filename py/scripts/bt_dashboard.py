@@ -207,14 +207,14 @@ def main(argv: list[str]) -> None:
     if price.empty:
         st.info("No candles for this symbol.")
     else:
-        st.plotly_chart(build_chart(price, trades), use_container_width=True)
+        st.plotly_chart(build_chart(price, trades), width="stretch")
 
     all_trades = trades_table(payload)
     if all_trades.empty:
         st.info("No trades recorded.")
     else:
         st.subheader("All trades")
-        st.dataframe(all_trades, use_container_width=True)
+        st.dataframe(all_trades, width="stretch")
 
 
 if __name__ == "__main__":

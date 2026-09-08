@@ -1,0 +1,27 @@
+{
+  "name": "mfi_swingdiv_SNPS_A",
+  "training_start": "2024-06-01",
+  "training_end": "2024-06-02",
+  "trading_start": "2024-07-01",
+  "trading_end": "2026-09-08",
+  "commission": 0.0,
+  "initial_capital": 50000,
+  "strategy_type": "mfi_swingdiv_dsl",
+  "bars": ["1d"],
+  "symbols": ["ADBE", "NVO", "SNPS"],
+  "strategy_params": {
+    "pivot_bars": 3,
+    "mfi_period": 14,
+    "ob_floor": 60.0,
+    "mfi_gap": 3.0,
+    "pivot_lookback": 120,
+    "min_swing": 0.0,
+    "mom_lookback": 10,
+    "mom_gate_atr": 2.5,
+    "atr_period": 14,
+    "trail_atr_mult": 1.2,
+    "disaster_atr_mult": 2.0,
+    "risk_pct": 0.4,
+    "warmup_bars": 60
+  }
+}

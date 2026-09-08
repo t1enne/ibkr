@@ -285,6 +285,26 @@ class TaContext:
         )
         return self._view(sym, arr, interval)
 
+    def mfi(
+        self, sym: str, period: int = 14, interval: str | None = None
+    ) -> SeriesView:
+        """Pine ``mfi`` — money flow index over ``period`` bars (0..100)."""
+        from src.indicators.ta import mfi as _mfi
+
+        key: CacheKey = ("mfi", sym, (period,))
+        a = self._series(sym, interval)
+
+        def _calc() -> np.ndarray:
+            return _mfi(
+                _ser(a["high"]),
+                _ser(a["low"]),
+                _ser(a["close"]),
+                _ser(a["volume"]),
+                period,
+            ).to_numpy()
+
+        return self._view(sym, self._compute(key, _calc), interval)
+
     def highest(self, sym: str, period: int, interval: str | None = None) -> SeriesView:
         """Pine ``highest`` — rolling maximum over ``period`` bars (incl. current)."""
         return self._rolling_extreme(sym, "highest", period, interval)
