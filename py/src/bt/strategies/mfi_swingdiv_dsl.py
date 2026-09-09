@@ -2,7 +2,8 @@
 
 Shorts the newer of the two most recent higher-high pivots when MFI undercuts
 it (divergence); a cold-fade momentum gate parks entries during hot
-up-thrusts. Chandelier ATR trail exit, wide disaster SL. Per-symbol state,
+up-thrusts, and an entry trend gate requires price to have pulled back under
+a recent high. Chandelier ATR trail exit, wide disaster SL. Per-symbol state,
 no lookahead.
 """
 
@@ -39,6 +40,9 @@ class Params(StrategyParams):
     # -- cold-fade momentum gate (0 = off) --
     mom_lookback: int = 10  # closes back for the up-thrust ROC
     mom_gate_atr: float = 2.5  # skip short when ROC over mom_lookback >= this * ATR
+    # -- entry trend gate (0 = off) --
+    high_lookback: int = 50  # prior closes scanned for the recent high reference
+    high_atr: float = 0.5  # close must be >= this many ATRs under the recent high
     # -- chandelier trailing management --
     atr_period: int = 14
     trail_atr_mult: float = 2.0  # ATRs off the running best close that bank the trade
@@ -161,6 +165,14 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         # Park while thrust runs; re-fire once it cools.
         put(last_pivot_hi=hi1, last_pivot_mfi=m1, last_pivot_i=i1)
         return
+
+    # Entry trend gate: no short while price presses a recent high (intact
+    # uptrend). Require it pulled back, else park and re-check next bar.
+    if p.high_lookback > 0 and n > p.high_lookback:
+        recent_high = float(np.max(closes[n - 1 - p.high_lookback : n - 1]))
+        if close >= recent_high - p.high_atr * atr:
+            put(last_pivot_hi=hi1, last_pivot_mfi=m1, last_pivot_i=i1)
+            return
 
     _enter_short(
         ctx,
