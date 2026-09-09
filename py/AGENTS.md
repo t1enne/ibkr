@@ -19,6 +19,13 @@ When implementing a feature or fix:
 
 ### Running things
 
+**Read full `bt run` / sweep output — never filter it through `grep`/`head` when
+reporting.** Metrics that live in the tail/body (kurtosis, skewness, stability,
+per-symbol draws, worst-DD periods) carry the actual risk story; a summary
+line like Sharpe can look healthy while kurtosis or a single symbol's bleed
+tells the real tale. Only trim the output when you are very sure the removed
+rows add no signal, and say when you cut it.
+
 ```bash
 uv run ibkr bt run strats/trend.json       # CLI entry point
 uv run ibkr data query SPY                 # Query SPY data from the local DB
