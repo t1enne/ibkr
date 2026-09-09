@@ -388,7 +388,12 @@ def _execute_pending(
             deferred.append(signal)
             continue
         equity = equity_of(portfolio)
-        signal = sized_signal(signal, equity, portfolio.cash, candle, sizing)
+        # Rebalancing reduces (partial cover) carry an explicit signed delta and
+        # closes route by position_id -- neither is a fresh open, so neither is
+        # sized by the shared sizing layer. Only long/short opens with qty <= 0
+        # are engine-sized (sized_signal turns qty<=0 opens into share counts).
+        if signal.action in (ActionType.long, ActionType.short):
+            signal = sized_signal(signal, equity, portfolio.cash, candle, sizing)
         fill = exec_handler.execute_signal(signal, candle, exec_params)
         portfolio = exec_handler.apply_fill(portfolio, fill)
 
