@@ -1,0 +1,29 @@
+{
+  "name": "mfi_exh_meltup_auto",
+  "training_start": "2023-06-01",
+  "training_end": "2024-07-01",
+  "trading_start": "2024-07-01",
+  "trading_end": "2026-09-08",
+  "commission": 0.0,
+  "initial_capital": 50000,
+  "strategy_type": "mfi_exhaustion_dsl",
+  "bars": ["1d"],
+  "symbols": ["NVO", "SNPS", "PLTR", "MU"],
+  "strategy_params": {
+    "mfi_period": 14,
+    "mfi_top_look": 20,
+    "ob_floor": 60.0,
+    "mfi_gap": 8.0,
+    "fresh_look": 5,
+    "leg_look": 40,
+    "vol_dry": 1.0,
+    "regime_sma": 0,
+    "atr_period": 14,
+    "trail_atr_mult": 1.2,
+    "entry_stop_atr": 3.0,
+    "risk_pct": 0.4,
+    "warmup_bars": 60,
+    "meltup_look": 200,
+    "meltup_upday": 2.1
+  }
+}
