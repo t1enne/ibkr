@@ -52,7 +52,7 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
     ``__len__``, ``__iter__``, ``keys``, ``items``, ``values``.
     """
 
-    __slots__ = ("_rows", "_cursor", "_ta", "_strategy_state")
+    __slots__ = ("_rows", "_cursor", "_ta", "_strategy_state", "_fundamentals")
 
     def __init__(
         self,
@@ -63,8 +63,36 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         self._cursor: Timestamp | None = cursor
         self._ta: Any = None  # optional prefetched TaContext (DSL)
         self._strategy_state: dict | None = None  # optional per-run DSL holder
+        self._fundamentals: Any = None  # optional Fundamentals store (DSL)
 
     # -- DSL support --------------------------------------------------------
+
+    def attach_fundamentals(self, fundamentals: Any) -> None:
+        """Bind a prefetched ``Fundamentals`` store to this store (DSL).
+
+        Type is deliberately loose ``Any`` for the same reason as ``attach_ta``:
+        the engine layer must not import the concrete strategy-layer context, so
+        the DSL narrows it via isinstance at call time. Binding also hands the
+        store's cursor to the fundamentals series (``bind_cursor``) so every
+        as-first-stated read honors the same publication ceiling as the bars —
+        one cursor, no second source of truth.
+        """
+        self._fundamentals = fundamentals
+        if fundamentals is not None:
+            fundamentals.bind_cursor(self.cursor_timestamp)
+
+    @property
+    def fundamentals(self) -> Any:
+        """The prefetched Fundamentals store for DSL strategies, or None."""
+        return self._fundamentals
+
+    def cursor_timestamp(self) -> Timestamp | None:
+        """The engine's current cursor (None before the first ``advance``).
+
+        Read through by the fundamentals series so their visibility tracks the
+        bar cursor instead of a snapshot taken at bind time.
+        """
+        return self._cursor
 
     def attach_ta(self, ta: Any) -> None:
         """Bind a prefetched TaContext to this store (set once by the engine).

@@ -44,6 +44,7 @@ from types import FunctionType
 from typing import Any, Callable, Literal
 
 from src.bt.state import ActionType, TradeSignal, BacktestState, Candle, Position
+from src.bt.strategies.fundamentals_context import Fundamentals
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.ta_context import OhlcvView, TaContext
 from src.bt.strategies.utils import sl_tp_from_pct
@@ -75,6 +76,7 @@ class StrategyContext:
         "_state",
         "_candle",
         "_ta",
+        "_fundamentals",
         "_params",
         "_symbols",
         "_interval",
@@ -90,10 +92,12 @@ class StrategyContext:
         ta: TaContext,
         symbols: tuple[str, ...],
         interval: str,
+        fundamentals: Fundamentals | None = None,
     ) -> None:
         self._state = state
         self._candle = candle
         self._ta = ta
+        self._fundamentals = fundamentals
         self._params = params
         self._symbols = symbols
         self._interval = interval
@@ -155,6 +159,23 @@ class StrategyContext:
     @property
     def ta(self) -> TaContext:
         return self._ta
+
+    @property
+    def fundamentals(self) -> Fundamentals:
+        """Cursor-safe SEC fundamentals accessor (``ctx.fundamentals``).
+
+        Raises when the run didn't load a fundamentals store, rather than
+        returning an empty one: a strategy that reads fundamentals deserves to
+        know the data channel is absent (empty series would look like "this
+        company has no filings" and silently disable its filter).
+        """
+        if self._fundamentals is None:
+            raise RuntimeError(
+                "ctx.fundamentals requires a fundamentals store; run through "
+                "`src.bt.engine.backtest.run` (it loads one per config symbol "
+                "set) so `state.candles.fundamentals` is set."
+            )
+        return self._fundamentals
 
     # -- data access -----------------------------------------------------------
 
@@ -493,6 +514,19 @@ class _StrategyAdapter:
                 "`src.bt.engine.backtest.run` (it builds `ta` from data) so "
                 f"state.candles.ta is set for module {self.ctx_fn.__module__}."
             )
+        # Fundamentals are optional (a strategy may never read them) and arrive
+        # on the store as a loose `Any` — the DSL narrows it here. A non-Fundamentals
+        # value means someone attached the wrong object, so fail instead of
+        # silently serving an empty store.
+        raw_fundamentals = getattr(state.candles, "fundamentals", None)
+        fundamentals: Fundamentals | None = None
+        if raw_fundamentals is not None:
+            if not isinstance(raw_fundamentals, Fundamentals):
+                raise RuntimeError(
+                    "state.candles.fundamentals is not a Fundamentals store "
+                    f"(got {type(raw_fundamentals).__name__})."
+                )
+            fundamentals = raw_fundamentals
         holder = None
         if self.stateful:
             holder = getattr(state.candles, "strategy_state", None)
@@ -517,6 +551,7 @@ class _StrategyAdapter:
             ta=ta,
             symbols=symbols_from(state),
             interval=candle.interval or self.interval,
+            fundamentals=fundamentals,
         )
         if holder is not None:
             ctx.shared = holder
@@ -614,5 +649,6 @@ __all__ = [
     "SeriesView",
     "OhlcvView",
     "TaContext",
+    "Fundamentals",
     "symbols_from",
 ]

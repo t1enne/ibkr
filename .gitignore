@@ -34,3 +34,5 @@ ibgateway-stable-standalone*.sh
 
 # worktrees
 .worktrees
+# SEC EDGAR companyfacts payload cache (re-downloadable)
+data/fundamentals_cache/

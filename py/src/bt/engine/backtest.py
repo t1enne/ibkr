@@ -115,6 +115,7 @@ def run_backtest(
     benchmark_curves: Optional[Mapping[str, pd.Series]] = None,
     ta: Optional[TaContext] = None,
     strategy_state: Optional[dict] = None,
+    fundamentals: Any = None,
     signal_observer: Optional[Callable] = None,
 ) -> Tuple[BacktestResults, BacktestState]:
     """Run backtest with the given candle generator and handlers.
@@ -140,6 +141,10 @@ def run_backtest(
         strategy_state: Optional per-run cross-candle state holder for stateful
             DSL strategies (minted fresh by ``run`` per window; attached to the
             CandleStore so no module-level singleton is shared).
+        fundamentals: Optional prefetched ``Fundamentals`` store (as-first-stated
+            fiscal series loaded once from the local DB). Typed ``Any`` like
+            ``ta`` — the engine layer stays decoupled from the strategy layer and
+            the DSL narrows it via isinstance.
 
     Returns:
         Tuple of (BacktestResults, final BacktestState)
@@ -184,6 +189,11 @@ def run_backtest(
         ta.bind(store)
     if strategy_state is not None:
         store.attach_strategy_state(strategy_state)
+    if fundamentals is not None:
+        # Bind after construction so the store's cursor reader is wired to the
+        # same cursor the TaContext uses — publication-time and bar-time
+        # visibility come from one clock.
+        store.attach_fundamentals(fundamentals)
     state = merge_bt_state(state, dict(candles=store))
 
     for candle in candle_gen:
@@ -615,11 +625,17 @@ def run(
     strat_mod,
     benchmark_curves: Optional[Mapping[str, pd.Series]] = None,
     signal_observer: Optional[Callable] = None,
+    fundamentals: Any = None,
 ) -> BacktestResults:
     """Convenience function for running backtest with defaults.
 
     This creates default handlers and runs the backtest.  Use run_backtest()
     for full control.
+
+    ``fundamentals`` is an optional prefetched ``Fundamentals`` store (see
+    ``load_fundamentals``); it is attached to the CandleStore so decorated
+    strategies reach it via ``ctx.fundamentals``. Typed ``Any`` on purpose:
+    the engine never imports the concrete DSL context.
     """
     from src.bt.engine.handlers import default_execution_handler, default_risk_handler
 
@@ -643,6 +659,13 @@ def run(
 
     ta = init_ta(data, bt.config.symbols, bt.config.bars[0])
     strategy_state = {} if getattr(on_candle, "stateful", False) else None
+    if fundamentals is None:
+        # Load the symbol set's as-first-stated fiscal series once per run. A
+        # missing table / uncovered symbol yields empty series rather than
+        # failing the run, so fundamentals stay an additive input.
+        from src.bt.strategies.fundamentals_context import load_fundamentals
+
+        fundamentals = load_fundamentals(bt.config.symbols)
 
     results, _ = run_backtest(
         bt,
@@ -653,6 +676,7 @@ def run(
         benchmark_curves=benchmark_curves,
         ta=ta,
         strategy_state=strategy_state,
+        fundamentals=fundamentals,
         signal_observer=signal_observer,
     )
     return results
