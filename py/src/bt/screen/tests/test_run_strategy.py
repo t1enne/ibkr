@@ -13,7 +13,9 @@ import pytest
 
 from src.bt.screen.run_strategy import (
     Posture,
+    ScreenRow,
     SignalCollector,
+    _filter_recent,
     _project,
     _resolve_latest,
     _resolve_posture,
@@ -155,3 +157,21 @@ def test_project_scalar_latest_still_supported():
     collector.on_signal(_sig(ActionType.short, "AAPL", ts=TS))
     rows = _project(collector, ("AAPL",), Posture(), TS)
     assert rows[0].score == Posture().base_score_open
+
+
+def _row(sym: str, sig_ts: pd.Timestamp | None, ts: pd.Timestamp = TS) -> ScreenRow:
+    return ScreenRow(
+        symbol=sym,
+        action="long" if sig_ts is not None else "flat",
+        score=1.0 if sig_ts is not None else 0.0,
+        signals=(),
+        ts=ts,
+        sig_ts=sig_ts,
+    )
+
+
+def test_filter_recent_drops_stale_and_flat():
+    old = cast(pd.Timestamp, pd.Timestamp("2025-05-01"))  # 40d before TS
+    rows = (_row("AAPL", TS), _row("MSFT", old), _row("NVDA", None))
+    assert [r.symbol for r in _filter_recent(rows, 5)] == ["AAPL"]
+    assert _filter_recent(rows, None) == rows

@@ -35,7 +35,16 @@ TABLE_COLS = ["symbol", "action", "score", "signals", "date"]
     "A screen only needs enough bars to warm the strategy + display indicators, "
     "never the config's multi-year backtest span.",
 )
-def screen(strategy_file: str, warmup: int | None) -> None:
+@click.option(
+    "--max-age",
+    "-a",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Only report postures whose setting bar is within N days of the "
+    "symbol's own latest bar. 0 = no limit.",
+)
+def screen(strategy_file: str, warmup: int | None, max_age: int) -> None:
     """Score a universe by running its strategy through the real engine.
 
     STRATEGY_FILE: the same JSON strategy config a ``bt run`` consumes. The
@@ -48,14 +57,15 @@ def screen(strategy_file: str, warmup: int | None) -> None:
     """
     from src.bt.screen.run_strategy import (
         COMMON_COLS,
+        WARMUP_DAYS,
         common_metrics,
         run_screen_from_strategy,
     )
 
-    rows, state = (
-        run_screen_from_strategy(strategy_file)
-        if warmup is None
-        else run_screen_from_strategy(strategy_file, warmup_days=warmup)
+    rows, state = run_screen_from_strategy(
+        strategy_file,
+        warmup_days=warmup if warmup is not None else WARMUP_DAYS,
+        max_age_days=max_age or None,
     )
 
     table_rows: list[dict[str, str]] = []
@@ -78,7 +88,7 @@ def screen(strategy_file: str, warmup: int | None) -> None:
         )
 
     if not table_rows:
-        click.echo("No signals.")
+        click.echo("No recent signals.")
         return
 
     for line in render_from_dicts(

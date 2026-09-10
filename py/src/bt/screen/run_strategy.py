@@ -94,6 +94,7 @@ def run_screen_from_strategy(
     config_path: str,
     posture: Posture = Posture(),
     warmup_days: int = WARMUP_DAYS,
+    max_age_days: int | None = None,
 ) -> tuple[tuple[ScreenRow, ...], BacktestState]:
     """Score a universe by running its strategy through the real engine.
 
@@ -141,7 +142,29 @@ def run_screen_from_strategy(
         s: _latest_ts(df) for s in config.symbols
     }
     rows = _project(collector, tuple(config.symbols), posture, latest)
+    rows = _filter_recent(rows, max_age_days)
     return rows, final
+
+
+def _filter_recent(
+    rows: tuple[ScreenRow, ...],
+    max_age_days: int | None,
+) -> tuple[ScreenRow, ...]:
+    """Drop flat rows and postures whose setting bar is older than ``max_age_days``.
+
+    Age is measured against each row's OWN latest data bar (``r.ts``), never
+    wall-clock, so a stale/delisted symbol's fresh intent is not misjudged
+    against today. ``None`` disables the filter (current behaviour).
+    """
+    if max_age_days is None:
+        return rows
+    keep: list[ScreenRow] = []
+    for r in rows:
+        if r.action == "flat" or r.sig_ts is None:
+            continue
+        if (r.ts - r.sig_ts) <= pd.Timedelta(days=max_age_days):
+            keep.append(r)
+    return tuple(keep)
 
 
 def _load_feed(config: StrategyConfig) -> pd.DataFrame:
