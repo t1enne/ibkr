@@ -35,6 +35,7 @@ import numpy as np
 
 from src.bt.strategies.dsl import strategy, StrategyContext
 from src.bt.strategies.types import StrategyParams
+from src.bt.strategies.vp_breakout_dsl import _gross_exposure
 
 STRATEGY_TYPE = "mfi_divergence_dsl"
 _STATE_KEY = "mfi_divergence_state"
@@ -66,6 +67,14 @@ class Params(StrategyParams):
     entry_stop_atr: float = 3.0  # initial stop, ATRs beyond entry
     risk_pct: float = 0.4
     warmup_bars: int = 60
+    # -- drawdown control --
+    # Per-name notional is ``risk_pct`` of live equity, so a correlated cluster
+    # can dominate the book (measured: DD -49% on 6y at risk_pct=0.4).
+    # ``risk_pct`` is the primary DD lever; this caps aggregate |gross| notional
+    # as a fraction of initial capital (1.0 = off).
+    max_gross_exposure: float = (
+        1.0  # aggregate |notional| cap, fraction of initial capital (1.0 = off)
+    )
 
 
 @strategy(bars="1d", stateful=True)
@@ -273,6 +282,16 @@ def _enter(
 ) -> None:
     if not (atr > 0 and close > 0 and ctx.state.portfolio.cash > 0):
         return
+    # -- drawdown control: aggregate gross-notional cap (1.0 = off) --
+    if 0.0 < p.max_gross_exposure < 1.0:
+        equity = ctx.current_equity()
+        init = ctx.state.portfolio.initial_capital
+        # DSL sizes the candidate at ``risk_pct * equity`` of notional; express
+        # it as a fraction of initial capital to match ``_gross_exposure``.
+        candidate = p.risk_pct * equity / init if init > 0 else 0.0
+        gross = _gross_exposure(init, ctx.state.portfolio.positions)
+        if gross + candidate >= p.max_gross_exposure:
+            return
     stop = p.entry_stop_atr * atr / close
     if side == "long":
         ctx.long(
