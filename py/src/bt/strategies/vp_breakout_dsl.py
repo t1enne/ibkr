@@ -35,6 +35,7 @@ from src.bt.size.pure import risk_sized_qty
 from src.bt.strategies.dsl import strategy, StrategyContext
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.types import StrategyParams
+from src.bt.strategies.utils import gross_exposure, gross_gate
 
 STRATEGY_TYPE = "vp_breakout_dsl"
 
@@ -75,7 +76,7 @@ class Params(StrategyParams):
     atr_mult: float = 2.0  # stop = atr_mult * ATR against entry
     risk_pct: float = 0.005
     max_gross_exposure: float = (
-        1.0  # aggregate |notional| cap, fraction of initial capital
+        1.0  # aggregate |notional| cap, fraction of live equity (1.0 = off)
     )
     # -- misc --
     cooldown_bars: int = 5
@@ -168,22 +169,11 @@ def _snap(ctx: StrategyContext, sym: str) -> object:
 
 
 def _gross_exposure(
-    initial_capital: float,
+    base_equity: float,
     positions: Mapping[str, tuple[Position, ...]],
 ) -> float:
-    """Aggregate |gross notional| across all open lots / initial capital.
-
-    Sums ``abs(qty) * last_price`` for every open lot (longs and shorts both
-    count positively — gross exposure is the capital at work, not net). Pure,
-    so a strategy can call it directly on ``ctx.state.portfolio``.
-    """
-    if initial_capital <= 0:
-        return 0.0
-    total = 0.0
-    for lots in positions.values():
-        for pos in lots:
-            total += abs(float(pos.qty)) * float(pos.last_price)
-    return total / initial_capital
+    """Back-compat shim -> :func:`src.bt.strategies.utils.gross_exposure`."""
+    return gross_exposure(base_equity, positions)
 
 
 def _size(ctx: StrategyContext, params: Params, price: float, atr_val: float) -> float:
@@ -356,18 +346,16 @@ def _enter(ctx: StrategyContext, sym: str, params: Params) -> None:
     # Aggregate gross-exposure cap (Priority 4, "portfolio construction"). The
     # per-position size only risks ``risk_pct`` of *current cash* per name, so
     # without this the book has no portfolio-level notional ceiling when several
-    # names are up concurrently. Skip this entry if it would push total |gross|
-    # notional (incl. the candidate lot) past ``max_gross_exposure``.
-    if params.max_gross_exposure < 1.0 and params.max_gross_exposure > 0.0:
-        if (
-            _gross_exposure(
-                ctx.state.portfolio.initial_capital,
-                ctx.state.portfolio.positions,
-            )
-            + size
-            >= params.max_gross_exposure
-        ):
-            return
+    # names are up concurrently. The gate compares gross + candidate against a
+    # live-equity-relative cap; ``_size`` returns the candidate as a fraction of
+    # *initial capital*, so rescale it onto the equity base first.
+    equity = ctx.current_equity()
+    init = ctx.state.portfolio.initial_capital
+    candidate = size * init / equity if equity > 0 else 0.0
+    if gross_gate(
+        equity, ctx.state.portfolio.positions, params.max_gross_exposure, candidate
+    ):
+        return
 
     if long_breakout:
         ctx.long(

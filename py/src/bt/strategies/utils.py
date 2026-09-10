@@ -1,4 +1,5 @@
 from typing import List, Optional, Any, Tuple
+from collections.abc import Mapping
 
 from src.bt.state import (
     TradeSignal,
@@ -94,3 +95,51 @@ def sl_tp_from_pct(
         sl = entry_price * (1 + stop_loss) if stop_loss > 0 else None
         tp = entry_price * (1 - take_profit) if take_profit > 0 else None
     return sl, tp
+
+
+# ---------------------------------------------------------------------------
+# portfolio-level gross-exposure cap
+# ---------------------------------------------------------------------------
+
+
+def gross_exposure(
+    base_equity: float,
+    positions: Mapping[str, Tuple[Position, ...]],
+) -> float:
+    """Aggregate |gross notional| across all open lots / ``base_equity``.
+
+    Sums ``abs(qty) * last_price`` for every open lot (longs and shorts both
+    count positively — gross exposure is capital at work, not net). Pure.
+
+    Pass **live MTM equity** as ``base_equity`` so the returned fraction is
+    directly comparable to an equity-scaled lot fraction
+    (``size * current_equity / price``). Dividing by *initial* capital instead
+    makes a fixed cap lock the book out progressively as equity grows — the
+    bug :func:`gross_gate` exists to avoid.
+    """
+    if base_equity <= 0:
+        return 0.0
+    total = 0.0
+    for lots in positions.values():
+        for pos in lots:
+            total += abs(float(pos.qty)) * float(pos.last_price)
+    return total / base_equity
+
+
+def gross_gate(
+    equity: float,
+    positions: Mapping[str, Tuple[Position, ...]],
+    cap: float,
+    candidate_fraction: float,
+) -> bool:
+    """True when an entry should be **skipped** by the gross-exposure cap.
+
+    ``cap`` is the aggregate |notional| ceiling as a fraction of live equity;
+    ``cap >= 1.0`` (or ``<= 0``) disables the gate. ``candidate_fraction`` is
+    the prospective lot's notional as a fraction of the **same** ``equity``
+    base. Blocks the entry when the current gross plus the candidate would
+    reach or exceed ``cap``.
+    """
+    if not 0.0 < cap < 1.0:
+        return False
+    return gross_exposure(equity, positions) + candidate_fraction >= cap

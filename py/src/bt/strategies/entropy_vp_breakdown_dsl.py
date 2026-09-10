@@ -65,6 +65,7 @@ from src.indicators.volume_profile.strategy import OnlineVP
 from src.indicators.adaptive_entropy import AdaptiveEntropyConfig, OnlineAdaptiveEntropy
 from src.bt.size.pure import risk_sized_qty
 from src.bt.strategies.dsl import strategy, StrategyContext
+from src.bt.strategies.utils import gross_gate
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.types import StrategyParams
 
@@ -470,21 +471,16 @@ def _enter(ctx: StrategyContext, sym: str, params: Params) -> None:
         return
 
     # Aggregate gross-exposure cap: skip if this entry would push total |gross|
-    # notional past ``max_gross_exposure`` of initial capital. A value >= 1.0
-    # disables the cap (100%+ of capital is effectively unconstrained for a
-    # risk-sized book).
-    if 0.0 < params.max_gross_exposure < 1.0:
-        from src.bt.strategies.vp_breakout_dsl import _gross_exposure
-
-        if (
-            _gross_exposure(
-                ctx.state.portfolio.initial_capital,
-                ctx.state.portfolio.positions,
-            )
-            + size
-            >= params.max_gross_exposure
-        ):
-            return
+    # notional past ``max_gross_exposure`` of live equity. ``_size`` returns the
+    # candidate as a fraction of *initial capital*, so rescale onto the equity
+    # base first. A value >= 1.0 disables the cap.
+    equity = ctx.current_equity()
+    init = ctx.state.portfolio.initial_capital
+    candidate = size * init / equity if equity > 0 else 0.0
+    if gross_gate(
+        equity, ctx.state.portfolio.positions, params.max_gross_exposure, candidate
+    ):
+        return
 
     # Initial stop for sizing is one ATR distance above the entry; the dynamic
     # trailing stop is established from here and ratcheted down each bar.
