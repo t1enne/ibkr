@@ -17,7 +17,7 @@ import respx
 
 from src.data.fundamentals import dl as dlmod
 from src.data.fundamentals.query import load_stated
-from src.data.fundamentals.schema import FundamentalSchema, bootstrap
+from src.data.fundamentals.schema import FundamentalSchema, _using, bootstrap
 from src.data.fundamentals.sec_client import download_fundamentals
 from src.utils import parse_timestamp
 
@@ -166,6 +166,47 @@ async def test_download_payload_cache_avoids_second_fetch(
         await download_fundamentals(["AAPL"], batch_delay_s=0.0, cache=cache)
         await download_fundamentals(["AAPL"], batch_delay_s=0.0, cache=cache)
     assert facts_route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_download_is_idempotent_across_runs(
+    db_file: Path, tmp_path: Path
+) -> None:
+    """The original symptom: re-running `dl` must not append duplicate rows.
+
+    A second run with `--refresh` (so the payload cache is bypassed and the full
+    ingest path really executes) must report zero rows written and leave the
+    stored row set identical.
+    """
+    cache = tmp_path / "cache"
+    with respx.mock:
+        _mock_sec()
+        first = await dlmod.download(["AAPL"], cache=cache)
+        before = _count(db_file)
+        second = await dlmod.download(["AAPL"], cache=cache, refresh=True)
+
+    assert first[0].rows == 4
+    assert second[0].rows == 0
+    assert _count(db_file) == before == 4
+
+
+def test_recap_distinguishes_nothing_new_from_nothing_at_all() -> None:
+    """A no-op re-run must not read as "no fundamentals" (the data is stored)."""
+    from src.data.fundamentals.dl import DownloadRecap, _recap_line
+
+    up_to_date = DownloadRecap("AAPL", 0, 2, ts("2023-05-01"), ts("2024-02-01"))
+    assert "up to date" in _recap_line(up_to_date)
+    assert "no SEC fundamentals" not in _recap_line(up_to_date)
+
+    nothing = DownloadRecap("SPY", 0, 0, None, None)
+    assert "no SEC fundamentals" in _recap_line(nothing)
+
+
+def _count(db_file: Path) -> int:
+    """Rows in the fundamentals table of the isolated DB."""
+    conn = FundamentalSchema._meta.database
+    with _using(conn):
+        return FundamentalSchema.select().count()
 
 
 def pd_timestamp(value: str):

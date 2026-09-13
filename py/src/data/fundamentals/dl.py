@@ -28,7 +28,12 @@ from src.data.fundamentals.sec_client import download_fundamentals
 
 @dataclass(frozen=True)
 class DownloadRecap:
-    """Per-symbol outcome of a fundamentals download."""
+    """Per-symbol outcome of a fundamentals download.
+
+    ``rows`` is the number of rows actually written (0 on an idempotent re-run);
+    ``periods`` describes the payload, so the two together distinguish "nothing
+    new" from "nothing at all".
+    """
 
     symbol: str
     rows: int
@@ -85,11 +90,14 @@ async def download(
             recaps.append(DownloadRecap(ticker, 0, 0, None, None))
             continue
         rows = _window(sec_payload_to_rows(ticker, payload), from_date, to_date)
-        insert_fundamentals(rows)
+        # Report what the insert actually wrote, not what the payload contained:
+        # a re-run of unchanged filings is a no-op, and the recap is the only
+        # place that is visible to the operator.
+        written = insert_fundamentals(rows)
         recaps.append(
             DownloadRecap(
                 symbol=ticker,
-                rows=len(rows),
+                rows=written,
                 periods=len({r.period_end for r in rows}),
                 first_filed=min((r.filed for r in rows), default=None),
                 last_filed=max((r.filed for r in rows), default=None),
@@ -99,7 +107,14 @@ async def download(
 
 
 def _recap_line(recap: DownloadRecap) -> str:
-    if recap.rows == 0:
+    """One recap line: what was written, and over which fiscal periods.
+
+    ``periods`` counts the periods seen in the payload, so a no-op re-run reads
+    "0 rows ... up to date" (the filings are stored, nothing was new) rather
+    than the misleading "no SEC fundamentals", which is reserved for symbols we
+    genuinely have nothing for.
+    """
+    if recap.periods == 0:
         return f"{recap.symbol}: no SEC fundamentals"
     span = (
         f"{recap.first_filed.strftime('%Y-%m-%d')} -> "
@@ -107,10 +122,8 @@ def _recap_line(recap: DownloadRecap) -> str:
         if recap.first_filed is not None and recap.last_filed is not None
         else "n/a"
     )
-    return (
-        f"{recap.symbol}: {recap.rows} rows  {recap.periods} fiscal periods"
-        f"  filed {span}"
-    )
+    written = f"{recap.rows} rows" if recap.rows else "up to date"
+    return f"{recap.symbol}: {written}  {recap.periods} fiscal periods  filed {span}"
 
 
 @click.command(name="dl")

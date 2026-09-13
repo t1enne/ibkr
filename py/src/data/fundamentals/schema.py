@@ -146,6 +146,32 @@ class FundamentalRow:
 # ``candle.timestamp`` convention so both tables share one time encoding.
 _MS_PER_DAY = 86_400_000
 
+#: Natural key of a stated fact, enforced UNIQUE (mirrors
+#: ``candle_ticker_timestamp_idx`` on the candle table, which is what makes the
+#: candle insert idempotent). ``form`` is deliberately **excluded**: ``filed``
+#: already disambiguates two filings of one period, while a period-only key would
+#: collide the original with its restatement and destroy the PIT distinction.
+NATURAL_KEY_COLUMNS: tuple[str, ...] = (
+    "ticker",
+    "statement",
+    "field",
+    "period_start",
+    "period_end",
+    "filed",
+)
+
+#: Name of the UNIQUE index backing :data:`NATURAL_KEY_COLUMNS`.
+NATURAL_KEY_INDEX = "fundamental_natural_key_idx"
+
+#: Peewee derives index names from the table+columns (an overlong hashed name),
+#: so the index is created explicitly by :func:`bootstrap` under a stable name
+#: instead. The DDL lives next to :data:`NATURAL_KEY_COLUMNS` so the two cannot
+#: drift apart.
+NATURAL_KEY_DDL = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {NATURAL_KEY_INDEX} "
+    f"ON fundamental ({', '.join(NATURAL_KEY_COLUMNS)})"
+)
+
 
 class FundamentalSchema(Model):
     """Sparse fiscal fundamentals row (see :class:`FundamentalRow`)."""
@@ -175,16 +201,51 @@ def _default_conn() -> SqliteDatabase:
 
 
 def bootstrap(db_conn=None) -> None:
-    """Create the ``fundamental`` table if absent (idempotent).
+    """Create the ``fundamental`` table and its natural-key UNIQUE index.
 
-    Mirrors the candle convention: tables are created explicitly rather than by
+    Mirrors the candle convention: schema is created explicitly rather than by
     an import side effect, so a read-only run over an existing DB never pays a
     schema write. ``db_conn`` (a :class:`SqliteDatabase`) overrides the module
     default, which is what tests and any non-default DB use.
+
+    The index is created separately from ``create_tables`` because that call
+    does not ALTER an existing table: a DB migrated before the index existed
+    already has the table and would otherwise never gain the constraint that
+    makes :func:`insert_fundamentals` idempotent. ``IF NOT EXISTS`` keeps the
+    whole thing idempotent and safe on a table created in the same call.
+
+    A table that predates the constraint may already hold duplicate natural keys
+    (the very rows the constraint prevents going forward), which would make
+    ``CREATE UNIQUE INDEX`` fail. Those exact-duplicate rows are collapsed first
+    — see :func:`_collapse_duplicate_keys`. Restatements are not duplicates (they
+    differ in ``filed``) and are never touched.
     """
     conn = db_conn if db_conn is not None else _default_conn()
     with _using(conn):
         conn.create_tables([FundamentalSchema])
+        _collapse_duplicate_keys(conn)
+        conn.execute_sql(NATURAL_KEY_DDL)
+
+
+#: Delete every row sharing a natural key except the lowest ``id`` (the first
+#: write, which is what :func:`insert_fundamentals` would now have kept anyway).
+#: A grouped subquery rather than a window function, so it runs on any SQLite.
+_COLLAPSE_DUPES = (
+    "DELETE FROM fundamental WHERE id NOT IN ("
+    "SELECT MIN(id) FROM fundamental "
+    f"GROUP BY {', '.join(NATURAL_KEY_COLUMNS)})"
+)
+
+
+def _collapse_duplicate_keys(conn: SqliteDatabase) -> int:
+    """Remove exact-duplicate natural-key rows; return how many were removed.
+
+    Needed only to make the UNIQUE index creatable on a table that predates it.
+    Safe when there is nothing to collapse (the DELETE matches no rows) and on a
+    table created in the same call (it is empty).
+    """
+    removed = conn.execute_sql(_COLLAPSE_DUPES).rowcount
+    return int(removed) if removed and removed > 0 else 0
 
 
 @contextmanager
@@ -226,15 +287,22 @@ def insert_fundamentals(
     batch_size: int = 500,
     db_conn: SqliteDatabase | None = None,
 ) -> int:
-    """Atomically insert ``rows``; returns the number of rows written.
+    """Atomically insert ``rows``, skipping facts already stored.
 
-    Not idempotent by design: two filings of the same period are two distinct
-    facts (the restatement *is* the data), so a natural-key ignore would throw
-    away exactly the PIT distinction the store exists to keep. Re-running a
-    download for unchanged data therefore appends duplicates that
-    :func:`~src.data.fundamentals.query.as_first_stated` collapses on read —
-    correctness is unaffected, and the same tradeoff already applies to the
-    candle path. Repeat ``dl`` only after new filings exist.
+    **Idempotent**: rows whose natural key
+    (:data:`NATURAL_KEY_COLUMNS` — ticker/statement/field/period span/``filed``)
+    is already present are ignored (``ON CONFLICT DO NOTHING``), so re-running a
+    download for unchanged data writes nothing. This is the same mechanism that
+    makes the candle insert idempotent (a UNIQUE index + ``on_conflict_ignore``).
+
+    Restatements are preserved rather than collapsed: two filings of one fiscal
+    period differ in ``filed``, so they are two distinct facts and both survive
+    (the restatement *is* the data). ``form`` is not part of the key for the same
+    reason — ``filed`` already disambiguates.
+
+    Returns the number of rows actually written (duplicates skipped by the
+    constraint are not counted), so a caller can tell a real ingest from a no-op
+    re-run.
 
     ``batch_size`` bounds the executemany bind-parameter count (SQLite's
     variable limit), like the candle chunked insert. ``db_conn`` targets a
@@ -244,11 +312,26 @@ def insert_fundamentals(
     if not payload:
         return 0
     conn = db_conn if db_conn is not None else _default_conn()
+    written = 0
     with _using(conn):
         for i in range(0, len(payload), batch_size):
+            batch = payload[i : i + batch_size]
             with conn.atomic():
-                FundamentalSchema.insert_many(payload[i : i + batch_size]).execute()
-    return len(payload)
+                written += _insert_batch(batch)
+    return written
+
+
+def _insert_batch(batch: list[dict]) -> int:
+    """Insert one batch, ignoring rows already present; return how many landed.
+
+    peewee's ``on_conflict_ignore().execute()`` returns only the last rowid (its
+    own cursor is not exposed), so the inserted count comes from diffing the
+    table size around the statement. Kept inside the caller's ``atomic()`` block
+    so the measurement and the write share one transaction.
+    """
+    before = FundamentalSchema.select().count()
+    FundamentalSchema.insert_many(batch).on_conflict_ignore().execute()
+    return FundamentalSchema.select().count() - before
 
 
 __all__ = [
@@ -262,6 +345,9 @@ __all__ = [
     "FundamentalSchema",
     "statement_of",
     "field_names",
+    "NATURAL_KEY_COLUMNS",
+    "NATURAL_KEY_INDEX",
+    "NATURAL_KEY_DDL",
     "bootstrap",
     "insert_fundamentals",
 ]
