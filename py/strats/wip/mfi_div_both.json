@@ -7,9 +7,21 @@
   "commission": 0.0,
   "initial_capital": 50000,
   "strategy_type": "mfi_divergence_dsl",
-  "bars": [
-    "1d"
-  ],
+  "bars": ["1d"],
+  "strategy_params": {
+    "mfi_period": 14,
+    "div_look": 30,
+    "div_min_gap": 8.0,
+    "allow_longs": true,
+    "allow_shorts": true,
+    "sym_roc_look": 120,
+    "sym_roc_min": 0.05,
+    "atr_period": 7,
+    "trail_atr_mult": 1.2,
+    "entry_stop_atr": 3.0,
+    "risk_pct": 0.4,
+    "warmup_bars": 60
+  },
   "symbols": [
     "AAPL",
     "ABBV",
@@ -124,22 +136,5 @@
     "XBI",
     "XEL",
     "SPY"
-  ],
-  "benchmark_symbols": [
-    "SPY"
-  ],
-  "strategy_params": {
-    "mfi_period": 14,
-    "div_look": 30,
-    "div_min_gap": 8.0,
-    "allow_longs": true,
-    "allow_shorts": true,
-    "sym_roc_look": 120,
-    "sym_roc_min": 0.05,
-    "atr_period": 7,
-    "trail_atr_mult": 1.2,
-    "entry_stop_atr": 3.0,
-    "risk_pct": 0.4,
-    "warmup_bars": 60
-  }
+  ]
 }
