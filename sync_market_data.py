@@ -126,7 +126,9 @@ def ensure_gateway() -> None:
     run(["uv", "--directory", str(PY_DIR), "run", "scripts/login_ibkr.py"])
     time.sleep(3)
     if not tickle_auth():
+        time.sleep(3)
         sys.exit("Login ran but /tickle still reports unauthenticated.")
+
     log("Session authenticated after login.")
 
 
