@@ -305,6 +305,23 @@ class TaContext:
 
         return self._view(sym, self._compute(key, _calc), interval)
 
+    def obv_z(
+        self, sym: str, window: int = 40, interval: str | None = None
+    ) -> SeriesView:
+        """OBV level z-score over ``window`` bars — the direct cumulative-flow
+        read (sign = flow direction, magnitude = strength off the names' own
+        noise floor).
+        """
+        from src.indicators.ta import obv_z as _obv_z
+
+        key: CacheKey = ("obv_z", sym, (window,))
+        a = self._series(sym, interval)
+
+        def _calc() -> np.ndarray:
+            return _obv_z(_ser(a["close"]), _ser(a["volume"]), window).to_numpy()
+
+        return self._view(sym, self._compute(key, _calc), interval)
+
     def highest(self, sym: str, period: int, interval: str | None = None) -> SeriesView:
         """Pine ``highest`` — rolling maximum over ``period`` bars (incl. current)."""
         return self._rolling_extreme(sym, "highest", period, interval)

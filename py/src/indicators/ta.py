@@ -241,6 +241,31 @@ def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return obv.fillna(0).cumsum()
 
 
+def obv_z(close: pd.Series, volume: pd.Series, window: int = 40) -> pd.Series:
+    """OBV level z-score against its own trailing ``window`` (mean/std).
+
+    The direct cumulative-flow read: sign = money-flow direction, magnitude =
+    strength off the name's own noise floor (``~+1.5/-1.5`` starts to be
+    notable). Rows inside the first ``window`` bars (and any row with a zero
+    rolling std) are ``NaN`` so callers fail closed.
+
+    Args:
+        close: Close prices series
+        volume: Volume series
+        window: trailing window for the OBV level's mean/std (bars)
+
+    Returns:
+        Series with the OBV z-score, ``NaN`` where it cannot be computed.
+    """
+    if window <= 0:
+        return pd.Series(np.nan, index=close.index, dtype=float)
+    level = obv(close, volume)
+    roll = level.rolling(window=window)
+    std = roll.std()
+    z = (level - roll.mean()) / std.replace(0, np.nan)
+    return z.where(np.isfinite(z))
+
+
 def mfi(
     high: pd.Series,
     low: pd.Series,

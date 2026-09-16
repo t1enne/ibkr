@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.indicators.ta import mfi, rsi
+from src.indicators.ta import mfi, obv, obv_z, rsi
 
 
 def _frame_from_closes(closes: pd.Series, volume: float = 1e6) -> pd.DataFrame:
@@ -82,3 +82,48 @@ def test_rsi_bounded_0_100():
     r = rsi(closes, 14).dropna()
     assert float(r.min()) >= 0.0
     assert float(r.max()) <= 100.0
+
+
+# ---- OBV / OBV z-score (direct cumulative-flow channel) ----
+
+
+def test_obv_accumulates_on_up_days_distributes_on_down_days():
+    close = pd.Series([10.0, 11.0, 10.5, 12.0])
+    volume = pd.Series([100.0, 200.0, 300.0, 400.0])
+    # day0 diff NaN -> 0; day1 +1 up (+200); day2 -0.5 down (-300); day3 +1.5 up (+400)
+    out = obv(close, volume)
+    assert list(out) == [0.0, 200.0, -100.0, 300.0]
+
+
+def test_obv_z_positive_when_flow_accumulates():
+    closes = pd.Series([float(x) for x in range(10, 60)])  # strictly rising
+    z = obv_z(closes, pd.Series(1.0, index=closes.index), window=40).dropna()
+    assert len(z) > 0
+    assert float(z.iloc[-1]) > 0
+
+
+def test_obv_z_negative_when_flow_distributes():
+    closes = pd.Series([float(x) for x in range(60, 10, -1)])  # strictly falling
+    z = obv_z(closes, pd.Series(1.0, index=closes.index), window=40).dropna()
+    assert len(z) > 0
+    assert float(z.iloc[-1]) < 0
+
+
+def test_obv_z_nan_when_flow_flat():
+    # flat price -> OBV never moves -> zero rolling std -> fail closed
+    closes = pd.Series([10.0] * 60)
+    z = obv_z(closes, pd.Series(1.0, index=closes.index), window=40)
+    assert z.isna().all()
+
+
+def test_obv_z_window_off_is_all_nan():
+    closes = pd.Series([float(x) for x in range(10, 60)])
+    z = obv_z(closes, pd.Series(1.0, index=closes.index), window=0)
+    assert z.isna().all()
+
+
+def test_obv_z_first_window_rows_are_nan():
+    closes = pd.Series([float(x) for x in range(10, 60)])
+    z = obv_z(closes, pd.Series(1.0, index=closes.index), window=40)
+    assert z.iloc[:39].isna().all()
+    assert np.isfinite(z.iloc[-1])
