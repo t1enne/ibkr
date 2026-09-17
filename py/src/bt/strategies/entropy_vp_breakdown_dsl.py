@@ -96,6 +96,34 @@ class Params(StrategyParams):
     vol_expand_mult: float = 1.3  # breakdown volume >= this x avg
     wick_check: float = 0.5  # close must sit in the lower fraction of the bar
     trend_lookback: int = 50  # concurrency: price vs its own rolling mean
+    # -- stretch filter (independent; default off) --
+    # Reject a breakdown whose bar is already over-extended below its own short
+    # EMA (``stretch_ema_period``) by more than ``max_stretch_atr`` ATRs. Kills
+    # shorts fired into capitulation / the relative bottom of the range. Disabled
+    # when ``max_stretch_atr <= 0``.
+    max_stretch_atr: float = 0.0
+    stretch_ema_period: int = 20
+    # -- oscillator timing gate (independent; default off) --
+    # Require the entry bar's oscillator to have *rolled over* from an extreme
+    # rather than confirming at the low: enter only when the oscillator sits at
+    # or below ``osc_ceiling`` (i.e. no longer overbought). ``osc_kind`` selects
+    # ``"rsi"`` or ``"mfi"``. Disabled when ``osc_ceiling <= 0``.
+    osc_kind: str = "rsi"
+    osc_period: int = 14
+    osc_ceiling: float = 0.0
+    # -- SPY trend gate (independent; default off) --
+    # Block NEW shorts unless the broad market is in a down/flat regime. Two
+    # independent reads, either of which must confirm a *non-bull* tape:
+    #   * ``spy_ema_period > 0`` — require SPY close BELOW its EMA(period), AND
+    #   * ``spy_roc_period > 0`` — require SPY ROC over the period <= ``spy_roc_max``.
+    # When both are enabled they are ANDed (sustained downtrend). When both are
+    # off the gate is disabled. Uses ``market_symbol`` (must be in the feed).
+    spy_ema_period: int = 0
+    spy_roc_period: int = 0
+    spy_roc_max: float = 0.0
+    # When True, an open short is force-closed as soon as the SPY gate turns
+    # non-bearish (mirror of the entry gate on the exit path).
+    spy_exit_on_flip: bool = True
     # -- adaptive-entropy regime gate --
     # Per-symbol entry gate: a short is allowed when the symbol's quantised
     # ``trend >= min_trend`` (``-1`` = bear-only ``trend == -1``, ``0`` =
@@ -348,6 +376,79 @@ def trail_stop(
     return anchor - mult * atr
 
 
+def _stretch_ok(
+    ctx: StrategyContext, sym: str, params: Params, close: float, atr_val: float
+) -> bool:
+    """Reject a short when the bar is over-extended below its short EMA.
+
+    ``stretch = (ema - close) / atr`` — how many ATRs price sits *below* its own
+    EMA. A reading above ``max_stretch_atr`` means the decline is already
+    stretched, so shorting here is fading into exhaustion / the relative bottom.
+    Returns ``True`` (allow) when the filter is disabled or data is unavailable.
+    """
+    if params.max_stretch_atr <= 0:
+        return True
+    if np.isnan(atr_val) or atr_val <= 0:
+        return True
+    ema = _last(ctx.ta.ema(sym, params.stretch_ema_period))
+    if np.isnan(ema):
+        return True
+    stretch = (ema - close) / atr_val
+    return stretch <= params.max_stretch_atr
+
+
+def _osc_ok(ctx: StrategyContext, sym: str, params: Params) -> bool:
+    """Oscillator timing gate: short only once the oscillator is not overbought.
+
+    Reads ``rsi`` or ``mfi`` (per ``osc_kind``) at the entry bar and requires it
+    at or below ``osc_ceiling`` — i.e. the oscillator has rolled over from its
+    extreme rather than confirming at the low. Returns ``True`` (allow) when the
+    filter is disabled or the read is unavailable.
+    """
+    if params.osc_ceiling <= 0:
+        return True
+    if params.osc_kind == "mfi":
+        val = _last(ctx.ta.mfi(sym, params.osc_period))
+    else:
+        val = _last(ctx.ta.rsi(sym, params.osc_period))
+    if np.isnan(val):
+        return True
+    return val <= params.osc_ceiling
+
+
+def _spy_trend_ok(ctx: StrategyContext, params: Params) -> bool:
+    """SPY trend gate: allow a NEW short only when the market is not bullish.
+
+    Two independent, optional reads (both enabled -> ANDed):
+      * EMA: SPY close must sit **below** its ``spy_ema_period`` EMA.
+      * ROC: SPY return over ``spy_roc_period`` bars must be ``<= spy_roc_max``.
+    Returns ``True`` (allow) when the gate is disabled or the feed is missing.
+    """
+    if params.spy_ema_period <= 0 and params.spy_roc_period <= 0:
+        return True
+    try:
+        o = ctx.ohlcv(params.market_symbol)
+    except KeyError:
+        return True
+    if len(o.close) == 0:
+        return True
+    close = float(o.close[-1])
+    if params.spy_ema_period > 0:
+        ema = _last(ctx.ta.ema(params.market_symbol, params.spy_ema_period))
+        if np.isfinite(ema) and close >= ema:
+            return False  # SPY above its EMA -> bull tape, no shorts
+    if params.spy_roc_period > 0:
+        arr = o.close.to_array()
+        n = len(arr)
+        if n > params.spy_roc_period:
+            ref = float(arr[-1 - params.spy_roc_period])
+            if ref > 0:
+                roc = close / ref - 1.0
+                if roc > params.spy_roc_max:
+                    return False  # SPY rising -> bull tape, no shorts
+    return True
+
+
 def _size(ctx: StrategyContext, params: Params, price: float, atr_val: float) -> float:
     """0..1 capital fraction to deploy, ATR-risk sized on current cash."""
     if np.isnan(atr_val) or atr_val <= 0 or price <= 0:
@@ -384,6 +485,7 @@ def on_candle(ctx: StrategyContext):
     # Market regime gauge (feed-only; never traded).
     _feed_market(ctx, shared, params)
     risk_off = not market_risk_on(shared, params)
+    spy_ok = _spy_trend_ok(ctx, params)  # SPY not-bull check, once per bar
 
     # ---- Advances / exits first --------------------------------------------
     for sym in ctx.symbols:
@@ -399,6 +501,11 @@ def on_candle(ctx: StrategyContext):
         # force-close the short now before it bleeds into the rising tape.
         if risk_off:
             _exit(ctx, shared, params, sym, "market regime flipped bull (risk-off)")
+            continue
+        # SPY trend flip: when the broad market turns non-bearish, force-close
+        # the short (the entry gate would refuse it — don't keep riding it).
+        if params.spy_exit_on_flip and not spy_ok:
+            _exit(ctx, shared, params, sym, "SPY trend no longer bearish")
             continue
         _manage_open(ctx, shared, params, sym, o, pos)
 
@@ -449,6 +556,19 @@ def _enter(ctx: StrategyContext, sym: str, params: Params) -> None:
     # (market trend == -1) and slow-SMA (close below SMA) to agree the broad
     # market is bearish — only harvest the short edge in a real down regime.
     if not market_bear_ok(ctx.shared, params):
+        return
+
+    # SPY trend gate: never short into a rising broad market.
+    if not _spy_trend_ok(ctx, params):
+        return
+
+    # Stretch filter: reject entries already too far below their own short EMA.
+    if not _stretch_ok(ctx, sym, params, close, atr_val):
+        return
+
+    # Oscillator timing gate: only short once the oscillator has rolled off an
+    # extreme (not while price is still confirming at the lows).
+    if not _osc_ok(ctx, sym, params):
         return
 
     avg_vol = _avg_volume(ctx, sym, params)
