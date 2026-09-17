@@ -28,10 +28,20 @@ from src.bt.cmds._shared import _json_default
     default=None,
     help="Write output to FILE instead of stdout (any format).",
 )
-def run(strategy_file: str, fmt: str, output: str | None):
+@click.option(
+    "--plot",
+    "plot",
+    is_flag=True,
+    default=False,
+    help="Run the backtest then open the Streamlit dashboard over the result.",
+)
+def run(strategy_file: str, fmt: str, output: str | None, plot: bool):
     """Run a backtest from a strategy JSON config file.
 
     STRATEGY_FILE: JSON config with symbols, dates, strategy params.
+
+    --plot runs the backtest then launches the Streamlit dashboard over the
+    result (overrides --format/--output).
 
     Output:
       text  — human-readable summary table.
@@ -44,6 +54,7 @@ def run(strategy_file: str, fmt: str, output: str | None):
     """
     from src.bt import load_strategy, run_backtest_results
     from src.bt import get_backtest_results_analysis
+    from src.bt.dashboard import launch_dashboard
     from src.bt.output import (
         render_result_json,
         render_result_jsonl,
@@ -52,6 +63,9 @@ def run(strategy_file: str, fmt: str, output: str | None):
 
     config = load_strategy(strategy_file)
     results = run_backtest_results(config)
+    if plot:
+        launch_dashboard(render_plot_json(results))
+        return
     if fmt == "plot":
         payload = render_plot_json(results)
     elif fmt == "json":
