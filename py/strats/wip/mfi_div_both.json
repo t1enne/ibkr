@@ -1,17 +1,21 @@
 {
   "name": "mfi_div_both",
-  "training_start": "2023-06-01",
-  "training_end": "2024-07-01",
-  "trading_start": "2024-07-01",
+  "training_start": "2019-11-15",
+  "training_end": "2020-01-01",
+  "trading_start": "2020-01-01",
   "trading_end": "2026-09-08",
   "commission": 0.0,
   "initial_capital": 50000,
   "strategy_type": "mfi_divergence_dsl",
-  "bars": ["1d"],
+  "bars": [
+    "1d"
+  ],
   "strategy_params": {
     "mfi_period": 14,
-    "div_look": 30,
+    "div_look": 25,
     "div_min_gap": 8.0,
+    "div_min_price_ext": 0.0,
+    "cooldown_bars": 0,
     "allow_longs": true,
     "allow_shorts": true,
     "sym_roc_look": 120,
@@ -20,7 +24,10 @@
     "trail_atr_mult": 1.2,
     "entry_stop_atr": 3.0,
     "risk_pct": 0.4,
-    "warmup_bars": 60
+    "warmup_bars": 60,
+    "need_ma_alignment": true,
+    "spy_ma_period": 150,
+    "symbol_ma_period": 100
   },
   "symbols": [
     "AAPL",
@@ -129,7 +136,6 @@
     "TXN",
     "UNH",
     "VRTX",
-    "WBD",
     "WDAY",
     "WDC",
     "WMT",
