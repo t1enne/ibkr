@@ -128,8 +128,13 @@ def test_bull_divergence_price_ext_rejects_shallow_low() -> None:
     # recent low 9 vs prior 10 -> extension only (10-9)/10 = 10%
     close = [11.0, 10.0, 11.0, 12.0, 9.0, 10.0]
     mfi = np.array([30.0, 20.0, 30.0, 40.0, 35.0, 45.0])
-    assert _bull_divergence(_O(close), _p(div_min_price_ext=0.05), mfi, len(close)) is True
-    assert _bull_divergence(_O(close), _p(div_min_price_ext=0.20), mfi, len(close)) is False
+    assert (
+        _bull_divergence(_O(close), _p(div_min_price_ext=0.05), mfi, len(close)) is True
+    )
+    assert (
+        _bull_divergence(_O(close), _p(div_min_price_ext=0.20), mfi, len(close))
+        is False
+    )
 
 
 def test_bull_divergence_price_ext_off_by_default() -> None:
@@ -142,5 +147,10 @@ def test_bear_divergence_price_ext_rejects_shallow_high() -> None:
     # recent high 22 vs prior 20 -> extension (22-20)/20 = 10%
     close = [10.0, 20.0, 9.0, 8.0, 22.0, 12.0]
     mfi = np.array([50.0, 80.0, 45.0, 40.0, 65.0, 35.0])
-    assert _bear_divergence(_O(close), _p(div_min_price_ext=0.05), mfi, len(close)) is True
-    assert _bear_divergence(_O(close), _p(div_min_price_ext=0.20), mfi, len(close)) is False
+    assert (
+        _bear_divergence(_O(close), _p(div_min_price_ext=0.05), mfi, len(close)) is True
+    )
+    assert (
+        _bear_divergence(_O(close), _p(div_min_price_ext=0.20), mfi, len(close))
+        is False
+    )
