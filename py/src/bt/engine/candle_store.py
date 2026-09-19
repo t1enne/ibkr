@@ -127,6 +127,22 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         """
         return self._strategy_state
 
+    @property
+    def is_exhausted(self) -> bool:
+        """True when the cursor sits at the final accumulated bar of every key.
+
+        Read-only; used by post-run consumers (the plot DSL) to assert the run
+        finished rather than being truncated mid-stream, which would silently
+        under-count indicator series. False before the first ``advance`` (no
+        cursor) and on an empty store.
+        """
+        if self._cursor is None or not self._rows:
+            return False
+        return all(
+            self.cursor_count(sym, iv) == int(cols["_len"][0])
+            for (sym, iv), cols in self._rows.items()
+        )
+
     def cursor_count(self, sym: str, interval: str) -> int:
         """Number of accumulated bars for *sym*/*interval* up to the cursor.
 

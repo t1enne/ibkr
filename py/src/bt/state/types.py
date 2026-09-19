@@ -245,3 +245,7 @@ class BacktestResults:
     z_scores: Optional[pd.DataFrame] = None
     regimes: Optional[pd.DataFrame] = None
     benchmark_curves: dict[str, "pd.Series"] = field(default_factory=dict)
+    # The config the run was executed with. Loose ``Any`` to avoid a
+    # state -> bt.types (StrategyConfig) import edge; consumed post-run by
+    # ``output.render_plot_json`` to resolve the strategy's plot fn + params.
+    config: Any = None

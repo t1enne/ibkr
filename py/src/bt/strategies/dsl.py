@@ -40,14 +40,17 @@ them.
 from __future__ import annotations
 
 import sys
-from types import FunctionType
-from typing import Any, Callable, Literal
+from types import FunctionType, MappingProxyType
+from typing import Any, Callable, Literal, TYPE_CHECKING, cast
 
 from src.bt.state import ActionType, TradeSignal, BacktestState, Candle, Position
 from src.bt.strategies.fundamentals_context import Fundamentals
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.ta_context import OhlcvView, TaContext
 from src.bt.strategies.utils import sl_tp_from_pct
+
+if TYPE_CHECKING:
+    pass
 
 
 class StrategyContext:
@@ -82,6 +85,7 @@ class StrategyContext:
         "_interval",
         "_signals",
         "_shared",
+        "_readonly",
     )
 
     def __init__(
@@ -103,6 +107,64 @@ class StrategyContext:
         self._interval = interval
         self._signals: list[TradeSignal] = []
         self._shared: dict | None = None
+        # Post-run plot contexts are read-only (set by ``for_plot``); mutating
+        # methods assert against this so a ``plot`` can't emit a phantom signal.
+        self._readonly: bool = False
+
+    @classmethod
+    def for_plot(
+        cls,
+        results: Any,  # BacktestResults — Any avoids a state-layer import cycle
+        *,
+        symbol: str,
+        interval: str,
+        params: Any,
+    ) -> "StrategyContext":
+        """Read-only context for a post-run ``plot(ctx, params)`` call.
+
+        The cursor sits at the end of the feed, so ``ctx.ta`` series are the full
+        history. ``ctx.shared`` is bound unconditionally to the run's strategy
+        state (a stateful strategy's pivot cache) and exposed write-protected.
+        """
+        data = results.data
+        ta = getattr(data, "ta", None)
+        if not isinstance(ta, TaContext):
+            raise RuntimeError(
+                "plot() requires a prefetched TaContext; run through "
+                "`src.bt.engine.backtest.run` (it builds `ta` from data) so "
+                "results.data.ta is set."
+            )
+        if not data.is_exhausted:
+            raise RuntimeError(
+                "plot() requires a terminal cursor: `results.data` was captured "
+                "mid-backtest, so ctx.ta series would be silently truncated and "
+                "the chart plausible-but-wrong."
+            )
+        state = results.final_state
+        df = data[(symbol, interval)]
+        tail = df.iloc[-1]
+        candle = Candle(
+            timestamp=df.index[-1],
+            symbol=symbol,
+            open=float(tail["open"]),
+            high=float(tail["high"]),
+            low=float(tail["low"]),
+            close=float(tail["close"]),
+            volume=float(tail["volume"]),
+            interval=interval,
+        )
+        ctx = cls(
+            state=state,
+            candle=candle,
+            params=params,
+            ta=ta,
+            symbols=symbols_from(state),
+            interval=interval,
+            fundamentals=None,
+        )
+        ctx.shared = data.strategy_state or {}
+        ctx._readonly = True
+        return ctx
 
     @property
     def shared(self) -> dict:
@@ -113,6 +175,10 @@ class StrategyContext:
         Raises when the strategy wasn't declared stateful -- calling this from a
         stateless strategy is a footgun, so fail loudly rather than silently
         sharing nothing.
+
+        On a read-only plot context the returned mapping is a shallow
+        ``MappingProxyType`` guard (nested dicts stay mutable) -- a guard against
+        accidental writes from ``plot``, not a sandbox.
         """
         if self._shared is None:
             raise RuntimeError(
@@ -120,6 +186,10 @@ class StrategyContext:
                 "`@strategy(stateful=True)` (cross-call state is the DSL's "
                 "GLOBAL replacement)."
             )
+        if self._readonly:
+            # Shallow guard (nested dicts stay mutable) -- cast so the writable
+            # call sites keep a `dict` type without a separate accessor.
+            return cast("dict", MappingProxyType(self._shared))
         return self._shared
 
     @shared.setter
@@ -266,6 +336,7 @@ class StrategyContext:
         lots = self._state.portfolio.positions.get(sym, ())
         from src.bt.portfolio.pure import resolve_lot
 
+        assert not self._readonly, "plot() must be read-only"
         target = resolve_lot(lots, lot=lot, tag=tag)
         if target is None or qty <= 0:
             return
@@ -317,6 +388,7 @@ class StrategyContext:
         ``partial_close(..., tag=...)`` is readable lot targeting instead of
         raw ``position_id`` strings.
         """
+        assert not self._readonly, "plot() must be read-only"
         self._emit(ActionType.long, sym, size, sl, tp, reason, tag, size_mode)
 
     def short(
@@ -347,6 +419,7 @@ class StrategyContext:
         analogue) stored on the :class:`Position` for readable ``partial_close``
         lot targeting.
         """
+        assert not self._readonly, "plot() must be read-only"
         self._emit(ActionType.short, sym, size, sl, tp, reason, tag, size_mode)
 
     def close(
@@ -369,6 +442,7 @@ class StrategyContext:
         ``position_id=None``).
         """
         lots = self._state.portfolio.positions.get(sym, ())
+        assert not self._readonly, "plot() must be read-only"
         if not lots:
             return
         price = self.price(sym)
@@ -577,6 +651,10 @@ def strategy(bars: str = "1d", stateful: bool = False):
         bars: signal interval served by ``ctx`` (matches the config base bar).
         stateful: when True, persist cross-call state in ``ctx.shared`` (a
             per-run dict, fresh for every run window).
+
+    Invariant: a module-level ``plot`` (if present) is NOT part of the engine
+    contract. It is never called from ``on_candle`` and is never invoked by the
+    engine; ``output.render_plot_json`` calls it post-run, once per symbol.
     """
 
     def decorate(fn: FunctionType):

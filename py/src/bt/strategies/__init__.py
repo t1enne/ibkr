@@ -13,10 +13,10 @@ from __future__ import annotations
 import glob
 import importlib
 import os
-from typing import Protocol, TYPE_CHECKING, cast, Any
+from typing import Protocol, TYPE_CHECKING, cast, Any, Callable
 
 if TYPE_CHECKING:
-    from src.bt.strategies.types import StrategyParams
+    from src.bt.strategies.types import PlotSpec, StrategyParams
 
 
 class _StrategyModule(Protocol):
@@ -103,6 +103,18 @@ def resolve_params(
     return params_cls.from_dict(params)
 
 
+def plot_fn_for(strat_name: str) -> Callable[..., "PlotSpec"] | None:
+    """The strategy's optional module-level ``plot`` callable, or ``None``.
+
+    Read off the module (not the adapter): a module defines ``plot`` *after* its
+    decorated ``on_candle``, so at decoration time the attribute may not exist
+    yet. A strategy without a ``plot`` returns ``None`` and the plot payload
+    gains no ``plot`` key — keeping output byte-identical for every existing
+    strategy.
+    """
+    return getattr(init_strat(strat_name), "plot", None)
+
+
 # Lazy re-export of the DSL symbols. Imported on demand (functions only) so
 # ``from src.bt.strategies.dsl import strategy`` stays available without forcing
 # ``src.bt.strategies`` -> dsl -> ``src.bt.state`` -> engine -> backtest ->
@@ -128,6 +140,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "init_strat",
     "resolve_params",
+    "plot_fn_for",
     "strategy",
     "StrategyContext",
     "SeriesView",

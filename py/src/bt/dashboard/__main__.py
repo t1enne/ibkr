@@ -60,7 +60,9 @@ def main(argv: list[str]) -> None:
     if price.empty:
         st.info("No candles for this symbol.")
     else:
-        st.plotly_chart(build_chart(price, trades), width="stretch")
+        st.plotly_chart(
+            build_chart(price, trades, plot=frame.get("plot")), width="stretch"
+        )
 
     all_trades = trades_table(payload)
     if all_trades.empty:

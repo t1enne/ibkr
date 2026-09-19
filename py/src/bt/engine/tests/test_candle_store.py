@@ -117,3 +117,19 @@ def test_wraps_by_reference():
 
     assert store.count("SPY", "1h") == 4
     assert store.latest("SPY", "1h") == 104.0
+
+
+def test_is_exhausted_requires_cursor_at_final_bar():
+    """is_exhausted is False before any advance and while truncated."""
+    store = CandleStore(_make_rows())
+    assert store.is_exhausted is False  # no cursor yet
+    store.advance(_ts("2024-01-02 11:00"))
+    assert store.is_exhausted is False  # one bar still ahead
+    store.advance(_ts("2024-01-02 12:00"))
+    assert store.is_exhausted is True
+    store.advance(_ts("2024-01-03 00:00"))
+    assert store.is_exhausted is True  # cursor past the end still exhaustive
+
+
+def test_is_exhausted_empty_store_is_false():
+    assert CandleStore({}).is_exhausted is False

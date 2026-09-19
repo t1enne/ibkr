@@ -287,6 +287,7 @@ def run_backtest(
             data=state.candles,
             final_state=state,
             benchmark_curves=bm_curves,
+            config=config,
         ),
         state,
     )

@@ -13,9 +13,13 @@ pass ``default=_json_default`` only as a safety net.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+import logging
+from dataclasses import asdict
+from typing import Any, Callable, Iterable
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def _ts_str(v: Any) -> str | None:
@@ -119,12 +123,17 @@ def _frame_interval(results: Any, symbol: str, entry_ts: Any) -> str | None:
     return frames[0][0]
 
 
-def render_plot_json(results: Any) -> dict[str, Any]:
+def render_plot_json(results: Any, *, plot: bool = True) -> dict[str, Any]:
     """BacktestResults -> one JSON doc shaped for candlestick charting.
 
     Extends the base json shape (metrics + trades + equity) with, per symbol,
     the candle OHLCV series used by the dashboard so no DB re-query is needed
     to draw price markers. Each trade also gains its resolved ``interval``.
+
+    When ``plot`` is True and the strategy defines a module-level ``plot``, the
+    returned :class:`~src.bt.strategies.types.PlotSpec` is spliced into the
+    owning symbol/frame under a ``plot`` key. Strategies without a ``plot``
+    (or ``plot=False``) get a payload byte-identical to before this feature.
     """
     symbols: dict[str, list[dict[str, Any]]] = {}
     for sym, iv in results.data.keys():
@@ -152,6 +161,8 @@ def render_plot_json(results: Any) -> dict[str, Any]:
                 ],
             }
         )
+    if plot:
+        _splice_plot_specs(results, symbols)
     trades = []
     for t in results.pf.trades:
         tj = trade_json(t)
@@ -164,6 +175,63 @@ def render_plot_json(results: Any) -> dict[str, Any]:
         "equity_curve": equity_points(results.pf.equity_curve),
         "benchmark_curves": benchmark_json(results.benchmark_curves),
     }
+
+
+def _splice_plot_specs(results: Any, symbols: dict[str, list[dict[str, Any]]]) -> None:
+    """Attach each symbol's ``plot`` spec to its signal-interval frame in place.
+
+    A strategy without a ``plot`` (or without a config) leaves the payload
+    untouched -- the regression guarantee. A failure inside ``plot`` is logged
+    and dropped: plotting must never fail an already-computed backtest.
+    """
+    from src.bt.strategies import plot_fn_for, resolve_params
+
+    config = getattr(results, "config", None)
+    strat_type = getattr(config, "strategy_type", None) if config is not None else None
+    if strat_type is None:
+        return
+    fn = plot_fn_for(strat_type)
+    if fn is None:
+        return
+    params = resolve_params(strat_type, getattr(config, "strategy_params", {}))
+    bars = getattr(config, "bars", None)
+    interval = bars[0] if bars else None
+    for sym, frames in symbols.items():
+        target = _plot_frame(frames, interval)
+        if target is None:
+            continue
+        _call_plot(fn, results, sym, target["interval"], params, target)
+
+
+def _plot_frame(
+    frames: list[dict[str, Any]], interval: str | None
+) -> dict[str, Any] | None:
+    """The frame a plot belongs to: the signal interval, else the first frame."""
+    if interval is not None:
+        for frame in frames:
+            if frame["interval"] == interval:
+                return frame
+    return frames[0] if frames else None
+
+
+def _call_plot(
+    fn: Callable[..., Any],
+    results: Any,
+    sym: str,
+    interval: str,
+    params: Any,
+    frame: dict[str, Any],
+) -> None:
+    """Invoke ``plot`` under the guard and splice ``asdict(spec)`` into ``frame``."""
+    from src.bt.strategies.dsl import StrategyContext
+
+    try:
+        ctx = StrategyContext.for_plot(
+            results, symbol=sym, interval=interval, params=params
+        )
+        frame["plot"] = asdict(fn(ctx, params))
+    except Exception as exc:  # plotting must never fail a computed backtest
+        logger.warning("plot spec failed for %s (%s); omitting", sym, exc)
 
 
 def render_result_jsonl(results: Any) -> list[dict[str, Any]]:

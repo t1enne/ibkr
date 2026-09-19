@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import click
 
@@ -35,13 +36,31 @@ from src.bt.cmds._shared import _json_default
     default=False,
     help="Run the backtest then open the Streamlit dashboard over the result.",
 )
-def run(strategy_file: str, fmt: str, output: str | None, plot: bool):
+@click.option(
+    "--no-plot-spec",
+    "no_plot_spec",
+    is_flag=True,
+    default=False,
+    help="Skip the strategy's declarative plot spec (candlesticks only). "
+    "Also suppressed when IBKR_PLOT_SPEC=0.",
+)
+def run(
+    strategy_file: str,
+    fmt: str,
+    output: str | None,
+    plot: bool,
+    no_plot_spec: bool,
+):
     """Run a backtest from a strategy JSON config file.
 
     STRATEGY_FILE: JSON config with symbols, dates, strategy params.
 
     --plot runs the backtest then launches the Streamlit dashboard over the
     result (overrides --format/--output).
+
+    When the strategy defines a module-level ``plot(ctx, params)``, its
+    declarative spec is included in the plot payload; ``--no-plot-spec`` (or
+    IBKR_PLOT_SPEC=0) suppresses it.
 
     Output:
       text  — human-readable summary table.
@@ -63,11 +82,12 @@ def run(strategy_file: str, fmt: str, output: str | None, plot: bool):
 
     config = load_strategy(strategy_file)
     results = run_backtest_results(config)
+    spec = _plot_spec_enabled(no_plot_spec)
     if plot:
-        launch_dashboard(render_plot_json(results))
+        launch_dashboard(render_plot_json(results, plot=spec))
         return
     if fmt == "plot":
-        payload = render_plot_json(results)
+        payload = render_plot_json(results, plot=spec)
     elif fmt == "json":
         payload = render_result_json(results)
     elif fmt == "jsonl":
@@ -92,6 +112,17 @@ def _emit(text: str, output: str | None) -> None:
             fh.write(text)
     else:
         click.echo(text)
+
+
+def _plot_spec_enabled(no_plot_spec: bool) -> bool:
+    """Whether the strategy's declarative plot spec is included in payloads.
+
+    Off via ``--no-plot-spec`` or ``IBKR_PLOT_SPEC=0`` (belt-and-braces for
+    non-interactive callers that must not pay for, or emit, plot geometry).
+    """
+    if no_plot_spec or os.environ.get("IBKR_PLOT_SPEC") == "0":
+        return False
+    return True
 
 
 def register(group: click.Group) -> None:
