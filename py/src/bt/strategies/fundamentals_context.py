@@ -81,12 +81,21 @@ class SeriesPIT:
     _cursor: Callable[[], Cursor] | None = field(
         default=None, repr=False, compare=False
     )
+    #: ``filed`` in ascending order — the bisect axis for the visible *count*.
+    #: Separate from ``filed`` (which is period-ordered) because the two orders
+    #: disagree on real SEC data: a cumulative annual fact for an older period
+    #: is often filed *after* interim facts for newer periods. See
+    #: ``_visible_positions`` for why that forces a mask rather than a prefix.
+    _filed_sorted: tuple[pd.Timestamp, ...] = field(
+        default=(), repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         # Derive ``filed`` from the window when not supplied, so a hand-built
         # series (tests, notebook) is cursor-safe without extra ceremony.
         if not self.filed:
             object.__setattr__(self, "filed", tuple(r.filed for r in self.window))
+        object.__setattr__(self, "_filed_sorted", tuple(sorted(self.filed)))
 
     def bind(self, cursor: Callable[[], Cursor]) -> "SeriesPIT":
         """Return a copy reading visibility from ``cursor`` (engine wiring).
@@ -104,28 +113,59 @@ class SeriesPIT:
     @property
     def visible(self) -> int:
         """Count of periods whose filing is at/before the cursor (0..len)."""
-        return self._visible_count()
+        return len(self._visible_positions())
 
-    def _visible_count(self) -> int:
+    def _cursor_timestamp(self) -> pd.Timestamp | None:
+        """The publication boundary, or None when nothing is observable yet.
+
+        ``None`` means either no cursor reader at all (notebook/test path — the
+        caller is plainly not backtesting, so the whole curve is fair game) or a
+        bound-but-unadvanced cursor (the run has not started, so no filing is
+        public). The two cases are distinguished by the caller, not here.
+        """
         if self._cursor is None:
-            # Unbound series (no engine cursor reader at all). This is the
-            # notebook/test path: the caller built the series directly and is
-            # plainly not backtesting, so the whole curve is observable.
-            return len(self.window)
+            return None
         ts = self._cursor()
         if ts is None:
-            # Bound to an engine cursor that has NOT been advanced yet. The run
-            # has not started, so no filing is public — serving the full curve
-            # here would be a lookahead. Empty is the only safe answer.
-            return 0
-        # ``filed`` is ascending (same order as ``period``), so the publication
-        # boundary is a binary search, not a scan.
-        return bisect.bisect_right(
-            cast("Sequence[pd.Timestamp]", self.filed), pd.Timestamp(ts)
-        )
+            return None
+        # ``parse_timestamp`` only accepts ``str | pd.Timestamp``, while a cursor
+        # may be a ``date``/``datetime`` (see ``Cursor``), so normalise through
+        # ``pd.Timestamp`` here. ``pd.Timestamp(...)`` is typed ``Timestamp |
+        # NaTType`` (an unparseable value yields NaT), and NaT is the same
+        # "nothing to observe" case as a ``None`` cursor.
+        stamp = ts if isinstance(ts, pd.Timestamp) else pd.Timestamp(ts)
+        # ``pd.Timestamp(...)`` is typed ``Timestamp | NaTType`` and neither
+        # ``pd.isna`` nor an identity check narrows that arm away for the
+        # checker, so the cast records the guaranteed-by-inspection fact: NaT was
+        # returned as ``None`` just above.
+        return None if stamp is pd.NaT else cast(pd.Timestamp, stamp)
+
+    def _visible_positions(self) -> tuple[int, ...]:
+        """Period-order indices of rows published at/before the cursor.
+
+        A **mask**, not a prefix: visibility is decided per row by ``filed``,
+        while the series is ordered by ``period_end``, and real SEC data has the
+        two disagree — a cumulative annual fact for an older period is routinely
+        filed after interim facts for newer periods (a 10-K restating FY2008 was
+        filed 2010-03-18, while the FY2009 Q2 10-Q was filed 2009-08-20). So the
+        visible periods are a subsequence of ``window``, and slicing a prefix
+        would both drop legitimate periods and admit filing-future ones.
+
+        The common case (``filed`` already ascending with ``period_end``) is
+        short-circuited to a prefix, keeping the hot path allocation-free.
+        """
+        if self._cursor is None:
+            return tuple(range(len(self.window)))
+        ts = self._cursor_timestamp()
+        if ts is None:
+            return ()
+        if self.filed == self._filed_sorted:
+            # Monotonic: the boundary is a count, so a single bisect suffices.
+            return tuple(range(bisect.bisect_right(self._filed_sorted, ts)))
+        return tuple(i for i, r in enumerate(self.window) if r.filed <= ts)
 
     def __len__(self) -> int:
-        return self._visible_count()
+        return len(self._visible_positions())
 
     def __getitem__(self, i: int | slice) -> float | list[float]:
         """Value at position ``i`` (negative counts back from the newest).
@@ -134,14 +174,15 @@ class SeriesPIT:
         sequence of series values. Out-of-range reads raise ``IndexError``
         (there is no NaN padding: an absent period is absent).
         """
-        n = self._visible_count()
+        idxs = self._visible_positions()
+        n = len(idxs)
         if isinstance(i, slice):
             start, stop, step = i.indices(n)
-            return [self.window[j].value for j in range(start, stop, step)]
+            return [self.window[idxs[j]].value for j in range(start, stop, step)]
         idx = i if i >= 0 else n + i
         if idx < 0 or idx >= n:
             raise IndexError(f"index {i} out of range on {n}-period series")
-        return self.window[idx].value
+        return self.window[idxs[idx]].value
 
     def spans(self) -> tuple[tuple[pd.Timestamp, pd.Timestamp], ...]:
         """``(period_start, period_end)`` per visible period, ascending.
@@ -150,21 +191,33 @@ class SeriesPIT:
         arithmetic: the pair distinguishes a 13-week quarter from a 52-week
         year on cumulative-YTD SEC facts.
         """
-        n = self._visible_count()
-        return tuple((r.period_start, r.period_end) for r in self.window[:n])
+        return tuple(
+            (self.window[i].period_start, self.window[i].period_end)
+            for i in self._visible_positions()
+        )
 
     def forms(self) -> tuple[str, ...]:
         """Form type per visible period (``"10-Q"`` vs ``"10-K"``), ascending."""
-        n = self._visible_count()
-        return tuple(r.form for r in self.window[:n])
+        return tuple(self.window[i].form for i in self._visible_positions())
 
     def last(self) -> float | None:
         """Newest visible value, or None when nothing is visible yet."""
-        n = self._visible_count()
-        return None if n == 0 else self.window[n - 1].value
+        idxs = self._visible_positions()
+        return None if not idxs else self.window[idxs[-1]].value
+
+    def values(self) -> list[float]:
+        """Every visible value in period order, as a list of floats.
+
+        The typed counterpart of ``series[:]``: slicing returns
+        ``float | list[float]`` (a scalar and a slice share one ``__getitem__``),
+        so a caller wanting the whole curve must narrow a union. Fiscal
+        arithmetic wants the list, so it is spelled once here rather than
+        re-derived at each call site.
+        """
+        return [self.window[i].value for i in self._visible_positions()]
 
     def __repr__(self) -> str:
-        return f"SeriesPIT(visible={self._visible_count()}, total={len(self.window)})"
+        return f"SeriesPIT(visible={len(self)}, total={len(self.window)})"
 
 
 class StatementSeries(Generic[Snap]):
@@ -203,12 +256,30 @@ class StatementSeries(Generic[Snap]):
 
         As-first-stated, matching the series — pair with
         :meth:`Fundamentals.latest` for the restated view.
+
+        The default period is the newest visible ``period_end`` **across every
+        field of the statement**, not the newest visible period of some one
+        field: a statement's fields are independently sparse (a filer may tag
+        ``net_income`` and never ``gross_profit``), so anchoring on an arbitrary
+        single field would return ``None`` for a period whose rows plainly
+        exist.
         """
-        n = self._series[next(iter(self._series))].visible if self._series else 0
+        if not self._series:
+            return None
         if period is None:
-            if n == 0:
+            # Newest *published* period — never ``period[-1]`` blindly, whose
+            # filing may still be in the strategy's future (_visible_positions).
+            newest: pd.Timestamp | None = None
+            for series in self._series.values():
+                idxs = series._visible_positions()
+                if not idxs:
+                    continue
+                candidate = series.period[idxs[-1]]
+                if newest is None or candidate > newest:
+                    newest = candidate
+            if newest is None:
                 return None
-            period = self._series[next(iter(self._series))].period[n - 1]
+            period = newest
         return rows_to_snapshot(
             self._rows, self._symbol, period, statement=self._statement
         )

@@ -134,16 +134,10 @@ def test_non_gaap_tag_is_ignored() -> None:
 
 
 def test_unusable_facts_are_dropped_not_zeroed() -> None:
-    """Missing span, SEC's null-date sentinel, non-numeric val, unknown form -> no row."""
+    """Null-date sentinel, non-numeric val, unknown form, missing filed -> no row."""
     body = {
         "units": {
             "USD": [
-                {
-                    "end": "2024-03-31",
-                    "val": 5.0,
-                    "form": "10-Q",
-                    "filed": "2024-05-01",
-                },  # no start
                 {
                     "start": "2024-01-01",
                     "end": "1999-12-31",
@@ -171,10 +165,68 @@ def test_unusable_facts_are_dropped_not_zeroed() -> None:
                     "val": 5.0,
                     "form": "10-Q",
                 },  # no filed
+                {
+                    "end": "2024-03-31",
+                    "val": 5.0,
+                    "form": "10-Q",
+                },  # no filed, instant
             ]
         }
     }
     assert sec_payload_to_rows("AAPL", _payload(("Assets", body))) == []
+
+
+def test_balance_instants_are_kept_with_collapsed_span() -> None:
+    """A balance-sheet fact is an instant: ``end`` without ``start`` is valid.
+
+    SEC reports stocks (assets/equity) as point-in-time facts, so rejecting a
+    missing ``start`` silently dropped **every** balance row. The admitted row
+    collapses its span to one day, which is what lets a strategy tell a stock
+    (``spans()`` start == end) from a flow (a real fiscal duration) — and it is
+    what makes the column non-empty in the first place.
+    """
+    body = {
+        "units": {
+            "USD": [
+                {
+                    "end": "2024-03-31",
+                    "val": 5.0,
+                    "form": "10-Q",
+                    "filed": "2024-05-01",
+                }
+            ]
+        }
+    }
+    rows = sec_payload_to_rows("AAPL", _payload(("Assets", body)))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.statement == "balance"
+    assert row.field == "assets"
+    assert row.value == 5.0
+    assert row.period_start == row.period_end == parse_timestamp("2024-03-31")
+    assert row.filed == parse_timestamp("2024-05-01")
+
+
+def test_instant_facts_still_rejected_for_flows() -> None:
+    """Income/cashflow are durations: an instant there stays unusable.
+
+    ``instant_ok`` is scoped to balance statements only, so a start-less
+    income fact is still dropped rather than silently spanning one day.
+    """
+    body = {
+        "units": {
+            "USD": [
+                {
+                    "end": "2024-03-31",
+                    "val": 5.0,
+                    "form": "10-Q",
+                    "filed": "2024-05-01",
+                }
+            ]
+        }
+    }
+    for tag in ("Revenues", "NetCashProvidedByUsedInOperatingActivities"):
+        assert sec_payload_to_rows("AAPL", _payload((tag, body))) == []
 
 
 def test_duplicate_fact_repeats_dedupe() -> None:

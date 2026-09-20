@@ -301,3 +301,69 @@ def test_build_applies_as_first_stated_per_symbol() -> None:
     )
     assert fund.symbols == ("DEMO", "OTHER")
     assert fund.income("DEMO").net_income[:] == [10.0]
+
+
+# --- sparse-filing axis: ``filed`` need not ascend with ``period_end`` -------
+
+
+def test_visibility_is_per_row_when_filed_disagrees_with_period_order() -> None:
+    """Real SEC data files an older period *after* a newer one.
+
+    A sparse series of cumulative facts does not keep ``filed`` in ``period_end``
+    order: an FY fact covering an old year is routinely published later than the
+    interim 10-Qs of the years after it. When that happens the visible periods
+    are a *subsequence* of the window, so a prefix slice would both hide a
+    legitimate period and expose a filing-future one.
+    """
+    old_year = _row(
+        "net_income", 1.0, "2022-01-01", "2022-12-31", "2025-03-01", form="10-K"
+    )
+    newer_quarters = [
+        _row("net_income", 2.0, "2023-01-01", "2023-03-31", "2023-05-01"),
+        _row("net_income", 3.0, "2023-04-01", "2023-06-30", "2023-08-01"),
+    ]
+    cursor: list[pd.Timestamp | None] = [ts("2024-01-01")]
+    fund = Fundamentals.build(
+        {"DEMO": [old_year, *newer_quarters]}, cursor=lambda: cursor[0]
+    )
+    ni = fund.income("DEMO").net_income
+
+    # The two 2023 quarters are public; the 2022 10-K is not filed until 2025.
+    assert len(ni) == 2
+    assert ni[:] == [2.0, 3.0]
+    assert ni.last() == 3.0
+    assert [end.year for _, end in ni.spans()] == [2023, 2023]
+    assert ni.forms() == ("10-Q", "10-Q")
+
+    # Once the late annual filing lands it joins the curve *behind* the quarters
+    # in period order, not appended at the end.
+    cursor[0] = ts("2025-03-01")
+    assert ni[:] == [1.0, 2.0, 3.0]
+    assert ni[-1] == 3.0
+    assert ni.last() == 3.0
+    assert ni.forms() == ("10-K", "10-Q", "10-Q")
+
+
+def test_snapshot_defaults_to_newest_visible_not_last_period() -> None:
+    """``snapshot()`` with no period must not pick a not-yet-filed period.
+
+    The period-ordered window ends with whatever period is *latest by period
+    date*, which may be a filing still in the strategy's future. Defaulting to
+    it would leak: the snapshot's numeric values would come from ``period``
+    regardless of the cursor.
+    """
+    late = _row(
+        "net_income", 999.0, "2024-01-01", "2024-12-31", "2026-01-01", form="10-K"
+    )
+    early = _row(
+        "net_income", 10.0, "2023-01-01", "2023-12-31", "2024-02-01", form="10-K"
+    )
+    cursor: list[pd.Timestamp | None] = [ts("2024-06-01")]
+    fund = Fundamentals.build({"DEMO": [early, late]}, cursor=lambda: cursor[0])
+    snapshot = fund.income("DEMO").snapshot()
+    assert isinstance(snapshot, Income)
+    assert snapshot.net_income == 10.0
+
+    # With nothing published yet there is no defensible "newest" -> None.
+    cursor[0] = ts("2020-01-01")
+    assert fund.income("DEMO").snapshot() is None

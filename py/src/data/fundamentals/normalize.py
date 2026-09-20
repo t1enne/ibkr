@@ -156,16 +156,29 @@ def _facts_for_tag(
 
 def _fact_period(
     fact: dict[str, Any],
+    *,
+    instant_ok: bool = False,
 ) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, Form] | None:
     """``(period_start, period_end, filed, form)`` for a fact, or None if unusable.
 
-    Requires ``start``/``end`` (a fiscal span) plus ``filed`` (the PIT anchor);
-    a fact missing either is an instant-only or unfiled datum we can't place on
-    the fiscal axis. ``end`` of ``1999-12-31`` is SEC's null-date sentinel.
+    Requires ``end`` (the fiscal close) plus ``filed`` (the PIT anchor); a fact
+    missing either cannot be placed on the fiscal axis. ``end`` of
+    ``1999-12-31`` is SEC's null-date sentinel.
+
+    Balance-sheet facts are **instants**: they carry ``end`` but no ``start``
+    (a point-in-time stock, unlike a duration flow). ``instant_ok`` admits them
+    and collapses the span to a single day — ``period_start == period_end`` —
+    which is what makes ``SeriesPIT.spans()`` able to distinguish a stock from a
+    flow. Without the flag an instant is rejected, matching the original
+    duration-only contract for income/cashflow tags.
     """
     start, end, filed = fact.get("start"), fact.get("end"), fact.get("filed")
-    if not start or not end or not filed or str(end).startswith(_NULL_END_PREFIX):
+    if not end or not filed or str(end).startswith(_NULL_END_PREFIX):
         return None
+    if not start:
+        if not instant_ok:
+            return None
+        start = end
     form = _FORM_MAP.get(str(fact.get("form", "")))
     if form is None:
         return None
@@ -175,6 +188,12 @@ def _fact_period(
         parse_timestamp(str(filed)),
         form,
     )
+
+
+#: Statements whose facts are instants (stocks) rather than spans (flows).
+#: A balance sheet is a snapshot at a fiscal close, so SEC reports ``end``
+#: without ``start``; income and cashflow items are durations over a period.
+_INSTANT_STATEMENTS: frozenset[Statement] = frozenset({"balance"})
 
 
 def _rows_for_tag(
@@ -192,7 +211,7 @@ def _rows_for_tag(
     seen: set[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = set()
     rows: list[FundamentalRow] = []
     for value, fact in _facts_for_tag(payload, tag):
-        period = _fact_period(fact)
+        period = _fact_period(fact, instant_ok=statement in _INSTANT_STATEMENTS)
         if period is None:
             continue
         start, end, filed, form = period

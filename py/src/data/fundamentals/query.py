@@ -131,9 +131,14 @@ def build_series(
 
     The dedupe happens here (not in the store) so ``rows`` may hold every filing:
     the earliest filing of each period owns the curve, and a restatement never
-    joins it. Surviving rows are period-ascending, so ``filed`` ascends with
-    ``period_end`` — the monotonicity :class:`SeriesPIT`'s binary search needs,
-    asserted rather than silently assumed.
+    joins it. Surviving rows are period-ascending.
+
+    ``filed`` is deliberately **not** asserted to ascend with ``period_end``.
+    That holds on a dense 10-Q grid, but sparse SEC data breaks it: a cumulative
+    annual fact for an older period is routinely filed *after* interim facts for
+    newer periods (an FY2008 10-K filed 2010-03-18 while the FY2009 Q2 10-Q was
+    filed 2009-08-20). ``SeriesPIT`` therefore decides visibility per row rather
+    than treating it as one prefix boundary.
 
     Deferred import of ``SeriesPIT``: the DSL context module imports this one.
     """
@@ -146,11 +151,6 @@ def build_series(
             if row.statement == statement and row.field == field
         ),
         key=lambda r: (r.period_end, r.filed),
-    )
-    filed = [r.filed for r in matching]
-    assert filed == sorted(filed), (
-        f"series {field!r} filings must ascend with period_end; rows must carry a "
-        "filing date per stated period"
     )
     return SeriesPIT(
         period=tuple(r.period_end for r in matching),
