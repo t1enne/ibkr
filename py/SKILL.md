@@ -8,9 +8,74 @@ allowed-tools: Bash(uv:*), Bash(cd:*), Bash(find:*), Bash(cat:*), Bash(ls:*), Ba
 
 Full backtesting agent for the IBKR PY quantitative trading toolkit. Design, implement, and run strategy backtests end-to-end.
 
+## Hard rules (read first)
+
+1. **Never test a strategy.** Strategies, `strats/*.json`, research scripts and
+   sweeps are exempt from `AGENTS.md`'s test rule. No `test_<strategy>.py`, no
+   strategy fixtures. Tests cover *engine* code only (indicators, metrics,
+   sizing, risk, portfolio). Validate strategies by **running** them.
+2. **`bt sweep` / `bt split` / `bt optimize` before any script.** Grid, IS/OOS
+   and walk-forward questions all have a subcommand. A hand-rolled
+   candle-load + grid-loop + `run()` harness is forbidden; that is `bt sweep`
+   (`bt optimize` if folds must also validate OOS). Custom scripts only when
+   the task exceeds this surface — say so first.
+3. **Never filter or re-derive output.** No `grep`/`head`/`tail` over a report,
+   no recomputing a metric in scratch code. Risk lives in the tail (kurtosis,
+   skewness, stability, per-symbol draws, worst-DD). If you cut rows, name them.
+4. **Don't add config fields or modules** to work around a missing capability —
+   check the DSL surface and the `bt` subcommands first.
+
 ## Workflow
 
-When asked to backtest, create a strategy, or evaluate a trading idea, follow this sequence:
+The **strategy development lifecycle** below is mandatory. Do not skip stages,
+and do not grow scope before the current stage is signed off.
+
+### Stage 0 — Minimum parameters
+
+Use **as few params as possible**. Before adding any param, stop and ask:
+*can the signal generation be rewritten so this param is unnecessary?*
+
+A param is a fitted degree of freedom. Every one you add trades robustness for
+`sweep` surface and invites curve-fit. Prefer:
+
+- Rewriting the signal condition (structural change) over thresholding a new knob.
+- Hard-coded structural constants (e.g. "close above 200d SMA") over tunable `**params`.
+- Deriving a value from data (ATR-scaled, percentile-ranked) over an absolute number.
+
+Hard-coding a structural constant is allowed and encouraged; adding a param to
+absorb a bad signal is not. State the justification when you do add a param.
+
+### Stage 1 — Develop on 1 symbol, ≤1 year
+
+Develop and iterate with **`symbols` = one instrument** and a trading window of
+**at most 1 year**. Fast iteration, and a small sample hides less.
+
+When the run completes, **spawn a specialized subagent to review each trade, one
+by one**, against the entry/exit logic. Ask for: does every entry match the
+stated rule, does every exit fire for the stated reason, any lookahead or
+off-by-one, any bar where the rule should have fired and did not. Trade-by-trade
+review is the point of the small window — a 1-year single-symbol log fits.
+
+Report the trades + the subagent's verdict; **do not proceed until the user
+approves the entries and exits.**
+
+### Stage 2 — Expand only after approval
+
+On explicit user approval of the entries/exits, begin expanding. Grow **one
+axis at a time, exponentially** — do not jump to the final universe/window:
+
+1. **Universe:** 1 → 2 → 4 → 8 → … symbols. Re-check `bt run` after each step.
+2. **Window:** 1y → 2y → 4y → full available history. Re-check after each step.
+
+Exponential growth means the doubling step where the edge breaks is the answer
+you were looking for — a metric that collapses at 4 symbols or 2 years is
+evidence, not a setback. Use `bt split --folds` to separate IS from OOS as the
+window grows; never tune on the expanded window without an OOS check.
+
+Only after the expanded run survives do you move the config to its earned
+bucket under `strats/<pass|wip|fail>/`.
+
+### Commands per stage
 
 1. **Understand the request** — what symbols, what kind of strategy, what timeframe?
 2. **Pick or write a strategy module** — reuse an existing `STRATEGY_TYPE` if one fits, otherwise write a new one (DSL by default).
@@ -162,16 +227,34 @@ results = run(bt, df, strat_mod=strat_mod)
 
 ## Interpreting Results
 
-The output contains:
+The `bt run` report contains:
 
 - **Drawdown periods** — worst 5 drawdowns with dates and duration
 - **Trade log** — every trade with entry/exit times, prices, PnL, direction, reason, SL/TP levels
 - **Statistics** — win rate, total trades, starting capital, total P&L, backtest duration
 - **Metrics table** — annual return, volatility, Sharpe, Calmar, Sortino, Omega, max drawdown, stability, skewness, kurtosis, alpha, beta
 
+**Read the whole report before reporting.** A healthy Sharpe can hide fat tails
+(kurtosis/skewness), regime dependence (stability), or one symbol's bleed. Never
+summarize from the headline number; never trim except explicitly.
+
+**Scope discipline:** a report from a 1-symbol / ≤1-year run is an *entry/exit
+review artifact*, not evidence of an edge. Do not present it as a strategy
+verdict, and do not expand scope without the Stage 2 approval gate above.
+
+| Question | Command |
+| --- | --- |
+| Does this config work? | `bt run <config>` |
+| Best params over the whole window? | `bt sweep <config> '{grid}'` |
+| Are locked params curve-fit? | `bt split <config> --folds N` |
+| Tune per fold, validate OOS honestly? | `bt optimize <config> '{grid}' --folds N` |
+
+Sweep = search. Split = sanity check. Optimize = both, chained honestly.
+
 ## Design Heuristics
 
-When building or modifying strategies, follow these patterns from the codebase:
+When building or modifying strategies, follow these patterns from the codebase.
+The parameter-minimization rule from Stage 0 is a hard rule, not a heuristic.
 
 ### Keep `on_candle()` simple
 
@@ -214,7 +297,11 @@ Prefer `state.candles.get((sym, freq))` (or DSL `ctx.ta` with an explicit
 There is no `state.model_state` channel; cross-candle model state is owned by
 the strategy (`ctx.shared`).
 
-## Testing a Strategy
+## Testing
+
+**Never write tests for strategies** — even ones with nontrivial computation.
+Test only **engine** code (indicators, metrics, sizing, risk, portfolio).
+Strategy validation = run the backtest and read the full report.
 
 ```bash
 make test                                     # all tests
@@ -226,6 +313,8 @@ uv run pytest src/bt/risk/tests/ -v
 
 ## Common Gotchas
 
+- **Don't invent a workflow.** Check for an existing `bt` subcommand first.
+- **Don't launder output.** A re-derived metric or `grep`-ed report is not evidence.
 - **Data availability**: when an agent needs candles that are missing/stale, just run `data dl` (see the runbook below) — `data query` only *reads* the local DB and never fetches.
 - **Bar size**: strategies expect the bar size in config to match available data. Most data is `1h`.
 - **HTF lookahead**: `state.candles.get((sym, freq))` and the DSL `ctx.ta`

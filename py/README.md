@@ -13,6 +13,10 @@ make run bt run strats/pass/<config>.json   # same, via Make shortcut
 Configs live classified under `strats/{pass,wip,fail}/` (see `SKILL.md`);
 the module behind each is `strategy_type` in the JSON.
 
+> **Agents: read [SKILL.md](SKILL.md) before writing or changing any strategy.**
+> It is the strategy-authoring contract. Do not infer authoring conventions
+> from this README or from `src/bt/strategies/` alone.
+
 `make run` with no args shows available commands:
 
 ```bash
@@ -27,6 +31,26 @@ make run bt run strats/pass/<config>.json -- --format jsonl
 ```
 
 Run `make run <args>` for zero extra typing; use `uv run ibkr <args>` directly to avoid the `--` syntax.
+
+## Agent Rules (read before touching strategies)
+
+Hard rules for AI agents. The usual failure is not a broken backtest — it's an
+agent burning a session rebuilding machinery the toolkit already has.
+
+1. **Read [SKILL.md](SKILL.md) first.** Any strategy authoring, editing, tuning
+   or evaluation starts there. Skipping it causes rules 2–5.
+2. **Never test a strategy.** Strategies, `strats/*.json`, research and sweeps
+   are exempt from `AGENTS.md`'s test rule — no `test_<strategy>.py`, no
+   fixtures. Tests cover *engine* code only. Validate strategies by **running** them.
+3. **Use `bt run` / `bt sweep` / `bt split` / `bt optimize` — no throwaway
+   harnesses.** A bespoke candle-load + grid-loop + `run()` script is forbidden;
+   that is `bt sweep` (`bt optimize` if folds must also validate OOS). Custom
+   scripts only beyond this surface — say so first.
+4. **Never mangle output.** No `grep`/`head` when reporting, no re-deriving
+   metrics in scratch code. Read the full output; the risk story (kurtosis,
+   skewness, stability, per-symbol bleed) is in the tail. Name any trim.
+5. **`--workers` is throughput, not correctness.** Raise it for many combos or
+   folds; keep `1` for trivial runs.
 
 ## Architecture
 
@@ -419,5 +443,5 @@ cd ../py && uv sync
 
 ## Resources
 
-- **Strategy authoring & backtesting workflow**: [SKILL.md](SKILL.md)
+- **Strategy authoring & backtesting workflow**: [SKILL.md](SKILL.md) — read before any strategy work
 - **Coding standards for contributors**: [AGENTS.md](AGENTS.md)

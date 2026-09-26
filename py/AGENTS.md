@@ -5,7 +5,36 @@
 
 ## Alpha research
 
-Read SKILL.md
+Read SKILL.md **before** authoring, editing, tuning or evaluating any strategy —
+it is the authoring contract (DSL surface, config fields, `bt` subcommands).
+Hard rules (full text at the top of `SKILL.md`):
+
+- **Never test a strategy.** Strategy modules, `strats/*.json`, research scripts
+  and sweeps are exempt from the test rule below — validate by **running** them.
+- **Use `bt run`/`sweep`/`split`/`optimize` — never a throwaway script.** A
+  hand-rolled candle-load + grid-loop + `run()` harness is `bt sweep` (or
+  `bt optimize` for per-fold IS tune → OOS validate). Custom scripts only beyond
+  this surface — say so first.
+- **Never filter or re-derive a run's output.** No `grep`/`head`/`tail` over the
+  report, no recomputing metrics. The risk story (kurtosis, skewness, stability,
+  per-symbol draws, worst-DD) is in the tail. Name any trim.
+
+### Strategy development lifecycle (mandatory)
+
+Full text in `SKILL.md` § Workflow. In order:
+
+1. **Minimum parameters.** Use as few params as possible. Before adding one, ask
+   whether the signal generation can be rewritten so the param is unnecessary.
+   Every param is a fitted degree of freedom.
+2. **Develop on 1 symbol, ≤1 year.** Keep the trading window to max 1 year and a
+   single symbol. Then spawn a specialized subagent to **review every trade, one
+   by one**, against the stated entry/exit rules. Report trades + verdict; do not
+   proceed until the **user approves the entries and exits**.
+3. **Expand exponentially after approval.** Grow one axis at a time — symbols
+   1 → 2 → 4 → 8 → …, window 1y → 2y → 4y → full. Re-run `bt run` after each
+   doubling step and use `bt split --folds` to separate IS from OOS. The step
+   where the edge breaks is the finding. Classify into `strats/<pass|wip|fail>/`
+   only after the expanded run survives.
 
 ## Development Workflow
 
@@ -14,7 +43,7 @@ When implementing a feature or fix:
 1. **Understand** — read relevant strategy code, types, and tests. Don't guess.
 2. **Plan** — state approach before writing. If unclear, ask.
 3. **Implement** — minimum code that works. Pure functions, immutable state, full type annotations.
-4. **Test** — every new computation gets a test. Strategies, scripts and research doesn't need a test. Run `make test` before declaring done.
+4. **Test** — every new computation gets a test, **except** strategies, strategy configs, scripts and research — those are validated by *running* them, never by unit tests (see § Alpha research). Run `make test` before declaring done.
 5. **Verify** — `make check` must pass (lint + format + typecheck + tests).
 
 ### Running things
