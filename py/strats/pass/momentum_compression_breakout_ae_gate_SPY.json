@@ -127,15 +127,12 @@
     "decay_bars": 10,
     "atr_period": 14,
     "atr_mult": 1.5,
-    "risk_pct": 0.02,
-    "warmup_bars": 80,
+    "risk_pct": 0.01,
     "cooldown_bars": 5,
     "regime_symbol": "SPY",
     "regime_trend_min": 1,
     "regime_min_strength": 0.12,
     "ae_lookback": 40,
-    "ae_num_bins": 10,
-    "max_positions": 10,
-    "max_position_notional": 0.25
+    "ae_num_bins": 10
   }
 }

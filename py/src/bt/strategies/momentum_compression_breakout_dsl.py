@@ -22,16 +22,23 @@ Cross-candle state (per-symbol compression boxes + cooldowns) lives in
 ``ctx.shared`` via ``@strategy(stateful=True)`` — the DSL replacement for the
 ``GLOBAL`` dict, minted fresh per run/window so split/sweep/optimize windows
 are isolated.
+
+Research note — lower-low (LL) exits, tested and NOT adopted: a blanket "exit on a
+lower-low break" halves the return because it truncates the
+right tail, where this strategy's edge lives. The LL moment IS state-separable —
+an in-profit breach (``close > entry_price``) is a pullback, an underwater one a
+failure (OR 49, AUC 0.94) - but conditioning on it still loses Calmar (1.45 →
+1.30) and collapses the worst OOS fold (0.50 → 0.19). The harm is concentrated:
+one APP trade is 30.6% of the forgone P&L, ten are 77.5%.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
-
-from src.bt.state import PortfolioState
 from src.bt.size.pure import equity_of, risk_sized_qty
 from src.bt.strategies.dsl import strategy, StrategyContext
 from src.bt.strategies.series import SeriesView
@@ -68,15 +75,8 @@ class Params(StrategyParams):
     # -- breakout + risk ---------------------------------------------------
     atr_period: int = 14
     atr_mult: float = 2.0  # stop distance = atr_mult * ATR
-    risk_pct: float = 0.01  # risk of current cash per trade
-    warmup_bars: int = 80
+    risk_pct: float = 0.01  # risk of current equity per trade
     cooldown_bars: int = 5  # bars to wait after an exit before a re-entry
-    max_positions: int = (
-        8  # hard cap on concurrent open positions (aggregate risk bound)
-    )
-    max_position_notional: float = (
-        0.25  # single position's value cap (fraction of equity)
-    )
     # -- adaptive-entropy market-regime gate ---------------------------------
     # The AE indicator computed on ``regime_symbol`` (an index like QQQ/SPY)
     # acts as an entry gate: longs only open while the index is in an
@@ -119,16 +119,18 @@ def _hovering_between_mas(
     atr_val: float,
     tol: float,
 ) -> bool:
-    """True when ``close[-1]`` sits at/inside the [SMA_fast, SMA_slow] band.
+    """True when the current close sits at/inside the [SMA_fast, SMA_slow] band.
 
     The band is the min/max of the two SMAs (a golden-cross means both are
     below price; the point is *price nowhere far outside them*). A small ATR
     tolerance lets the close sit right on an MA edge.
     """
-    if sma_fast != sma_fast or sma_slow != sma_slow or not atr_val or np.isnan(atr_val):
+    if not math.isfinite(atr_val) or atr_val <= 0:
+        return False
+    if not (math.isfinite(sma_fast) and math.isfinite(sma_slow)):
         return False
     lo, hi = min(sma_fast, sma_slow), max(sma_fast, sma_slow)
-    close = float(closes[-1])
+    close = closes.last()
     return (lo - tol * atr_val) <= close <= (hi + tol * atr_val)
 
 
@@ -151,13 +153,13 @@ def _hovering_streak(
         if i >= n:
             break
         atr_back = atr_series[-(i + 1)]
-        if not float(atr_back) or np.isnan(float(atr_back)):
+        if not math.isfinite(atr_back) or atr_back <= 0:
             break
         hovering = _hovering_between_mas(
             closes,
-            float(sma_fast[-(i + 1)]),
-            float(sma_slow[-(i + 1)]),
-            float(atr_back),
+            sma_fast[-(i + 1)],
+            sma_slow[-(i + 1)],
+            atr_back,
             params.hover_tol,
         )
         if not hovering:
@@ -169,11 +171,13 @@ def _hovering_streak(
 def _is_compression(o, params: Params, avg_vol: float, atr_val: float) -> bool:
     """Body + volume + MA-hover conditions for a single bar."""
     n = len(o.close)
-    if n < params.ma_slow + 2 or np.isnan(atr_val) or atr_val <= 0:
+    if n < params.ma_slow + 2 or not math.isfinite(atr_val) or atr_val <= 0:
         return False
-    body = abs(float(o.close[-1]) - float(o.open[-1]))
+    body = abs(o.close.last() - o.open.last())
     small_body = body <= params.body_atr_ratio * atr_val
-    vol_ok = avg_vol == avg_vol and float(o.volume[-1]) <= params.vol_mult * avg_vol
+    # A NaN ``avg_vol`` (not enough history) fails the bound, so the bar is
+    # simply not compressive — same outcome as an explicit NaN guard.
+    vol_ok = math.isfinite(avg_vol) and o.volume.last() <= params.vol_mult * avg_vol
     return bool(small_body and vol_ok)
 
 
@@ -212,10 +216,7 @@ def _big_move_ok(closes: SeriesView, params: Params) -> bool:
 def _coil_conditions(ctx: StrategyContext, sym: str, params: Params) -> bool:
     """Compression (tiny body + low volume) plus the MA-hovering streak."""
     o = ctx.ohlcv(sym)
-    n = len(o.close)
-    if n < params.warmup_bars:
-        return False
-    atr_val = float(ctx.ta.atr(sym, params.atr_period)[-1])
+    atr_val = ctx.ta.atr(sym, params.atr_period).last()
     avg_vol = _avg_volume(ctx, sym, params)
     if not _is_compression(o, params, avg_vol, atr_val):
         return False
@@ -256,7 +257,7 @@ def _update_box(
         high = float(np.max(o.high.to_array()[-params.comp_window :]))
         if not (np.isfinite(low) and np.isfinite(high)) or high <= low:
             return None
-        atr_val = float(ctx.ta.atr(sym, params.atr_period)[-1])
+        atr_val = ctx.ta.atr(sym, params.atr_period).last()
         setup_ok = bool(_big_move_ok(o.close, params)) or (
             box is not None and box.setup_ok
         )
@@ -265,7 +266,7 @@ def _update_box(
         )
     if isinstance(box, _Box):
         # Not a compressive bar, but is price still coiling inside the band?
-        close = float(o.close[-1])
+        close = o.close.last()
         if box.low <= close <= box.high:
             return box  # keep armed: the coil is intact
     return None
@@ -280,19 +281,13 @@ def _exit_reason(
     exit (fill at next open) and the stop level for the ATR exit.
     """
     o = ctx.ohlcv(sym)
-    close = float(o.close[-1])
-    atr_val = float(ctx.ta.atr(sym, params.atr_period)[-1])
-    stop_dist = (
-        params.atr_mult * atr_val
-        if atr_val > 0 and not np.isnan(atr_val)
-        else float("inf")
-    )
-    sma_f = float(ctx.ta.sma(sym, params.ma_fast)[-1])
-    sma_f_prev = float(ctx.ta.sma(sym, params.ma_fast)[-2])
-    if float(o.low[-1]) <= entry_price - stop_dist:
+    close = o.close.last()
+    atr_val = ctx.ta.atr(sym, params.atr_period).last()
+    stop_dist = params.atr_mult * atr_val if atr_val > 0 else float("inf")
+    sma_f = ctx.ta.sma(sym, params.ma_fast).last()
+    sma_f_prev = ctx.ta.sma(sym, params.ma_fast)[-2]
+    if o.low.last() <= entry_price - stop_dist:
         return ("[stop] ATR stop hit", entry_price - stop_dist)
-    if sma_f != sma_f or sma_f_prev != sma_f_prev:
-        return None
     if close < sma_f and sma_f < sma_f_prev:
         return ("[trend] close below sloping-down 10 SMA", None)
     return None
@@ -301,11 +296,6 @@ def _exit_reason(
 # ---------------------------------------------------------------------------
 # adaptive-entropy market-regime gate
 # ---------------------------------------------------------------------------
-
-
-def open_position_count(portfolio: PortfolioState) -> int:
-    """Number of distinct symbols currently holding at least one open lot."""
-    return sum(1 for lots in portfolio.positions.values() if lots)
 
 
 def _regime_model(ctx: StrategyContext) -> OnlineAdaptiveEntropy:
@@ -444,11 +434,9 @@ def on_candle(ctx: StrategyContext):
         if live is None:
             continue
 
-        close = float(o.close[-1])
-        sma_f = float(ctx.ta.sma(sym, params.ma_fast)[-1])
-        sma_s = float(ctx.ta.sma(sym, params.ma_slow)[-1])
-        if sma_f != sma_f or sma_s != sma_s:
-            continue
+        close = o.close.last()
+        sma_f = ctx.ta.sma(sym, params.ma_fast).last()
+        sma_s = ctx.ta.sma(sym, params.ma_slow).last()
         if not (close > live.high and sma_f > sma_s):
             continue  # breakout must be real and trend must be intact
 
@@ -459,39 +447,24 @@ def on_candle(ctx: StrategyContext):
         if not regime_ok:
             continue
 
-        # Aggregate capital-allocation guard: never stack more than
-        # ``max_positions`` concurrent positions. Without a cap the strategy
-        # opens every co-occurring breakout during a bull regime, concentrating
-        # notional in a correlated momentum basket (measured at 5x+ capital).
-        if open_position_count(ctx.state.portfolio) >= params.max_positions:
-            continue
-
-        # Per-position exposure cap: bound a single position's notional value to
-        # ``max_position_notional`` * current equity so no one name can dominate
-        # the book (the gate's bull regimes otherwise fund a few correlated names
-        # with oversized share counts).
+        # ATR-risk sizing, single rule: risk ``risk_pct`` of *live MTM equity*
+        # over the ATR-stop distance. Fixing the risk budget to equity (not
+        # cash) is what lets the position size compound with the book; the
+        # 0..1 fraction is then written against that same equity so
+        # ``ctx.long(size_mode="equity")`` re-multiplies back to this qty.
+        # The 1.0 clamp is the only position cap: it keeps a single name inside
+        # available cash, so no separate notional/position-count rail is needed.
         equity = equity_of(ctx.state.portfolio)
-        notional_cap = params.max_position_notional * equity if equity > 0 else 0.0
-
-        # ATR-risk sizing (strategy-owned): back-solve ctx.long's 0..1 size
-        # from the absolute share count that risks ``risk_pct`` of cash.
         price = close
-        cash = ctx.state.portfolio.cash
-        if price <= 0 or cash <= 0 or live.stop_atr <= 0 or np.isnan(live.stop_atr):
-            continue
+        assert price > 0, f"breakout price must be positive, got {price}"
+        assert equity > 0, f"equity must be positive to size, got {equity}"
         stop_dist = params.atr_mult * live.stop_atr
         qty = risk_sized_qty(
-            equity=cash, price=price, stop_dist=stop_dist, risk_pct=params.risk_pct
+            equity=equity, price=price, stop_dist=stop_dist, risk_pct=params.risk_pct
         )
         if qty <= 0:
             continue
-        qty = (
-            min(qty, notional_cap / price) if (price > 0 and notional_cap > 0) else qty
-        )
-        if qty <= 0:
-            continue
-        size = qty * price / ctx.state.portfolio.initial_capital
-        size = min(max(size, 0.0), 1.0)
+        size = min(qty * price / equity, 1.0)
         if size <= 0:
             continue
 
@@ -499,6 +472,7 @@ def on_candle(ctx: StrategyContext):
             sym,
             size=size,
             reason=f"[breakout] close {close:.2f} > box high {live.high:.2f}",
+            size_mode="equity",
         )
         # Consume the box so an immediate re-breakout can't re-enter flat.
         boxes.pop(sym, None)
