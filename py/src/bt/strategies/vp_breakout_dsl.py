@@ -29,7 +29,7 @@ from typing import Literal, Mapping
 
 import numpy as np
 
-from src.bt.state.types import Position
+from src.bt.state.types import ActionType, Position
 from src.indicators.volume_profile.strategy import OnlineVP
 from src.bt.size.pure import risk_sized_qty
 from src.bt.strategies.dsl import strategy, StrategyContext
@@ -230,7 +230,7 @@ def on_candle(ctx: StrategyContext):
         close = ctx.ohlcv(sym).close.last()
         vah = getattr(snap, "vah", None)
         val = getattr(snap, "val", None)
-        is_long = pos.qty >= 0
+        is_long = pos.type == ActionType.long
         outcome = _exit(ctx, sym, is_long, close, vah, val, params)
         if outcome:
             reason, guard = outcome
