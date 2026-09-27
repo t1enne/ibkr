@@ -151,6 +151,7 @@ def run_backtest(
     """
     config = bt.config
     _assert_dsl_strategy(strategy_mod, allow_none=True)
+    _assert_benchmark_symbols_last(config)
     symbols = config.symbols
     strategy_fn = strategy_mod.on_candle if strategy_mod else None
     last_symbol = symbols[-1] if symbols else None
@@ -618,6 +619,40 @@ def _assert_dsl_strategy(strategy_mod: Any, *, allow_none: bool = True) -> None:
             "decorated strategies. Wrap it with `from src.bt.strategies.dsl "
             "import strategy; @strategy(...)`."
         )
+
+
+def _assert_benchmark_symbols_last(config: StrategyConfig) -> None:
+    """Assert every tradable benchmark symbol sits at the tail of ``symbols``.
+
+    The engine fires ``on_candle`` once per timestamp, only on
+    ``config.symbols[-1]``. That symbol's bar is therefore the run's
+    *evaluation clock*: the engine only visits timestamps the last symbol has
+    a bar for. A benchmark that gates entries (regime/trend gate) reads its
+    own series from the candle store, so if it is ALSO a configured symbol but
+    is placed anywhere before the tail, the run silently evaluates on the tail
+    symbol's calendar instead — a later-IPO or sparser tail symbol drops every
+    timestamp the gating benchmark lacks, and the same config yields different
+    results purely from symbol order.
+
+    Benchmarks are observers, never tail-competing trade targets, so this is a
+    hard config error: reject instead of degrading silently.
+    """
+    symbols = config.symbols
+    if not symbols:
+        return
+    benchmarks_in_feed = [b for b in config.benchmark_symbols if b in symbols]
+    if not benchmarks_in_feed:
+        return
+    tail = symbols[len(symbols) - len(benchmarks_in_feed) :]
+    if tail == benchmarks_in_feed:
+        return
+    offenders = [f"{b!r} at index {symbols.index(b)}" for b in benchmarks_in_feed]
+    raise AssertionError(
+        "benchmark symbols present in config.symbols must be the LAST entries "
+        f"(in benchmark_symbols order); got {symbols!r} with benchmark(s) "
+        f"{', '.join(offenders)}. on_candle fires only on symbols[-1], so the "
+        "evaluation clock must be a benchmark, not a tradable tail symbol."
+    )
 
 
 def run(
