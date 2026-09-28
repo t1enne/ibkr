@@ -214,6 +214,10 @@ def on_candle(ctx: StrategyContext):
     shared.setdefault(_COOLDOWN_KEY, {})
 
     _refresh_vp(ctx, params)
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them.
+    if ctx.phase == "warmup":
+        return
 
     # ---- Exits first -------------------------------------------------------
     for sym in ctx.symbols:

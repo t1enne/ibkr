@@ -1,14 +1,20 @@
 {
   "name": "pf-equal-weight-buy-hold",
   "strategy_type": "pf_equal_weight",
-  "symbols": ["GOOG", "META", "AMZN", "QQQ"],
+  "symbols": [
+    "GOOG",
+    "META",
+    "AMZN",
+    "QQQ"
+  ],
   "initial_capital": 100000,
   "commission": 0.001,
-  "training_start": "2021-01-01",
-  "training_end": "2021-01-01",
+  "warmup": "250d",
   "trading_start": "2021-01-02",
   "trading_end": "2025-01-01",
-  "bars": ["1d"],
+  "bars": [
+    "1d"
+  ],
   "strategy_params": {
     "rebalance_days": 0
   }

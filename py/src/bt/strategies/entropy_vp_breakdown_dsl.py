@@ -484,6 +484,10 @@ def on_candle(ctx: StrategyContext):
 
     # Market regime gauge (feed-only; never traded).
     _feed_market(ctx, shared, params)
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them.
+    if ctx.phase == "warmup":
+        return
     risk_off = not market_risk_on(shared, params)
     spy_ok = _spy_trend_ok(ctx, params)  # SPY not-bull check, once per bar
 

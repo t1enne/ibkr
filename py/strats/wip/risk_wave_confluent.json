@@ -1,7 +1,6 @@
 {
   "name": "risk-wave-confluent",
-  "training_start": "2020-01-02",
-  "training_end": "2020-11-13",
+  "warmup": "250d",
   "trading_start": "2020-11-16",
   "trading_end": "2026-09-01",
   "commission": 0.05,

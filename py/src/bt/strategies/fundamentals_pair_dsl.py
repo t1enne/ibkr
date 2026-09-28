@@ -194,6 +194,11 @@ def on_candle(ctx: StrategyContext) -> None:
     re-ranking per bar would trade noise plus commission); between re-ranks the
     existing book is held untouched.
     """
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     params: Params = ctx.params
     bars = int(ctx.shared.setdefault("bars", 0))
     ctx.shared["bars"] = bars + 1

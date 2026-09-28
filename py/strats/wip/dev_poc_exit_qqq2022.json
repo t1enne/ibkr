@@ -1,14 +1,20 @@
 {
-  "name": "bear-breakout-dsl-2022",
+  "name": "dev-poc-exit-qqq2022",
   "warmup": "250d",
   "trading_start": "2022-01-01",
-  "trading_end": "2025-12-31",
+  "trading_end": "2022-12-31",
   "commission": 0.05,
   "initial_capital": 100000,
   "strategy_type": "vp_breakout_dsl",
-  "bars": ["1d"],
-  "benchmark_symbols": ["SPY"],
-  "symbols": ["QQQ", "IWM", "DIA", "TLT", "GLD", "SPY"],
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
+  "symbols": [
+    "QQQ"
+  ],
   "strategy_params": {
     "direction": "both",
     "vp_window": 300,

@@ -112,11 +112,12 @@ def _flat_overrides(merge: dict[str, Any], patch: dict[str, Any]) -> dict[str, A
 
 
 def _combo_data_span(conf: StrategyConfig) -> tuple[pd.Timestamp, pd.Timestamp]:
-    """Return the (train_start, test_end) load span a combo needs."""
+    """Return the (warmup start, test_end) load span a combo needs."""
+    from src.bt import warmup_load_start
     from src.bt.engine.backtest import Backtest
 
     b = Backtest(conf)
-    return b.window.train_start, b.window.test_end
+    return warmup_load_start(conf, b.window.test_start), b.window.test_end
 
 
 def _sweep_worker(task: tuple[tuple[str, ...], str, dict[str, Any]]) -> SweepResult:
@@ -170,9 +171,9 @@ def run_sweep(
 
     Data loading is grouped by symbol set: for each distinct ``symbols`` list
     across combos, candles load once over the *union* of all that set's spans
-    (train_start..test_end), then each combo's window is sliced from that feed
+    (warmup_start..test_end), then each combo's window is sliced from that feed
     via ``window_df`` — no per-combo reload, and sweeping top-level
-    ``symbols`` / ``training_start`` / ``trading_start`` / ``trading_end``
+    ``symbols`` / ``warmup`` / ``trading_start`` / ``trading_end``
     now works correctly.
 
     ``on_result`` (optional) is called with (index, total, flat_overrides, pf)
@@ -203,7 +204,7 @@ def run_sweep(
     for conf in confs:
         by_key.setdefault((tuple(conf.symbols), conf.bars[0]), []).append(conf)
 
-    # Load once per key over the union of that set's spans (train_start..test_end).
+    # Load once per key over the union of that set's spans (warmup_start..test_end).
     feed_cache: dict[tuple[tuple[str, ...], str], pd.DataFrame] = {}
     for (symbols, bar), conf_list in by_key.items():
         spans = [_combo_data_span(c) for c in conf_list]

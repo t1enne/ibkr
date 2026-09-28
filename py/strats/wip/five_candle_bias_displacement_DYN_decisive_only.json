@@ -1,7 +1,6 @@
 {
   "name": "five-candle-bias-DYN-decisive1.5-BASE2pct",
-  "training_start": "2016-01-01",
-  "training_end": "2019-12-31",
+  "warmup": "250d",
   "trading_start": "2020-01-01",
   "trading_end": "2026-08-01",
   "commission": 0.05,

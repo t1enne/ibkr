@@ -36,8 +36,13 @@ class RegimeState:
 
 @dataclass(frozen=True)
 class EngineWindow:
-    train_start: pd.Timestamp
-    train_end: pd.Timestamp
+    """The engine's evaluation window.
+
+    ``warmup_bars`` is how many bars are walked BEFORE ``test_start`` with the
+    strategy invoked but unable to trade (see ``Backtest.window``).
+    """
+
+    warmup_bars: int
     test_start: pd.Timestamp
     test_end: pd.Timestamp
 
@@ -49,8 +54,12 @@ class StrategyConfig:
     symbols: list[str]
     initial_capital: float
     commission: float
-    training_start: str
-    training_end: str
+    # Calendar duration string (e.g. "1y", "6m", "90d") walked before
+    # ``trading_start`` with the strategy invoked but trading suppressed. The
+    # engine derives ``warmup_bars`` from it at the config's base interval
+    # (``src.bt.warmup``); a strategy's OWN bar-count readiness gate is what
+    # actually guarantees enough accumulated state.
+    warmup: str
     trading_start: str
     trading_end: str
     bars: list[str]

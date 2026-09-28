@@ -314,6 +314,10 @@ def on_candle(ctx: StrategyContext):
 
     _filters(ctx, params)
     _refresh_ts(ctx, params)
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them.
+    if ctx.phase == "warmup":
+        return
     regime_ok = _regime_ok(ctx, params)
 
     # ---- Exits first (always run, even outside the gate) --------------------

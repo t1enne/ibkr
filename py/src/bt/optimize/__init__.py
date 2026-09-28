@@ -165,6 +165,7 @@ def run_optimize(
             f"{', '.join(sorted(_metric_names()))}"
         )
 
+    from src.bt import warmup_load_start
     from src.bt.engine.backtest import Backtest
     from src.bt.data_feed import load_candles
     from src.bt.parallel import run_in_processes
@@ -174,9 +175,12 @@ def run_optimize(
 
     merged_patches = grid_combos(merge)
 
-    # Load once over the full span — per-window runs slice it, no per-run reload.
+    # Load once over ``warmup + earliest fold`` so every fold — including the
+    # first — has its own warmup span of history in front of its bars. Each
+    # window re-derives its warmup from its own ``trading_start`` in
+    # ``run_window``; there is no per-run reload.
     probe = Backtest(cfg)
-    load_start = min(fold.is_start for fold in folds)
+    load_start = warmup_load_start(cfg, min(fold.is_start for fold in folds))
     data = load_candles(
         cfg.symbols,
         load_start,

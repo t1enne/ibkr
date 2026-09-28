@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import click
-import pandas as pd
 
 from src.bt.cmds._shared import cli_ts
 
@@ -31,12 +30,6 @@ from src.bt.cmds._shared import cli_ts
     help="Min IS window length for walk-forward.",
 )
 @click.option(
-    "--train-start",
-    type=click.DateTime(formats=["%Y-%m-%d"]),
-    default=None,
-    help="Override warmup start before IS.",
-)
-@click.option(
     "--workers",
     type=int,
     default=1,
@@ -55,7 +48,6 @@ def split(
     is_end,
     folds,
     min_is_years,
-    train_start,
     workers: int,
     fmt: str,
 ):
@@ -74,9 +66,6 @@ def split(
     )
 
     cfg = load_strategy(strategy_file)
-    train_start_ts: pd.Timestamp | None = (
-        cli_ts(train_start) if train_start is not None else None
-    )
 
     def _stream_fold(fold, is_result, oos_result) -> None:
         click.echo(
@@ -94,10 +83,9 @@ def split(
                 cfg,
                 folds,
                 min_is_years=min_is_years,
-                train_start=train_start_ts,
             )
         elif is_end is not None:
-            folds_list = anchor_split(cfg, cli_ts(is_end), train_start=train_start_ts)
+            folds_list = anchor_split(cfg, cli_ts(is_end))
         else:
             raise click.UsageError(
                 "Provide one of --is-end (single split) or --folds (walk-forward)."

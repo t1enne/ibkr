@@ -53,6 +53,11 @@ def on_candle(ctx: StrategyContext):
     ``ctx.shared`` gates the one-shot allocation; drift re-alignment is tracked
     by a bar counter when ``rebalance_days`` > 0.
     """
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     n = len(ctx.symbols)
     size = round(1 / n, 2)
 

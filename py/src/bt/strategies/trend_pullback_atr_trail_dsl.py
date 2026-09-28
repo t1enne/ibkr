@@ -132,6 +132,11 @@ def _last(v: object) -> float:
 
 @strategy(bars="1d", stateful=True)
 def on_candle(ctx: StrategyContext):
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     shared = ctx.shared
     shared.setdefault("cooldowns", {})
     shared.setdefault("in_trail", set())

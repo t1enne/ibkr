@@ -15,6 +15,7 @@ this driver only hands it an observer so intent survives ``_finalize``.
 """
 
 from __future__ import annotations
+from src.bt.warmup import parse_warmup_bars
 
 from dataclasses import dataclass, replace
 from typing import Literal, Mapping, cast
@@ -41,16 +42,6 @@ COMMON_COLS = [
     "hi_52w",
     "lo_52w",
 ]
-
-#: Default trailing lookback loaded for a screen (calendar days). Bounds the
-#: warm-up feed to what a screen actually needs to compute the latest-bar
-#: decision: every DSL warm-up window (momentum big_lookback=63, SMAs <= 20,
-#: AE entropy ~40) plus the widest display indicator (ema_200 / 52-week,
-#: ~200-250 1d bars) fits well inside ~550 calendar days (~370 trading days),
-#: leaving headroom for weekends and exchange holidays. Overridable via the
-#: screen command's -w/--warmup. A screen never trades, so it deliberately
-#: does NOT load (or replay) a config's full multi-year train->test backtest.
-WARMUP_DAYS: int = 550
 
 Action = Literal["long", "short", "flat"]
 
@@ -93,7 +84,6 @@ class SignalCollector:
 def run_screen_from_strategy(
     config_path: str,
     posture: Posture = Posture(),
-    warmup_days: int = WARMUP_DAYS,
     max_age_days: int | None = None,
 ) -> tuple[tuple[ScreenRow, ...], BacktestState]:
     """Score a universe by running its strategy through the real engine.
@@ -110,17 +100,18 @@ def run_screen_from_strategy(
     """
     cfg = load_strategy(config_path)
     data_end = _data_end(cfg)
+    warmup_days = parse_warmup_bars(cfg.warmup, "1d")
     warm_start = cast(pd.Timestamp, data_end - pd.Timedelta(days=warmup_days))
 
-    # A screen does not trade and has no train/test split: collapse the config's
-    # (irrelevant, multi-year) window onto the warm tail so (a) we load only
-    # what we score and (b) the engine's can_trade gate (test<=ts<=test_end)
-    # covers the whole tail — letting signals fire through the final bar, whose
-    # timestamp is data_end, so fresh-vs-held attribution stays correct.
+    # A screen does not trade and has no IS/OOS split: it runs over a trailing
+    # warm-up window ending at the newest data bar and treats the WHOLE tail as
+    # the trading window, so signals fire through the final bar (whose timestamp
+    # is data_end) and fresh-vs-held attribution stays correct. ``warmup`` is 0:
+    # the loaded tail already IS the span the strategy sees, so there is no
+    # second warmup collapse — every loaded bar is tradable tape.
     config = replace(
         cfg,
-        training_start=_iso(warm_start),
-        training_end=_iso(data_end),
+        warmup="0d",
         trading_start=_iso(warm_start),
         trading_end=_iso(data_end),
     )
@@ -169,10 +160,12 @@ def _filter_recent(
 
 def _load_feed(config: StrategyConfig) -> pd.DataFrame:
     """Load the MultiIndex-column OHLCV frame the engine generator consumes."""
+    from src.bt import warmup_load_start
+
     bt = Backtest(config)
     return load_candles(
         config.symbols,
-        bt.window.train_start,
+        warmup_load_start(config, bt.window.test_start),
         bt.window.test_end,
         config.bars[0],
     )

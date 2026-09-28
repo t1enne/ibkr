@@ -1,7 +1,6 @@
 {
   "name": "cross-mr-long-only",
-  "training_start": "2019-09-01",
-  "training_end": "2020-03-09",
+  "warmup": "250d",
   "trading_start": "2020-03-10",
   "trading_end": "2026-08-04",
   "commission": 0.05,

@@ -1,13 +1,14 @@
 {
   "name": "trend-pullback-atr-trail-dsl",
-  "training_start": "2013-01-01",
-  "training_end": "2015-01-01",
+  "warmup": "250d",
   "trading_start": "2015-01-01",
   "trading_end": "2025-12-31",
   "commission": 0.1,
   "initial_capital": 50000,
   "strategy_type": "trend_pullback_atr_trail_dsl",
-  "bars": ["1d"],
+  "bars": [
+    "1d"
+  ],
   "strategy_params": {
     "atr_period": 14,
     "atr_mult": 1.5,
@@ -21,5 +22,9 @@
     "stop_loss": 0.08,
     "take_profit": 0.2
   },
-  "symbols": ["SPY", "GLD", "QQQ"]
+  "symbols": [
+    "SPY",
+    "GLD",
+    "QQQ"
+  ]
 }

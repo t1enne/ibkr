@@ -1,7 +1,6 @@
 {
   "name": "entropy-vp-breakdown",
-  "training_start": "2020-01-01",
-  "training_end": "2021-12-31",
+  "warmup": "250d",
   "trading_start": "2022-01-01",
   "trading_end": "2026-08-07",
   "commission": 0.05,

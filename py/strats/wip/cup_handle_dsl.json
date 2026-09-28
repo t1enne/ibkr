@@ -1,13 +1,14 @@
 {
   "name": "cup-handle-breakout-dsl",
-  "training_start": "2020-01-01",
-  "training_end": "2020-01-01",
+  "warmup": "250d",
   "trading_start": "2020-01-02",
   "trading_end": "2025-01-01",
   "commission": 0.1,
   "initial_capital": 50000,
   "strategy_type": "cup_handle_dsl",
-  "bars": ["1d"],
+  "bars": [
+    "1d"
+  ],
   "strategy_params": {
     "swing_lookback": 3,
     "max_cup_depth_pct": 0.4,
@@ -38,5 +39,11 @@
     "cooldown_bars": 5,
     "profit_target_mult": 1.2
   },
-  "symbols": ["QQQ", "GOOG", "META", "NVDA", "AAPL"]
+  "symbols": [
+    "QQQ",
+    "GOOG",
+    "META",
+    "NVDA",
+    "AAPL"
+  ]
 }

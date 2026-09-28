@@ -523,6 +523,11 @@ def _manage_trail(
 
 @strategy(bars="1d", stateful=True)
 def on_candle(ctx: StrategyContext):
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     params = ctx.params
     if not isinstance(params, Params):
         params = Params.from_dict(ctx.params)

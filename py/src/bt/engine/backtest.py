@@ -47,6 +47,7 @@ import pandas as pd
 from src.bt.metrics import calculate_portfolio_result
 from src.bt.strategies import resolve_params
 from src.bt.strategies.ta_context import TaContext
+from src.bt.warmup import parse_warmup_bars
 
 if TYPE_CHECKING:
     from src.bt.types import StrategyConfig
@@ -86,8 +87,7 @@ class Backtest:
 
     def __post_init__(self):
         self.window = EngineWindow(
-            train_start=parse_timestamp(self.config.training_start),
-            train_end=parse_timestamp(self.config.training_end),
+            warmup_bars=parse_warmup_bars(self.config.warmup, self.config.bars[0]),
             test_start=parse_timestamp(self.config.trading_start),
             test_end=parse_timestamp(self.config.trading_end),
         )
@@ -198,14 +198,38 @@ def run_backtest(
     state = merge_bt_state(state, dict(candles=store))
 
     for candle in candle_gen:
+        # Phase for this bar: bars strictly before ``test_start`` are warmup —
+        # the strategy IS invoked (accumulators/indicators fill, cursor
+        # advances) but trading is suppressed and emitting a signal is a hard
+        # error in the DSL. Trading (and only trading) happens inside the
+        # test window. ``warmup_bars == 0`` makes every bar a trading bar, so a
+        # zero warmup is a pure no-op.
+        in_warmup = candle.timestamp < bt.window.test_start
         can_trade = bt.window.test_start <= candle.timestamp <= bt.window.test_end
         is_base = not candle.interval or candle.interval == config.bars[0]
+        state.candles.set_phase("warmup" if in_warmup else "trade")
 
         # Stage 1: stash EVERY candle (base + HTF) into the same accumulator
         rows, state = _append_candle(rows, state, candle, config.bars[0])
 
         # HTF-only candles: accumulate and skip rest of pipeline
         if not is_base:
+            continue
+
+        # Warmup phase: run the strategy so its state warms, but skip fills,
+        # risk and marking entirely — no position can exist, no equity point is
+        # recorded, and any signal emission raises inside the DSL.
+        if in_warmup:
+            state = _generate_signals(
+                state,
+                candle,
+                resolved_params,
+                strategy_fn,
+                last_symbol,
+                True,
+                rows,
+                signal_observer=None,
+            )
             continue
 
         # Stage 3: execute pending signals (from prior candles)
@@ -341,6 +365,7 @@ def build_benchmark_curves(
 
 def _get_bench_curves(config: StrategyConfig, bt: Backtest):
     from src.bt.data_feed import load_candles
+    from src.bt.warmup import warmup_start
 
     if not config.benchmark_symbols:
         return {}
@@ -348,7 +373,7 @@ def _get_bench_curves(config: StrategyConfig, bt: Backtest):
     try:
         bm_df = load_candles(
             config.benchmark_symbols,
-            bt.window.train_start,
+            warmup_start(bt.window.test_start, config.warmup),
             bt.window.test_end,
             config.bars[0],
         )

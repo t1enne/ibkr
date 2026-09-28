@@ -31,8 +31,9 @@ def window_df(
 
     Drops everything past `trading_end` so the engine never processes future
     data (which leaked out-of-window closes, model updates, and marks across
-    the boundary). Keeps the head (`data` already starts at the warmup/train
-    start), so the model still warms up on prior history before the window.
+    the boundary). Keeps the head (`data` already starts at the warmup
+    start), so the fold's warmup bars are walked before its ``trading_start``
+    — the engine, not this slice, draws the warmup/trade boundary.
     """
     return data.loc[:trading_end]
 
@@ -62,9 +63,13 @@ def run_window(
 ) -> PortfolioResult:
     """Run one IS or OOS window by overriding the config's trading window.
 
-    Data is loaded once per split, then sliced per window so the engine only
-    sees candles up to `trading_end` — no post-window data (fixes out-of-window
-    trade closes, model-updater leakage, and wasted full-feed iteration).
+    Each window gets **its own warmup + its own bars**: the window's span is
+    ``[trading_start - warmup, trading_end]`` and the warmup is re-derived from
+    this window's ``trading_start`` (via the engine's window override), so an
+    OOS fold warms on the bars immediately before it rather than starting cold.
+    The caller must hand a feed that already reaches back to
+    ``warmup_load_start(cfg, min window start)`` — see ``run_split`` /
+    ``run_optimize`` — and this slice drops only the tail, so no look-ahead.
 
     Benchmark candles are loaded once and sliced per window too, avoiding a
     DB reload for every IS/OOS window.

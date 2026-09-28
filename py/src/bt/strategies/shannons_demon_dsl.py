@@ -193,6 +193,11 @@ def _rebalance_leg(
 
 @strategy(bars="1d", stateful=True)
 def on_candle(ctx: StrategyContext):
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     shared = ctx.shared
     shared.setdefault("bar_idx", 0)
     shared.setdefault("last_rebalance", -ctx.params.rebalance_frequency)

@@ -53,6 +53,15 @@ if TYPE_CHECKING:
     pass
 
 
+class WarmupTradeError(RuntimeError):
+    """Raised when a strategy tries to open a position during the warmup span.
+
+    Warmup bars are walked so strategy state (``ctx.shared`` accumulators,
+    ``ctx.ta`` series) is warm when trading begins — no fill can occur on them,
+    so emitting an entry there is a programming error, not a dropped signal.
+    """
+
+
 class StrategyContext:
     """Per-candle decision surface handed to a decorated strategy.
 
@@ -86,6 +95,7 @@ class StrategyContext:
         "_signals",
         "_shared",
         "_readonly",
+        "_phase",
     )
 
     def __init__(
@@ -110,6 +120,9 @@ class StrategyContext:
         # Post-run plot contexts are read-only (set by ``for_plot``); mutating
         # methods assert against this so a ``plot`` can't emit a phantom signal.
         self._readonly: bool = False
+        # Engine phase for this bar: "warmup" (before ``trading_start``) or
+        # "trade". Signal emission is a hard error during warmup.
+        self._phase: str = "trade"
 
     @classmethod
     def for_plot(
@@ -164,6 +177,7 @@ class StrategyContext:
         )
         ctx.shared = data.strategy_state or {}
         ctx._readonly = True
+        ctx._phase = "trade"
         return ctx
 
     @property
@@ -205,6 +219,25 @@ class StrategyContext:
     @property
     def state(self) -> "BacktestState":
         return self._state
+
+    @property
+    def phase(self) -> Literal["warmup", "trade"]:
+        """Engine phase for the current bar: ``"warmup"`` or ``"trade"``.
+
+        Bars strictly before ``trading_start`` are warmup bars: the engine
+        walks them with the strategy invoked (so ``ctx.shared`` accumulators
+        and ``ctx.ta`` series fill) but the strategy must NOT trade. A
+        strategy that is not ready yet returns early on warmup bars::
+
+            if ctx.phase == "warmup":
+                return   # accumulate only; begin trading at trading_start
+
+        Calling ``ctx.long``/``ctx.short`` during warmup raises: emitting a
+        trade signal for a bar where no fill can happen is a programming error,
+        and silently discarding it would leave a stateful strategy's own
+        bookkeeping diverged from the engine's book.
+        """
+        return cast("Literal['warmup', 'trade']", self._phase)
 
     @property
     def candle(self) -> "Candle":
@@ -473,6 +506,7 @@ class StrategyContext:
         tag: str = "",
         size_mode: Literal["capital", "equity"] = "capital",
     ) -> None:
+        self._assert_tradable(action, sym)
         price = self.price(sym)
         is_long = action == ActionType.long
         sl_price, tp_price = sl_tp_from_pct(
@@ -502,6 +536,26 @@ class StrategyContext:
                 take_profit=tp_price,
                 tag=tag,
             )
+        )
+
+    def _assert_tradable(self, action: ActionType, sym: str) -> None:
+        """Reject a position-opening emission on a warmup bar.
+
+        Warmup bars exist so accumulators fill without trading; a ``long``/
+        ``short`` emitted there could never fill (the engine skips execution
+        during warmup), and discarding it would leave the strategy's own
+        ``ctx.shared`` bookkeeping permanently out of sync with the engine's
+        book. Fail loudly instead: a strategy that is not ready must return
+        early on ``ctx.phase == "warmup"``.
+        """
+        if self._phase != "warmup":
+            return
+        raise WarmupTradeError(
+            f"{action.value} signal for {sym!r} emitted at {self._candle.timestamp} "
+            "during the warmup window (before trading_start). Warmup bars fill "
+            "strategy state only — no fill can happen there. Guard the decision "
+            "with `if ctx.phase == 'warmup': return` (or move the entry behind "
+            "the strategy's own bar-count readiness gate)."
         )
 
     # -- Pine built-ins (pure; operate on cursor-truncated views / floats) ------
@@ -629,6 +683,9 @@ class _StrategyAdapter:
         )
         if holder is not None:
             ctx.shared = holder
+        # Mirror the engine's phase so a strategy can tell a state-warming bar
+        # from a tradable one (``ctx.phase == "warmup"``).
+        ctx._phase = getattr(state.candles, "phase", "trade")
         self.ctx_fn(ctx)
         return ctx._signals
 
@@ -724,6 +781,7 @@ def _cross(a, b, over: bool) -> bool:
 __all__ = [
     "strategy",
     "StrategyContext",
+    "WarmupTradeError",
     "SeriesView",
     "OhlcvView",
     "TaContext",

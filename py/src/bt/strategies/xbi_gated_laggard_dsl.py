@@ -168,6 +168,11 @@ def _laggard_targets(ctx: StrategyContext, params: Params) -> list[str]:
 
 @strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     params: Params = ctx.params
     shared = ctx.shared
     st: _Ctx = shared.setdefault(_CTX_KEY, _Ctx())

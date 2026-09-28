@@ -1,17 +1,24 @@
 {
   "name": "shannons-demon-spy-gld-dsl",
-  "training_start": "2015-01-01",
-  "training_end": "2015-01-02",
+  "warmup": "250d",
   "trading_start": "2015-01-02",
   "trading_end": "2025-03-01",
   "commission": 0.05,
   "initial_capital": 100000,
   "strategy_type": "shannons_demon_dsl",
-  "bars": ["1d"],
-  "benchmark_symbols": ["SPY", "GLD"],
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "SPY",
+    "GLD"
+  ],
   "strategy_params": {
     "rebalance_frequency": 2,
-    "target_weights": [0.5, 0.5],
+    "target_weights": [
+      0.5,
+      0.5
+    ],
     "drift_tolerance": 0.01,
     "warmup_bars": 63,
     "cash_leg": false,
@@ -22,5 +29,8 @@
     "stop_loss": 0.0,
     "take_profit": 0.0
   },
-  "symbols": ["SPY", "GLD"]
+  "symbols": [
+    "SPY",
+    "GLD"
+  ]
 }

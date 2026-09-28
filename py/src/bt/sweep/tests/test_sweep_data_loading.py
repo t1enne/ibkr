@@ -20,8 +20,7 @@ def _fix_cfg() -> StrategyConfig:
         symbols=["A"],
         initial_capital=100000.0,
         commission=0.05,
-        training_start="2020-01-01",
-        training_end="2020-06-01",
+        warmup="0d",
         trading_start="2020-06-01",
         trading_end="2020-12-31",
         bars=["1d"],
@@ -132,12 +131,13 @@ def test_sweep_window_slices_each_combo_to_its_own_span(monkeypatch):
 
     run_sweep(cfg, merge, sort_metric="annual_return")
 
-    # Single load over the union span (start = min training_start = 2020-01-01,
-    # end = max trading_end = 2020-12-31).
+    # Single load over the union span: the earliest combo's warmup start
+    # (``trading_start - warmup``; 0d warmup here, so 2020-06-01) through the
+    # latest combo's trading_end.
     assert len(load_calls) == 1
     assert load_calls[0][0] == ["A"]
     load_start, load_end = load_calls[0][1], load_calls[0][2]
-    assert load_start == pd.Timestamp("2020-01-01")
+    assert load_start == pd.Timestamp("2020-06-01")
     assert load_end == pd.Timestamp("2020-12-31")
 
     # Each combo ran against a feed trimmed exactly to its own trading_end.
@@ -189,8 +189,7 @@ def test_sweep_pooled_matches_sequential_engine(monkeypatch):
         symbols=["A"],
         initial_capital=100000.0,
         commission=0.05,
-        training_start="2019-01-01",
-        training_end="2020-01-01",
+        warmup="0d",
         trading_start="2020-01-02",
         trading_end="2020-12-31",
         bars=["1d"],

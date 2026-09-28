@@ -1,14 +1,17 @@
 {
   "name": "momentum-compression-breakout-ae-gate-SPY",
-  "training_start": "2016-01-01",
-  "training_end": "2019-12-31",
+  "warmup": "250d",
   "trading_start": "2019-12-31",
   "trading_end": "2026-08-08",
   "commission": 0.05,
   "initial_capital": 50000,
   "strategy_type": "momentum_compression_breakout_dsl",
-  "bars": ["1d"],
-  "benchmark_symbols": ["SPY"],
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
   "symbols": [
     "ADBE",
     "AMD",

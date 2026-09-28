@@ -1,15 +1,26 @@
 {
   "name": "vp-breakout-dsl-regime",
-  "training_start": "2016-01-01",
-  "training_end": "2019-12-31",
+  "warmup": "250d",
   "trading_start": "2019-12-31",
   "trading_end": "2026-01-01",
   "commission": 0.05,
   "initial_capital": 100000,
   "strategy_type": "vp_breakout_dsl",
-  "bars": ["1d"],
-  "benchmark_symbols": ["SPY"],
-  "symbols": ["SPY", "QQQ", "IWM", "DIA", "TLT", "GLD", "SLV"],
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
+  "symbols": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "TLT",
+    "GLD",
+    "SLV"
+  ],
   "strategy_params": {
     "vp_window": 350,
     "num_bins": 50,

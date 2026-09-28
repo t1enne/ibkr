@@ -57,14 +57,12 @@ def screen(strategy_file: str, warmup: int | None, max_age: int) -> None:
     """
     from src.bt.screen.run_strategy import (
         COMMON_COLS,
-        WARMUP_DAYS,
         common_metrics,
         run_screen_from_strategy,
     )
 
     rows, state = run_screen_from_strategy(
         strategy_file,
-        warmup_days=warmup if warmup is not None else WARMUP_DAYS,
         max_age_days=max_age or None,
     )
 

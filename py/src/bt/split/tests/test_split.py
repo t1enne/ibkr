@@ -21,7 +21,7 @@ from src.utils import parse_timestamp
 def _cfg(
     trading_start: str = "2015-01-02",
     trading_end: str = "2025-12-31",
-    training_start: str = "2015-01-01",
+    warmup: str = "0d",
 ) -> StrategyConfig:
     return StrategyConfig(
         name="t",
@@ -29,8 +29,7 @@ def _cfg(
         symbols=["XLB", "XLV", "XLY", "XLU", "SPY"],
         initial_capital=50000,
         commission=0.1,
-        training_start=training_start,
-        training_end=training_start,
+        warmup=warmup,
         trading_start=trading_start,
         trading_end=trading_end,
         bars=["1d"],
@@ -87,12 +86,12 @@ def test_anchor_split_windows() -> None:
     assert f.is_start <= f.is_end < f.oos_start <= f.oos_end
 
 
-def test_anchor_split_respects_train_start() -> None:
+def test_anchor_split_is_start_is_trading_start() -> None:
+    """IS begins at ``trading_start``; the warmup span in front of it is the
+    engine's job (``EngineWindow.warmup_bars``), not a fold-input date."""
     cfg = _cfg()
-    folds = anchor_split(
-        cfg, parse_timestamp("2020-12-31"), train_start=parse_timestamp("2014-01-01")
-    )
-    assert folds[0].is_start == pd.Timestamp("2014-01-01")
+    folds = anchor_split(cfg, parse_timestamp("2020-12-31"))
+    assert folds[0].is_start == parse_timestamp("2015-01-02")
 
 
 def test_anchor_split_is_end_past_trading_end_raises() -> None:
@@ -189,10 +188,10 @@ def test_walk_forward_folds_require_positive_folds() -> None:
         walk_forward_folds(cfg, n_folds=0)
 
 
-def test_walk_forward_folds_train_start_must_precede_is() -> None:
+def test_walk_forward_folds_is_starts_at_trading_start() -> None:
     cfg = _cfg()
-    with pytest.raises(ValueError):
-        walk_forward_folds(cfg, n_folds=2, train_start=parse_timestamp("2020-01-01"))
+    folds = walk_forward_folds(cfg, n_folds=2, min_is_years=0.0)
+    assert all(f.is_start == parse_timestamp("2015-01-02") for f in folds)
 
 
 def _fold(i: int) -> split_mod.TestFold:

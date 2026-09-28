@@ -52,7 +52,14 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
     ``__len__``, ``__iter__``, ``keys``, ``items``, ``values``.
     """
 
-    __slots__ = ("_rows", "_cursor", "_ta", "_strategy_state", "_fundamentals")
+    __slots__ = (
+        "_rows",
+        "_cursor",
+        "_ta",
+        "_strategy_state",
+        "_fundamentals",
+        "_phase",
+    )
 
     def __init__(
         self,
@@ -64,6 +71,11 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         self._ta: Any = None  # optional prefetched TaContext (DSL)
         self._strategy_state: dict | None = None  # optional per-run DSL holder
         self._fundamentals: Any = None  # optional Fundamentals store (DSL)
+        # Engine-owned phase flag: "warmup" while the engine walks bars before
+        # ``test_start``, otherwise "trade". The DSL mirrors it onto
+        # ``ctx.phase`` and uses it to make signal emission during warmup a
+        # hard error rather than a silently-discarded signal.
+        self._phase: str = "trade"
 
     # -- DSL support --------------------------------------------------------
 
@@ -118,6 +130,23 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         reads it from the ``state`` it is handed, never from a module singleton.
         """
         self._strategy_state = holder
+
+    @property
+    def phase(self) -> str:
+        """Engine phase for the current bar: ``"warmup"`` or ``"trade"``.
+
+        Set by the engine before each strategy invocation: ``"warmup"`` on
+        bars walked before ``test_start``. The DSL exposes this as
+        ``ctx.phase``; a strategy that is not ready to trade yet returns early
+        on warmup bars (its accumulators still fill, since the store is fed and
+        the cursor advances on those bars regardless).
+        """
+        return self._phase
+
+    def set_phase(self, phase: str) -> None:
+        """Mark the engine phase for the next strategy invocation (engine-only)."""
+        assert phase in ("warmup", "trade"), f"unknown phase {phase!r}"
+        self._phase = phase
 
     @property
     def strategy_state(self) -> dict | None:

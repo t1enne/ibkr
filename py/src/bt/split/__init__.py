@@ -94,8 +94,6 @@ class SplitReport:
 def anchor_split(
     cfg: StrategyConfig,
     is_end: pd.Timestamp,
-    *,
-    train_start: pd.Timestamp | None = None,
 ) -> list[TestFold]:
     """Single split: IS=[trading_start, is_end], OOS=[is_end+1d, trading_end].
 
@@ -116,11 +114,10 @@ def anchor_split(
             "(OOS window would be empty)"
         )
 
-    is_start = train_start if train_start is not None else start
     return [
         TestFold(
             index=0,
-            is_start=is_start,
+            is_start=start,
             is_end=is_end,
             oos_start=is_end + DAY,
             oos_end=end,
@@ -134,7 +131,6 @@ def walk_forward_folds(
     *,
     min_is_years: float = 5.0,
     oos_length: str | pd.DateOffset = "auto",
-    train_start: pd.Timestamp | None = None,
 ) -> list[TestFold]:
     """Expansion-window walk-forward: IS always starts at trading_start, grows.
 
@@ -151,7 +147,8 @@ def walk_forward_folds(
     non-empty is skipped, and fewer-than-requested folds warn (plan edge
     case 2).
 
-    `is_start` respects the train_start warmup if given.
+    `is_start` is ``trading_start``; the warmup span in front of it is walked
+    by the engine (see ``EngineWindow.warmup_bars``).
 
     Warns once when the first fold's IS is shorter than min_is_years.
     """
@@ -181,12 +178,7 @@ def walk_forward_folds(
             if cursor == end:
                 break
 
-    is_start = train_start if train_start is not None else start
-    if is_start > start:
-        raise ValueError(
-            f"--train-start {is_start.date()} cannot be after trading_start "
-            f"{start.date()}"
-        )
+    is_start = start
 
     first_is_len = boundaries[0] - is_start
     if first_is_len.days / 365.25 < min_is_years:
@@ -261,8 +253,9 @@ def run_split(
     """Run one backtest per IS and OOS window of every fold.
 
     - strategy_params are NEVER mutated across folds (locked params).
-    - Loads candles once over [train_start, trading_end], window-sliced per
-      fold via trading-window overrides (no per-fold data reload). DSL
+    - Loads candles once over [warmup_start, trading_end], window-sliced per
+      fold via trading-window overrides (no per-fold data reload); each fold
+      gets its own warmup span in front of its bars. DSL
       strategies get fresh per-run ``ctx.shared`` state minted by the engine
       each window, so folds are independent and parallelizable.
 
@@ -275,13 +268,15 @@ def run_split(
     if not folds:
         raise ValueError("No folds to run — check the split windows")
 
+    from src.bt import warmup_load_start
     from src.bt.data_feed import load_candles
     from src.bt.parallel import run_in_processes
 
-    load_start = min(
-        parse_timestamp(cfg.training_start),
-        min(f.is_start for f in folds),
-    )
+    # Every fold is fed ``warmup + fold bars``: the load reaches back far enough
+    # that the EARLIEST fold's ``is_start`` has its own warmup span of history
+    # in front of it. Each window then re-derives its warmup from its own
+    # ``trading_start`` inside ``run_window``.
+    load_start = warmup_load_start(cfg, min(f.is_start for f in folds))
     data = load_candles(
         cfg.symbols,
         load_start,

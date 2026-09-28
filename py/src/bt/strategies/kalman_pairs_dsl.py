@@ -87,7 +87,12 @@ def on_candle(ctx: StrategyContext):
 
     # The Kalman signal is strategy-owned (see docstring) — read it from the
     # OnlinePairs filter held in ctx.shared, not from any engine ModelState.
+    # ``observe`` is the accumulator feed, so it must run on warmup bars too.
     result = _filter(ctx, ctx.params).observe(ctx.state, s1, s2, ctx.interval)
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them.
+    if ctx.phase == "warmup":
+        return
     if not result.ready or result.z_score is None or result.beta is None:
         return
 

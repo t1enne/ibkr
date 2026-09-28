@@ -119,6 +119,11 @@ def _deploy_equal_weight(
 
 @strategy(bars="1d", stateful=True)
 def on_candle(ctx: StrategyContext):
+    # Warmup bars fill strategy state only — no fill can happen there, so the
+    # DSL raises on any entry emitted during them. Accumulators above/below
+    # still receive warmup bars because the engine feeds the store regardless.
+    if ctx.phase == "warmup":
+        return
     params: Params = ctx.params
     book = params.book_symbols
     if not book:

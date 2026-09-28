@@ -1,7 +1,6 @@
 {
   "name": "mfi_pivotdiv_both",
-  "training_start": "2019-11-15",
-  "training_end": "2020-01-01",
+  "warmup": "250d",
   "trading_start": "2020-01-01",
   "trading_end": "2026-09-08",
   "commission": 0.0,
