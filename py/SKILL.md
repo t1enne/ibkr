@@ -12,7 +12,7 @@ Full backtesting agent for the IBKR PY quantitative trading toolkit. Design, imp
 
 1. **Never test a strategy.** Strategies, `strats/*.json`, research scripts and
    sweeps are exempt from `AGENTS.md`'s test rule. No `test_<strategy>.py`, no
-   strategy fixtures. Tests cover *engine* code only (indicators, metrics,
+   strategy fixtures. Tests cover _engine_ code only (indicators, metrics,
    sizing, risk, portfolio). Validate strategies by **running** them.
 2. **`bt sweep` / `bt split` / `bt optimize` before any script.** Grid, IS/OOS
    and walk-forward questions all have a subcommand. A hand-rolled
@@ -33,7 +33,7 @@ and do not grow scope before the current stage is signed off.
 ### Stage 0 — Minimum parameters
 
 Use **as few params as possible**. Before adding any param, stop and ask:
-*can the signal generation be rewritten so this param is unnecessary?*
+_can the signal generation be rewritten so this param is unnecessary?_
 
 A param is a fitted degree of freedom. Every one you add trades robustness for
 `sweep` surface and invites curve-fit. Prefer:
@@ -50,7 +50,7 @@ absorb a bad signal is not. State the justification when you do add a param.
 Develop and iterate with **`symbols` = one instrument** and a trading window of
 **at most 1 year**. Fast iteration, and a small sample hides less.
 
-When the run completes, **spawn a specialized subagent to review each trade, one
+When the run completes, **spawn a specialized subagent to review each trade (`quant` or `trader`, one
 by one**, against the entry/exit logic. Ask for: does every entry match the
 stated rule, does every exit fire for the stated reason, any lookahead or
 off-by-one, any bar where the rule should have fired and did not. Trade-by-trade
@@ -115,7 +115,7 @@ Strategies live in `src/bt/strategies/`. Authoring is **DSL-only** — decorate 
 function of a `StrategyContext` with `@strategy(...)`; the module is
 auto-discovered (any module exposing `STRATEGY_TYPE` is registered; nothing to
 wire). The DSL owns candle iteration, cursor-safe indicator prefetch, and
-signal construction, so you write *what* to do, not *how* data reaches you:
+signal construction, so you write _what_ to do, not _how_ data reaches you:
 
 ```python
 # src/bt/strategies/my_strategy.py
@@ -172,7 +172,7 @@ classification bucket they earn — see `strats/README.md`):
   "trading_end": "2025-01-01",
   "commission": 0.1,
   "initial_capital": 10000,
-  "strategy_type": "my_strategy",   // must match a discovered STRATEGY_TYPE
+  "strategy_type": "my_strategy", // must match a discovered STRATEGY_TYPE
   "bars": ["1h", "4h"],
   "strategy_params": {
     "fast": 9,
@@ -238,15 +238,15 @@ The `bt run` report contains:
 (kurtosis/skewness), regime dependence (stability), or one symbol's bleed. Never
 summarize from the headline number; never trim except explicitly.
 
-**Scope discipline:** a report from a 1-symbol / ≤1-year run is an *entry/exit
-review artifact*, not evidence of an edge. Do not present it as a strategy
+**Scope discipline:** a report from a 1-symbol / ≤1-year run is an _entry/exit
+review artifact_, not evidence of an edge. Do not present it as a strategy
 verdict, and do not expand scope without the Stage 2 approval gate above.
 
-| Question | Command |
-| --- | --- |
-| Does this config work? | `bt run <config>` |
-| Best params over the whole window? | `bt sweep <config> '{grid}'` |
-| Are locked params curve-fit? | `bt split <config> --folds N` |
+| Question                              | Command                                   |
+| ------------------------------------- | ----------------------------------------- |
+| Does this config work?                | `bt run <config>`                         |
+| Best params over the whole window?    | `bt sweep <config> '{grid}'`              |
+| Are locked params curve-fit?          | `bt split <config> --folds N`             |
 | Tune per fold, validate OOS honestly? | `bt optimize <config> '{grid}' --folds N` |
 
 Sweep = search. Split = sanity check. Optimize = both, chained honestly.
@@ -315,7 +315,7 @@ uv run pytest src/bt/risk/tests/ -v
 
 - **Don't invent a workflow.** Check for an existing `bt` subcommand first.
 - **Don't launder output.** A re-derived metric or `grep`-ed report is not evidence.
-- **Data availability**: when an agent needs candles that are missing/stale, just run `data dl` (see the runbook below) — `data query` only *reads* the local DB and never fetches.
+- **Data availability**: when an agent needs candles that are missing/stale, just run `data dl` (see the runbook below) — `data query` only _reads_ the local DB and never fetches.
 - **Bar size**: strategies expect the bar size in config to match available data. Most data is `1h`.
 - **HTF lookahead**: `state.candles.get((sym, freq))` and the DSL `ctx.ta`
   `interval=` reads are both safe (cursor-truncated).
