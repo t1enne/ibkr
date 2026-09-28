@@ -16,6 +16,7 @@ from typing import Callable, Mapping
 
 import pandas as pd
 
+from src.bt.metrics import trade_count, win_rate
 from src.bt.types import StrategyConfig, PortfolioResult
 from src.bt.window import run_window, window_has_data
 from src.utils import parse_timestamp
@@ -336,13 +337,6 @@ def run_split(
 # ---------------------------------------------------------------------------
 
 
-def _win_rate(result: PortfolioResult) -> float:
-    closed = [t for t in result.trades if t.status.value == "closed"]
-    if not closed:
-        return 0.0
-    return sum(1.0 for t in closed if t.pnl > 0) / len(closed)
-
-
 def _render_fold(fm: FoldMetrics) -> list[str]:
     """Render one fold as an IS|OOS metric block with a from→to header."""
     from src.bt.table import Col, Table, render
@@ -370,8 +364,8 @@ def _render_fold(fm: FoldMetrics) -> list[str]:
         ),
         (
             "WinRate",
-            f"{_win_rate(fm.in_sample):.1%}",
-            f"{_win_rate(fm.out_of_sample):.1%}",
+            f"{win_rate(fm.in_sample):.1%}",
+            f"{win_rate(fm.out_of_sample):.1%}",
         ),
     )
     cols = (Col("Metric", "<"), Col("IS", ">"), Col("OOS", ">"))
@@ -413,8 +407,8 @@ def split_report_to_dict(report: SplitReport) -> dict:
 
     def _result_dict(r: PortfolioResult) -> dict:
         d = {f: float(getattr(r, f)) for f in float_fields}
-        d["win_rate"] = _win_rate(r)
-        d["trade_count"] = len([t for t in r.trades if t.status.value == "closed"])
+        d["win_rate"] = win_rate(r)
+        d["trade_count"] = trade_count(r)
         return d
 
     return {

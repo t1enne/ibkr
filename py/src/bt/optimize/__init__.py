@@ -85,13 +85,22 @@ def _best_combo_on_window(
 
 
 def _is_metrics(pf: PortfolioResult) -> dict[str, float]:
-    """Serialize a PortfolioResult's numeric fields for reporting."""
-    return {
+    """Serialize a PortfolioResult's numeric fields plus trade-derived stats.
+
+    ``win_rate`` / ``trade_count`` are derived from trades, not dataclass
+    fields, so they are computed here rather than read off the result.
+    """
+    from src.bt.metrics import trade_count, win_rate
+
+    metrics = {
         f.name: float(getattr(pf, f.name))
         for f in fields(PortfolioResult)
         if isinstance(getattr(pf, f.name), (int, float))
         and not isinstance(getattr(pf, f.name), bool)
     }
+    metrics["win_rate"] = win_rate(pf)
+    metrics["trade_count"] = float(trade_count(pf))
+    return metrics
 
 
 def _optimize_fold_worker(fold: TestFold) -> OptimizeResult:
@@ -277,57 +286,84 @@ def run_optimize(
     return results, agg
 
 
+def _fold_row(r: OptimizeResult) -> tuple[str, ...]:
+    """One fold's IS|OOS metric cells for the summary table.
+
+    Missing metrics render as "—" so a partial ``is_metrics`` mapping (older
+    pickled results / hand-built fixtures) degrades instead of raising.
+    """
+    from src.bt.metrics import trade_count, win_rate
+
+    f = r.fold
+    is_m = r.is_metrics
+    oos = r.oos
+
+    def i_pct(key: str, spec: str = ".1%") -> str:
+        v = is_m.get(key)
+        return "—" if v is None else format(v, spec)
+
+    def i_num(key: str, spec: str = ".2f") -> str:
+        v = is_m.get(key)
+        return "—" if v is None else format(v, spec)
+
+    is_trades = is_m.get("trade_count")
+    is_wr = is_m.get("win_rate")
+
+    return (
+        str(f.index + 1),
+        f"{f.is_start.date()}→{f.is_end.date()}",
+        f"{f.oos_start.date()}→{f.oos_end.date()}",
+        " ".join(f"{k}={v}" for k, v in r.best_params.items()) or "—",
+        i_num("sharpe_ratio"),
+        f"{oos.sharpe_ratio:.2f}",
+        i_pct("annual_return"),
+        f"{oos.annual_return:.1%}",
+        i_pct("max_drawdown"),
+        f"{oos.max_drawdown:.1%}",
+        i_num("kurtosis", ".1f"),
+        f"{oos.kurtosis:.1f}",
+        "—" if is_trades is None else str(int(is_trades)),
+        str(trade_count(oos)),
+        "—" if is_wr is None else f"{is_wr:.0%}",
+        f"{win_rate(oos):.0%}",
+    )
+
+
+_OPTIMIZE_COLUMNS = (
+    ("Fold", "<"),
+    ("IS window", "<"),
+    ("OOS window", "<"),
+    ("Chosen params", "<"),
+    ("IS Shp", ">"),
+    ("OOS Shp", ">"),
+    ("IS Ann", ">"),
+    ("OOS Ann", ">"),
+    ("IS DD", ">"),
+    ("OOS DD", ">"),
+    ("IS Kurt", ">"),
+    ("OOS Kurt", ">"),
+    ("IS Trd", ">"),
+    ("OOS Trd", ">"),
+    ("IS Win", ">"),
+    ("OOS Win", ">"),
+)
+
+
 def render_optimize_report(results: list[OptimizeResult], agg: dict[str, float]) -> str:
-    """Render per-fold IS-tuned/OOS-validated metrics as aligned blocks."""
+    """Render every fold's IS-tuned/OOS-validated metrics as ONE wide table.
+
+    One row per fold; IS and OOS columns side by side so degradation is read
+    horizontally. Kurtosis/win-rate/trade-count carry the tail risk and
+    sample-size story a Sharpe-only view hides.
+    """
     from src.bt.table import Col, Table, render
 
-    lines: list[str] = []
-    for r in results:
-        f = r.fold
-        lines.append(
-            f"Fold {f.index + 1}:  "
-            f"IS {f.is_start.date()}→{f.is_end.date()}  |  "
-            f"OOS {f.oos_start.date()}→{f.oos_end.date()}"
-        )
-        params = (
-            " ".join(f"{k}={v}" for k, v in r.best_params.items())
-            or "(no swept params)"
-        )
-        lines.append(f"  chosen params: {params}")
-        table = render(
-            Table(
-                columns=(
-                    Col("Metric", "<"),
-                    Col("IS (tuned)", ">"),
-                    Col("OOS (unseen)", ">"),
-                ),
-                rows=(
-                    (
-                        "Annual",
-                        f"{r.is_metrics['annual_return']:.2%}",
-                        f"{r.oos.annual_return:.2%}",
-                    ),
-                    (
-                        "Sharpe",
-                        f"{r.is_metrics['sharpe_ratio']:.2f}",
-                        f"{r.oos.sharpe_ratio:.2f}",
-                    ),
-                    (
-                        "MaxDD",
-                        f"{r.is_metrics['max_drawdown']:.2%}",
-                        f"{r.oos.max_drawdown:.2%}",
-                    ),
-                    (
-                        "Calmar",
-                        f"{r.is_metrics['calmar_ratio']:.2f}",
-                        f"{r.oos.calmar_ratio:.2f}",
-                    ),
-                    ("Trades", f"{len(r.oos.trades)}", ""),
-                ),
-            )
-        )
-        lines.extend("  " + line for line in table)
-
+    table = Table(
+        columns=tuple(Col(label, align) for label, align in _OPTIMIZE_COLUMNS),
+        rows=tuple(_fold_row(r) for r in results),
+    )
+    lines = render(table)
+    lines.append("")
     lines.append(
         f"AGGREGATE: mean OOS Sharpe {agg['mean_oos_sharpe']:.2f} · "
         f"min OOS Sharpe {agg['min_oos_sharpe']:.2f} · "
@@ -340,6 +376,8 @@ def optimize_report_to_json(
     results: list[OptimizeResult], agg: dict[str, float]
 ) -> dict:
     """Serialize per-fold optimization results into a JSON-ready dict."""
+    from src.bt.metrics import trade_count, win_rate
+
     float_fields = (
         "total_return",
         "annual_return",
@@ -347,10 +385,15 @@ def optimize_report_to_json(
         "max_drawdown",
         "calmar_ratio",
         "sortino_ratio",
+        "kurtosis",
+        "skewness",
     )
 
     def _result_dict(oos: PortfolioResult) -> dict:
-        return {f: float(getattr(oos, f)) for f in float_fields}
+        d: dict[str, float] = {f: float(getattr(oos, f)) for f in float_fields}
+        d["win_rate"] = win_rate(oos)
+        d["trade_count"] = float(trade_count(oos))
+        return d
 
     return {
         "folds": [

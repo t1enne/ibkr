@@ -151,10 +151,28 @@ def test_optimize_agg_and_serialization():
     )
     agg = {"mean_oos_sharpe": 1.4, "min_oos_sharpe": 1.4, "folds": 1}
     text = render_optimize_report([r], agg)
-    assert "chosen params: strategy_params.x=3" in text
+    assert "strategy_params.x=3" in text
+    assert "OOS Kurt" in text
+    assert "OOS Win" in text
+    assert "OOS Trd" in text
     assert "mean OOS Sharpe 1.40" in text
 
     js = optimize_report_to_json([r], agg)
     assert js["folds"][0]["oos"]["sharpe_ratio"] == 1.4
+    assert "kurtosis" in js["folds"][0]["oos"]
+    assert "win_rate" in js["folds"][0]["oos"]
+    assert "trade_count" in js["folds"][0]["oos"]
+    assert js["folds"][0]["is"]["sharpe_ratio"] == 1.9
     assert js["folds"][0]["chosen_params"] == {"strategy_params.x": 3}
     assert js["agg"]["mean_oos_sharpe"] == 1.4
+
+
+def test_is_metrics_includes_trade_derived_stats():
+    """``_is_metrics`` folds trade-derived win rate / count into the dict."""
+    from src.bt.metrics import trade_count, win_rate
+
+    pf = _fake_pf(1.2, 0.2)
+    m = _impl._is_metrics(pf)
+    assert m["win_rate"] == win_rate(pf) == 0.0
+    assert m["trade_count"] == float(trade_count(pf)) == 0.0
+    assert "kurtosis" in m

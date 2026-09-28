@@ -792,3 +792,21 @@ def exposure_and_turnover(
         "turnover": turnover,
         "annualized_turnover": float(annualized_turnover),
     }
+
+
+def closed_trades(result: PortfolioResult) -> list:
+    """Closed trades only — the denominator for win rate / trade count."""
+    return [t for t in result.trades if t.status.value == "closed"]
+
+
+def trade_count(result: PortfolioResult) -> int:
+    """Number of closed trades in a result."""
+    return len(closed_trades(result))
+
+
+def win_rate(result: PortfolioResult) -> float:
+    """Fraction of closed trades with positive PnL (0.0 when no closed trades)."""
+    closed = closed_trades(result)
+    if not closed:
+        return 0.0
+    return sum(1.0 for t in closed if t.pnl > 0) / len(closed)

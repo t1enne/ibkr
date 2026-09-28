@@ -89,6 +89,8 @@ def optimize(
     cfg = load_strategy(strategy_file)
 
     def _stream_fold(fold, best_params: dict, is_metrics: dict, oos) -> None:
+        if fmt == "json":
+            return  # keep stdout a single parseable JSON document
         params_desc = " ".join(f"{k}={v}" for k, v in best_params.items())
         click.echo(
             f"[fold {fold.index + 1}]  "
