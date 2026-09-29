@@ -57,7 +57,6 @@ from src.bt.state import (
     ActionType,
     BacktestState,
     Candle,
-    PortfolioState,
     TradeSignal,
     FillEvent,
     ExecutionParams,
@@ -68,7 +67,7 @@ from src.bt.state import (
     TradeExitReason,
 )
 from src.bt.size.pure import SizingParams, equity_of, sized_signal
-from src.bt.portfolio.pure import describe_open_rejection
+from src.bt.portfolio.pure import FillRejection, apply_fills
 from src.bt.types import StrategyConfig, EngineWindow, BacktestResults
 from src.bt.engine.handlers import ExecutionHandler, RiskHandler
 from src.utils import parse_timestamp
@@ -205,89 +204,64 @@ def run_backtest(
         store.attach_fundamentals(fundamentals)
     state = merge_bt_state(state, dict(candles=store))
 
+    # Timestamp-grouped drain: candles are buffered by timestamp and the whole
+    # bar is flushed through Stages 4-8 together, so Stage 4/6 settle as ONE
+    # atomic cohort (see ``_flush_bar`` / ``apply_fills``). Buffering is what
+    # makes a cohort COMPLETE before its first fill — the allocation is then a
+    # single pure call, and ``config.symbols`` order drops out of the result by
+    # construction rather than by memoisation. HTF candles never reach the
+    # pipeline; they are stashed in Stage 1 and the bar flush skips them.
+    bar: list[Candle] = []
+    bar_ts: Optional[pd.Timestamp] = None
     for candle in candle_gen:
+        if bar_ts is not None and candle.timestamp != bar_ts:
+            state = _flush_bar(
+                bar,
+                state,
+                exec_handler,
+                risk_handler,
+                config,
+                bt,
+                resolved_params,
+                strategy_fn,
+                last_symbol,
+                rows,
+                eq_buffer,
+                rejections,
+                signal_observer,
+            )
+            bar = []
+        bar_ts = candle.timestamp
         # Phase for this bar: bars strictly before ``test_start`` are warmup —
         # the strategy IS invoked (accumulators/indicators fill, cursor
         # advances) but trading is suppressed and emitting a signal is a hard
         # error in the DSL. Trading (and only trading) happens inside the
         # test window. ``warmup_bars == 0`` makes every bar a trading bar, so a
         # zero warmup is a pure no-op.
-        in_warmup = candle.timestamp < bt.window.test_start
-        can_trade = bt.window.test_start <= candle.timestamp <= bt.window.test_end
-        is_base = not candle.interval or candle.interval == config.bars[0]
-        state.candles.set_phase("warmup" if in_warmup else "trade")
-
+        state.candles.set_phase(
+            "warmup" if candle.timestamp < bt.window.test_start else "trade"
+        )
         # Stage 1: stash EVERY candle (base + HTF) into the same accumulator
         rows, state = _append_candle(rows, state, candle, config.bars[0])
+        if not candle.interval or candle.interval == config.bars[0]:
+            bar.append(candle)
 
-        # HTF-only candles: accumulate and skip rest of pipeline
-        if not is_base:
-            continue
-
-        # Warmup phase: run the strategy so its state warms, but skip fills,
-        # risk and marking entirely — no position can exist, no equity point is
-        # recorded, and any signal emission raises inside the DSL.
-        if in_warmup:
-            state = _generate_signals(
-                state,
-                candle,
-                resolved_params,
-                strategy_fn,
-                last_symbol,
-                True,
-                rows,
-                signal_observer=None,
-            )
-            continue
-
-        # Stage 3: execute pending signals (from prior candles)
-        state = _execute_pending(
+    if bar:
+        state = _flush_bar(
+            bar,
             state,
-            candle,
             exec_handler,
+            risk_handler,
             config,
-            bt.execution_params,
-            bt.sizing,
-            rejections=rejections,
-        )
-
-        # Stage 5: generate new signals (only on last symbol per timestamp)
-        state = _generate_signals(
-            state,
-            candle,
+            bt,
             resolved_params,
             strategy_fn,
             last_symbol,
-            can_trade,
             rows,
-            signal_observer=signal_observer,
+            eq_buffer,
+            rejections,
+            signal_observer,
         )
-
-        # Stage 6: execute signals generated this tick (skip fill_at_next_open
-        # signals — they fill at next bar's open via Stage 4)
-        state = _execute_pending(
-            state,
-            candle,
-            exec_handler,
-            config,
-            bt.execution_params,
-            bt.sizing,
-            skip_next_open=True,
-            rejections=rejections,
-        )
-
-        # Stage 7: check stop-loss / take-profit
-        state = _check_risk(
-            state,
-            candle,
-            exec_handler,
-            risk_handler,
-            bt.execution_params,
-            bt.risk_config,
-        )
-
-        # Stage 8: mark to market
-        state = _mark_to_market(state, candle, eq_buffer)
 
     # Finalize: close positions, build results
     state = _finalize(state, bt.execution_params, equity_points=eq_buffer)
@@ -414,48 +388,56 @@ def _bucket_signals(
     return {sym: tuple(v) for sym, v in buckets.items()}
 
 
-def _new_open_count(signals: tuple[TradeSignal, ...], portfolio: PortfolioState) -> int:
-    """Count the timestamp's signals that open a NEW position.
+def _execute_cohort(
+    state: BacktestState,
+    cohort: list[tuple[TradeSignal, Candle]],
+    exec_handler: ExecutionHandler,
+    exec_params: ExecutionParams,
+    sizing: SizingParams,
+    skip_next_open: bool,
+) -> tuple[BacktestState, tuple[FillRejection, ...]]:
+    """Build one phase's fills and settle them atomically in ONE pure call.
 
-    Only ``long``/``short`` on a symbol with no open lot consume new capital,
-    so only they share the allocation. Closes, rebalance/reduces and signals
-    for a symbol that already holds a position are excluded (they add no
-    exposure). Counting at signal-generation time — against the
-    PRE-execution portfolio — is what makes the divisor order-invariant: it
-    never reads a partially-filled book.
+    ``cohort`` is ``(signal, candle)`` pairs for every symbol that has a pending
+    fill in this phase of the bar, in ``config.symbols`` order. Each pair is
+    sized (qty <= 0 opens only) against the SAME bar-start equity and priced with
+    ``execute_signal`` against its own candle, then the whole batch is handed to
+    ``apply_fills`` — which scales opens by one shared cash factor and applies
+    non-opens first. Because the batch is complete before the first fill,
+    ``config.symbols`` order cannot reach the result.
+
+    Only the symbols present in ``cohort`` have their buckets drained; every
+    other symbol keeps its pending signals (a symbol with no bar this timestamp
+    fills at its next one). Returns the new state and the drained symbols.
     """
-    held = portfolio.positions
-    return sum(
-        1
-        for s in signals
-        if s.action in (ActionType.long, ActionType.short) and not held.get(s.symbol)
-    )
-
-
-def _apply_alloc_divisor(
-    signals: tuple[TradeSignal, ...], divisor: int
-) -> tuple[TradeSignal, ...]:
-    """Stamp ``alloc_divisor`` on each signal; ``1`` returns them untouched.
-
-    Every signal of the bucket is scaled by the SAME divisor (opens AND
-    non-opens carry it for bookkeeping, but only opens have their ``qty``
-    divided at execution — see ``_execute_pending``). Scaling is a pure
-    ``replace`` — ``stop_loss``/``take_profit`` are price levels and are left
-    exactly as the strategy set them.
-    """
-    if divisor <= 1:
-        return signals
-    return tuple(replace(s, alloc_divisor=float(divisor)) for s in signals)
+    if not cohort:
+        return state, ()
+    equity = equity_of(state.portfolio)
+    fills: list[FillEvent] = []
+    drained: list[str] = []
+    for signal, candle in cohort:
+        if skip_next_open and signal.fill_at_next_open:
+            continue
+        if signal.action in (ActionType.long, ActionType.short):
+            signal = sized_signal(signal, equity, state.portfolio.cash, candle, sizing)
+        fills.append(exec_handler.execute_signal(signal, candle, exec_params))
+        drained.append(signal.symbol)
+    portfolio, rejections = apply_fills(state.portfolio, tuple(fills))
+    pending = dict(state.pending_signals)
+    for sym in drained:
+        pending.pop(sym, None)
+    state = merge_bt_state(state, dict(portfolio=portfolio, pending_signals=pending))
+    return state, tuple(rejections)
 
 
 def _warn_rejections(rejections: list, config: StrategyConfig) -> None:
     """Write a one-line-per-symbol + total summary of dropped fills to stderr.
 
-    Policy: a single run-end summary, not a line per rejection. The shipped
-    configs reject the majority of attempted entries, so per-event output would
-    bury the report; a per-symbol count plus a worst-case example keeps the
+    Policy: a single run-end summary, not a line per rejection — a heavily
+    over-subscribed config rejects most attempted entries, so per-event output
+    would bury the report. A per-symbol count plus the worst example keeps the
     signal ("your strategy is over-subscribed") without the volume. Writes to
-    STDERR — a warning must not contaminate stdout (JSONL/JSON CLI output).
+    STDERR: a warning must not contaminate stdout (JSONL/JSON CLI output).
     """
     if not rejections:
         return
@@ -476,71 +458,128 @@ def _warn_rejections(rejections: list, config: StrategyConfig) -> None:
     )
 
 
-def _execute_pending(
-    state: BacktestState,
-    candle: Candle,
-    exec_handler: ExecutionHandler,
-    config: StrategyConfig,
-    exec_params: ExecutionParams,
-    sizing: SizingParams,
-    skip_next_open: bool = False,
-    rejections: Optional[list] = None,
-) -> BacktestState:
-    """Stage 4/6: Execute pending signals for the current symbol.
+def _mark_bar(state: BacktestState, bar: list[Candle]) -> BacktestState:
+    """Set each bar symbol's open lots to that symbol's close. No equity point.
 
-    Reads from state.pending_signals[symbol] directly — no filtering needed.
-    When skip_next_open is True (Stage 6, same-bar), signals with
-    fill_at_next_open=True are deferred to the next bar's Stage 4 call.
-
-    Signals whose qty <= 0 are sized by the shared sizing layer (equity/cash/
-    fixed base, size, per-symbol cap + cash clamp) before
-    execution; explicitly-sized signals pass through unchanged.
-
-    Equal-timestamp allocation: every opening signal is divided by its
-    ``alloc_divisor`` (stamped at generation — see ``_generate_signals``) so N
-    concurrent entries share the book instead of the earliest-in-
-    ``config.symbols`` one taking the cash. Equity for the sizing layer is read
-    ONCE per drain, before any fill of this bucket, so no signal is sized off a
-    book its predecessors already shrank.
-
-    ``rejections`` (engine-owned list, optional) collects the pure
-    ``FillRejection`` records of fills the portfolio refused for insufficient
-    cash; the caller reports them (this stage never does I/O itself).
+    Pure ``replace`` over the positions dict. Used at evaluation time so every
+    symbol's mark is current regardless of its place in ``config.symbols``;
+    Stage 8 re-marks (idempotent) and records the equity point.
     """
-    symbol = candle.symbol
-    queued = state.pending_signals.get(symbol, ())
-    if not queued:
+    positions = dict(state.portfolio.positions)
+    changed = False
+    for candle in bar:
+        lots = positions.get(candle.symbol)
+        if not lots:
+            continue
+        positions[candle.symbol] = tuple(
+            replace(p, last_price=candle.close) for p in lots
+        )
+        changed = True
+    if not changed:
+        return state
+    return merge_bt_state(
+        state, dict(portfolio=replace(state.portfolio, positions=positions))
+    )
+
+
+def _flush_bar(
+    bar: list[Candle],
+    state: BacktestState,
+    exec_handler: ExecutionHandler,
+    risk_handler: RiskHandler,
+    config: StrategyConfig,
+    bt: Backtest,
+    resolved_params: object,
+    strategy_fn: Optional[Callable],
+    last_symbol: Optional[str],
+    rows: CandleRows,
+    eq_buffer: list,
+    rejections: list,
+    signal_observer: Optional[Callable],
+) -> BacktestState:
+    """Run one timestamp's base candles through Stages 3-8, cohort-atomic.
+
+    Stage 3 (next-open fills of PRIOR signals) and Stage 6 (same-bar fills of
+    THIS bar's signals) each settle as one ``apply_fills`` call over every symbol
+    of the bar; Stage 5 runs only on the last symbol (the evaluation clock).
+    Stage 7/8 stay per symbol, in ``config.symbols`` order, exactly as before —
+    only the fill settlement became atomic.
+
+    The Stage 3 cohort is complete before its first fill because
+    ``fill_at_next_open`` signals are all still pending when the bar opens, which
+    is what makes atomic settlement possible at all. Warmup bars run Stage 5
+    only (state warms, no fills, no risk, no marking).
+    """
+    ts = bar[0].timestamp
+    in_warmup = ts < bt.window.test_start
+    can_trade = bt.window.test_start <= ts <= bt.window.test_end
+
+    if in_warmup:
+        last = bar[-1]
+        if last.symbol == last_symbol:
+            state = _generate_signals(
+                state, last, resolved_params, strategy_fn, last_symbol, True, rows
+            )
         return state
 
-    portfolio = state.portfolio
-    # Pre-execution equity: order-invariant sizing base for the whole bucket.
-    equity = equity_of(portfolio)
-    deferred: list[TradeSignal] = []
-    for signal in queued:
-        if skip_next_open and signal.fill_at_next_open:
-            deferred.append(signal)
-            continue
-        # Rebalancing reduces (partial cover) carry an explicit signed delta and
-        # closes route by position_id -- neither is a fresh open, so neither is
-        # sized by the shared sizing layer. Only long/short opens with qty <= 0
-        # are engine-sized (sized_signal turns qty<=0 opens into share counts).
-        if signal.action in (ActionType.long, ActionType.short):
-            signal = sized_signal(signal, equity, portfolio.cash, candle, sizing)
-            signal = replace(signal, qty=signal.qty / signal.alloc_divisor)
-        fill = exec_handler.execute_signal(signal, candle, exec_params)
-        if rejections is not None:
-            rejected = describe_open_rejection(portfolio, fill)
-            if rejected is not None:
-                rejections.append(rejected)
-        portfolio = exec_handler.apply_fill(portfolio, fill)
+    cohort4 = [
+        (sig, candle)
+        for candle in bar
+        for sig in state.pending_signals.get(candle.symbol, ())
+    ]
+    state, rejected = _execute_cohort(
+        state, cohort4, exec_handler, bt.execution_params, bt.sizing, False
+    )
+    rejections.extend(rejected)
 
-    new_pending = dict(state.pending_signals)
-    if deferred:
-        new_pending[symbol] = tuple(deferred)
-    else:
-        new_pending.pop(symbol, None)
+    # Mark EVERY symbol of the bar at THIS bar before the strategy runs. Stage 8
+    # marks positions only AFTER Stage 5, so at evaluation time the symbols the
+    # bar has not yet marked are stale by one bar. Marking only the evaluation
+    # clock (symbols[-1]) left its PEERS stale instead, so ``current_equity()`` —
+    # and with it ``size_mode="equity"`` sizing — depended on which symbol
+    # happened to be last. Marking the whole bar makes every symbol equally
+    # current, so dispatch equity is independent of ``config.symbols`` order.
+    # Stage 8's later mark is idempotent (same close) and still appends the point.
+    state = _mark_bar(state, bar)
 
-    return merge_bt_state(state, dict(portfolio=portfolio, pending_signals=new_pending))
+    state = _generate_signals(
+        state,
+        bar[-1],
+        resolved_params,
+        strategy_fn,
+        last_symbol,
+        can_trade,
+        rows,
+        signal_observer=signal_observer,
+    )
+
+    cohort6 = [
+        (sig, candle)
+        for candle in bar
+        for sig in state.pending_signals.get(candle.symbol, ())
+    ]
+    if cohort6:
+        state, rejected = _execute_cohort(
+            state,
+            cohort6,
+            exec_handler,
+            bt.execution_params,
+            bt.sizing,
+            True,
+        )
+        rejections.extend(rejected)
+
+    for candle in bar:
+        state = _check_risk(
+            state,
+            candle,
+            exec_handler,
+            risk_handler,
+            bt.execution_params,
+            bt.risk_config,
+        )
+        state = _mark_to_market(state, candle, eq_buffer)
+    return state
 
 
 def _generate_signals(
@@ -567,6 +606,24 @@ def _generate_signals(
     # Advance cursor so CandleStore only sees data up to this timestamp
     state.candles.advance(candle.timestamp)
 
+    # Mark the LAST symbol (the evaluation clock) at THIS bar before the
+    # strategy runs. Stage 8 marks the clock's positions only AFTER Stage 5, so
+    # without this the clock symbol's mark is stale by one bar at evaluation
+    # time — a tail-symbol-specific asymmetry (the same class as the truncated
+    # evaluation clock): ``current_equity()`` then differs purely because the
+    # clock symbol happens to be last, and ``size_mode="equity"`` sizing is
+    # order-dependent. Marking it here makes every symbol equally current, so
+    # equity at dispatch is independent of ``config.symbols`` order. Stage 8's
+    # later mark is idempotent (same price) and still appends the equity point.
+    clock_lots = state.portfolio.positions.get(candle.symbol)
+    if clock_lots:
+        marked = tuple(replace(p, last_price=candle.close) for p in clock_lots)
+        positions = dict(state.portfolio.positions)
+        positions[candle.symbol] = marked
+        state = merge_bt_state(
+            state, dict(portfolio=replace(state.portfolio, positions=positions))
+        )
+
     new_signals = strategy_fn(state, candle, resolved_params)
     if not new_signals:
         return state
@@ -575,20 +632,13 @@ def _generate_signals(
         for sig in new_signals:
             signal_observer(sig)
 
-    # Equal-timestamp allocation: count this timestamp's NEW opens against the
-    # pre-execution book and stamp the divisor on every signal of the batch, so
-    # N concurrent entries each take ~1/N instead of the earliest symbol taking
-    # the cash. Counted here (once, before any fill) — never per symbol during
-    # the drain — which is what makes the result independent of
-    # ``config.symbols`` order. Divisor 1 leaves single-signal batches
-    # numerically untouched.
-    batch = tuple(new_signals)
-    divisor = _new_open_count(batch, state.portfolio)
-    batch = _apply_alloc_divisor(batch, divisor)
-
-    # Merge into existing pending dict — signals for same symbol accumulate
+    # Bucket by symbol. Allocation is NOT stamped here: it needs the cohort's
+    # fills (priced at the next bar) and the pre-execution book, which only exist
+    # at the bar flush. ``apply_fills`` (in the portfolio layer) settles the
+    # whole cohort in one order-invariant call, so generation stays a pure
+    # bucket+merge step.
     pending = dict(state.pending_signals)
-    for sym, sigs in _bucket_signals(batch).items():
+    for sym, sigs in _bucket_signals(tuple(new_signals)).items():
         existing = pending.get(sym, ())
         pending[sym] = existing + sigs
 

@@ -133,15 +133,6 @@ class TradeSignal:
     stop_loss: Optional[float] = None  # explicit SL for new positions
     take_profit: Optional[float] = None  # explicit TP for new positions
     tag: str = ""  # optional strategy-facing lot label (stored on the Position)
-    # Equal-share divisor for same-timestamp allocation. The engine counts the
-    # timestamp's NEW-position opens (long/short on a currently-flat symbol)
-    # before executing any of them and stamps that count here; every open of
-    # the bucket has its ``qty`` divided by ``alloc_divisor`` so N concurrent
-    # entries share the book instead of racing for cash in ``config.symbols``
-    # order. ``1.0`` (default) is a no-op — single-signal buckets and all
-    # non-opening signals are untouched. SL/TP are PRICE levels and are NEVER
-    # divided: only ``qty`` is scaled.
-    alloc_divisor: float = 1.0
     # For next-open **close** signals that model an intra-bar stop trigger: the
     # level the stop fired at, plus the position side. When both are set,
     # ``execute_signal`` fills at the adverse worse-of the stop level and the

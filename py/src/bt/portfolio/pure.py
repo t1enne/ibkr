@@ -7,9 +7,10 @@ positions dict: Dict[str, Tuple[Position, ...]] — symbol → tuple of Position
 Multiple positions per symbol are supported (e.g. partial entries, net rebalancing).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple as TupleT
 
+import math
 import pandas as pd
 
 from src.bt.state.types import (
@@ -94,6 +95,96 @@ def apply_fill(
         return _rebalance_position(portfolio, fill)
 
     return _open_position(portfolio, fill)
+
+
+def apply_fills(
+    portfolio: PortfolioState,
+    fills: tuple[FillEvent, ...],
+) -> tuple[PortfolioState, TupleT[FillRejection, ...]]:
+    """Apply a whole timestamp cohort of fills atomically. Pure.
+
+    One call settles every fill that executes at the SAME phase of the same bar
+    (Stage 4's next-open batch, or Stage 6's same-bar batch — never both, see
+    ``run_backtest``), so the result cannot depend on the order of ``fills``.
+
+    Ordering rule: NON-OPENS FIRST. Closes and rebalance/reduces are applied
+    before any open, so capital a close frees is available to an open in the
+    same cohort (the engine drains a bar in ``config.symbols`` order; settling
+    closes first removes that order from "does this entry fit?"). Non-opens are
+    NEVER scaled — they free or rebalance capital, they do not compete for it.
+
+    Allocation: the opening fills' notional (``qty * executed_price``) is summed
+    ONCE from the post-close book and a SINGLE ``scale = min(1, cash /
+    requested)`` is applied to every open's qty. Dividing by the cohort's open
+    count alone is not enough — once the book is invested, CASH is the binding
+    constraint and the tail fill would still be dropped. Scaling every open by
+    the same factor, derived from one pre-execution book, is what makes the
+    batch order-invariant.
+
+    Legacy guard: a cohort with <= 1 open is applied UNSCALED and untrimmed, so
+    a lone order fills or is rejected exactly as before — the vast majority of
+    strategies emit one signal per bar and are numerically untouched. SL/TP are
+    PRICE levels and are never scaled; only ``qty`` changes. Scaled qtys are
+    floored to the 4 dp ``_open_position`` rounds to, so a permutation cannot
+    tip a fill over the cash edge by rounding.
+
+    Returns the new portfolio plus the rejections for "genuine exhaustion"
+    (an open that still does not fit at the shared scale) — the engine reports
+    those; this function never does I/O.
+    """
+    non_opens = tuple(
+        f for f in fills if f.signal.action not in (ActionType.long, ActionType.short)
+    )
+    opens = tuple(
+        f for f in fills if f.signal.action in (ActionType.long, ActionType.short)
+    )
+    # Canonical order (symbol) so the resulting book is byte-identical for every
+    # permutation of the input cohort — ``positions`` is a dict (order-free), but
+    # ``trades`` is an append-ordered tuple, so the APPLY order must be fixed.
+    for fill in sorted(non_opens, key=lambda f: f.signal.symbol):
+        portfolio = apply_fill(portfolio, fill)
+    opens = _scale_opens(portfolio, opens)
+    rejections: list[FillRejection] = []
+    for fill in sorted(opens, key=lambda f: f.signal.symbol):
+        rejected = describe_open_rejection(portfolio, fill)
+        if rejected is not None:
+            rejections.append(rejected)
+        portfolio = _open_position(portfolio, fill)
+    return portfolio, tuple(rejections)
+
+
+def _scale_opens(
+    portfolio: PortfolioState, opens: tuple[FillEvent, ...]
+) -> tuple[FillEvent, ...]:
+    """Divide a cohort's opens by one shared, pre-execution cash scale.
+
+    Returns ``opens`` unchanged for a lone open (or none) — the legacy path that
+    keeps single-signal strategies bit-identical. Otherwise scales each open's
+    qty by ``scale = min(1, cash / requested)`` and floors to 4 dp so the scaled
+    result is deterministic and can never round UP past the cash edge.
+    """
+    if len(opens) <= 1:
+        return opens
+    # Reserve the fixed commission of every open up front: scaling the notional
+    # by ``(cash - total_commission) / requested`` makes the cohort's total cost
+    # (notional + commission) land exactly on ``cash``. Without the reservation a
+    # batch that fits to the cent still leaves the last fill a commission short
+    # and it is rejected — a rounding artefact, not genuine exhaustion.
+    commission = sum(f.commission for f in opens)
+    requested = sum(max(f.signal.qty, 0.0) * f.executed_price for f in opens)
+    budget = portfolio.cash - commission
+    if requested <= 0 or budget <= 0:
+        return opens
+    scale = min(1.0, budget / requested)
+    if scale >= 1.0:
+        return opens
+    return tuple(
+        replace(
+            f,
+            signal=replace(f.signal, qty=math.floor(f.signal.qty * scale * 1e4) / 1e4),
+        )
+        for f in opens
+    )
 
 
 def _open_position(
