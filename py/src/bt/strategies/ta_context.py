@@ -38,6 +38,10 @@ _FIELDS = ("open", "high", "low", "close", "volume")
 # members are ints/strings.
 CacheKey = tuple[str, str, tuple]
 
+# Guard for the volume-weighted denominator: a window whose volume sums to
+# (near) zero has no meaningful VWATR and must yield NaN, not inf.
+_EPS = 1e-12
+
 
 @dataclass(frozen=True)
 class OhlcvView:
@@ -322,6 +326,77 @@ class TaContext:
 
         return self._view(sym, self._compute(key, _calc), interval)
 
+    def vwatr(
+        self, sym: str, period: int = 14, interval: str | None = None
+    ) -> SeriesView:
+        """Volume-weighted ATR: ``smooth(TR * volume) / smooth(volume)``.
+
+        ``smooth`` is the plain trailing rolling mean over ``period`` bars (NOT
+        Wilder-smoothed like :meth:`atr`) and ``TR`` is the standard true range.
+        Same units as price, so a stop distance in VWATR is a dollar distance.
+        """
+        key: CacheKey = ("vwatr", sym, (period,))
+        a = self._series(sym, interval)
+
+        def _calc() -> np.ndarray:
+            return _vwatr_np(a["high"], a["low"], a["close"], a["volume"], period)
+
+        return self._view(sym, self._compute(key, _calc), interval)
+
+    def true_range(self, sym: str, interval: str | None = None) -> SeriesView:
+        """Standard true range ``max(high-low, |high-prev_close|, |low-prev_close|)``.
+
+        First bar is NaN (no prior close). The Wilder-*smoothed* form is
+        :meth:`atr`; this accessor exposes the raw bar ranges so a caller can
+        smooth them its own way.
+        """
+        key: CacheKey = ("true_range", sym, ())
+        a = self._series(sym, interval)
+        arr = self._compute(
+            key, lambda: _true_range_np(a["high"], a["low"], a["close"])
+        )
+        return self._view(sym, arr, interval)
+
+    def plain_atr(
+        self, sym: str, period: int = 14, interval: str | None = None
+    ) -> SeriesView:
+        """**Plain** rolling-mean average true range over ``period`` bars.
+
+        Distinct from :meth:`atr`, which is Wilder-smoothed (``ewm(alpha=1/n)``).
+        Same units and same true range, different smoothing — the divergence
+        exits that normalize by range want this one.
+        """
+        key: CacheKey = ("plain_atr", sym, (period,))
+        a = self._series(sym, interval)
+        arr = self._compute(
+            key,
+            lambda: _rolling_mean_np(
+                _true_range_np(a["high"], a["low"], a["close"]), period
+            ),
+        )
+        return self._view(sym, arr, interval)
+
+    def vwatr_baseline(
+        self, sym: str, period: int = 14, window: int = 60, interval: str | None = None
+    ) -> SeriesView:
+        """Plain trailing rolling mean of :meth:`vwatr` over ``window`` bars.
+
+        The strategy's ``vwatr_base_win`` baseline: an expansion reference, not
+        a signal. Computed from the VWATR series itself, so the head is NaN
+        until both the VWATR warm-up (``period`` bars) and the baseline window
+        are satisfied (``period + window - 1`` bars).
+        """
+        key: CacheKey = ("vwatr_baseline", sym, (period, window))
+        a = self._series(sym, interval)
+
+        def _calc() -> np.ndarray:
+            return _rolling_mean_np(
+                _vwatr_np(a["high"], a["low"], a["close"], a["volume"], period),
+                window,
+            )
+
+        return self._view(sym, self._compute(key, _calc), interval)
+
     def highest(self, sym: str, period: int, interval: str | None = None) -> SeriesView:
         """Pine ``highest`` — rolling maximum over ``period`` bars (incl. current)."""
         return self._rolling_extreme(sym, "highest", period, interval)
@@ -396,6 +471,59 @@ def _rolling_sum_np(values: np.ndarray, period: int) -> np.ndarray:
     from numpy.lib.stride_tricks import sliding_window_view
 
     out[period - 1 :] = sliding_window_view(values, period).sum(axis=1)
+    return out
+
+
+def _rolling_mean_np(values: np.ndarray, window: int) -> np.ndarray:
+    """Plain trailing rolling mean (NaN propagates, ``skipna`` is NOT used)."""
+    out = np.full(values.shape, np.nan, dtype=np.float64)
+    if window < 1 or len(values) < window:
+        return out
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    out[window - 1 :] = sliding_window_view(values, window).mean(axis=1)
+    return out
+
+
+def _true_range_np(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    """True range; the first bar is NaN (no previous close)."""
+    n = len(close)
+    tr = np.full(n, np.nan, dtype=np.float64)
+    if n < 2:
+        return tr
+    prev_close = close[:-1]
+    hl = high[1:] - low[1:]
+    hc = np.abs(high[1:] - prev_close)
+    lc = np.abs(low[1:] - prev_close)
+    tr[1:] = np.maximum(np.maximum(hl, hc), lc)
+    return tr
+
+
+def _vwatr_np(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    period: int,
+) -> np.ndarray:
+    """Volume-weighted ATR: ``smooth(TR * volume) / smooth(volume)``.
+
+    ``smooth`` is a plain trailing rolling mean, and true range is itself NaN on
+    bar 0, so the first ``period`` bars are NaN (NOT ``period - 1``: the NaN
+    propagates through the window rather than being skip-filled). A window whose
+    volume sum is ~0 yields NaN rather than inf.
+    """
+    tr = _true_range_np(high, low, close)
+    num = _rolling_mean_np(tr * volume, period)
+    den = _rolling_mean_np(volume, period)
+    return _safe_div_np(num, den)
+
+
+def _safe_div_np(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+    """Elementwise ``num / den``; non-finite or ~zero denominator -> NaN."""
+    out = np.full(num.shape, np.nan, dtype=np.float64)
+    ok = np.isfinite(num) & np.isfinite(den) & (np.abs(den) > _EPS)
+    out[ok] = num[ok] / den[ok]
     return out
 
 

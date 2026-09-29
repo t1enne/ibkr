@@ -1,9 +1,9 @@
 """VWATR expansion strategy -- long only.
 
 VWATR = smooth(TR * volume) / smooth(volume): a true-range average weighted by
-each bar's own volume. Same unit as ATR. All windows come from cursor-truncated
-ctx.ohlcv, so no bar can leak; VWATR is not read from ctx.ta (no accessor for
-the weighted form). Entry, two conditions:
+each bar's own volume. Same unit as ATR. Computed once per run in ``ctx.ta``
+(``ctx.ta.vwatr`` / ``ctx.ta.vwatr_baseline``), served cursor-truncated, so no
+bar can leak. Entry, two conditions:
   1. rising VWATR:  VWATR[t] > VWATR[t - slope_bars]
   2. breakout:      close > max(close[t - breakout_look : t])
 
@@ -72,50 +72,6 @@ from src.bt.strategies.types import (
 STRATEGY_TYPE = "vwatr_dsl"
 _STATE_KEY = "vwatr_state"
 
-_EPS = 1e-12
-
-
-def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
-    """Trailing rolling mean; entries before the window fills are NaN."""
-    out = np.full(values.shape, np.nan, dtype=np.float64)
-    if window < 1 or len(values) < window:
-        return out
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    out[window - 1 :] = sliding_window_view(values, window).mean(axis=1)
-    return out
-
-
-def _true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    """Wilder true range; first bar NaN (no previous close)."""
-    n = len(close)
-    tr = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return tr
-    prev_close = close[:-1]
-    hl = high[1:] - low[1:]
-    hc = np.abs(high[1:] - prev_close)
-    lc = np.abs(low[1:] - prev_close)
-    tr[1:] = np.maximum(np.maximum(hl, hc), lc)
-    return tr
-
-
-def _vwatr(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    period: int,
-) -> np.ndarray:
-    """Volume-weighted ATR: ``smooth(TR * volume) / smooth(volume)``."""
-    tr = _true_range(high, low, close)
-    num = _rolling_mean(tr * volume, period)
-    den = _rolling_mean(volume, period)
-    out = np.full(close.shape, np.nan, dtype=np.float64)
-    ok = np.isfinite(num) & np.isfinite(den) & (np.abs(den) > _EPS)
-    out[ok] = num[ok] / den[ok]
-    return out
-
 
 @dataclass(frozen=True)
 class _State:
@@ -160,18 +116,13 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         return
 
     close = o.close.to_array()
-    high = o.high.to_array()
-    low = o.low.to_array()
-    volume = o.volume.to_array()
     n = len(close)
-    if n == 0 or not (len(high) == len(low) == len(volume) == n):
-        return
 
     px = float(close[-1])
     if not np.isfinite(px) or px <= 0:
         return
 
-    vwatr_arr = _vwatr(high, low, close, volume, p.vwatr_period)
+    vwatr_arr = ctx.ta.vwatr(sym, p.vwatr_period).to_array()
     vwatr = float(vwatr_arr[-1]) if n else float("nan")
     if not np.isfinite(vwatr) or vwatr <= 0:
         return
@@ -200,8 +151,7 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         return
 
     # ---- entry: rising expansion + structural breakout ----
-    baseline = _rolling_mean(vwatr_arr, p.vwatr_base_win)
-    base_now = float(baseline[-1])
+    base_now = float(ctx.ta.vwatr_baseline(sym, p.vwatr_period, p.vwatr_base_win)[-1])
     if not np.isfinite(base_now) or base_now <= 0:
         return
 
@@ -246,15 +196,11 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
 
 # ---------------------------------------------------------------------------
 # plot -- VWATR slope / ratio panels, trail band, and trade markers, so the
-# read behind each entry is auditable. VWATR is recomputed with the same
-# helpers on_candle uses; ctx.ta has no volume-weighted accessor. Markers come
-# from state.portfolio.trades, so a marker cannot disagree with a fill.
+# read behind each entry is auditable. Every series comes from ``ctx.ta`` (the
+# same compute on_candle reads) with the cursor at the terminal bar, so a full
+# history is expected -- not a truncation. Markers come from
+# state.portfolio.trades, so a marker cannot disagree with a fill.
 # ---------------------------------------------------------------------------
-
-
-def _daily_frame(ctx: StrategyContext, sym: str):
-    """Cursor-truncated OHLCV DataFrame for ``sym`` at the signal interval."""
-    return ctx.state.candles.get((sym, ctx.interval))
 
 
 def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
@@ -267,19 +213,15 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
     leaves the chart honest about having nothing to show.
     """
     sym = ctx.candle.symbol
-    df = _daily_frame(ctx, sym)
+    df = ctx.state.candles.get((sym, ctx.interval))
     if df is None or len(df) < params.vwatr_period + params.vwatr_base_win:
         return PlotSpec()
 
-    high = df["high"].to_numpy(dtype=np.float64)
-    low = df["low"].to_numpy(dtype=np.float64)
-    close = df["close"].to_numpy(dtype=np.float64)
-    volume = df["volume"].to_numpy(dtype=np.float64)
+    close = ctx.ta.close(sym).to_array()
+    vwatr_arr = ctx.ta.vwatr(sym, params.vwatr_period).to_array()
+    baseline = ctx.ta.vwatr_baseline(sym, params.vwatr_period, params.vwatr_base_win)
 
-    vwatr_arr = _vwatr(high, low, close, volume, params.vwatr_period)
-    baseline = _rolling_mean(vwatr_arr, params.vwatr_base_win)
-
-    ratio = _safe_div(vwatr_arr, baseline)
+    ratio = _safe_div(vwatr_arr, baseline.to_array())
     # VWATR slope over slope_bars: >0 is the entry condition.
     slope = vwatr_arr - _shift(vwatr_arr, params.slope_bars)
 
@@ -322,7 +264,7 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
 def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     """Elementwise ``num / den`` with non-finite / tiny denominators -> NaN."""
     out = np.full(num.shape, np.nan, dtype=np.float64)
-    ok = np.isfinite(num) & np.isfinite(den) & (np.abs(den) > _EPS)
+    ok = np.isfinite(num) & np.isfinite(den) & (np.abs(den) > 1e-12)
     out[ok] = num[ok] / den[ok]
     return out
 

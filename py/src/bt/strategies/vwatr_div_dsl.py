@@ -3,6 +3,11 @@ THREE divergence exits vwatr_dsl does not use. No entry filter (entry features
 tested correlate ~0 with trade return), so this module changes ONLY the exit and
 the re-entry gate.
 
+VWATR itself (``smooth(TR * volume) / smooth(volume)``) lives in the shared TA
+layer now: ``ctx.ta.vwatr`` and ``ctx.ta.vwatr_baseline``. The ``atr_ratio``
+divergence path uses ``ctx.ta.plain_atr`` -- a plain rolling-mean ATR, NOT the
+Wilder-smoothed ``ctx.ta.atr``.
+
 LEDGER -- sizing, not gating, is the lever. Read before touching params.
 CONFIG: strats/pass/vwatr_div_exp8_6y_risk0.08.json (8 high-vol names, 1d, 6y).
 Beats SPY by a large multiple at SR > 1 at roughly HALF the drawdown of an
@@ -92,47 +97,9 @@ from src.bt.strategies.types import (
 STRATEGY_TYPE = "vwatr_div_dsl"
 _STATE_KEY = "vwatr_div_state"
 
+# Guard for the volume-weighted denominator (also used by ``plot``'s ratio
+# panels): a window whose volume sums to ~0 has no meaningful VWATR.
 _EPS = 1e-12
-
-
-def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
-    out = np.full(values.shape, np.nan, dtype=np.float64)
-    if window < 1 or len(values) < window:
-        return out
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    out[window - 1 :] = sliding_window_view(values, window).mean(axis=1)
-    return out
-
-
-def _true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    n = len(close)
-    tr = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return tr
-    prev_close = close[:-1]
-    hl = high[1:] - low[1:]
-    hc = np.abs(high[1:] - prev_close)
-    lc = np.abs(low[1:] - prev_close)
-    tr[1:] = np.maximum(np.maximum(hl, hc), lc)
-    return tr
-
-
-def _vwatr(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    period: int,
-) -> np.ndarray:
-    """Volume-weighted ATR: ``smooth(TR * volume) / smooth(volume)``."""
-    tr = _true_range(high, low, close)
-    num = _rolling_mean(tr * volume, period)
-    den = _rolling_mean(volume, period)
-    out = np.full(close.shape, np.nan, dtype=np.float64)
-    ok = np.isfinite(num) & np.isfinite(den) & (np.abs(den) > _EPS)
-    out[ok] = num[ok] / den[ok]
-    return out
 
 
 def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
@@ -252,7 +219,6 @@ def _norm_diverging(
     vwatr_arr: np.ndarray,
     atr_arr: np.ndarray,
     close: np.ndarray,
-    base_arr: np.ndarray,
     n: int,
     norm_mode: str,
 ) -> bool:
@@ -307,24 +273,18 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         return
 
     close = o.close.to_array()
-    high = o.high.to_array()
-    low = o.low.to_array()
-    volume = o.volume.to_array()
     n = len(close)
-    if n == 0 or not (len(high) == len(low) == len(volume) == n):
-        return
 
     px = float(close[-1])
     if not np.isfinite(px) or px <= 0:
         return
 
-    vwatr_arr = _vwatr(high, low, close, volume, p.vwatr_period)
+    vwatr_arr = ctx.ta.vwatr(sym, p.vwatr_period).to_array()
     vwatr = float(vwatr_arr[-1]) if n else float("nan")
     if not np.isfinite(vwatr) or vwatr <= 0:
         return
 
-    baseline = _rolling_mean(vwatr_arr, p.vwatr_base_win)
-    base_now = float(baseline[-1])
+    base_now = float(ctx.ta.vwatr_baseline(sym, p.vwatr_period, p.vwatr_base_win)[-1])
 
     # ---- exit while long ----
     if ctx.quantity(sym) != 0:
@@ -351,12 +311,16 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
             )
         # 2) price-unit divergence
         elif p.norm_mode in ("pct_ratio", "atr_ratio"):
+            # NOTE: the ``atr_ratio`` denominator is a PLAIN rolling-mean ATR
+            # over ``vwatr_period`` (``ctx.ta.plain_atr``), deliberately NOT
+            # Wilder-smoothed like ``ctx.ta.atr``. Swapping in ``ctx.ta.atr``
+            # would change the exit and every downstream number.
             atr_arr = (
-                _rolling_mean(_true_range(high, low, close), p.vwatr_period)
+                ctx.ta.plain_atr(sym, p.vwatr_period).to_array()
                 if p.norm_mode == "atr_ratio"
                 else vwatr_arr
             )
-            if _norm_diverging(vwatr_arr, atr_arr, close, baseline, n, p.norm_mode):
+            if _norm_diverging(vwatr_arr, atr_arr, close, n, p.norm_mode):
                 reason = (
                     f"[vwatr-div] {p.norm_mode} diverge {sym}: close {px:.2f} "
                     f"at best, vwatr +{vwatr_arr[n - 1] - vwatr_arr[n - 2]:.4f} "
@@ -446,19 +410,18 @@ def _as_series(index, values: np.ndarray):
 
 
 def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
+    """Post-run chart spec. The cursor is at the terminal bar here, so every
+    ``ctx.ta`` series is the full visible history (not a truncation).
+    """
     sym = ctx.candle.symbol
     df = ctx.state.candles.get((sym, ctx.interval))
     if df is None or len(df) < params.vwatr_period + params.vwatr_base_win:
         return PlotSpec()
 
-    high = df["high"].to_numpy(dtype=np.float64)
-    low = df["low"].to_numpy(dtype=np.float64)
-    close = df["close"].to_numpy(dtype=np.float64)
-    volume = df["volume"].to_numpy(dtype=np.float64)
-
-    vwatr_arr = _vwatr(high, low, close, volume, params.vwatr_period)
-    baseline = _rolling_mean(vwatr_arr, params.vwatr_base_win)
-    ratio = _safe_div(vwatr_arr, baseline)
+    close = ctx.ta.close(sym).to_array()
+    vwatr_arr = ctx.ta.vwatr(sym, params.vwatr_period).to_array()
+    baseline = ctx.ta.vwatr_baseline(sym, params.vwatr_period, params.vwatr_base_win)
+    ratio = _safe_div(vwatr_arr, baseline.to_array())
     pct = _safe_div(vwatr_arr, close)
     slope = vwatr_arr - _shift(vwatr_arr, params.slope_bars)
     slope_prev = _shift(slope, params.slope_bars)
