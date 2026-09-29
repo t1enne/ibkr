@@ -411,6 +411,27 @@ result prices that cost. If mean OOS Sharpe holds up across folds the edge is
 likely real; if IS is strong but OOS collapses, the grid is fitting noise.
 Reports perf-fold chosen params + IS/OOS metrics, plus mean/min OOS Sharpe.
 
+**Neither `sweep`+`split` nor `optimize` is a clean test — both leak.**
+
+- `sweep`+`split` leaks *selection into OOS*: sweep picks params on the whole
+  window, then split cuts folds out of data those params already saw.
+- `optimize` leaks *IS selection into OOS*: OOS is honest w.r.t. the chosen
+  params, but degenerate IS optima (knife-edge param, overfit tail) carry
+  forward. Low fold count makes one bad pick poison that fold's OOS.
+
+Which is worse depends on split width and param count. Never quote either
+number alone. Read the OOS **distribution**, not the mean:
+
+1. Inspect perfold chosen params. High fold-to-fold param variance = IS
+   selection is noise; the OOS number is meaningless regardless of OOS
+   discipline. This is the tell.
+2. Report OOS min and spread across folds, not just the mean.
+3. For a genuinely clean test, nest: tune on IS, select on a middle segment,
+   OOS untouched until the end.
+
+`split` measures stability of a *fixed* config. `optimize` measures a *search*.
+Testing a search → `optimize`, with the param-variance check in step 1.
+
 Run folds in parallel with `--workers N` — each fold tunes its IS and
 validates its OOS independently (combos inside a fold stay sequential).
 
