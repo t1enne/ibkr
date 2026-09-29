@@ -6,12 +6,8 @@
   "commission": 0.05,
   "initial_capital": 100000,
   "strategy_type": "xbi_gated_laggard_dsl",
-  "bars": [
-    "1d"
-  ],
-  "benchmark_symbols": [
-    "XBI"
-  ],
+  "bars": ["1d"],
+  "benchmark_symbols": ["XBI"],
   "strategy_params": {
     "lookback": 63,
     "hold_days": 22,
@@ -24,7 +20,6 @@
     "min_total_daily_history": 130
   },
   "symbols": [
-    "XBI",
     "ABBV",
     "ALKS",
     "ALNY",
@@ -49,6 +44,7 @@
     "SRPT",
     "TMO",
     "UNH",
-    "VRTX"
+    "VRTX",
+    "XBI"
   ]
 }
