@@ -99,70 +99,78 @@ def max_drawdown(equity_curve: pd.Series) -> float:
 def drawdown_periods(
     equity_curve: pd.Series, min_drawdown: float = 0.05
 ) -> List[DrawdownPeriod]:
+    """Episodes where the curve sits below a prior peak by more than ``min_drawdown``.
+
+    An episode opens on the first bar whose drawdown exceeds the threshold and
+    is anchored to the *running-maximum* bar (the true peak), not the bar before
+    it. The valley is the episode-local minimum, and recovery is the bar that
+    returns the curve to its prior peak. A still-open episode at the end of the
+    curve reports ``recovery_date=None`` with its valley taken from within that
+    episode only -- never a global argmin, which could land before the peak.
+
+    Only episodes whose valley exceeds ``min_drawdown`` are emitted.
+    """
+    if len(equity_curve) == 0:
+        return []
+
     rolling_max = equity_curve.cummax()
     drawdown = (equity_curve - rolling_max) / rolling_max
 
     periods: List[DrawdownPeriod] = []
-    in_drawdown = False
-    peak_idx: Optional[pd.Timestamp] = None
-
     dates = list(drawdown.index)
     values = drawdown.values
 
-    for i, (date, value) in enumerate(zip(dates, values)):
-        if not in_drawdown and value < -min_drawdown:
-            in_drawdown = True
-            peak_idx = dates[0] if i == 0 else dates[i - 1]
+    peak_idx: Optional[pd.Timestamp] = None
+    valley_idx: Optional[int] = None
+    in_drawdown = False
 
-        elif in_drawdown and value >= 0:
-            in_drawdown = False
-            if peak_idx is not None:
-                valley_idx = i - 1
-                valley_date = dates[valley_idx]
-                recovery_date: Optional[pd.Timestamp] = date
-                net_dd_pct = abs(values[valley_idx]) * 100
-
-                try:
-                    duration = (date - peak_idx).days
-                except (
-                    TypeError,
-                    AttributeError,
-                ):
-                    duration = i - dates.index(peak_idx) if peak_idx in dates else 0
-
-                periods.append(
-                    DrawdownPeriod(
-                        peak_date=peak_idx,
-                        valley_date=valley_date,
-                        recovery_date=recovery_date,
-                        duration=duration,
-                        net_drawdown_pct=net_dd_pct,
-                    )
-                )
+    def _close_episode(
+        recovery: Optional[pd.Timestamp],
+    ) -> None:
+        nonlocal peak_idx, valley_idx, in_drawdown
+        if peak_idx is None or valley_idx is None:
             peak_idx = None
-
-    if in_drawdown and peak_idx is not None:
-        valley_idx = np.argmin(values)
-        valley_date = dates[valley_idx]
-        net_dd_pct = abs(values[valley_idx]) * 100
-
-        try:
-            duration = (dates[-1] - peak_idx).days
-        except (
-            TypeError,
-            AttributeError,
-        ):
-            duration = len(dates) - dates.index(peak_idx) if peak_idx in dates else 0
-
-        periods.append(
-            DrawdownPeriod(
-                peak_date=peak_idx,
-                valley_date=valley_date,
-                recovery_date=None,
-                duration=duration,
-                net_drawdown_pct=net_dd_pct,
+            valley_idx = None
+            in_drawdown = False
+            return
+        net_dd_pct = abs(float(values[valley_idx])) * 100
+        if net_dd_pct / 100 >= min_drawdown:
+            end = recovery if recovery is not None else dates[-1]
+            periods.append(
+                DrawdownPeriod(
+                    peak_date=peak_idx,
+                    valley_date=dates[valley_idx],
+                    recovery_date=recovery,
+                    duration=(end - peak_idx).days,
+                    net_drawdown_pct=net_dd_pct,
+                )
             )
-        )
+        peak_idx = None
+        valley_idx = None
+        in_drawdown = False
+
+    for i, (date, value) in enumerate(zip(dates, values)):
+        value = float(value)
+        if value >= 0:
+            # At (or back to) a new high: any open episode has recovered.
+            if in_drawdown:
+                _close_episode(recovery=date)
+            continue
+
+        if value > -min_drawdown:
+            # Below the peak but not deep enough -- the episode never opened.
+            # Keep ``peak_idx`` tracking only while an episode is open.
+            continue
+
+        if not in_drawdown:
+            in_drawdown = True
+            peak_idx = dates[i - 1] if i > 0 else dates[0]
+            valley_idx = i
+        elif valley_idx is None or value < float(values[valley_idx]):
+            valley_idx = i
+
+    if in_drawdown:
+        _close_episode(recovery=None)
 
     return sorted(periods, key=lambda x: x.net_drawdown_pct, reverse=True)
 
