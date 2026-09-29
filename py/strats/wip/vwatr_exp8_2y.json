@@ -1,0 +1,30 @@
+{
+  "name": "vwatr_exp8_2y",
+  "warmup": "300d",
+  "trading_start": "2024-01-01",
+  "trading_end": "2026-01-01",
+  "commission": 0.05,
+  "initial_capital": 50000,
+  "strategy_type": "vwatr_dsl",
+  "bars": [
+    "1d"
+  ],
+  "symbols": [
+    "LTBR",
+    "SRPT",
+    "MSTR",
+    "PLUG",
+    "ENPH",
+    "MARA",
+    "NTLA",
+    "LULU"
+  ],
+  "strategy_params": {
+    "vwatr_period": 14,
+    "vwatr_base_win": 60,
+    "vwatr_mult": 2.0,
+    "slope_bars": 2,
+    "breakout_look": 20,
+    "risk_pct": 0.02
+  }
+}
