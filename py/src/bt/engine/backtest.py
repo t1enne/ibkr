@@ -33,6 +33,7 @@ Usage:
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 from src.bt.engine.candle_store import CandleStore, CandleRows
@@ -56,6 +57,7 @@ from src.bt.state import (
     ActionType,
     BacktestState,
     Candle,
+    PortfolioState,
     TradeSignal,
     FillEvent,
     ExecutionParams,
@@ -66,6 +68,7 @@ from src.bt.state import (
     TradeExitReason,
 )
 from src.bt.size.pure import SizingParams, equity_of, sized_signal
+from src.bt.portfolio.pure import describe_open_rejection
 from src.bt.types import StrategyConfig, EngineWindow, BacktestResults
 from src.bt.engine.handlers import ExecutionHandler, RiskHandler
 from src.utils import parse_timestamp
@@ -178,6 +181,11 @@ def run_backtest(
     # in ``update_prices``). Seeded with the initial equity point; frozen to a
     # tuple on the final PortfolioState at ``_finalize``.
     eq_buffer: list = list(state.portfolio.equity_curve)
+    # Engine-owned rejection sink: fills dropped for insufficient cash are
+    # collected as pure ``FillRejection`` records and summarised to stderr ONCE
+    # at run end. Not one line per rejection — a heavily over-subscribed config
+    # rejects most attempted entries, and per-rejection spam is unusable.
+    rejections: list = []
 
     # Create CandleStore once — wraps rows by reference, mutates in-place.
     # Strategies access it as state.candles (Mapping interface) + .latest()/.count().
@@ -234,7 +242,13 @@ def run_backtest(
 
         # Stage 3: execute pending signals (from prior candles)
         state = _execute_pending(
-            state, candle, exec_handler, config, bt.execution_params, bt.sizing
+            state,
+            candle,
+            exec_handler,
+            config,
+            bt.execution_params,
+            bt.sizing,
+            rejections=rejections,
         )
 
         # Stage 5: generate new signals (only on last symbol per timestamp)
@@ -259,6 +273,7 @@ def run_backtest(
             bt.execution_params,
             bt.sizing,
             skip_next_open=True,
+            rejections=rejections,
         )
 
         # Stage 7: check stop-loss / take-profit
@@ -276,6 +291,11 @@ def run_backtest(
 
     # Finalize: close positions, build results
     state = _finalize(state, bt.execution_params, equity_points=eq_buffer)
+
+    # Report dropped fills once, at the run's edge (the engine owns run-level
+    # I/O; the portfolio layer stays pure). Silent rejection is what made the
+    # cash race invisible — a strategy never learned its entry never happened.
+    _warn_rejections(rejections, config)
 
     # Build equity series, deduplicating by timestamp (equity curve
     # accumulates one point per candle = N points per timestamp).
@@ -394,6 +414,68 @@ def _bucket_signals(
     return {sym: tuple(v) for sym, v in buckets.items()}
 
 
+def _new_open_count(signals: tuple[TradeSignal, ...], portfolio: PortfolioState) -> int:
+    """Count the timestamp's signals that open a NEW position.
+
+    Only ``long``/``short`` on a symbol with no open lot consume new capital,
+    so only they share the allocation. Closes, rebalance/reduces and signals
+    for a symbol that already holds a position are excluded (they add no
+    exposure). Counting at signal-generation time — against the
+    PRE-execution portfolio — is what makes the divisor order-invariant: it
+    never reads a partially-filled book.
+    """
+    held = portfolio.positions
+    return sum(
+        1
+        for s in signals
+        if s.action in (ActionType.long, ActionType.short) and not held.get(s.symbol)
+    )
+
+
+def _apply_alloc_divisor(
+    signals: tuple[TradeSignal, ...], divisor: int
+) -> tuple[TradeSignal, ...]:
+    """Stamp ``alloc_divisor`` on each signal; ``1`` returns them untouched.
+
+    Every signal of the bucket is scaled by the SAME divisor (opens AND
+    non-opens carry it for bookkeeping, but only opens have their ``qty``
+    divided at execution — see ``_execute_pending``). Scaling is a pure
+    ``replace`` — ``stop_loss``/``take_profit`` are price levels and are left
+    exactly as the strategy set them.
+    """
+    if divisor <= 1:
+        return signals
+    return tuple(replace(s, alloc_divisor=float(divisor)) for s in signals)
+
+
+def _warn_rejections(rejections: list, config: StrategyConfig) -> None:
+    """Write a one-line-per-symbol + total summary of dropped fills to stderr.
+
+    Policy: a single run-end summary, not a line per rejection. The shipped
+    configs reject the majority of attempted entries, so per-event output would
+    bury the report; a per-symbol count plus a worst-case example keeps the
+    signal ("your strategy is over-subscribed") without the volume. Writes to
+    STDERR — a warning must not contaminate stdout (JSONL/JSON CLI output).
+    """
+    if not rejections:
+        return
+    per_symbol: dict[str, int] = {}
+    for r in rejections:
+        per_symbol[r.symbol] = per_symbol.get(r.symbol, 0) + 1
+    listed = ", ".join(
+        f"{sym}={n}" for sym, n in sorted(per_symbol.items(), key=lambda kv: -kv[1])
+    )
+    worst = max(rejections, key=lambda r: r.cash_used - r.available_cash)
+    print(
+        f"[bt] WARNING: {len(rejections)} fill(s) rejected for insufficient cash "
+        f"across {len(per_symbol)} symbol(s) for {config.name!r} "
+        f"({listed}). Worst: {worst.symbol} at {worst.timestamp} needed "
+        f"{worst.cash_used:.2f} but only {worst.available_cash:.2f} cash was "
+        f"available — the entry never happened and the strategy was not told.",
+        file=sys.stderr,
+    )
+
+
 def _execute_pending(
     state: BacktestState,
     candle: Candle,
@@ -402,6 +484,7 @@ def _execute_pending(
     exec_params: ExecutionParams,
     sizing: SizingParams,
     skip_next_open: bool = False,
+    rejections: Optional[list] = None,
 ) -> BacktestState:
     """Stage 4/6: Execute pending signals for the current symbol.
 
@@ -412,6 +495,17 @@ def _execute_pending(
     Signals whose qty <= 0 are sized by the shared sizing layer (equity/cash/
     fixed base, size, per-symbol cap + cash clamp) before
     execution; explicitly-sized signals pass through unchanged.
+
+    Equal-timestamp allocation: every opening signal is divided by its
+    ``alloc_divisor`` (stamped at generation — see ``_generate_signals``) so N
+    concurrent entries share the book instead of the earliest-in-
+    ``config.symbols`` one taking the cash. Equity for the sizing layer is read
+    ONCE per drain, before any fill of this bucket, so no signal is sized off a
+    book its predecessors already shrank.
+
+    ``rejections`` (engine-owned list, optional) collects the pure
+    ``FillRejection`` records of fills the portfolio refused for insufficient
+    cash; the caller reports them (this stage never does I/O itself).
     """
     symbol = candle.symbol
     queued = state.pending_signals.get(symbol, ())
@@ -419,19 +513,25 @@ def _execute_pending(
         return state
 
     portfolio = state.portfolio
+    # Pre-execution equity: order-invariant sizing base for the whole bucket.
+    equity = equity_of(portfolio)
     deferred: list[TradeSignal] = []
     for signal in queued:
         if skip_next_open and signal.fill_at_next_open:
             deferred.append(signal)
             continue
-        equity = equity_of(portfolio)
         # Rebalancing reduces (partial cover) carry an explicit signed delta and
         # closes route by position_id -- neither is a fresh open, so neither is
         # sized by the shared sizing layer. Only long/short opens with qty <= 0
         # are engine-sized (sized_signal turns qty<=0 opens into share counts).
         if signal.action in (ActionType.long, ActionType.short):
             signal = sized_signal(signal, equity, portfolio.cash, candle, sizing)
+            signal = replace(signal, qty=signal.qty / signal.alloc_divisor)
         fill = exec_handler.execute_signal(signal, candle, exec_params)
+        if rejections is not None:
+            rejected = describe_open_rejection(portfolio, fill)
+            if rejected is not None:
+                rejections.append(rejected)
         portfolio = exec_handler.apply_fill(portfolio, fill)
 
     new_pending = dict(state.pending_signals)
@@ -475,9 +575,20 @@ def _generate_signals(
         for sig in new_signals:
             signal_observer(sig)
 
+    # Equal-timestamp allocation: count this timestamp's NEW opens against the
+    # pre-execution book and stamp the divisor on every signal of the batch, so
+    # N concurrent entries each take ~1/N instead of the earliest symbol taking
+    # the cash. Counted here (once, before any fill) — never per symbol during
+    # the drain — which is what makes the result independent of
+    # ``config.symbols`` order. Divisor 1 leaves single-signal batches
+    # numerically untouched.
+    batch = tuple(new_signals)
+    divisor = _new_open_count(batch, state.portfolio)
+    batch = _apply_alloc_divisor(batch, divisor)
+
     # Merge into existing pending dict — signals for same symbol accumulate
     pending = dict(state.pending_signals)
-    for sym, sigs in _bucket_signals(tuple(new_signals)).items():
+    for sym, sigs in _bucket_signals(batch).items():
         existing = pending.get(sym, ())
         pending[sym] = existing + sigs
 
@@ -661,6 +772,10 @@ def _assert_benchmark_symbols_last(config: StrategyConfig) -> None:
 
     Benchmarks are observers, never tail-competing trade targets, so this is a
     hard config error: reject instead of degrading silently.
+
+    This is the benchmark-specific case of the general rule below (see
+    ``_assert_evaluation_clock_covers_window``): ``symbols[-1]`` IS the run's
+    evaluation clock, and nothing but a full-history symbol may occupy it.
     """
     symbols = config.symbols
     if not symbols:
@@ -677,6 +792,70 @@ def _assert_benchmark_symbols_last(config: StrategyConfig) -> None:
         f"(in benchmark_symbols order); got {symbols!r} with benchmark(s) "
         f"{', '.join(offenders)}. on_candle fires only on symbols[-1], so the "
         "evaluation clock must be a benchmark, not a tradable tail symbol."
+    )
+
+
+def _assert_evaluation_clock_covers_window(
+    data: pd.DataFrame, config: StrategyConfig
+) -> None:
+    """Assert the evaluation clock's first bar precedes the trading window.
+
+    ``symbols[-1]`` IS the run's evaluation clock (see
+    ``_assert_benchmark_symbols_last``): the engine fires ``on_candle`` only
+    on that symbol's candle, so every timestamp the tail symbol lacks a bar
+    for is a timestamp the WHOLE strategy is never evaluated on — for every
+    symbol, not just the late one. A tail symbol whose history starts inside
+    the trading window (later IPO, or data synced from a later date) therefore
+    silently truncates the run, and merely reordering ``symbols`` yields a
+    different — usually far better — result from identical data and params.
+
+    The check is exact, not tolerance-based: the clock must have a bar at or
+    before ``trading_start`` so the strategy is live for the whole window.
+    Bars before ``trading_start`` never fire (warmup has ``can_trade=False``),
+    so a tail that starts anywhere in ``[feed_start, trading_start]`` is fine —
+    the pre-existing multi-day spread between symbols' first bars (e.g.
+    2019-11-06 vs 2019-11-15) is normal and must NOT trip this. Only a tail
+    whose FIRST bar lands after the window opens is rejected: that is the case
+    that silently degrades, and it is unambiguous given the loaded feed.
+
+    Raise rather than degrade: the user accepted throwing until the engine can
+    pick a per-timestamp clock itself.
+    """
+    symbols = config.symbols
+    if len(symbols) < 2:  # nothing to be late *relative to*; single/empty ok
+        return
+    tail = symbols[-1]
+    try:
+        block = data.xs(tail, axis=1)
+    except KeyError:
+        return  # symbol absent from this feed: not a clock-truncation case
+    own = block.dropna(subset=["close"])
+    trading_start = parse_timestamp(config.trading_start)
+    if len(own) == 0:
+        raise AssertionError(
+            f"evaluation clock {tail!r} (symbols[-1]) has no candles in the "
+            f"loaded feed at all; on_candle fires only on it, so the strategy "
+            f"would never be evaluated. Remedy: reorder config.symbols so a "
+            f"full-history symbol is last, or sync {tail!r}'s history."
+        )
+    first = own.index.min()
+    if first <= trading_start:
+        return
+    starts = {
+        s: data.xs(s, axis=1).dropna(subset=["close"]).index.min()
+        for s in symbols
+        if s != tail
+    }
+    earliest = min(starts.values())
+    earliest_syms = [s for s, ts in starts.items() if ts == earliest]
+    raise AssertionError(
+        f"evaluation clock {tail!r} (symbols[-1]) starts {first} — AFTER "
+        f"trading_start {trading_start} — while {earliest_syms!r} start "
+        f"{earliest}. on_candle fires only on symbols[-1], so every timestamp "
+        f"before {first} is never evaluated for ANY symbol: the run is silently "
+        f"truncated to the tail symbol's calendar. Remedy: reorder "
+        f"config.symbols so a full-history symbol is last, or sync {tail!r}'s "
+        f"history back to trading_start."
     )
 
 
@@ -703,6 +882,11 @@ def run(
     # Enforce the DSL-only contract: ``strat_mod`` must be a ``@strategy``
     # adapter (required positional — every live caller passes ``init_strat``).
     _assert_dsl_strategy(strat_mod, allow_none=False)
+    # Reject a config whose symbols[-1] (the evaluation clock) starts inside the
+    # trading window — the engine fires only on it, so the run would be silently
+    # truncated to the tail symbol's calendar (see the assertion's docstring).
+    # Checked here (not in run_backtest) because only ``run`` holds the feed.
+    _assert_evaluation_clock_covers_window(data, bt.config)
 
     gen = candle_generator(data, bt.config)
     exec_handler = default_execution_handler()

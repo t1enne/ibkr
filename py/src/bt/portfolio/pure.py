@@ -7,7 +7,10 @@ positions dict: Dict[str, Tuple[Position, ...]] — symbol → tuple of Position
 Multiple positions per symbol are supported (e.g. partial entries, net rebalancing).
 """
 
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple as TupleT
+
+import pandas as pd
 
 from src.bt.state.types import (
     PortfolioState,
@@ -20,6 +23,54 @@ from src.bt.state.types import (
     TradeStatus,
     TradeExitReason,
 )
+
+
+@dataclass(frozen=True)
+class FillRejection:
+    """Pure record of a fill the portfolio REFUSED to apply.
+
+    Currently only raised by ``_open_position`` when the fill would drive cash
+    negative: the fill is silently dropped (portfolio returned unchanged). The
+    record exists so an I/O layer can report it — a pure portfolio function
+    must not write to stderr itself (see ``describe_open_rejection``).
+    """
+
+    symbol: str
+    timestamp: pd.Timestamp
+    qty: float
+    cash_used: float
+    available_cash: float
+
+
+def describe_open_rejection(
+    portfolio: PortfolioState,
+    fill: FillEvent,
+) -> Optional[FillRejection]:
+    """Report a fill that ``_open_position`` would reject for insufficient cash.
+
+    Pure and side-effect-free — it only *describes* the rejection; the engine
+    owns the stderr write. Single source of truth for the cash guard, shared
+    with ``_open_position`` so the two can never drift apart.
+
+    Returns ``None`` when the fill would apply (non-open signal, non-positive
+    qty, or enough cash).
+    """
+    signal = fill.signal
+    if signal.action not in (ActionType.long, ActionType.short):
+        return None
+    qty = round(signal.qty, 4)
+    if qty <= 0:
+        return None
+    cash_used = qty * fill.executed_price + fill.commission
+    if portfolio.cash - cash_used >= 0:
+        return None
+    return FillRejection(
+        symbol=signal.symbol,
+        timestamp=fill.timestamp,
+        qty=qty,
+        cash_used=cash_used,
+        available_cash=portfolio.cash,
+    )
 
 
 def apply_fill(
@@ -59,11 +110,13 @@ def _open_position(
     qty = round(signal.qty, 4)
     if qty <= 0:
         return portfolio
-    # Calculate new cash
+    # Insufficient cash: drop the fill (portfolio unchanged). The guard is
+    # shared with ``describe_open_rejection`` so the engine can report the
+    # rejection without this pure function doing I/O.
+    if describe_open_rejection(portfolio, fill) is not None:
+        return portfolio
     cash_used = qty * fill.executed_price + fill.commission
     new_cash = portfolio.cash - cash_used
-    if new_cash < 0:
-        return portfolio
 
     # Generate position_id from signal if provided, else auto-generate
     pid = signal.position_id or f"{signal.symbol}_{fill.timestamp.timestamp()}"
