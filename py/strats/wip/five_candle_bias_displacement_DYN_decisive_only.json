@@ -13,7 +13,6 @@
     "SPY"
   ],
   "symbols": [
-    "SPY",
     "QQQ",
     "IWM",
     "DIA",
@@ -59,7 +58,8 @@
     "PYPL",
     "SHOP",
     "PLTR",
-    "MSTR"
+    "MSTR",
+    "SPY"
   ],
   "strategy_params": {
     "lookback": 5,

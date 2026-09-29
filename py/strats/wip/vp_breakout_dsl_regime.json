@@ -13,13 +13,13 @@
     "SPY"
   ],
   "symbols": [
-    "SPY",
     "QQQ",
     "IWM",
     "DIA",
     "TLT",
     "GLD",
-    "SLV"
+    "SLV",
+    "SPY"
   ],
   "strategy_params": {
     "vp_window": 350,

@@ -23,8 +23,8 @@
     "take_profit": 0.2
   },
   "symbols": [
-    "SPY",
     "GLD",
-    "QQQ"
+    "QQQ",
+    "SPY"
   ]
 }
