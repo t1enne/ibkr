@@ -1,87 +1,55 @@
-"""VWATR divergence strategy -- long only. Same skeleton as vwatr_dsl; adds
-THREE divergence exits vwatr_dsl does not use. No entry filter (entry features
-tested correlate ~0 with trade return), so this module changes ONLY the exit and
-the re-entry gate.
+(
+    """VWATR divergence strategy -- long only. Adds THREE divergence exits over
+vwatr_dsl; no entry filter (entry features correlate ~0 with trade return).
+`ctx.ta.vwatr`/`vwatr_baseline` are shared TA; ``atr_ratio`` uses PLAIN
+rolling-mean ATR (not Wilder) -- swapping in ``ctx.ta.atr`` changes every
+number.
 
-VWATR itself (``smooth(TR * volume) / smooth(volume)``) lives in the shared TA
-layer now: ``ctx.ta.vwatr`` and ``ctx.ta.vwatr_baseline``. The ``atr_ratio``
-divergence path uses ``ctx.ta.plain_atr`` -- a plain rolling-mean ATR, NOT the
-Wilder-smoothed ``ctx.ta.atr``.
+LEDGER (read before touching params).
+CONFIG: strats/pass/vwatr_div_exp8_6y_risk0.08.json (8 high-vol names, 1d, 6y)
+-- SR 1.12, +2223% vs SPY +118%, DD -50%, kurt 12.5.
+- `risk_pct`: 6y response is UNIMODAL interior peak; shipped value sits on the
+  plateau -- treat as plateau, never argmax. `decel_ratio`: MONOTONE toward
+  boundary = degenerate. `bt split --folds 2|3` passes; `bt optimize` fails on
+  thin early IS (picks grid boundary).
+- TAIL CONCENTRATION: median trade << mean; a few winners carry gross profit.
+- SYMBOL DEPENDENCE: worst drop-one omission drops SR to ~SPY (ENPH among the
+  LEAST damaging -- earlier drafts wrong).
+- REGIME: P&L mostly from the last third of the window -- late-window bull.
+- NO GATE EXISTS (pre-registered search, 45 series, 0/45 p<0.05;
+  strats/wip/vwatr_div_gate_research/). Hole is FLAT, not losing -- the
+  missing mass is the FAT RIGHT TAIL. Gate filters entries; cannot create an
+  absent melt-up. CALENDAR PLACEBO: hole is mid-sample, so slow level series
+  separate by construction.
+- EXITS: slope divergence = real mechanism, degenerate param (decel boundary);
+  price-unit + baseline divergence FAILED; wider trail WORSE.
+- FRED SIZING (`risk_scale="fred"`, vix dir, 250d, base 0.02, 20 names): mean
+  OOS 0.67 (0.48/0.76/0.75), fold-1 hole 0.48 -- first variant to move the
+  2022-23 hole (none/composite same-base: 0.48 mean / 0.22 min; fred adds
+  +0.19 OOS at identical base). Blends / other series failed (t10y2y 0.37;
+  diluted vix 0.45-0.48). VIX mean-reverts: dir -1 shrinks in vol, grows in
+  calm -- unlike t10y2y (era level, date-bet). Composite module reverted;
+  `_percentile_rank` stays local. Below 8-name pass (OOS 1.06). `hyspread`
+  FRED data starts 2023-09-30; `vix` (1990+) / `t10y2y` (1976+) cover hole.
 
-LEDGER -- sizing, not gating, is the lever. Read before touching params.
-CONFIG: strats/pass/vwatr_div_exp8_6y_risk0.08.json (8 high-vol names, 1d, 6y).
-Beats SPY by a large multiple at SR > 1 at roughly HALF the drawdown of an
-equal-weight buy-and-hold of the same names. High kurtosis (fat tails).
-`risk_pct` was the real bug -- hardcoded low, never swept. Its 6y response is
-UNIMODAL with an INTERIOR peak (peak != boundary), so the param is real; but the
-shipped value sits on that plateau within noise and the risk-adjusted optimum
-(Calmar) is LOWER than the return-max point. Treat it as "in the plateau", never
-an argmax -- do not re-tune to it. Contrast `decel_ratio`, MONOTONE-decaying
-toward its boundary (always want smaller) = degenerate knob. Compounding
-(`size_mode="equity"`) supplies the exponential curve SHAPE, but the signal stays
-profitable at the smallest sizing, so sizing SCALES the risk-adjusted edge rather
-than manufacturing it. WALK-FORWARD passes (`bt split --folds 2|3`); `bt optimize`
-on risk_pct FAILS as expected -- thin early IS makes it pick a grid boundary.
-TWO ADVERSE FACTS, neither fatal, both must be disclosed:
-  - TAIL CONCENTRATION. Profit factor is unremarkable and the MEDIAN trade is far
-    below the MEAN: a handful of winners carries most of the gross profit. Drop
-    the top few and total return collapses toward flat -- a fat-right-tail bet,
-    not a broad edge. Symbol/year bootstraps CANNOT see this (they resample names
-    and regimes, never trades).
-  - SYMBOL DEPENDENCE. Drop-one shows the worst single-symbol omission drops SR to
-    around SPY's: one name IS load-bearing. (Drafts claimed "no single symbol is
-    load-bearing / worst = drop ENPH"; both WRONG -- ENPH is among the LEAST
-    damaging to drop.)
-REGIME: most of the P&L comes from the last third of the window -- a late-window
-/ high-beta-bull result, not all-weather.
-
-NO GATE EXISTS -- proven by a pre-registered search; don't repeat it. Dozens of
-external macro/breadth/vol series were tested against the mid-sample flat hole and
-NONE cleared p<0.05 (artifacts: strats/wip/vwatr_div_gate_research/). WHY none CAN
-work: the hole is FLAT, not losing -- the missing mass is the FAT RIGHT TAIL. A
-gate filters ENTRIES; it cannot create an absent melt-up. Sizing scales a tail
-that IS present -- hence risk_pct works and every gate died. Dead gate ideas, all
-failing the trade-deletion / fold test: SPY SMA(200)+vol filter, VWATR coil
-precondition, `baseline_gate` both ways, `macro_gate` (gains only by deleting
-trades or acting as a calendar switch -- DD-per-trade WORSENS). Any future search
-must control for the CALENDAR PLACEBO: the hole is a mid-sample era, so every slow
-level series "separates" by construction -- a raw level variable at small |corr|
-is a date bet in disguise.
-
-WHAT THE EXITS DO.
-1. SLOPE DIVERGENCE -- REAL MECHANISM, DEGENERATE PARAM. Base uses only
-   sign(slope); here slope is measured twice and the exit fires when price is at
-   running-best AND slope_now < decel_ratio*slope_prev. vs the base it RAISES
-   trade count and win rate while holding DD. NOT a disguised tighter trail
-   (tighter vwatr_mult is strictly WORSE) -- it fires on slope rollover AT the
-   high, not a price give-back. `decel_ratio` = fraction of prior slope still
-   required (0.5 = slope must halve); LARGER fires EARLIER/more often, NOT never
-   (slope_now is usually <= 0 when decelerating, so `decel_ratio >= 1` fires
-   near-always -- the old "never fires" claim was WRONG). Monotone-declining from
-   the low boundary => boundary value.
-2/3. PRICE-UNIT DIVERGENCE (VWATR/close, VWATR/ATR) and BASELINE DIVERGENCE both
-   FAILED: the former because a 1-bar delta flips sign constantly (noise, not
-   divergence); the latter because `below` is re-timing and `above` worsens DD.
-WIDER TRAIL IS WORSE -- a third independent contradiction of vwatr_dsl's "wider
-monotonically better across 10 names". Flagged, not reconciled. Judge the TAIL
-(kurtosis / worst DD per symbol), not only the mean.
-
-HYGIENE. `decel_ratio=0.0` COLLINEAR with `div_exit=False` -> `__post_init__`
-RAISES. Grid over `strategy_params` only. Opt-in `macro_gate` (default OFF; spec
-format on Params) needs its symbols in config `symbols` before the benchmark,
-never traded. `rearm_bars` DELETED (dead code). Use `bt split --folds 2|3` --
-`oos_length="auto"` makes long windows / 4 folds = ~1y slices, and thin early IS
-makes the optimizer pick boundary values and lose OOS.
+HYGIENE: single switch -- `decel_ratio=0` turns the divergence exit OFF
+(`div_exit` removed, was collinear). Grid over `strategy_params` only.
+`bt split --folds 2|3`; thin early IS breaks optimizers.
 """
+    ""
+)
 
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
+import pandas as pd
 
 from src.bt.size.pure import risk_sized_qty
+from src.indicators.macro._shared import load_daily
 from src.bt.state import ActionType
 from src.bt.strategies.dsl import StrategyContext, strategy
 from src.bt.strategies.types import (
@@ -116,50 +84,28 @@ class _State:
 
 @dataclass(frozen=True)
 class Params(StrategyParams):
-    # -- VWATR (unchanged from vwatr_dsl) --
+    # -- VWATR --
     vwatr_period: int = 14
     vwatr_base_win: int = 60
     vwatr_mult: float = 2.0
     slope_bars: int = 2
     breakout_look: int = 20
     risk_pct: float = 0.02
+    # -- FRED-only dynamic sizing --
+    risk_scale: Literal["none", "fred"] = "none"  # "fred" = risk_pct x macro score
+    risk_fred: str = ""  # FRED asset (load_daily name), e.g. "vix"; "" = off
+    risk_fred_dir: Literal[-1, 1] = 1  # +1 size up with level, -1 size down
+    risk_fred_mode: Literal["dir", "band"] = "dir"  # monotone | research band
+    rs_fred_win: int = 250  # FRED percentile window (daily); VIX pct250
     # -- divergence layer --
-    # 1: slope divergence exit. ``decel_ratio`` = fraction of the prior slope
-    #    still required to hold. Must be > 0: the guard is ``decel_ratio > 0``,
-    #    so 0.0 is collinear with ``div_exit=False`` (a degenerate grid point).
-    decel_ratio: float = 0.5
-    div_exit: bool = True  # enable the slope-divergence exit
-    # 2: price-unit divergence exit. "none" | "pct_ratio" | "atr_ratio"
-    norm_mode: str = "none"
-    # 3: baseline divergence gate on entry. "none" | "above" | "below"
-    baseline_gate: str = "none"
-    # 4: MACRO REGIME gate (opt-in, default off => baseline unchanged).
-    #    Each entry "SYMBOL:WINDOW:THRESHOLD" rejects an entry when the series'
-    #    z-score vs its own trailing WINDOW bars is BELOW THRESHOLD. Series must
-    #    be present in config.symbols and named with the GATE_ prefix.
-    macro_gate: tuple[str, ...] = ()
-    _gate_cache: dict = dataclasses.field(default_factory=dict, compare=False)
-
-    def __post_init__(self) -> None:
-        # ``decel_ratio <= 0`` is collinear with ``div_exit=False`` (the exit
-        # guard is ``p.decel_ratio > 0``). Reject it rather than let a grid
-        # silently sweep a point that disables the very feature it names.
-        if self.div_exit and self.decel_ratio <= 0:
-            raise ValueError(
-                "decel_ratio must be > 0 when div_exit=True; "
-                "decel_ratio=0 is collinear with div_exit=False"
-            )
+    decel_ratio: float = 0.0  # slope-div exit: frac of prior slope; 0 = OFF
+    norm_mode: str = "none"  # price-unit div exit: none | pct_ratio | atr_ratio
+    baseline_gate: str = "none"  # entry gate: none | above | below
 
 
 def _macro_gate_open(ctx: StrategyContext, specs: tuple[str, ...]) -> bool:
-    """True when EVERY macro gate spec passes on the current bar.
-
-    Each spec is ``"SYMBOL:WINDOW:THRESHOLD"``: the series' close is z-scored
-    against its own trailing ``WINDOW`` bars and the gate rejects (returns False)
-    when that z-score is below ``THRESHOLD``. The z-score uses only bars up to
-    and including the cursor, so it is look-ahead free; a series with too little
-    history blocks the entry (conservative) rather than silently admitting it.
-    """
+    """True when every spec "SYM:WINDOW:THRESHOLD" passes: close z-scored vs
+    trailing WINDOW (cursor-safe); short history blocks conservatively."""
     for spec in specs:
         try:
             sym, win_s, thr_s = spec.split(":")
@@ -208,8 +154,7 @@ def _slope_decelerating(
         return False
     slope_now = v0 - v1
     slope_prev = v1 - v2
-    # Only meaningful while expansion is still positive; if VWATR is already
-    # falling the trail (not this read) is the exit.
+    # only while expansion positive; falling VWATR -> trail's exit
     if slope_prev <= 0:
         return False
     return slope_now < decel_ratio * slope_prev
@@ -222,12 +167,7 @@ def _norm_diverging(
     n: int,
     norm_mode: str,
 ) -> bool:
-    """True when VWATR is rising in dollars while falling as % of price.
-
-    Compares the *change* of VWATR against the *change* of the normalized form
-    over the same bar, so a level difference (always positive) cannot be
-    mistaken for divergence.
-    """
+    """VWATR rising in $ while falling as % of price; delta-vs-delta not level."""
     if n < 3:
         return False
     if norm_mode == "pct_ratio":
@@ -240,28 +180,82 @@ def _norm_diverging(
     d_n = norm[n - 1] - norm[n - 2]
     if not (np.isfinite(d_v) and np.isfinite(d_n)):
         return False
-    # absolute dollars expanding, percentage range contracting
-    return d_v > 0 and d_n < 0
+    return d_v > 0 and d_n < 0  # $ expanding, % contracting
+
+
+# VIX research band (research_vix.py): pct250 Q3 [0.45,0.8] negative in BOTH
+# split halves; Q1/Q4 stable-positive. Shrink only inside the band.
+_RS_BAND_LO: float = 0.45
+_RS_BAND_HI: float = 0.80
+_RS_BAND_FACTOR: float = 0.65
+_RS_DIR_AMP: float = 1.0  # dir-mode amp, engine-validated (OOS 0.67)
+_FRED_CACHE_KEY = "vwatr_div_fred_series"
+
+
+def _fred_series(
+    ctx: StrategyContext, name: str
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Daily forward-filled FRED asset as ``(dates, values)``, cached in
+    ``ctx.shared`` (per-run, worker-safe; loaded once per process)."""
+    cache: dict[str, tuple[np.ndarray, np.ndarray] | None] = ctx.shared.setdefault(
+        _FRED_CACHE_KEY, {}
+    )
+    if name not in cache:
+        s = load_daily(name)
+        if s.empty:
+            cache[name] = None
+            return None
+        dates = np.asarray(s.index.values, dtype="datetime64[ns]")
+        cache[name] = (dates, s.to_numpy(dtype=float))
+    return cache[name]
+
+
+def _percentile_rank(series: np.ndarray, i: int, window: int) -> float:
+    """Fraction of the trailing window (current index excluded) strictly
+    below ``series[i]``; 0.5 (neutral) on out-of-bounds / NaN / thin window."""
+    if i < 0 or i >= series.size:
+        return 0.5
+    current = series[i]
+    if not np.isfinite(current):
+        return 0.5
+    finite_window = series[max(0, i - window) : i]
+    finite_window = finite_window[np.isfinite(finite_window)]
+    if finite_window.size < 2:
+        return 0.5
+    return float(np.mean(finite_window < current))
+
+
+def _fred_risk_score(p: Params, ctx: StrategyContext, ts: pd.Timestamp) -> float:
+    """FRED-only risk multiplier: risk_pct x this, NO composite blend.
+
+    Percentile of the macro series' latest print at ``ts`` against its own
+    PRIOR daily prints (current excluded, ``load_daily`` lookahead-free),
+    then either monotone scaling (``risk_fred_dir``, structural amp
+    ``_RS_DIR_AMP``) or the non-monotone research band
+    (``risk_fred_mode="band"``). Missing asset / out-of-span -> neutral 1.0.
+    Clamped to [0.5, 1.5].
+    """
+    if not p.risk_fred:
+        return 1.0
+    series = _fred_series(ctx, p.risk_fred)
+    if series is None:
+        return 1.0
+    dates, values = series
+    j = int(np.searchsorted(dates, np.datetime64(ts))) - 1
+    if j < 0 or not np.isfinite(values[j]):
+        return 1.0
+    pct = _percentile_rank(values, j, p.rs_fred_win)
+    if p.risk_fred_mode == "band":
+        score = _RS_BAND_FACTOR if _RS_BAND_LO <= pct <= _RS_BAND_HI else 1.0
+    else:
+        score = 1.0 + (pct - 0.5) * p.risk_fred_dir * _RS_DIR_AMP
+    return min(1.5, max(0.5, score))
 
 
 def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     holder: dict[str, _State] = ctx.shared.setdefault(_STATE_KEY, {})
     state = holder.get(sym) or _State()
     holder[sym] = state
-
-    # Macro regime gate: evaluated once per distinct macro_gate spec per bar,
-    # cached in ctx.shared. A blocked bar blocks every symbol identically --
-    # the gate is a regime read, not a per-name filter.
-    gate_ok = True
-    if p.macro_gate:
-        gcache: dict = ctx.shared.setdefault("_macro_gate_state", {})
-        # _macro_gate_memo maps the spec tuple -> (bar_count, verdict).
-        n_now = len(ctx.ohlcv(sym).close) if ctx.ohlcv(sym) is not None else 0
-        memo = gcache.get("memo")
-        if memo is None or memo[0] != n_now:
-            memo = (n_now, _macro_gate_open(ctx, p.macro_gate))
-            gcache["memo"] = memo
-        gate_ok = memo[1]
 
     def put(**kw: object) -> None:
         nonlocal state
@@ -300,8 +294,7 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
 
         # 1) slope divergence under a new high
         if (
-            p.div_exit
-            and p.decel_ratio > 0
+            p.decel_ratio > 0
             and px >= best
             and _slope_decelerating(vwatr_arr, n, p.slope_bars, p.decel_ratio)
         ):
@@ -311,10 +304,7 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
             )
         # 2) price-unit divergence
         elif p.norm_mode in ("pct_ratio", "atr_ratio"):
-            # NOTE: the ``atr_ratio`` denominator is a PLAIN rolling-mean ATR
-            # over ``vwatr_period`` (``ctx.ta.plain_atr``), deliberately NOT
-            # Wilder-smoothed like ``ctx.ta.atr``. Swapping in ``ctx.ta.atr``
-            # would change the exit and every downstream number.
+            # plain rolling-mean ATR (not Wilder) for atr_ratio -- see ledger
             atr_arr = (
                 ctx.ta.plain_atr(sym, p.vwatr_period).to_array()
                 if p.norm_mode == "atr_ratio"
@@ -355,10 +345,6 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if p.baseline_gate == "below" and not (vwatr < base_now):
         return
 
-    # 4) macro regime gate (no-op unless macro_gate is set)
-    if not gate_ok:
-        return
-
     if n <= p.slope_bars:
         return
     vwatr_prev = float(vwatr_arr[n - 1 - p.slope_bars])
@@ -376,8 +362,14 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
 
     stop_price = p.vwatr_mult * vwatr
     equity = ctx.current_equity()
+    if p.risk_scale == "fred":
+        score = _fred_risk_score(p, ctx, ctx.candle.timestamp)
+        risk_eff = p.risk_pct * score
+    else:
+        score = 1.0
+        risk_eff = p.risk_pct
     qty = risk_sized_qty(
-        equity=equity, price=px, stop_dist=stop_price, risk_pct=p.risk_pct
+        equity=equity, price=px, stop_dist=stop_price, risk_pct=risk_eff
     )
     if qty <= 0:
         return
@@ -385,11 +377,16 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if size <= 0:
         return
 
+    risk_note = (
+        f"risk {risk_eff:.1%} (x{score:.2f}) qty {qty:.2f}"
+        if p.risk_scale == "fred"
+        else f"risk {risk_eff:.1%} qty {qty:.2f}"
+    )
     reason = (
         f"[vwatr-div] entry {sym}: close {px:.2f} > {prior_high:.2f}, "
         f"vwatr {vwatr:.3f} ({vwatr / base_now:.2f}x base {base_now:.3f}), "
         f"rising vs {vwatr_prev:.3f} over {p.slope_bars}b, "
-        f"risk {p.risk_pct:.1%} qty {qty:.2f} stop {stop_price:.2f}"
+        f"{risk_note} stop {stop_price:.2f}"
     )
 
     put(best=px)
@@ -420,9 +417,6 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
 
     close = ctx.ta.close(sym).to_array()
     vwatr_arr = ctx.ta.vwatr(sym, params.vwatr_period).to_array()
-    baseline = ctx.ta.vwatr_baseline(sym, params.vwatr_period, params.vwatr_base_win)
-    ratio = _safe_div(vwatr_arr, baseline.to_array())
-    pct = _safe_div(vwatr_arr, close)
     slope = vwatr_arr - _shift(vwatr_arr, params.slope_bars)
     slope_prev = _shift(slope, params.slope_bars)
 
@@ -457,6 +451,7 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
             Overlay(sparse(_as_series(df.index, upper)), "trail_hi", "line", "price"),
             Overlay(sparse(_as_series(df.index, lower)), "trail_lo", "line", "price"),
         ),
+        # slope pair only: vwatr/close = noise, baseline div failed (ledger)
         panels=(
             Panel(
                 sparse(_as_series(df.index, slope)),
@@ -466,10 +461,6 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
             Panel(
                 sparse(_as_series(df.index, slope_prev)), "vwatr slope (prior)", (0.0,)
             ),
-            Panel(
-                sparse(_as_series(df.index, pct)), "vwatr / close (price-unit norm)", ()
-            ),
-            Panel(sparse(_as_series(df.index, ratio)), "vwatr / baseline", ()),
         ),
         markers=tuple(markers),
     )

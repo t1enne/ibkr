@@ -27,7 +27,6 @@
     "breakout_look": 20,
     "risk_pct": 0.08,
     "decel_ratio": 0.1,
-    "div_exit": true,
     "norm_mode": "none",
     "baseline_gate": "none"
   }
