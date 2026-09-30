@@ -139,8 +139,14 @@ def _build_with_panels(
     from plotly.subplots import make_subplots
 
     spec = plot or {}
+    # Price row weighs 3x each sub-panel; total height keeps panels ~112px so
+    # the price pane gets a readable ~336px on a 2-panel layout.
     fig = make_subplots(
-        rows=1 + len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.03
+        rows=1 + len(panels),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[3] + [1] * len(panels),
     )
     _add_candles(fig, price, row=1)
     _add_open_markers(fig, trades, row=1)
@@ -158,7 +164,7 @@ def _build_with_panels(
     fig.update_layout(
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        height=560,
+        height=112 * (3 + len(panels)),
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
