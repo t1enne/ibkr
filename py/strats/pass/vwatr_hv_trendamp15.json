@@ -1,5 +1,5 @@
 {
-  "name": "vwatr_div_exp30_6y_risk0.08_dyn",
+  "name": "vwatr_hv_amp20",
   "warmup": "300d",
   "trading_start": "2020-09-01",
   "trading_end": "2026-09-01",
@@ -7,6 +7,10 @@
   "initial_capital": 50000,
   "strategy_type": "vwatr_div_dsl",
   "bars": ["1d"],
+  "strategy_params": {
+    "risk_pct": 0.006,
+    "risk_trend_amp": 2.5
+  },
   "symbols": [
     "SRPT",
     "MSTR",
@@ -38,23 +42,5 @@
     "ABNB",
     "QCOM",
     "PANW"
-  ],
-  "strategy_params": {
-    "vwatr_period": 14,
-    "vwatr_base_win": 60,
-    "vwatr_mult": 3.0,
-    "slope_bars": 3,
-    "breakout_look": 20,
-    "risk_pct": 0.01,
-    "risk_scale": "composite",
-    "risk_fred": "vix",
-    "risk_fred_dir": -1,
-    "risk_fred_mode": "band",
-    "rs_fred_win": 250,
-    "risk_earn_metric": "revenue",
-    "risk_clamp_hi": 1.5,
-    "decel_ratio": 0.1,
-    "norm_mode": "none",
-    "baseline_gate": "none"
-  }
+  ]
 }

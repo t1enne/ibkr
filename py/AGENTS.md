@@ -365,6 +365,19 @@ def on_candle(ctx: StrategyContext):
 - Classes: **≤ 150 LOC**
 - If you're exceeding these, extract or decompose.
 
+#### Docstrings (hard rule)
+
+- **≤ 50 lines** per docstring. Over that → delete, not expand.
+- **No numbers, no stats that drift.** Symbol counts, row counts, Sharpe/return
+  figures, version strings, dates, "N tickers", "~X%", benchmark numbers — all
+  rot the moment data/config changes and mislead readers. State the behavior,
+  not the measurement.
+- **High level only.** One-line purpose + contract (inputs, outputs, invariants,
+  failure modes). Leave derivation, history, thresholds and worked examples to
+  code and tests.
+- Docstrings document *intent and guarantees*, never current results. If a fact
+  is bound to change, it does not belong in a docstring.
+
 ### 5. Code Organization
 
 ```
@@ -535,5 +548,6 @@ Authoring is the DSL, so sizing flows through the DSL + engine `SizingParams`
 - [ ] Hot-path computation is vectorized (numpy/pandas, not Python loops)
 - [ ] New logic has tests covering edge cases
 - [ ] Functions ≤ 50 LOC, classes ≤ 150 LOC (or extracted)
+- [ ] Docstrings ≤ 50 lines, high level, zero driftable numbers/stats
 - [ ] Protocols used for injection, not inheritance
 - [ ] No dead code or commented-out blocks left behind
