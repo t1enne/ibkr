@@ -62,6 +62,14 @@ DEFAULT_SERIES: dict[str, dict] = {
         "id": "T10Y2Y",
         "title": "Market Yield on U.S. Treasury Securities at 10-Year, 2-Year Constant Maturity,",
     },
+    "hyspread": {
+        "id": "BAMLH0A0HYM2",
+        "title": "ICE BofA US High Yield Index Option-Adjusted Spread",
+    },
+    "vix": {
+        "id": "VIXCLS",
+        "title": "CBOE Volatility Index: VIX",
+    },
 }
 
 
