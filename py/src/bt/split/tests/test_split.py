@@ -314,6 +314,34 @@ def test_split_report_to_dict_counts_only_closed_trades() -> None:
     }
 
 
+def test_render_split_report_wide_table() -> None:
+    """Text report is ONE wide table row per fold, optimize-style."""
+    folds = (
+        FoldMetrics(
+            fold=_fold(0),
+            in_sample=_fake_result(2.0),
+            out_of_sample=_fake_result(1.5),
+        ),
+    )
+    report = SplitReport(config_name="t", params={"momentum_lookback": 30}, folds=folds)
+    text = split_mod.render_split_report(report)
+    assert "Split: t" in text
+    assert "IS Shp" in text
+    assert "OOS Shp" in text
+    assert "OOS Kurt" in text
+    assert "OOS Trd" in text
+    assert "OOS Win" in text
+    assert "2015-01-02→2020-01-01" in text
+    assert "AGGREGATE: mean OOS Sharpe 1.50" in text
+    assert "IS→OOS decay +0.50" in text
+    assert "| Metric |" not in text  # old per-fold block layout is gone
+
+
+def test_render_split_report_no_folds() -> None:
+    report = SplitReport(config_name="t", params={}, folds=())
+    assert "(no folds)" in split_mod.render_split_report(report)
+
+
 def _candle_df(
     start: str, end: str, freq: str = "D", symbols: tuple[str, ...] = ("A",)
 ) -> pd.DataFrame:

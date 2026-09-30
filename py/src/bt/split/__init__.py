@@ -337,60 +337,74 @@ def run_split(
 # ---------------------------------------------------------------------------
 
 
-def _render_fold(fm: FoldMetrics) -> list[str]:
-    """Render one fold as an IS|OOS metric block with a from→to header."""
-    from src.bt.table import Col, Table, render
+def _fold_row(fm: FoldMetrics) -> tuple[str, ...]:
+    """One fold's IS|OOS metric cells for the summary table."""
+    f = fm.fold
+    is_pf = fm.in_sample
+    oos_pf = fm.out_of_sample
+    return (
+        str(f.index + 1),
+        f"{f.is_start.date()}→{f.is_end.date()}",
+        f"{f.oos_start.date()}→{f.oos_end.date()}",
+        f"{is_pf.sharpe_ratio:.2f}",
+        f"{oos_pf.sharpe_ratio:.2f}",
+        f"{is_pf.annual_return:.1%}",
+        f"{oos_pf.annual_return:.1%}",
+        f"{is_pf.max_drawdown:.1%}",
+        f"{oos_pf.max_drawdown:.1%}",
+        f"{is_pf.kurtosis:.1f}",
+        f"{oos_pf.kurtosis:.1f}",
+        str(trade_count(is_pf)),
+        str(trade_count(oos_pf)),
+        f"{win_rate(is_pf):.0%}",
+        f"{win_rate(oos_pf):.0%}",
+    )
 
-    rows = (
-        (
-            "Annual",
-            f"{fm.in_sample.annual_return:.2%}",
-            f"{fm.out_of_sample.annual_return:.2%}",
-        ),
-        (
-            "Sharpe",
-            f"{fm.in_sample.sharpe_ratio:.2f}",
-            f"{fm.out_of_sample.sharpe_ratio:.2f}",
-        ),
-        (
-            "MaxDD",
-            f"{fm.in_sample.max_drawdown:.2%}",
-            f"{fm.out_of_sample.max_drawdown:.2%}",
-        ),
-        (
-            "Calmar",
-            f"{fm.in_sample.calmar_ratio:.2f}",
-            f"{fm.out_of_sample.calmar_ratio:.2f}",
-        ),
-        (
-            "WinRate",
-            f"{win_rate(fm.in_sample):.1%}",
-            f"{win_rate(fm.out_of_sample):.1%}",
-        ),
-    )
-    cols = (Col("Metric", "<"), Col("IS", ">"), Col("OOS", ">"))
-    header = (
-        f"Fold {fm.fold.index + 1}:  "
-        f"IS {fm.fold.is_start.date()}→{fm.fold.is_end.date()}  |  "
-        f"OOS {fm.fold.oos_start.date()}→{fm.fold.oos_end.date()}"
-    )
-    return [header] + render(Table(columns=cols, rows=rows))
+
+_SPLIT_COLUMNS = (
+    ("Fold", "<"),
+    ("IS window", "<"),
+    ("OOS window", "<"),
+    ("IS Shp", ">"),
+    ("OOS Shp", ">"),
+    ("IS Ann", ">"),
+    ("OOS Ann", ">"),
+    ("IS DD", ">"),
+    ("OOS DD", ">"),
+    ("IS Kurt", ">"),
+    ("OOS Kurt", ">"),
+    ("IS Trd", ">"),
+    ("OOS Trd", ">"),
+    ("IS Win", ">"),
+    ("OOS Win", ">"),
+)
 
 
 def render_split_report(report: SplitReport) -> str:
-    """Render IS vs OOS metrics per fold, one structured block per fold."""
-    lines: list[str] = [f"\nSplit: {report.config_name}"]
+    """Render every fold's IS vs OOS metrics as ONE wide table.
 
-    if report.folds:
-        summary = (
-            f"Mean OOS Sharpe {report.mean_oos_sharpe():.2f} · "
-            f"Min OOS Sharpe {report.min_oos_sharpe():.2f} · "
-            f"IS→OOS Sharpe decay {report.oos_vs_is_degradation():+.2f}"
-        )
-        lines.append(summary)
-        for fm in report.folds:
-            lines.extend(_render_fold(fm))
-            lines.append("")
+    Same layout as `bt optimize`: one row per fold, IS and OOS columns side
+    by side so degradation is read horizontally. Kurtosis/win-rate/trade-count
+    carry the tail-risk and sample-size story a Sharpe-only view hides.
+    """
+    from src.bt.table import Col, Table, render
+
+    if not report.folds:
+        return f"\nSplit: {report.config_name} (no folds)"
+
+    table = Table(
+        columns=tuple(Col(label, align) for label, align in _SPLIT_COLUMNS),
+        rows=tuple(_fold_row(fm) for fm in report.folds),
+    )
+    lines = [f"\nSplit: {report.config_name}"]
+    lines.extend(render(table))
+    lines.append("")
+    lines.append(
+        f"AGGREGATE: mean OOS Sharpe {report.mean_oos_sharpe():.2f} · "
+        f"min OOS Sharpe {report.min_oos_sharpe():.2f} · "
+        f"IS→OOS decay {report.oos_vs_is_degradation():+.2f} · "
+        f"{len(report.folds)} fold(s)"
+    )
     return "\n".join(lines).rstrip()
 
 
