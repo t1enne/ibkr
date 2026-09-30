@@ -1,40 +1,28 @@
 (
-    """VWATR divergence strategy -- long only. Adds THREE divergence exits over
+    """VWATR divergence strategy -- long only. Three divergence exits over
 vwatr_dsl; no entry filter (entry features correlate ~0 with trade return).
 `ctx.ta.vwatr`/`vwatr_baseline` are shared TA; ``atr_ratio`` uses PLAIN
 rolling-mean ATR (not Wilder) -- swapping in ``ctx.ta.atr`` changes every
 number.
 
-LEDGER (read before touching params).
-CONFIG: strats/pass/vwatr_div_exp8_6y_risk0.08.json (8 high-vol names, 1d, 6y)
--- SR 1.12, +2223% vs SPY +118%, DD -50%, kurt 12.5.
-- `risk_pct`: 6y response is UNIMODAL interior peak; shipped value sits on the
-  plateau -- treat as plateau, never argmax. `decel_ratio`: MONOTONE toward
-  boundary = degenerate. `bt split --folds 2|3` passes; `bt optimize` fails on
-  thin early IS (picks grid boundary).
-- TAIL CONCENTRATION: median trade << mean; a few winners carry gross profit.
-- SYMBOL DEPENDENCE: worst drop-one omission drops SR to ~SPY (ENPH among the
-  LEAST damaging -- earlier drafts wrong).
-- REGIME: P&L mostly from the last third of the window -- late-window bull.
-- NO GATE EXISTS (pre-registered search, 45 series, 0/45 p<0.05;
-  strats/wip/vwatr_div_gate_research/). Hole is FLAT, not losing -- the
-  missing mass is the FAT RIGHT TAIL. Gate filters entries; cannot create an
-  absent melt-up. CALENDAR PLACEBO: hole is mid-sample, so slow level series
-  separate by construction.
-- EXITS: slope divergence = real mechanism, degenerate param (decel boundary);
-  price-unit + baseline divergence FAILED; wider trail WORSE.
-- FRED SIZING (`risk_scale="fred"`, vix dir, 250d, base 0.02, 20 names): mean
-  OOS 0.67 (0.48/0.76/0.75), fold-1 hole 0.48 -- first variant to move the
-  2022-23 hole (none/composite same-base: 0.48 mean / 0.22 min; fred adds
-  +0.19 OOS at identical base). Blends / other series failed (t10y2y 0.37;
-  diluted vix 0.45-0.48). VIX mean-reverts: dir -1 shrinks in vol, grows in
-  calm -- unlike t10y2y (era level, date-bet). Composite module reverted;
-  `_percentile_rank` stays local. Below 8-name pass (OOS 1.06). `hyspread`
-  FRED data starts 2023-09-30; `vix` (1990+) / `t10y2y` (1976+) cover hole.
+KEY FACTS (condensed ledger).
+CONFIG: strats/pass/vwatr_div_exp8_6y_risk0.08.json -- SR 1.12, +2223% vs
+SPY +118%, DD -50%, kurt 12.5.
+- risk_pct interior plateau, never argmax; decel_ratio boundary degenerate;
+  thin early IS breaks optimizers (split 2|3 ok).
+- No gate exists: hole is FLAT, not losing -- the missing mass is the fat
+  right tail; a gate cannot create an absent melt-up.
+- Slope divergence is the real exit; price-unit + baseline divergences failed.
+- FRED sizing (vix dir) moved the 2022-23 hole; composite (fred x earn/
+  revenue, clamp [0.5,1.5]) restores it -- SR 1.22, OOS 1.09. fred is
+  load-bearing, revenue additive; earn alone loses.
+- EXP30 (30 names, risk 0.01) ships: SR 1.35, DD -33%, kurt 2.46, OOS 1.31
+  -- diversification + per-name risk cut, not signal.
+- Trade-count cohorts: highest cohort wins OOS; less trades is an in-sample
+  trap.
 
-HYGIENE: single switch -- `decel_ratio=0` turns the divergence exit OFF
-(`div_exit` removed, was collinear). Grid over `strategy_params` only.
-`bt split --folds 2|3`; thin early IS breaks optimizers.
+HYGIENE: single switch -- `decel_ratio=0` turns the divergence exit OFF.
+Grid over `strategy_params` only.
 """
     ""
 )
@@ -52,6 +40,7 @@ from src.bt.size.pure import risk_sized_qty
 from src.indicators.macro._shared import load_daily
 from src.bt.state import ActionType
 from src.bt.strategies.dsl import StrategyContext, strategy
+from src.bt.strategies.fundamentals_context import SeriesPIT
 from src.bt.strategies.types import (
     Marker,
     Overlay,
@@ -65,8 +54,7 @@ from src.bt.strategies.types import (
 STRATEGY_TYPE = "vwatr_div_dsl"
 _STATE_KEY = "vwatr_div_state"
 
-# Guard for the volume-weighted denominator (also used by ``plot``'s ratio
-# panels): a window whose volume sums to ~0 has no meaningful VWATR.
+# Guard for the volume-weighted denominator: ~0-volume window has no meaningful VWATR.
 _EPS = 1e-12
 
 
@@ -91,12 +79,23 @@ class Params(StrategyParams):
     slope_bars: int = 2
     breakout_look: int = 20
     risk_pct: float = 0.02
-    # -- FRED-only dynamic sizing --
-    risk_scale: Literal["none", "fred"] = "none"  # "fred" = risk_pct x macro score
+    # -- dynamic sizing: macro (fred) and/or earnings-momentum (earn) --
+    risk_scale: Literal["none", "fred", "earn", "composite"] = "none"
+    # "fred" = risk_pct x macro score (VIX percentile, portfolio-level);
+    # "composite" = same x fred score x earn score, re-clamped [0.5, 1.5]
     risk_fred: str = ""  # FRED asset (load_daily name), e.g. "vix"; "" = off
     risk_fred_dir: Literal[-1, 1] = 1  # +1 size up with level, -1 size down
     risk_fred_mode: Literal["dir", "band"] = "dir"  # monotone | research band
     rs_fred_win: int = 250  # FRED percentile window (daily); VIX pct250
+    # "earn" = risk_pct x fundamentals-momentum score (per-symbol, both
+    # directions; metric picks the voice -- revenue fires on loss-makers)
+    risk_earn_metric: Literal[
+        "eps_diluted", "net_income", "revenue", "operating_cash_flow"
+    ] = "eps_diluted"
+    # dynamic-score clamp band (earn + composite re-clamp); hi < lo degenerates
+    # to a constant scale (sweep diagnostic only).
+    risk_clamp_lo: float = 0.5
+    risk_clamp_hi: float = 2.0
     # -- divergence layer --
     decel_ratio: float = 0.0  # slope-div exit: frac of prior slope; 0 = OFF
     norm_mode: str = "none"  # price-unit div exit: none | pct_ratio | atr_ratio
@@ -104,8 +103,8 @@ class Params(StrategyParams):
 
 
 def _macro_gate_open(ctx: StrategyContext, specs: tuple[str, ...]) -> bool:
-    """True when every spec "SYM:WINDOW:THRESHOLD" passes: close z-scored vs
-    trailing WINDOW (cursor-safe); short history blocks conservatively."""
+    """True when every spec "SYM:WINDOW:THRESHOLD" passes (cursor-safe); short
+    history blocks conservatively."""
     for spec in specs:
         try:
             sym, win_s, thr_s = spec.split(":")
@@ -183,8 +182,8 @@ def _norm_diverging(
     return d_v > 0 and d_n < 0  # $ expanding, % contracting
 
 
-# VIX research band (research_vix.py): pct250 Q3 [0.45,0.8] negative in BOTH
-# split halves; Q1/Q4 stable-positive. Shrink only inside the band.
+# VIX band (research_vix.py): pct250 Q3 [0.45,0.8] negative in both halves;
+# shrink only inside the band.
 _RS_BAND_LO: float = 0.45
 _RS_BAND_HI: float = 0.80
 _RS_BAND_FACTOR: float = 0.65
@@ -196,7 +195,7 @@ def _fred_series(
     ctx: StrategyContext, name: str
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Daily forward-filled FRED asset as ``(dates, values)``, cached in
-    ``ctx.shared`` (per-run, worker-safe; loaded once per process)."""
+    ``ctx.shared`` (per-run, worker-safe)."""
     cache: dict[str, tuple[np.ndarray, np.ndarray] | None] = ctx.shared.setdefault(
         _FRED_CACHE_KEY, {}
     )
@@ -211,8 +210,8 @@ def _fred_series(
 
 
 def _percentile_rank(series: np.ndarray, i: int, window: int) -> float:
-    """Fraction of the trailing window (current index excluded) strictly
-    below ``series[i]``; 0.5 (neutral) on out-of-bounds / NaN / thin window."""
+    """Fraction of the trailing window (current excluded) strictly below
+    ``series[i]``; 0.5 neutral on out-of-bounds / NaN / thin window."""
     if i < 0 or i >= series.size:
         return 0.5
     current = series[i]
@@ -228,10 +227,8 @@ def _percentile_rank(series: np.ndarray, i: int, window: int) -> float:
 def _fred_risk_score(p: Params, ctx: StrategyContext, ts: pd.Timestamp) -> float:
     """FRED-only risk multiplier: risk_pct x this, NO composite blend.
 
-    Percentile of the macro series' latest print at ``ts`` against its own
-    PRIOR daily prints (current excluded, ``load_daily`` lookahead-free),
-    then either monotone scaling (``risk_fred_dir``, structural amp
-    ``_RS_DIR_AMP``) or the non-monotone research band
+    Percentile of the series' latest print against its PRIOR prints, then
+    monotone scaling (``risk_fred_dir``) or the non-monotone band
     (``risk_fred_mode="band"``). Missing asset / out-of-span -> neutral 1.0.
     Clamped to [0.5, 1.5].
     """
@@ -250,6 +247,67 @@ def _fred_risk_score(p: Params, ctx: StrategyContext, ts: pd.Timestamp) -> float
     else:
         score = 1.0 + (pct - 0.5) * p.risk_fred_dir * _RS_DIR_AMP
     return min(1.5, max(0.5, score))
+
+
+#: Same-quarter YoY match window (days): 364-366 typical, fiscal filers drift;
+#: 330-400 admits the same fiscal quarter, never a different-length span.
+_QUARTER_YOY_LO = 330
+_QUARTER_YOY_HI = 400
+
+
+def _earn_yoy_growth(series: SeriesPIT) -> float | None:
+    """YoY growth of the latest visible earnings vs its same-quarter filing.
+
+    Matches ``period_end`` ~1 year apart so cumulative-YTD spans never mix
+    quarters; visibility is cursor-borne. ``None`` on short series,
+    non-positive baseline, or no same-quarter match yet.
+    """
+    spans = series.spans()
+    values = series.values()
+    if len(values) < 2:
+        return None
+    latest_end = spans[-1][1]
+    latest = values[-1]
+    for i in range(len(values) - 2, -1, -1):
+        days = (latest_end - spans[i][1]).days
+        if _QUARTER_YOY_LO <= days <= _QUARTER_YOY_HI:
+            prev = values[i]
+            if not (np.isfinite(prev) and np.isfinite(latest)) or prev <= 0:
+                return None
+            return float((latest - prev) / prev)
+    return None
+
+
+#: ``risk_earn_metric`` -> (statement accessor, field). Net income/EPS silent
+#: on loss-makers; revenue fires on every filer.
+_EARN_METRIC_FIELD: dict[str, tuple[str, str]] = {
+    "eps_diluted": ("income", "eps_diluted"),
+    "net_income": ("income", "net_income"),
+    "revenue": ("income", "revenue"),
+    "operating_cash_flow": ("cashflow", "operating_cash_flow"),
+}
+
+
+def _earn_risk_score(p: Params, ctx: StrategyContext, sym: str) -> float:
+    """Per-symbol earnings-momentum risk multiplier: risk_pct x this.
+
+    Same-quarter YoY growth, clamped to ``[risk_clamp_lo, risk_clamp_hi]``;
+    neutral 1.0 when no fundamentals store or no matchable filing (missing
+    fundamental is not a weak fundamental). Unknown metric is a config
+    error, raised here rather than KeyError-ing on a later bar.
+    """
+    if p.risk_earn_metric not in _EARN_METRIC_FIELD:
+        raise ValueError(
+            f"unknown risk_earn_metric {p.risk_earn_metric!r}; pick one of "
+            f"{', '.join(sorted(_EARN_METRIC_FIELD))}"
+        )
+    statement, field = _EARN_METRIC_FIELD[p.risk_earn_metric]
+    accessor = getattr(ctx.fundamentals, statement)(sym)
+    series: SeriesPIT = getattr(accessor, field)
+    growth = _earn_yoy_growth(series)
+    if growth is None:
+        return 1.0
+    return min(p.risk_clamp_hi, max(p.risk_clamp_lo, 1.0 + growth))
 
 
 def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
@@ -304,7 +362,7 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
             )
         # 2) price-unit divergence
         elif p.norm_mode in ("pct_ratio", "atr_ratio"):
-            # plain rolling-mean ATR (not Wilder) for atr_ratio -- see ledger
+            # plain rolling-mean ATR (not Wilder) for atr_ratio
             atr_arr = (
                 ctx.ta.plain_atr(sym, p.vwatr_period).to_array()
                 if p.norm_mode == "atr_ratio"
@@ -365,6 +423,15 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if p.risk_scale == "fred":
         score = _fred_risk_score(p, ctx, ctx.candle.timestamp)
         risk_eff = p.risk_pct * score
+    elif p.risk_scale == "earn":
+        score = _earn_risk_score(p, ctx, sym)
+        risk_eff = p.risk_pct * score
+    elif p.risk_scale == "composite":
+        score = _fred_risk_score(p, ctx, ctx.candle.timestamp) * _earn_risk_score(
+            p, ctx, sym
+        )
+        score = min(p.risk_clamp_hi, max(p.risk_clamp_lo, score))
+        risk_eff = p.risk_pct * score
     else:
         score = 1.0
         risk_eff = p.risk_pct
@@ -379,7 +446,7 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
 
     risk_note = (
         f"risk {risk_eff:.1%} (x{score:.2f}) qty {qty:.2f}"
-        if p.risk_scale == "fred"
+        if p.risk_scale in ("fred", "earn", "composite")
         else f"risk {risk_eff:.1%} qty {qty:.2f}"
     )
     reason = (
@@ -407,9 +474,8 @@ def _as_series(index, values: np.ndarray):
 
 
 def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
-    """Post-run chart spec. The cursor is at the terminal bar here, so every
-    ``ctx.ta`` series is the full visible history (not a truncation).
-    """
+    """Post-run chart spec (cursor at terminal bar; ctx.ta series are the
+    full visible history)."""
     sym = ctx.candle.symbol
     df = ctx.state.candles.get((sym, ctx.interval))
     if df is None or len(df) < params.vwatr_period + params.vwatr_base_win:
@@ -451,7 +517,7 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
             Overlay(sparse(_as_series(df.index, upper)), "trail_hi", "line", "price"),
             Overlay(sparse(_as_series(df.index, lower)), "trail_lo", "line", "price"),
         ),
-        # slope pair only: vwatr/close = noise, baseline div failed (ledger)
+        # slope pair only: vwatr/close = noise; baseline div failed.
         panels=(
             Panel(
                 sparse(_as_series(df.index, slope)),
