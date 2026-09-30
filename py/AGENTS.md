@@ -78,6 +78,15 @@ uv run ibkr bt optimize strats/trend.json '{...grid...}' --folds 4 --workers 4
 # capped at the unit count, so oversized --workers is harmless.
 ```
 
+### Fills: rejected or scaled = results not solid
+
+A cash shortfall SCALES a multi-open cohort (silent — entries land at
+`scale × plan`), only a lone open rejects (stderr warning). Cohort grouping
+is order-sensitive (clock, data gaps, Stage 4 vs 6), so with rejections or
+over-subscription active, results vary with `config.symbols` order —
+advisory, never quoted across permutations. See `src/bt/portfolio/pure.py`
++ `src/bt/engine/backtest.py` docstrings.
+
 ## Running Screens (no CLI — run via Python)
 
 Screens are scoring layers that return 0..1 `ScreenResult`

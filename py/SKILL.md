@@ -316,6 +316,7 @@ uv run pytest src/bt/risk/tests/ -v
 - **Don't invent a workflow.** Check for an existing `bt` subcommand first.
 - **Don't launder output.** A re-derived metric or `grep`-ed report is not evidence.
 - **Data availability**: when an agent needs candles that are missing/stale, just run `data dl` (see the runbook below) — `data query` only _reads_ the local DB and never fetches.
+- **Data sources are separate.** `data dl` fetches candles only, via the IBKR Gateway. Company fundamentals = `data fundamentals dl` (SEC EDGAR, no Gateway). US macro = `scripts/fetch_macro_fred.py` (`FRED_API_KEY` is configured, writes `assets/*.csv`). Missing fundamentals/macro is not fixed by `data dl`.
 - **Bar size**: strategies expect the bar size in config to match available data. Most data is `1h`.
 - **HTF lookahead**: `state.candles.get((sym, freq))` and the DSL `ctx.ta`
   `interval=` reads are both safe (cursor-truncated).
@@ -349,14 +350,112 @@ uv run python -c "import httpx;print(httpx.get('https://localhost:5000/v1/api/is
 uv run python scripts/login_ibkr.py   # else login
 ```
 
+## `data fundamentals dl` — SEC EDGAR fundamentals (optional strategy data)
+
+Downloads SEC EDGAR (XBRL) filings into the local DB as **sparse fiscal rows**
+— one row per `(ticker, statement, field, period)` filing (~5 rows per symbol
+per year, not a daily grid). No Gateway needed (direct SEC HTTP):
+
+```bash
+uv run ibkr data fundamentals dl AAPL MSFT                     # positional symbols
+uv run ibkr data fundamentals dl --universe universes/nsdq.json
+uv run ibkr data fundamentals dl AAPL --from 2024-01-01 --to 2024-12-31 --refresh
+```
+
+Options:
+
+- `--from/-f`, `--to/-t` — bound the **filing** window (the `filed` date, not
+  the fiscal period: a 10-K filed in 2024 restates 2022's period, and excluding
+  it by period would drop exactly the point-in-time facts we keep).
+- `--refresh` — bypass the on-disk payload cache and re-fetch from SEC.
+- `--cache` — payload cache dir (default `../data/fundamentals_cache`).
+
+Idempotent. Per-symbol recap prints rows written (or `up to date` when `0`),
+fiscal periods landed, and the filed span — re-run after new filings appear.
+Symbols SEC has no CIK for (ETF, non-US registrant) report `0 rows` without
+aborting the batch.
+
+**Reading fundamentals in a strategy** — no CLI read path; use the cursor-safe
+`ctx.fundamentals` surface inside `on_candle`:
+
+```python
+series = ctx.fundamentals.income("AAPL").net_income   # fiscal-period SeriesPIT, not a bar series
+latest = series[-1]       # most recent period whose filing the strategy has already seen
+                          # as-first-stated: a restatement never rewrites a prior period,
+                          # rows filed after the cursor are invisible (no lookahead)
+snap = ctx.fundamentals.latest("AAPL", "income")  # newest-filed (restated) statement instead
+```
+
+Reference implementation: `vwatr_div_dsl.py` `risk_scale="earn"` — same-quarter
+YoY earnings growth (`series = ctx.fundamentals.income(sym).net_income`; match
+the period ~365 days earlier, 330–400-day window) scaling position size,
+clamped to [0.5, 1.5].
+
+## FRED macro data & macro indicators (optional strategy data)
+
+US macro series live as two-column `assets/<name>.csv` files (`date`, `<name>`;
+**blank cells = FRED no-print dates**) consumed by `src.indicators.macro`.
+
+**Fetch / refresh:**
+
+```bash
+export FRED_API_KEY=...     # free key from fred.stlouisfed.org
+uv run python scripts/fetch_macro_fred.py               # all defaults
+uv run python scripts/fetch_macro_fred.py --out assets --series GDPC1 INDPRO
+```
+
+Default set: `gdpc1`/`gdp` (GDP), `payems`/`unrate` (employment), `indpro`/`tcu`
+(production), `bopgstb` (trade balance), `dgs2`/`t10y2y` (yields), `hyspread`
+(HY OAS), `vix` (VIXCLS). `cpi` is World Bank data (annual inflation chained
+into a 1.0-based daily level — **not** from FRED, different loader). All series
+are forward-filled onto a daily grid on load, so every value is the latest
+known print.
+
+**Read in a strategy — lookahead-free factory:**
+
+```python
+from src.indicators.macro import init_macro_indicator
+
+vix = init_macro_indicator("vix")     # loads assets/vix.csv once at init
+level = vix(ts)                       # latest VIX print with release date <= ts
+```
+
+`init_macro_indicator("<name>")` returns `f(ts) -> float | None` — a single
+`Series.asof`, structurally unable to leak a future observation. Out-of-span or
+missing asset → `None` (treat as neutral). Bind **once** per run.
+
+Hot path (percentile / rolling reads): cache the loaded arrays in `ctx.shared`
+and index with `searchsorted` — the pattern behind `vwatr_div_dsl.py`
+`risk_scale="fred"` (VIX percentile vs prior 250 prints, scaled to [0.5, 1.5]):
+
+```python
+from src.indicators.macro._shared import load_daily
+
+@strategy(bars="1d", stateful=True)
+def on_candle(ctx):
+    cache = ctx.shared.setdefault("macros", {})
+    if "vix" not in cache:
+        s = load_daily("vix")
+        cache["vix"] = (
+            np.asarray(s.index.values, dtype="datetime64[ns]"),
+            s.to_numpy(dtype=float),
+        )
+    dates, values = cache["vix"]
+    j = int(np.searchsorted(dates, np.datetime64(ctx.candle.timestamp))) - 1
+    pct = float(np.mean(values[max(0, j - 250) : j] < values[j]))  # prior prints only
+```
+
+`deflated_log_prices(nominal, cpi)` is a separate pure vectorised helper
+(`ln(nominal) - ln(cpi)` real prices), not part of the cursor-indicator API.
+
 ## Module Reference
 
 All CLI groups under the `py` root command — also callable via `make run <subcommand> <args>`:
 
-| Group  | Commands                            | Description                                                                  |
-| ------ | ----------------------------------- | ---------------------------------------------------------------------------- |
-| `data` | `dl`, `query`, `preview`            | Sync/download OHLCV from IBKR, query local DB                                |
-| `bt`   | `run`, `sweep`, `split`, `optimize` | Backtesting engine, hyperparam sweep, IS/OOS validation, walk-forward tuning |
+| Group  | Commands                                    | Description                                                                  |
+| ------ | ------------------------------------------- | ---------------------------------------------------------------------------- |
+| `data` | `dl`, `query`, `preview`, `fundamentals dl` | Sync/download OHLCV from IBKR, query local DB; SEC EDGAR fundamentals        |
+| `bt`   | `run`, `sweep`, `split`, `optimize`         | Backtesting engine, hyperparam sweep, IS/OOS validation, walk-forward tuning |
 
 ### `bt sweep` — hyperparameter sweep
 
@@ -413,9 +512,9 @@ Reports perf-fold chosen params + IS/OOS metrics, plus mean/min OOS Sharpe.
 
 **Neither `sweep`+`split` nor `optimize` is a clean test — both leak.**
 
-- `sweep`+`split` leaks *selection into OOS*: sweep picks params on the whole
+- `sweep`+`split` leaks _selection into OOS_: sweep picks params on the whole
   window, then split cuts folds out of data those params already saw.
-- `optimize` leaks *IS selection into OOS*: OOS is honest w.r.t. the chosen
+- `optimize` leaks _IS selection into OOS_: OOS is honest w.r.t. the chosen
   params, but degenerate IS optima (knife-edge param, overfit tail) carry
   forward. Low fold count makes one bad pick poison that fold's OOS.
 
@@ -429,8 +528,17 @@ number alone. Read the OOS **distribution**, not the mean:
 3. For a genuinely clean test, nest: tune on IS, select on a middle segment,
    OOS untouched until the end.
 
-`split` measures stability of a *fixed* config. `optimize` measures a *search*.
+`split` measures stability of a _fixed_ config. `optimize` measures a _search_.
 Testing a search → `optimize`, with the param-variance check in step 1.
+
+**A run with rejected or scaled fills is not a solid result.** A cash
+shortfall SCALES a multi-open cohort (silent — entries land at `scale ×
+plan`), only a lone open rejects. Risk-sized entries then realize less $
+risk than authored. Cohort membership is order-sensitive (clock, data gaps,
+Stage 4 vs 6), so WHICH entries fill full / scaled / never depends on symbol
+list composition. `[bt] WARNING: N fill(s) rejected` or chronic
+over-subscription = metrics not comparable across symbol permutations or
+config edits. Fix sizing before quoting numbers.
 
 Run folds in parallel with `--workers N` — each fold tunes its IS and
 validates its OOS independently (combos inside a fold stay sequential).
