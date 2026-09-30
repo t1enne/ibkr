@@ -21,6 +21,12 @@ Pipeline invariants:
   - Signals are bucketed by symbol into a dict. _execute_pending reads
     directly from the current symbol's bucket — no O(N) scan over all
     pending signals.
+  - A cash shortfall SCALES a cohort, it does not reject — only a lone open
+    hits the legacy reject-or-full path. Scaling is silent: risk-sized
+    entries land at scale × plan, RR vs plan shifts (per-share R unchanged).
+    Grouping, not arithmetic, is the order-sensitive lever, so runs with
+    rejections are advisory across symbol permutations (see
+    ``portfolio.pure.apply_fills``).
 
 Usage:
     from src.bt.engine.backtest import Backtest, candle_generator, run_backtest
@@ -46,6 +52,7 @@ import numpy as np
 import pandas as pd
 
 from src.bt.metrics import calculate_portfolio_result
+from src.bt.table import Col, Table, render
 from src.bt.strategies import resolve_params
 from src.bt.strategies.ta_context import TaContext
 from src.bt.warmup import parse_warmup_bars
@@ -431,31 +438,32 @@ def _execute_cohort(
 
 
 def _warn_rejections(rejections: list, config: StrategyConfig) -> None:
-    """Write a one-line-per-symbol + total summary of dropped fills to stderr.
+    """Summarise dropped fills to stderr once per run.
 
     Policy: a single run-end summary, not a line per rejection — a heavily
     over-subscribed config rejects most attempted entries, so per-event output
-    would bury the report. A per-symbol count plus the worst example keeps the
-    signal ("your strategy is over-subscribed") without the volume. Writes to
-    STDERR: a warning must not contaminate stdout (JSONL/JSON CLI output).
+    would bury the report. A per-symbol table (same ``Table``/``render`` as the
+    metrics report) plus the worst example keeps the signal ("your strategy is
+    over-subscribed") without the volume. Writes to STDERR: a warning must not
+    contaminate stdout (JSONL/JSON CLI output).
     """
     if not rejections:
         return
     per_symbol: dict[str, int] = {}
     for r in rejections:
         per_symbol[r.symbol] = per_symbol.get(r.symbol, 0) + 1
-    listed = ", ".join(
-        f"{sym}={n}" for sym, n in sorted(per_symbol.items(), key=lambda kv: -kv[1])
+
+    def _emit(line: str = "") -> None:
+        print(line, file=sys.stderr)
+
+    _emit(f"[bt] WARNING: {len(rejections)} fill(s) scaled due to insufficient cash ")
+    rows = tuple(
+        (sym, str(n)) for sym, n in sorted(per_symbol.items(), key=lambda kv: -kv[1])
     )
-    worst = max(rejections, key=lambda r: r.cash_used - r.available_cash)
-    print(
-        f"[bt] WARNING: {len(rejections)} fill(s) rejected for insufficient cash "
-        f"across {len(per_symbol)} symbol(s) for {config.name!r} "
-        f"({listed}). Worst: {worst.symbol} at {worst.timestamp} needed "
-        f"{worst.cash_used:.2f} but only {worst.available_cash:.2f} cash was "
-        f"available — the entry never happened and the strategy was not told.",
-        file=sys.stderr,
-    )
+    for line in render(
+        Table(columns=(Col("symbol", "<"), Col("rejected", ">")), rows=rows)
+    ):
+        _emit(line)
 
 
 def _mark_bar(state: BacktestState, bar: list[Candle]) -> BacktestState:

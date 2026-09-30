@@ -131,6 +131,13 @@ def apply_fills(
     Returns the new portfolio plus the rejections for "genuine exhaustion"
     (an open that still does not fit at the shared scale) — the engine reports
     those; this function never does I/O.
+
+    Caveat — scaling is NOT rejection. An over-cash multi-open cohort is
+    divided by one shared ``scale`` (silent); only a lone open rejects. A
+    risk-sized entry lands at ``scale × plan`` — $ risk/reward, risk budget
+    and cost-adjusted RR off-plan, per-share R unchanged. Grouping, not
+    arithmetic, is order-sensitive: results under rejections are advisory,
+    never compared across symbol permutations or config edits.
     """
     non_opens = tuple(
         f for f in fills if f.signal.action not in (ActionType.long, ActionType.short)
@@ -164,6 +171,8 @@ def _scale_opens(
     result is deterministic and can never round UP past the cash edge.
     """
     if len(opens) <= 1:
+        # Lone-open guard: full-size-or-reject, never scaled. Same intent
+        # fills full alone, "scale × plan" with a peer (see ``apply_fills``).
         return opens
     # Reserve the fixed commission of every open up front: scaling the notional
     # by ``(cash - total_commission) / requested`` makes the cohort's total cost
