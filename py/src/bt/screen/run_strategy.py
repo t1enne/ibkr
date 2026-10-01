@@ -18,7 +18,7 @@ from __future__ import annotations
 from src.bt.warmup import parse_warmup_bars
 
 from dataclasses import dataclass, replace
-from typing import Literal, Mapping, cast
+from typing import Literal, Mapping, TypedDict, cast
 
 import numpy as np
 import pandas as pd
@@ -43,17 +43,29 @@ COMMON_COLS = [
     "lo_52w",
 ]
 
-Action = Literal["long", "short", "flat"]
+#: ``long``/``short`` open or reorient a side, ``close`` is an explicit exit
+#: directive, ``flat`` means no signal / no position (context only, never an
+#: order — a live consumer must not read it as "flatten").
+Action = Literal["long", "short", "close", "flat"]
 
 
 @dataclass(frozen=True)
 class ScreenRow:
     symbol: str
     action: Action
-    score: float  # >0 iff actionable; 1.0 fresh open, <1.0 retained
+    score: float  # >0 iff actionable; 1.0 fresh, <1.0 retained
     signals: tuple[str, ...]  # human reasons from TradeSignal.reason strings
     ts: pd.Timestamp  # newest loaded data bar for this symbol
     sig_ts: pd.Timestamp | None = None  # bar on which the live posture was set
+    # Executable fields lifted from the posture-setting TradeSignal so a live
+    # consumer can act on the row without replaying the engine (see
+    # ``render_screen_json``). Defaults keep non-signal (flat) rows inert.
+    price: float = 0.0
+    qty: float = 0.0  # absolute share count (0.0 = engine-sized)
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    position_id: str | None = None
+    tag: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,11 +93,31 @@ class SignalCollector:
         self._feed[sig.symbol] = self._feed.get(sig.symbol, ()) + (sig,)
 
 
+@dataclass(frozen=True)
+class ResolvedPosture:
+    """One symbol's replayed intent: action + score + the setting signal."""
+
+    action: Action
+    score: float
+    reasons: tuple[str, ...]
+    sig_ts: pd.Timestamp | None
+    signal: TradeSignal | None  # the latest posture-setting signal (None = flat)
+
+
+@dataclass(frozen=True)
+class ScreenRun:
+    """Full screen run result: ranked rows, post-finalize state, source config."""
+
+    rows: tuple[ScreenRow, ...]
+    state: BacktestState
+    config: StrategyConfig
+
+
 def run_screen_from_strategy(
     config_path: str,
     posture: Posture = Posture(),
     max_age_days: int | None = None,
-) -> tuple[tuple[ScreenRow, ...], BacktestState]:
+) -> ScreenRun:
     """Score a universe by running its strategy through the real engine.
 
     Runs over a **trailing warm-up window ending at the newest available data**
@@ -95,8 +127,10 @@ def run_screen_from_strategy(
     the reported posture is current tape, never the config's (possibly stale)
     ``trading_end``.
 
-    Returns ``(rows, final_state)``: rows carry the per-symbol posture, and
-    ``final_state`` is the engine's post-``_finalize`` state (book flattened).
+    Returns a ``ScreenRun``: ranked rows carry the per-symbol posture plus the
+    executable fields of its setting signal, ``state`` is the engine's
+    post-``_finalize`` state (book flattened), and ``config`` is the resolved
+    source config.
     """
     cfg = load_strategy(config_path)
     data_end = _data_end(cfg)
@@ -134,7 +168,7 @@ def run_screen_from_strategy(
     }
     rows = _project(collector, tuple(config.symbols), posture, latest)
     rows = _filter_recent(rows, max_age_days)
-    return rows, final
+    return ScreenRun(rows=rows, state=final, config=config)
 
 
 def _filter_recent(
@@ -268,70 +302,86 @@ def _project(
     rows: list[ScreenRow] = []
     for sym in symbols:
         own = _resolve_latest(latest_ts, sym)
-        action, score, reasons, sig_ts = _resolve_posture(
-            collector._feed.get(sym, ()), posture, own
-        )
-        if action == "flat" and not posture.include_flat:
+        rp = _resolve_posture(collector._feed.get(sym, ()), posture, own)
+        if rp.action == "flat" and not posture.include_flat:
             continue
-        rows.append(
-            ScreenRow(
-                symbol=sym,
-                action=action,
-                score=score,
-                signals=reasons,
-                ts=own,
-                sig_ts=sig_ts,
-            )
-        )
+        rows.append(_row_from_posture(sym, rp, own))
     # Ranked by score desc (actionable first), then symbol — deterministic.
     rows.sort(key=lambda r: (-r.score, r.symbol))
     return tuple(rows)
+
+
+def _row_from_posture(
+    sym: str,
+    rp: ResolvedPosture,
+    own: pd.Timestamp,
+) -> ScreenRow:
+    """Lift a resolved posture into a row, carrying its signal's executable fields."""
+    s = rp.signal
+    return ScreenRow(
+        symbol=sym,
+        action=rp.action,
+        score=rp.score,
+        signals=rp.reasons,
+        ts=own,
+        sig_ts=rp.sig_ts,
+        price=float(s.price) if s is not None else 0.0,
+        qty=float(s.qty) if s is not None else 0.0,
+        stop_loss=_opt_float(s.stop_loss) if s is not None else None,
+        take_profit=_opt_float(s.take_profit) if s is not None else None,
+        position_id=s.position_id if s is not None else None,
+        tag=s.tag if s is not None else "",
+    )
+
+
+def _opt_float(v: float | None) -> float | None:
+    """Pass an optional float through (``None`` stays ``None``)."""
+    return None if v is None else float(v)
 
 
 def _resolve_posture(
     feed: tuple[TradeSignal, ...],
     posture: Posture,
     latest_ts: pd.Timestamp,
-) -> tuple[Action, float, tuple[str, ...], pd.Timestamp | None]:
-    """Replay a symbol's chronological intents -> (action, score, signals, sig_ts).
+) -> ResolvedPosture:
+    """Replay a symbol's chronological intents -> its latest resolved posture.
 
     Latest-wins over the run (posture, never fills): a fresh ``long``/``short``
-    orients the symbol to that side; a ``close`` reverts to flat; a rebalance
-    leaves the incumbent side. A side (re)established on the newest scored bar
-    is a fresh open (``base_score_open``); a side decided earlier (nothing
-    newer this window) is a retained setup (``base_score_held``). Flat -> 0.0.
-    ``sig_ts`` is the bar that set the live posture; a 0.8-retained row whose
-    ``sig_ts`` trails ``latest_ts`` by weeks is a stale setup, not a fresh
-    signal — the reason string is emission-time, not current tape.
+    orients the symbol to that side; a ``close`` is an explicit exit directive;
+    a rebalance leaves the incumbent side. A side (re)established on the newest
+    scored bar is a fresh action (``base_score_open``); a side decided earlier
+    (nothing newer this window) is retained (``base_score_held``). No
+    position-setting signal -> flat, score 0.0. ``sig_ts`` is the bar that set
+    the live posture, and ``signal`` is the setting signal itself (for its
+    executable fields); a 0.8-retained row whose ``sig_ts`` trails ``latest_ts``
+    by weeks is a stale setup, not fresh — the reason string is emission-time.
     """
     action: Action | None = None
-    reasons: tuple[str, ...] = ()
-    decided_ts: pd.Timestamp | None = None  # ts of the signal that set ``action``
+    setting: TradeSignal | None = None  # latest signal that set ``action``
 
     for sig in feed:
         side = _side_of(sig)
         if side is None:  # rebalance keeps the incumbent side
             continue
         action = side
-        reasons = _reasons(sig)
-        decided_ts = sig.timestamp
+        setting = sig
 
-    if action in (None, "flat"):
-        return ("flat", 0.0, reasons, decided_ts)
+    if action is None or setting is None:
+        return ResolvedPosture("flat", 0.0, (), None, None)
 
-    fresh = decided_ts is not None and decided_ts == latest_ts
+    fresh = setting.timestamp == latest_ts
     score = posture.base_score_open if fresh else posture.base_score_held
-    return (action, score, reasons, decided_ts)
+    return ResolvedPosture(action, score, _reasons(setting), setting.timestamp, setting)
 
 
 def _side_of(sig: TradeSignal) -> Action | None:
-    """Posture a signal imposes: open side, flat on a close, None on rebalance."""
+    """Posture a signal imposes: open side, explicit close, None on rebalance."""
     if sig.action == ActionType.long:
         return "long"
     if sig.action == ActionType.short:
         return "short"
     if sig.action == ActionType.close:
-        return "flat"
+        return "close"
     return None  # rebalance
 
 
@@ -343,6 +393,88 @@ def _reasons(sig: TradeSignal) -> tuple[str, ...]:
     if isinstance(r, (list, tuple)):
         return tuple(str(x) for x in r)
     return (str(r),)
+
+
+# ---------------------------------------------------------------------------
+# machine-readable intent (pluggable into a live trading system)
+# ---------------------------------------------------------------------------
+
+#: Actions a live consumer may execute. ``flat`` is deliberately excluded: it
+#: means "no signal / no position", never "flatten the book".
+ACTIONABLE: tuple[Action, ...] = ("long", "short", "close")
+
+
+class ScreenSignalJson(TypedDict):
+    """One actionable per-symbol intent as a JSON-ready dict."""
+
+    symbol: str
+    action: Action
+    score: float
+    reasons: list[str]
+    signal_ts: str | None  # bar the intent fired on; None only for flat rows
+    data_ts: str  # symbol's newest loaded bar (freshness anchor)
+    price: float
+    qty: float  # absolute shares (0.0 = engine-sized, live layer decides)
+    stop_loss: float | None
+    take_profit: float | None
+    position_id: str | None
+    tag: str
+
+
+class ScreenJson(TypedDict):
+    """Top-level screen payload — stable shape for live-trading consumption."""
+
+    command: str
+    strategy: str
+    strategy_type: str
+    bars: str
+    generated_at: str
+    signals: list[ScreenSignalJson]
+
+
+def render_screen_json(
+    run: ScreenRun,
+    *,
+    strategy: str,
+    generated_at: pd.Timestamp | None = None,
+) -> ScreenJson:
+    """ScreenRun -> one JSON-ready payload of actionable per-symbol intent.
+
+    Only ``long``/``short``/``close`` rows are emitted (see ``ACTIONABLE``):
+    a live consumer must never mistake a no-signal ``flat`` row for an order
+    to flatten. Rows are already ranked (fresh before retained) by ``_project``.
+    """
+    signals: list[ScreenSignalJson] = [
+        _signal_json(r) for r in run.rows if r.action in ACTIONABLE
+    ]
+    return {
+        "command": "screen",
+        "strategy": strategy,
+        "strategy_type": run.config.strategy_type,
+        "bars": run.config.bars[0] if run.config.bars else "",
+        "generated_at": str(
+            generated_at if generated_at is not None else pd.Timestamp.now()
+        ),
+        "signals": signals,
+    }
+
+
+def _signal_json(r: ScreenRow) -> ScreenSignalJson:
+    """Lift one actionable row into its JSON representation."""
+    return {
+        "symbol": r.symbol,
+        "action": r.action,
+        "score": r.score,
+        "reasons": list(r.signals),
+        "signal_ts": str(r.sig_ts) if r.sig_ts is not None else None,
+        "data_ts": str(r.ts),
+        "price": r.price,
+        "qty": r.qty,
+        "stop_loss": r.stop_loss,
+        "take_profit": r.take_profit,
+        "position_id": r.position_id,
+        "tag": r.tag,
+    }
 
 
 # ---------------------------------------------------------------------------

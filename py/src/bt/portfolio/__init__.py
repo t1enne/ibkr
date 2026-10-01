@@ -19,6 +19,7 @@ from src.bt.state import (
 # Pure functions
 from src.bt.portfolio.pure import (
     apply_fill,
+    next_position_id,
     update_prices,
     mark_to_market_list,
     calculate_equity,
@@ -46,6 +47,7 @@ __all__ = [
     "create_initial_portfolio",
     # Pure functions
     "apply_fill",
+    "next_position_id",
     "update_prices",
     "mark_to_market_list",
     "calculate_equity",

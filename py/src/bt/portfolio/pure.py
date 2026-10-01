@@ -196,6 +196,22 @@ def _scale_opens(
     )
 
 
+def next_position_id(symbol: str, ts: pd.Timestamp, seq: int) -> str:
+    """Deterministic, run-local unique lot handle for an auto-opened position.
+
+    ``seq`` MUST be a counter carried by the append-only book itself — callers
+    pass ``len(portfolio.trades)`` at open time, which grows by exactly one per
+    open and is never truncated mid-run. This is what makes the id unique even
+    when two opens share a symbol AND a fill timestamp (same-bar multi-open
+    cohort): a timestamp-only id collides and the second lot becomes unreachable
+    by ``position_id`` in ``_close_position``/``_rebalance_position``.
+
+    Kept here (a pure function in ``src/bt/portfolio``) so the live
+    ``SimulatedBroker`` can import the same shape later.
+    """
+    return f"{symbol}_{ts.timestamp()}_{seq}"
+
+
 def _open_position(
     portfolio: PortfolioState,
     fill: FillEvent,
@@ -218,8 +234,12 @@ def _open_position(
     cash_used = qty * fill.executed_price + fill.commission
     new_cash = portfolio.cash - cash_used
 
-    # Generate position_id from signal if provided, else auto-generate
-    pid = signal.position_id or f"{signal.symbol}_{fill.timestamp.timestamp()}"
+    # Generate position_id from signal if provided, else auto-generate a
+    # run-unique handle. The uniqueness source is the book's own append-only
+    # trade count (one trade appended per open, never truncated during a run).
+    pid = signal.position_id or next_position_id(
+        signal.symbol, fill.timestamp, len(portfolio.trades)
+    )
 
     # Map the open action to a real position side. `rebalance` is a lifecycle
     # action (net-delta), not a side — a fresh open via rebalance (no existing

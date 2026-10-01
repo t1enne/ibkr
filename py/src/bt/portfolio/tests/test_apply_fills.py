@@ -9,7 +9,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.portfolio.pure import FillRejection, apply_fills
+from src.bt.portfolio.pure import FillRejection, apply_fills, next_position_id
 from src.bt.state import (
     ActionType,
     FillEvent,
@@ -182,3 +182,68 @@ def test_genuine_exhaustion_still_reports():
     rejections: tuple[FillRejection, ...] = ()
     _result, rejections = apply_fills(portfolio, (a, _open("BBB", 1.0, 1.0)))
     assert any(r.symbol == "AAA" for r in rejections)
+
+
+# ---------------------------------------------------------------------------
+# position_id collision: same symbol, same fill bar, multi-lot
+# ---------------------------------------------------------------------------
+
+
+def test_same_symbol_same_bar_opens_get_distinct_ids():
+    """Two opens on one symbol at one fill bar must NOT share a position_id."""
+    portfolio = _portfolio(cash=100_000.0)
+    result, rejections = apply_fills(
+        portfolio, (_open("AAA", 1.0, 100.0), _open("AAA", 2.0, 100.0))
+    )
+    assert rejections == ()
+    lots = result.positions["AAA"]
+    assert len(lots) == 2
+    assert lots[0].position_id != lots[1].position_id
+
+
+def test_close_removes_exactly_one_same_bar_lot():
+    """Closing one of two same-bar lots removes only that lot."""
+    portfolio = _portfolio(cash=100_000.0)
+    funded, _ = apply_fills(
+        portfolio, (_open("AAA", 1.0, 100.0), _open("AAA", 2.0, 100.0))
+    )
+    target, other = funded.positions["AAA"]
+    close = FillEvent(
+        signal=TradeSignal(
+            action=ActionType.close,
+            symbol="AAA",
+            timestamp=_ts("2024-01-03"),
+            price=100.0,
+            position_id=target.position_id,
+        ),
+        filled_qty=target.qty,
+        executed_price=100.0,
+        commission=0.0,
+        slippage=0.0,
+        timestamp=_ts("2024-01-03"),
+    )
+    result, _ = apply_fills(funded, (close,))
+    remaining = result.positions["AAA"]
+    assert len(remaining) == 1
+    assert remaining[0].position_id == other.position_id
+    assert remaining[0].position_id != target.position_id
+
+
+def test_auto_ids_are_deterministic_across_runs():
+    """Identical inputs -> identical auto-generated id sequence."""
+
+    def run() -> tuple[str, ...]:
+        p = _portfolio(cash=100_000.0)
+        r, _ = apply_fills(p, (_open("AAA", 1.0, 100.0), _open("AAA", 1.0, 100.0)))
+        return tuple(lot.position_id for lot in r.positions["AAA"])
+
+    first, second = run(), run()
+    assert first == second
+    assert len(set(first)) == 2
+
+
+def test_next_position_id_shape_and_uniqueness():
+    ts = _ts("2024-01-02")
+    assert next_position_id("SPY", ts, 0) == f"SPY_{ts.timestamp()}_0"
+    assert next_position_id("SPY", ts, 0) == next_position_id("SPY", ts, 0)
+    assert next_position_id("SPY", ts, 0) != next_position_id("SPY", ts, 1)

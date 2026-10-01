@@ -1,16 +1,21 @@
-"""`bt screen` command — score a universe by running a real strategy through
-the engine and showing its current-bar (manual-trade) intent.
+"""`bt screen` command — run a real strategy through the engine and surface
+its current-bar (manual-trade) intent, including explicit close signals.
 
 A screen is a backtest whose *intent* is surfaced, not whose fills matter: the
 strategy's own ``on_candle`` runs over the configured feed, the engine's signal
 observer captures every fresh emission before ``_finalize`` discards it, and the
-driver projects per-symbol posture into a ranked table. Same config a ``bt run``
-consumes; no separate screen vocabulary.
+driver projects per-symbol posture into a ranked table (``text``) or a stable
+machine-readable intent document (``json``) for live-trading consumption.
 """
 
 from __future__ import annotations
+
+import json
 from typing import TYPE_CHECKING
+
 import click
+
+from src.bt.cmds._shared import _json_default
 from src.bt.table import render_from_dicts
 
 if TYPE_CHECKING:
@@ -44,28 +49,50 @@ TABLE_COLS = ["symbol", "action", "score", "signals", "date"]
     help="Only report postures whose setting bar is within N days of the "
     "symbol's own latest bar. 0 = no limit.",
 )
-def screen(strategy_file: str, warmup: int | None, max_age: int) -> None:
-    """Score a universe by running its strategy through the real engine.
+@click.option(
+    "--format",
+    "-F",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format: text (ranked table) or json (machine-readable intent "
+    "for a live trading system; actionable long/short/close signals only).",
+)
+def screen(strategy_file: str, warmup: int | None, max_age: int, fmt: str) -> None:
+    """Run a strategy and surface its current-bar intent (opens AND closes).
 
     STRATEGY_FILE: the same JSON strategy config a ``bt run`` consumes. The
     strategy module runs over its configured feed; each symbol's latest emitted
-    intent is projected as an action + score (1.0 = fresh open on the newest
-    bar, 0.8 = an older/held setup). Ranked by score desc.
+    intent is projected as an action + score (1.0 = fresh on the newest bar,
+    0.8 = an older/retained setup). Actions are ``long``/``short`` (open or
+    reorient), ``close`` (explicit exit) and ``flat`` (no signal — text only).
+    Ranked by score desc.
 
     Output is an intent rank only — screens never trade, so a high score means
-    "the entry condition fired", not "expected profit" (pre-cost by design).
+    "the condition fired", not "expected profit" (pre-cost by design).
+
+    ``-F json`` emits only actionable (``long``/``short``/``close``) rows with
+    the setting signal's executable fields (price, qty, stop_loss, take_profit,
+    position_id, tag) so a live layer can act without replaying the engine.
     """
     from src.bt.screen.run_strategy import (
         COMMON_COLS,
         common_metrics,
+        render_screen_json,
         run_screen_from_strategy,
     )
 
-    rows, state = run_screen_from_strategy(
+    run = run_screen_from_strategy(
         strategy_file,
         max_age_days=max_age or None,
     )
 
+    if fmt == "json":
+        payload = render_screen_json(run, strategy=strategy_file)
+        click.echo(json.dumps(payload, indent=2, default=_json_default))
+        return
+
+    rows, state = run.rows, run.state
     table_rows: list[dict[str, str]] = []
     for r in rows:
         frame = _symbol_frame(state.candles, r.symbol)
