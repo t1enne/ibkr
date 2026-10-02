@@ -152,12 +152,36 @@ def test_no_signal_leaves_side_unchanged() -> None:
     assert reconcile((), book, CFG) == ()
 
 
-def test_determinism_lot_order_independent() -> None:
+def test_determinism_lot_order_is_pinned() -> None:
     a = lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1")
     b = lot("AAPL", 4.0, 95.0, ActionType.long, pid="L2")
     one = reconcile((sig("close"),), pf(100_000.0, a, b), CFG)
     two = reconcile((sig("close"),), pf(100_000.0, b, a), CFG)
-    assert set(one) == set(two)
+    # Ordered tuple, not set: emission follows the BOOK's lot order, and the
+    # same book yields the identical tuple every time (fully deterministic).
+    assert tuple(i.position_id for i in one) == ("L1", "L2")
+    assert tuple(i.position_id for i in two) == ("L2", "L1")
+    assert one == reconcile((sig("close"),), pf(100_000.0, a, b), CFG)
+
+
+def test_lot_without_broker_id_produces_no_close() -> None:
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid=""))
+    assert reconcile((sig("close"),), book, CFG) == ()
+
+
+def test_flip_sizes_open_against_freed_cash() -> None:
+    cfg = _cfg(symbols=("AAPL",), size=0.5)
+    book = pf(0.0, lot("AAPL", 10.0, 100.0, ActionType.short, pid="S1"))
+    close, open_ = reconcile((sig("long", qty=0.0),), book, cfg)
+    assert close.action is ActionType.close
+    assert close.position_id == "S1"
+    assert open_.action is ActionType.long
+    assert open_.qty > 0.0  # sized off the close's freed proceeds
+
+
+def test_size_qty_nan_price_is_zero() -> None:
+    cfg = _cfg(symbols=("AAPL",), size=0.5)
+    assert size_qty(float("nan"), pf(100_000.0), cfg) == 0.0
 
 
 def test_owned_filter_excludes_foreign_lot() -> None:

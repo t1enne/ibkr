@@ -94,10 +94,11 @@ class FakeSource:
 
 
 class FakeBroker:
-    def __init__(self, reject: bool = False) -> None:
+    def __init__(self, reject: bool = False, open_pid: str | None = "L1") -> None:
         self.seeded: PortfolioState | None = None
         self.placed: list[OrderIntent] = []
         self._reject = reject
+        self._open_pid = open_pid
 
     def seed(self, portfolio: PortfolioState) -> None:
         self.seeded = portfolio
@@ -114,7 +115,9 @@ class FakeBroker:
             slippage=0.0,
             timestamp=TS,
         )
-        pid = intent.position_id if intent.action is ActionType.close else "L1"
+        pid = (
+            intent.position_id if intent.action is ActionType.close else self._open_pid
+        )
         return Ok(OrderResult(intent=intent, fill=fill, ok=True, position_id=pid))
 
     async def close(self) -> Ok[None, FeedError]:
@@ -131,6 +134,17 @@ def make_candle_db(path: Path, ticker: str | None, ts: pd.Timestamp | None) -> N
         )
     con.commit()
     con.close()
+
+
+def ledger_rows(path: Path) -> list[tuple[object, ...]]:
+    """Every ``live_position`` row (id, status, closed_at), open AND closed."""
+    con = get_connection(path)
+    try:
+        return con.execute(
+            "SELECT position_id, status, closed_at FROM live_position"
+        ).fetchall()
+    finally:
+        con.close()
 
 
 def _source_fn(acts: tuple[tuple[SignalAction, float], ...]):
@@ -225,6 +239,36 @@ async def test_run_cycle_close_marks_closed(tmp_path: Path) -> None:
     )
 
     assert [i.action for i in report.intents] == [ActionType.close]
+    assert ledger.open_positions("S1") == ()
+    # Mark-closed, NOT deleted: the row survives with status + closed_at.
+    rows = ledger_rows(tmp_path / "l.sqlite")
+    assert len(rows) == 1
+    pid, status, closed_at = rows[0]
+    assert pid == "L1"
+    assert status == "closed"
+    assert closed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_unnamed_open_records_nothing(tmp_path: Path) -> None:
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=FakeBroker(open_pid=None),  # ok=True but no broker lot id
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert len(report.results) == 1 and report.results[0].ok
+    assert ledger_rows(tmp_path / "l.sqlite") == []  # unclosable lot NOT recorded
     assert ledger.open_positions("S1") == ()
 
 

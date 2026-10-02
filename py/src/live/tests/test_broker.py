@@ -102,6 +102,26 @@ async def test_place_settles_book_like_backtest() -> None:
 
 
 @pytest.mark.asyncio
+async def test_open_exceeding_cash_is_rejected_book_unchanged() -> None:
+    book = PortfolioState(
+        cash=100.0,
+        positions={},
+        trades=(),
+        equity_curve=(),
+        initial_capital=100.0,
+    )
+    broker = _broker(book)
+    # 10 * 100 = 1000 notional >> 100 cash: the shared cash guard drops it.
+    result: PlaceResult = await broker.place(_open_intent(qty=10.0))
+    assert isinstance(result, Ok)
+    order = cast(OrderResult, result.value)
+    assert order.ok is False
+    assert order.fill is None
+    assert "open rejected" in order.message
+    assert broker.portfolio() == book  # held book untouched
+
+
+@pytest.mark.asyncio
 async def test_close_without_position_id_is_rejected_not_raised() -> None:
     broker = _broker()
     intent = OrderIntent(

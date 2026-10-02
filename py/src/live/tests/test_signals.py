@@ -130,7 +130,7 @@ def test_live_signals_maps_actionable_rows(monkeypatch) -> None:
     assert bbb.qty == 0.0
 
 
-def test_live_signals_forwards_max_age_days(monkeypatch) -> None:
+def test_live_signals_forwards_max_age_days_as_none(monkeypatch) -> None:
     seen: dict[str, object] = {}
 
     def _capture(config_path: str, max_age_days: int | None = None):
@@ -140,8 +140,79 @@ def test_live_signals_forwards_max_age_days(monkeypatch) -> None:
     monkeypatch.setattr(signals, "run_screen_from_strategy", _capture)
     monkeypatch.setattr(signals, "load_strategy", lambda *a, **k: _config())
 
+    # The driver is ALWAYS asked for every row (its own age filter drops the
+    # flat rows a close is reconstructed from); the filter is local.
     assert signals.live_signals("ignored.json", max_age_days=7) == ()
-    assert seen["max_age_days"] == 7
+    assert seen["max_age_days"] is None
+
+
+def test_live_signals_reconstructs_close_from_flat_with_sig_ts(monkeypatch) -> None:
+    ts = _ts("2024-06-03")
+    sig_ts = _ts("2024-06-02")
+    rows = (
+        ScreenRow(
+            symbol="AAA",
+            action="flat",
+            score=0.0,
+            signals=("close",),
+            ts=ts,
+            sig_ts=sig_ts,
+        ),
+        # flat with no sig_ts -> never signalled -> HOLD (dropped).
+        ScreenRow(
+            symbol="BBB", action="flat", score=0.0, signals=(), ts=ts, sig_ts=None
+        ),
+    )
+    candles = _store({"AAA": _frame([1.0, 2.0]), "BBB": _frame([1.0, 2.0])})
+    _stub(monkeypatch, rows, _state(candles))
+
+    out = signals.live_signals("ignored.json")
+
+    assert tuple((s.symbol, s.action) for s in out) == (("AAA", "close"),)
+    assert out[0].signal_ts == sig_ts
+    assert out[0].reasons == ("close",)
+    assert out[0].price == 2.0
+
+
+def test_live_signals_local_age_filter_drops_stale(monkeypatch) -> None:
+    ts = _ts("2024-06-03")
+    fresh = ScreenRow(
+        symbol="AAA",
+        action="long",
+        score=1.0,
+        signals=("x",),
+        ts=ts,
+        sig_ts=_ts("2024-06-02"),
+    )
+    stale = ScreenRow(
+        symbol="BBB",
+        action="long",
+        score=0.8,
+        signals=("x",),
+        ts=ts,
+        sig_ts=_ts("2024-05-01"),
+    )
+    candles = _store({"AAA": _frame([1.0]), "BBB": _frame([1.0])})
+    _stub(monkeypatch, (fresh, stale), _state(candles))
+
+    out = signals.live_signals("ignored.json", max_age_days=5)
+    assert tuple(s.symbol for s in out) == ("AAA",)
+
+
+def test_live_signals_zero_max_age_disables_local_filter(monkeypatch) -> None:
+    ts = _ts("2024-06-03")
+    stale = ScreenRow(
+        symbol="BBB",
+        action="long",
+        score=0.8,
+        signals=("x",),
+        ts=ts,
+        sig_ts=_ts("2024-05-01"),
+    )
+    candles = _store({"BBB": _frame([1.0])})
+    _stub(monkeypatch, (stale,), _state(candles))
+
+    assert tuple(s.symbol for s in signals.live_signals("ignored.json", 0)) == ("BBB",)
 
 
 def test_live_signals_empty_when_no_rows(monkeypatch) -> None:

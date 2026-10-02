@@ -7,6 +7,7 @@ we exercise the pure helpers plus click's own argument validation.
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import cast
 
@@ -14,9 +15,17 @@ import pandas as pd
 import pytest
 from click.testing import CliRunner
 
-from src.bt.state import ActionType, PortfolioState, Position
+from src.bt import load_strategy
+from src.bt.state import ActionType, ExecutionParams, PortfolioState, Position
 from src.live.broker import OrderResult
-from src.live.cli import live_group, load_live_config, render_report
+from src.live.cli import (
+    _STRATEGY_FIELDS,
+    _strategy_config,
+    _write_strategy_config,
+    live_group,
+    load_live_config,
+    render_report,
+)
 from src.live.engine import CycleReport, run_cycle
 from src.live.ledger import PositionRecord
 from src.live.result import Ok, Result
@@ -163,6 +172,7 @@ def test_load_live_config_maps_every_field(tmp_path: Path) -> None:
     assert cfg.size_mode == "cash"
     assert cfg.size == 0.25
     assert cfg.max_symbol_allocation == 0.5
+    assert cfg.commission == 0.05
     assert cfg.portfolio_path == "pf.json"
     assert cfg.mode == "live"
 
@@ -204,6 +214,52 @@ def test_load_live_config_bad_mode_raises(tmp_path: Path) -> None:
 def test_load_live_config_bad_size_mode_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="size_mode must be"):
         load_live_config(write_config(tmp_path, size_mode="bogus"))
+
+
+def test_write_strategy_config_is_load_strategy_able(tmp_path: Path) -> None:
+    path = write_config(tmp_path, portfolio_path="pf.json", mode="live", size=0.25)
+    raw = json.loads(Path(path).read_text())
+    strategy = _strategy_config(path, raw)
+    with tempfile.TemporaryDirectory() as tmp:
+        normalized = _write_strategy_config(strategy, tmp)
+        # Reloadable through the strict canonical loader the screen bridge uses.
+        reloaded = load_strategy(normalized)
+        assert reloaded.name == strategy.name
+        assert reloaded.strategy_type == strategy.strategy_type
+        doc = json.loads(Path(normalized).read_text())
+        # Strategy-only: no live-only keys leak through.
+        assert set(doc) <= _STRATEGY_FIELDS
+        assert "portfolio_path" not in doc
+        assert "mode" not in doc
+        assert "size" not in doc
+
+
+def test_live_run_passes_commission_to_execution_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_exec(**kwargs: object) -> ExecutionParams:
+        captured.update(kwargs)
+        return ExecutionParams()
+
+    class FakeLedger:
+        def ensure_strategy(self, *a: object, **k: object) -> None: ...
+        def prune_closed(self, *a: object, **k: object) -> int:
+            return 0
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.create_execution_params", fake_exec)
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.cli.MockPortfolioSource", lambda p: object())
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+
+    path = write_config(tmp_path, portfolio_path="pf.json", commission=0.05)
+    out = CliRunner().invoke(live_group, ["run", path])
+    assert out.exit_code == 0, out.output
+    assert captured.get("fixed_commission") == 0.05
 
 
 # --- render_report ----------------------------------------------------------
