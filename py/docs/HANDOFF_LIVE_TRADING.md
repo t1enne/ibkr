@@ -772,3 +772,43 @@ follow-on.
 5. **Freshness gate** — fail-on-stale (default) vs trade-anyway?
 
 Confirm these and the plan is fully implementable as written.
+
+---
+
+## 10. Implementation addendum (doc-vs-reality, recorded after implementation)
+
+Where the built code differs from this doc, and the defaults actually wired:
+
+- **No `ScreenRun`.** The driver returns `(rows, final_state)`, not an object.
+- **`ScreenRow`** carries only `symbol`, `action` (`∈ long|short|flat`),
+  `score`, `signals`, `ts`, `sig_ts` — there is no `"close"` in the vocabulary.
+- **The driver's `max_age_days` filter deletes the flat rows** close must be
+  derived from, so live calls it with `max_age_days=None` and filters locally.
+  Closes are reconstructed from `flat` rows that carry a `sig_ts` (a flat row
+  with no `sig_ts` never signalled -> HOLD).
+- **`SizingParams.sizing_mode`, not `size_mode`** (the live config accepts flat
+  `size_mode`/`sizing` as the public spelling and maps it).
+- **`equity_of` takes the concrete `PortfolioState`**, so `size_qty` rebuilds
+  equity as `cash + calculate_positions_value(positions)` over the
+  `PortfolioView` instead.
+- **`execute_signal` takes a `Candle`** (the broker builds a synthetic
+  ref-price bar: all OHLCV = `intent.ref_price`).
+- **`Broker` gained `seed(portfolio)`** — the engine aligns the simulated book
+  with the freshly fetched snapshot before reconciling/settling it.
+- **`PortfolioView` uses `@property` members**, so a frozen `PortfolioState`
+  (plain dataclass fields) conforms structurally with no cast.
+- **Live-only top-level config keys** (`portfolio_path`, `mode`, sizing) are
+  projected through a **temp strategy-only file** for the screen bridge, because
+  `load_strategy` = `StrategyConfig(**data)` rejects unknown keys. `strategy_id`
+  stays the hash of the ORIGINAL raw config (temp path never affects scope).
+- **`SimulatedBroker` consults `describe_open_rejection` before `apply_fill`**:
+  the cash guard otherwise drops an open silently, which would be recorded as a
+  phantom fill.
+
+Implemented defaults (the §9 open decisions, as built):
+
+1. **Sizing** — explicit `qty` else `SizingParams` from config else `ValueError`.
+2. **Reconcile** — side-only HOLD (a side flip closes then reopens).
+3. **Missing signal** — HOLD.
+4. **Execution** — `SimulatedBroker` only (no real IBKR routing).
+5. **Freshness** — fail the cycle on a stale feed.
