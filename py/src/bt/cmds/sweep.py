@@ -82,7 +82,11 @@ def sweep(
         )
 
     results = run_sweep(
-        cfg, grid, sort_metric=sort_by, on_result=_stream_result, workers=workers
+        cfg,
+        grid,
+        sort_metric=sort_by,
+        on_result=None if fmt == "json" else _stream_result,
+        workers=workers,
     )
 
     if fmt == "json":

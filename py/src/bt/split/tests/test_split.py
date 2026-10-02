@@ -303,14 +303,14 @@ def test_split_report_to_dict_counts_only_closed_trades() -> None:
     assert fold0["is"]["trade_count"] == 1
     assert fold0["is"]["win_rate"] == pytest.approx(1.0)
     assert set(fold0["is"]) == {
-        "total_return",
-        "annual_return",
         "sharpe_ratio",
+        "annual_return",
         "max_drawdown",
-        "calmar_ratio",
-        "sortino_ratio",
+        "kurtosis",
+        "skewness",
         "win_rate",
         "trade_count",
+        "scaled_trades",
     }
 
 
@@ -326,10 +326,11 @@ def test_render_split_report_wide_table() -> None:
     report = SplitReport(config_name="t", params={"momentum_lookback": 30}, folds=folds)
     text = split_mod.render_split_report(report)
     assert "Split: t" in text
-    assert "IS Shp" in text
-    assert "OOS Shp" in text
+    assert "IS Sharpe" in text
+    assert "OOS Sharpe" in text
     assert "OOS Kurt" in text
-    assert "OOS Trd" in text
+    assert "OOS Trades" in text
+    assert "OOS Scaled" in text
     assert "OOS Win" in text
     assert "2015-01-02→2020-01-01" in text
     assert "AGGREGATE: mean OOS Sharpe 1.50" in text

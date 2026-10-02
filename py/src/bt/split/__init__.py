@@ -16,7 +16,6 @@ from typing import Callable, Mapping
 
 import pandas as pd
 
-from src.bt.metrics import trade_count, win_rate
 from src.bt.types import StrategyConfig, PortfolioResult
 from src.bt.window import run_window, window_has_data
 from src.utils import parse_timestamp
@@ -338,54 +337,43 @@ def run_split(
 
 
 def _fold_row(fm: FoldMetrics) -> tuple[str, ...]:
-    """One fold's IS|OOS metric cells for the summary table."""
+    """One fold's IS|OOS cells, interleaved from the canonical metric set."""
+    from src.bt.report_metrics import metric_cells
+
     f = fm.fold
-    is_pf = fm.in_sample
-    oos_pf = fm.out_of_sample
+    is_cells = metric_cells(fm.in_sample)
+    oos_cells = metric_cells(fm.out_of_sample)
+    interleaved = tuple(v for pair in zip(is_cells, oos_cells) for v in pair)
     return (
         str(f.index + 1),
         f"{f.is_start.date()}→{f.is_end.date()}",
         f"{f.oos_start.date()}→{f.oos_end.date()}",
-        f"{is_pf.sharpe_ratio:.2f}",
-        f"{oos_pf.sharpe_ratio:.2f}",
-        f"{is_pf.annual_return:.1%}",
-        f"{oos_pf.annual_return:.1%}",
-        f"{is_pf.max_drawdown:.1%}",
-        f"{oos_pf.max_drawdown:.1%}",
-        f"{is_pf.kurtosis:.1f}",
-        f"{oos_pf.kurtosis:.1f}",
-        str(trade_count(is_pf)),
-        str(trade_count(oos_pf)),
-        f"{win_rate(is_pf):.0%}",
-        f"{win_rate(oos_pf):.0%}",
+        *interleaved,
     )
 
 
-_SPLIT_COLUMNS = (
-    ("Fold", "<"),
-    ("IS window", "<"),
-    ("OOS window", "<"),
-    ("IS Shp", ">"),
-    ("OOS Shp", ">"),
-    ("IS Ann", ">"),
-    ("OOS Ann", ">"),
-    ("IS DD", ">"),
-    ("OOS DD", ">"),
-    ("IS Kurt", ">"),
-    ("OOS Kurt", ">"),
-    ("IS Trd", ">"),
-    ("OOS Trd", ">"),
-    ("IS Win", ">"),
-    ("OOS Win", ">"),
-)
+def _split_columns() -> tuple[tuple[str, str], ...]:
+    """Fold/window columns plus an IS|OOS pair per canonical metric."""
+    from src.bt.report_metrics import metric_labels
+
+    cols: list[tuple[str, str]] = [
+        ("Fold", "<"),
+        ("IS window", "<"),
+        ("OOS window", "<"),
+    ]
+    for label in metric_labels():
+        cols.append((f"IS {label}", ">"))
+        cols.append((f"OOS {label}", ">"))
+    return tuple(cols)
 
 
 def render_split_report(report: SplitReport) -> str:
     """Render every fold's IS vs OOS metrics as ONE wide table.
 
     Same layout as `bt optimize`: one row per fold, IS and OOS columns side
-    by side so degradation is read horizontally. Kurtosis/win-rate/trade-count
-    carry the tail-risk and sample-size story a Sharpe-only view hides.
+    by side so degradation is read horizontally. Kurtosis/skewness/win-rate/
+    trade-count (and scaled-fill count) carry the tail-risk and sample-size
+    story a Sharpe-only view hides.
     """
     from src.bt.table import Col, Table, render
 
@@ -393,7 +381,7 @@ def render_split_report(report: SplitReport) -> str:
         return f"\nSplit: {report.config_name} (no folds)"
 
     table = Table(
-        columns=tuple(Col(label, align) for label, align in _SPLIT_COLUMNS),
+        columns=tuple(Col(label, align) for label, align in _split_columns()),
         rows=tuple(_fold_row(fm) for fm in report.folds),
     )
     lines = [f"\nSplit: {report.config_name}"]
@@ -409,21 +397,12 @@ def render_split_report(report: SplitReport) -> str:
 
 
 def split_report_to_dict(report: SplitReport) -> dict:
-    """Serialize a SplitReport into a plain JSON-ready dict."""
-    float_fields = (
-        "total_return",
-        "annual_return",
-        "sharpe_ratio",
-        "max_drawdown",
-        "calmar_ratio",
-        "sortino_ratio",
-    )
+    """Serialize a SplitReport into a plain JSON-ready dict.
 
-    def _result_dict(r: PortfolioResult) -> dict:
-        d = {f: float(getattr(r, f)) for f in float_fields}
-        d["win_rate"] = win_rate(r)
-        d["trade_count"] = trade_count(r)
-        return d
+    Each fold's IS/OOS records are the canonical :func:`metric_dict` — the
+    same field set as sweep/optimize JSON.
+    """
+    from src.bt.report_metrics import metric_dict
 
     return {
         "config": report.config_name,
@@ -435,8 +414,8 @@ def split_report_to_dict(report: SplitReport) -> dict:
                 "is_end": fm.fold.is_end.date().isoformat(),
                 "oos_window": fm.fold.oos_trading_window()[0].date().isoformat(),
                 "oos_end": fm.fold.oos_end.date().isoformat(),
-                "is": _result_dict(fm.in_sample),
-                "oos": _result_dict(fm.out_of_sample),
+                "is": metric_dict(fm.in_sample),
+                "oos": metric_dict(fm.out_of_sample),
             }
             for fm in report.folds
         ],

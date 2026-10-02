@@ -55,6 +55,13 @@ line like Sharpe can look healthy while kurtosis or a single symbol's bleed
 tells the real tale. Only trim the output when you are very sure the removed
 rows add no signal, and say when you cut it.
 
+Every report — `bt run|sweep|split|optimize`, text and `-F json` — draws its
+metric columns from one canonical set (Sharpe, Ann, MaxDD, Kurt, Skew, Win,
+Trades, Scaled) defined in `src/bt/report_metrics.py`, so text columns and
+JSON keys cannot drift. `Scaled` is the count of fills dropped for genuine
+cash exhaustion (`PortfolioResult.scaled_trades`) — non-zero means the run is
+advisory across symbol permutations (see Fills below).
+
 ```bash
 uv run ibkr bt run strats/trend.json       # CLI entry point
 uv run ibkr data query SPY                 # Query SPY data from the local DB

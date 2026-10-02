@@ -154,7 +154,8 @@ def test_optimize_agg_and_serialization():
     assert "strategy_params.x=3" in text
     assert "OOS Kurt" in text
     assert "OOS Win" in text
-    assert "OOS Trd" in text
+    assert "OOS Trades" in text
+    assert "OOS Scaled" in text
     assert "mean OOS Sharpe 1.40" in text
 
     js = optimize_report_to_json([r], agg)

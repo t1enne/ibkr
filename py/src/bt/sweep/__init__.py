@@ -244,19 +244,16 @@ def render_sweep_report(
     sort_metric: str,
     limit: int | None = None,
 ) -> str:
-    """Render ranked sweep results as an aligned table."""
+    """Render ranked sweep results as an aligned table.
+
+    Empty metrics columns use the canonical labels; the ``params`` column is
+    one ``k=v`` per line so a wide swept grid grows row height instead of
+    blowing the line width.
+    """
+    from src.bt.report_metrics import metric_cells, metric_labels
     from src.bt.table import Col, Table, render
 
     shown = results if limit is None else results[:limit]
-
-    metric_cols: tuple[tuple[str, Callable[[SweepResult], str]], ...] = (
-        ("TotalRet", lambda r: f"{r.pf.total_return:.2%}"),
-        ("Annual", lambda r: f"{r.pf.annual_return:.2%}"),
-        ("Sharpe", lambda r: f"{r.pf.sharpe_ratio:.2f}"),
-        ("MaxDD", lambda r: f"{r.pf.max_drawdown:.2%}"),
-        ("Calmar", lambda r: f"{r.pf.calmar_ratio:.2f}"),
-        ("Trades", lambda r: str(len(r.pf.trades))),
-    )
 
     # Param columns: union of all swept keys across results, stable order.
     all_keys: list[str] = []
@@ -265,15 +262,14 @@ def render_sweep_report(
             if k not in all_keys:
                 all_keys.append(k)
 
-    headers: tuple[Col, ...] = tuple([Col("params", "<")])
-    headers = headers + tuple(Col(name, ">") for name, _ in metric_cols)
+    headers: tuple[Col, ...] = (Col("params", "<"),) + tuple(
+        Col(label, ">") for label in metric_labels()
+    )
 
     rows: tuple[tuple[str, ...], ...] = tuple(
-        tuple(
-            [
-                " ".join(f"{k}={r.overrides[k]}" for k in all_keys),
-                *(fmt(r) for _, fmt in metric_cols),
-            ]
+        (
+            "\n".join(f"{k}={r.overrides[k]}" for k in all_keys),
+            *metric_cells(r.pf),
         )
         for r in shown
     )
@@ -287,24 +283,18 @@ def render_sweep_report(
 
 
 def sweep_report_to_json(results: list[SweepResult]) -> dict:
-    """Serialize ranked sweep results into a JSON-ready dict."""
-    float_fields = (
-        "total_return",
-        "annual_return",
-        "sharpe_ratio",
-        "max_drawdown",
-        "calmar_ratio",
-        "sortino_ratio",
-    )
+    """Serialize ranked sweep results into a JSON-ready dict.
 
-    def _result_dict(pf: PortfolioResult) -> dict:
-        return {f: float(getattr(pf, f)) for f in float_fields}
+    Each record's ``metrics`` is the canonical :func:`metric_dict` — the SAME
+    field set the split/optimize JSON emitters produce.
+    """
+    from src.bt.report_metrics import metric_dict
 
     return {
         "results": [
             {
                 "params": r.overrides,
-                "metrics": _result_dict(r.pf),
+                "metrics": metric_dict(r.pf),
             }
             for r in results
         ]

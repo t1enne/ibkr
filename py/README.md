@@ -271,6 +271,14 @@ Candle data loads once per distinct (symbol set, bar) and is window-sliced per
 combo — no per-combo reload. Ranked by `--sort-by`; use `--limit` to show only
 the top N.
 
+Every report — `bt run|sweep|split|optimize`, text and `-F json` — draws from
+one canonical metric set (Sharpe, Ann, MaxDD, Kurt, Skew, Win, Trades,
+Scaled), so the columns and the JSON keys can never drift. The sweep table's
+`params` column is one `k=v` per line, so a wide swept grid grows row height
+instead of blowing the line width. `--format json` emits the same per-run
+metric dict — including `kurtosis`, `skewness`, `scaled_trades` and
+`win_rate` — under each result's `metrics`.
+
 ### `bt split` — in-sample vs out-of-sample validation
 
 Evaluates a strategy's **fixed** parameter set across IS/OOS windows. Two modes:
@@ -286,7 +294,9 @@ uv run ibkr bt split strats/pass/<config>.json --is-end 2020-12-31 --format json
 Options: `--min-is-years` (walk-forward first-fold history floor, default 5.0),
 `--train-start` (warmup override), `--format text|json`. Does **not** re-tune
 params per fold — it answers _"given these locked params, how does performance
-hold up out-of-sample?"_
+hold up out-of-sample?"_ The wide table pairs IS/OOS columns for every
+canonical metric (incl. Kurt, Skew, Scaled); `-F json` emits the same per-run
+metric dict per fold's `is`/`oos`.
 
 Run folds in parallel across worker processes with `--workers N`. Each fold
 (IS+OOS window pair) is independent; the shared candle + benchmark feeds pickle
@@ -309,8 +319,9 @@ Param grid shape matches `bt sweep` (list-valued leaves swept, scalars
 override once). **Honest about overfitting:** tuning per fold curve-fits the IS
 window, and the OOS result prices that cost. If mean OOS Sharpe holds up across
 folds, the edge is likely real; if IS is strong but OOS collapses, the grid is
-fitting noise. Reports per-fold chosen params + IS/OOS metrics and an aggregate
-of mean/min OOS Sharpe.
+fitting noise. Reports per-fold chosen params + IS/OOS metrics (same canonical
+columns as `bt split`, incl. Scaled), and an aggregate of mean/min OOS Sharpe.
+`-F json` emits the canonical per-run metric dict for both `is` and `oos`.
 
 Run folds in parallel across worker processes with `--workers N` — each fold
 tunes its own IS window and validates its OOS independently (combos inside a

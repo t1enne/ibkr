@@ -91,7 +91,12 @@ def split(
                 "Provide one of --is-end (single split) or --folds (walk-forward)."
             )
 
-        report = run_split(cfg, folds_list, on_result=_stream_fold, workers=workers)
+        report = run_split(
+            cfg,
+            folds_list,
+            on_result=None if fmt == "json" else _stream_fold,
+            workers=workers,
+        )
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
 

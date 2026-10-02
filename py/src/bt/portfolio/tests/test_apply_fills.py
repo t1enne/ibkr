@@ -92,6 +92,26 @@ def test_two_opens_share_cash_and_both_fill():
     assert result.cash >= 0
 
 
+def test_scale_cohorts_false_rejects_overflow_instead_of_scaling():
+    """The research counterfactual: no shared scale, full-size first-come fills."""
+    portfolio = _portfolio(cash=10_000.0)
+    a = _open("AAA", 100.0, 100.0)  # requests 10_000 -> fills full
+    b = _open("BBB", 100.0, 100.0)  # no cash left -> rejected
+    result, rejections = apply_fills(portfolio, (a, b), scale_cohorts=False)
+    assert set(result.positions) == {"AAA"}
+    assert result.positions["AAA"][0].qty == pytest.approx(100.0, abs=1e-4)
+    assert tuple(r.symbol for r in rejections) == ("BBB",)
+
+
+def test_scale_cohorts_false_lone_open_unchanged():
+    """A one-open cohort is identical with scaling on or off."""
+    portfolio = _portfolio(cash=10_000.0)
+    fill = _open("AAA", 50.0, 100.0)
+    on, _ = apply_fills(portfolio, (fill,), scale_cohorts=True)
+    off, _ = apply_fills(portfolio, (fill,), scale_cohorts=False)
+    assert on == off
+
+
 def test_cohort_order_does_not_change_the_book():
     portfolio = _portfolio(cash=10_000.0)
     fills = (

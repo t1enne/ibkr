@@ -100,6 +100,7 @@ def apply_fill(
 def apply_fills(
     portfolio: PortfolioState,
     fills: tuple[FillEvent, ...],
+    scale_cohorts: bool = True,
 ) -> tuple[PortfolioState, TupleT[FillRejection, ...]]:
     """Apply a whole timestamp cohort of fills atomically. Pure.
 
@@ -128,6 +129,12 @@ def apply_fills(
     floored to the 4 dp ``_open_position`` rounds to, so a permutation cannot
     tip a fill over the cash edge by rounding.
 
+    ``scale_cohorts=False`` is a research counterfactual: the shared cash scale
+    is skipped and the sorted opens settle one by one, rejecting any that no
+    longer fit. That path is order-sensitive by construction (advisory only) —
+    it exists to separate the cash-constraint effect from the specific
+    uniform-scaling rule.
+
     Returns the new portfolio plus the rejections for "genuine exhaustion"
     (an open that still does not fit at the shared scale) — the engine reports
     those; this function never does I/O.
@@ -150,7 +157,11 @@ def apply_fills(
     # ``trades`` is an append-ordered tuple, so the APPLY order must be fixed.
     for fill in sorted(non_opens, key=lambda f: f.signal.symbol):
         portfolio = apply_fill(portfolio, fill)
-    opens = _scale_opens(portfolio, opens)
+    # ``scale_cohorts=False`` is the research counterfactual: skip the shared
+    # cash scale and let the sorted opens settle one by one, rejecting any that
+    # no longer fit. Order-sensitive by construction — advisory only.
+    if scale_cohorts:
+        opens = _scale_opens(portfolio, opens)
     rejections: list[FillRejection] = []
     for fill in sorted(opens, key=lambda f: f.signal.symbol):
         rejected = describe_open_rejection(portfolio, fill)

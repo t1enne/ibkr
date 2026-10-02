@@ -26,6 +26,12 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from src.bt.report_metrics import (
+    metric_cells,
+    metric_cells_from_dict,
+    metric_dict,
+    metric_labels,
+)
 from src.bt.split import TestFold
 from src.bt.sweep import build_config, _flat_overrides, grid_combos
 from src.bt.types import StrategyConfig, PortfolioResult
@@ -40,7 +46,7 @@ class OptimizeResult:
     best_params: dict[
         str, Any
     ]  # swept leaf values chosen on IS (dot-joined path -> value)
-    is_metrics: dict[str, float]  # IS PortfolioResult of the best combo
+    is_metrics: dict[str, float | int]  # canonical metric_dict of the best IS combo
     oos: PortfolioResult
 
     def oos_metric(self, name: str) -> float:
@@ -84,23 +90,9 @@ def _best_combo_on_window(
     return best_patch, best_pf
 
 
-def _is_metrics(pf: PortfolioResult) -> dict[str, float]:
-    """Serialize a PortfolioResult's numeric fields plus trade-derived stats.
-
-    ``win_rate`` / ``trade_count`` are derived from trades, not dataclass
-    fields, so they are computed here rather than read off the result.
-    """
-    from src.bt.metrics import trade_count, win_rate
-
-    metrics = {
-        f.name: float(getattr(pf, f.name))
-        for f in fields(PortfolioResult)
-        if isinstance(getattr(pf, f.name), (int, float))
-        and not isinstance(getattr(pf, f.name), bool)
-    }
-    metrics["win_rate"] = win_rate(pf)
-    metrics["trade_count"] = float(trade_count(pf))
-    return metrics
+def _is_metrics(pf: PortfolioResult) -> dict[str, float | int]:
+    """Canonical per-run metric record for an IS window (see report_metrics)."""
+    return metric_dict(pf)
 
 
 def _optimize_fold_worker(fold: TestFold) -> OptimizeResult:
@@ -287,79 +279,49 @@ def run_optimize(
 
 
 def _fold_row(r: OptimizeResult) -> tuple[str, ...]:
-    """One fold's IS|OOS metric cells for the summary table.
+    """One fold's IS|OOS cells, interleaved from the canonical metric set.
 
-    Missing metrics render as "—" so a partial ``is_metrics`` mapping (older
-    pickled results / hand-built fixtures) degrades instead of raising.
+    The IS side is read from the serialized ``is_metrics`` dict (only the dict
+    survives a worker round-trip); the OOS side from the live result.
     """
-    from src.bt.metrics import trade_count, win_rate
-
     f = r.fold
-    is_m = r.is_metrics
-    oos = r.oos
-
-    def i_pct(key: str, spec: str = ".1%") -> str:
-        v = is_m.get(key)
-        return "—" if v is None else format(v, spec)
-
-    def i_num(key: str, spec: str = ".2f") -> str:
-        v = is_m.get(key)
-        return "—" if v is None else format(v, spec)
-
-    is_trades = is_m.get("trade_count")
-    is_wr = is_m.get("win_rate")
-
+    is_cells = metric_cells_from_dict(r.is_metrics)
+    oos_cells = metric_cells(r.oos)
+    interleaved = tuple(v for pair in zip(is_cells, oos_cells) for v in pair)
     return (
         str(f.index + 1),
         f"{f.is_start.date()}→{f.is_end.date()}",
         f"{f.oos_start.date()}→{f.oos_end.date()}",
-        " ".join(f"{k}={v}" for k, v in r.best_params.items()) or "—",
-        i_num("sharpe_ratio"),
-        f"{oos.sharpe_ratio:.2f}",
-        i_pct("annual_return"),
-        f"{oos.annual_return:.1%}",
-        i_pct("max_drawdown"),
-        f"{oos.max_drawdown:.1%}",
-        i_num("kurtosis", ".1f"),
-        f"{oos.kurtosis:.1f}",
-        "—" if is_trades is None else str(int(is_trades)),
-        str(trade_count(oos)),
-        "—" if is_wr is None else f"{is_wr:.0%}",
-        f"{win_rate(oos):.0%}",
+        "\n".join(f"{k}={v}" for k, v in r.best_params.items()) or "—",
+        *interleaved,
     )
 
 
-_OPTIMIZE_COLUMNS = (
-    ("Fold", "<"),
-    ("IS window", "<"),
-    ("OOS window", "<"),
-    ("Chosen params", "<"),
-    ("IS Shp", ">"),
-    ("OOS Shp", ">"),
-    ("IS Ann", ">"),
-    ("OOS Ann", ">"),
-    ("IS DD", ">"),
-    ("OOS DD", ">"),
-    ("IS Kurt", ">"),
-    ("OOS Kurt", ">"),
-    ("IS Trd", ">"),
-    ("OOS Trd", ">"),
-    ("IS Win", ">"),
-    ("OOS Win", ">"),
-)
+def _optimize_columns() -> tuple[tuple[str, str], ...]:
+    """Fold/window/params columns plus an IS|OOS pair per canonical metric."""
+    cols: list[tuple[str, str]] = [
+        ("Fold", "<"),
+        ("IS window", "<"),
+        ("OOS window", "<"),
+        ("Chosen params", "<"),
+    ]
+    for label in metric_labels():
+        cols.append((f"IS {label}", ">"))
+        cols.append((f"OOS {label}", ">"))
+    return tuple(cols)
 
 
 def render_optimize_report(results: list[OptimizeResult], agg: dict[str, float]) -> str:
     """Render every fold's IS-tuned/OOS-validated metrics as ONE wide table.
 
     One row per fold; IS and OOS columns side by side so degradation is read
-    horizontally. Kurtosis/win-rate/trade-count carry the tail risk and
-    sample-size story a Sharpe-only view hides.
+    horizontally. Kurtosis/skewness/win-rate/trade-count (and scaled-fill
+    count) carry the tail risk and sample-size story a Sharpe-only view hides.
     """
     from src.bt.table import Col, Table, render
 
     table = Table(
-        columns=tuple(Col(label, align) for label, align in _OPTIMIZE_COLUMNS),
+        columns=tuple(Col(label, align) for label, align in _optimize_columns()),
         rows=tuple(_fold_row(r) for r in results),
     )
     lines = render(table)
@@ -375,26 +337,11 @@ def render_optimize_report(results: list[OptimizeResult], agg: dict[str, float])
 def optimize_report_to_json(
     results: list[OptimizeResult], agg: dict[str, float]
 ) -> dict:
-    """Serialize per-fold optimization results into a JSON-ready dict."""
-    from src.bt.metrics import trade_count, win_rate
+    """Serialize per-fold optimization results into a JSON-ready dict.
 
-    float_fields = (
-        "total_return",
-        "annual_return",
-        "sharpe_ratio",
-        "max_drawdown",
-        "calmar_ratio",
-        "sortino_ratio",
-        "kurtosis",
-        "skewness",
-    )
-
-    def _result_dict(oos: PortfolioResult) -> dict:
-        d: dict[str, float] = {f: float(getattr(oos, f)) for f in float_fields}
-        d["win_rate"] = win_rate(oos)
-        d["trade_count"] = float(trade_count(oos))
-        return d
-
+    Each fold's IS/OOS record is the canonical :func:`metric_dict` — the same
+    field set as sweep/split JSON.
+    """
     return {
         "folds": [
             {
@@ -402,8 +349,8 @@ def optimize_report_to_json(
                 "is_window": f"{r.fold.is_start.date()}→{r.fold.is_end.date()}",
                 "oos_window": (f"{r.fold.oos_start.date()}→{r.fold.oos_end.date()}"),
                 "chosen_params": r.best_params,
-                "is": r.is_metrics,
-                "oos": _result_dict(r.oos),
+                "is": dict(r.is_metrics),
+                "oos": metric_dict(r.oos),
             }
             for r in results
         ],

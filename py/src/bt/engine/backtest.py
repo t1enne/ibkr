@@ -305,6 +305,7 @@ def run_backtest(
         state.portfolio.initial_capital,
         benchmark_curve=first_bm,
         equity_points=state.portfolio.equity_curve,
+        scaled_trades=len(rejections),
     )
 
     return (
@@ -402,6 +403,7 @@ def _execute_cohort(
     exec_params: ExecutionParams,
     sizing: SizingParams,
     skip_next_open: bool,
+    scale_cohorts: bool = True,
 ) -> tuple[BacktestState, tuple[FillRejection, ...]]:
     """Build one phase's fills and settle them atomically in ONE pure call.
 
@@ -429,7 +431,9 @@ def _execute_cohort(
             signal = sized_signal(signal, equity, state.portfolio.cash, candle, sizing)
         fills.append(exec_handler.execute_signal(signal, candle, exec_params))
         drained.append(signal.symbol)
-    portfolio, rejections = apply_fills(state.portfolio, tuple(fills))
+    portfolio, rejections = apply_fills(
+        state.portfolio, tuple(fills), scale_cohorts=scale_cohorts
+    )
     pending = dict(state.pending_signals)
     for sym in drained:
         pending.pop(sym, None)
@@ -456,7 +460,10 @@ def _warn_rejections(rejections: list, config: StrategyConfig) -> None:
     def _emit(line: str = "") -> None:
         print(line, file=sys.stderr)
 
-    _emit(f"[bt] WARNING: {len(rejections)} fill(s) scaled due to insufficient cash ")
+    _emit(
+        f"[bt] WARNING: {len(rejections)} fill(s) rejected due to insufficient "
+        "cash (cohort scaling already applied) "
+    )
     rows = tuple(
         (sym, str(n)) for sym, n in sorted(per_symbol.items(), key=lambda kv: -kv[1])
     )
@@ -536,7 +543,13 @@ def _flush_bar(
         for sig in state.pending_signals.get(candle.symbol, ())
     ]
     state, rejected = _execute_cohort(
-        state, cohort4, exec_handler, bt.execution_params, bt.sizing, False
+        state,
+        cohort4,
+        exec_handler,
+        bt.execution_params,
+        bt.sizing,
+        False,
+        bt.config.cohort_scaling,
     )
     rejections.extend(rejected)
 
@@ -574,6 +587,7 @@ def _flush_bar(
             bt.execution_params,
             bt.sizing,
             True,
+            bt.config.cohort_scaling,
         )
         rejections.extend(rejected)
 

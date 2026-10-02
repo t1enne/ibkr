@@ -232,7 +232,7 @@ The `bt run` report contains:
 - **Drawdown periods** — worst 5 drawdowns with dates and duration
 - **Trade log** — every trade with entry/exit times, prices, PnL, direction, reason, SL/TP levels
 - **Statistics** — win rate, total trades, starting capital, total P&L, backtest duration
-- **Metrics table** — annual return, volatility, Sharpe, Calmar, Sortino, Omega, max drawdown, stability, skewness, kurtosis, alpha, beta
+- **Metrics table** — annual return, volatility, Sharpe, Calmar, Sortino, Omega, max drawdown, stability, skewness, kurtosis, alpha, beta, plus **Scaled Trades** (fills dropped for cash exhaustion). `sweep`/`split`/`optimize` reports use the shared canonical set (Sharpe, Ann, MaxDD, Kurt, Skew, Win, Trades, Scaled) and their `-F json` emits the identical per-run metric dict.
 
 **Read the whole report before reporting.** A healthy Sharpe can hide fat tails
 (kurtosis/skewness), regime dependence (stability), or one symbol's bleed. Never
@@ -469,7 +469,12 @@ uv run ibkr bt sweep strat.json '{...grid...}' --sort-by sharpe_ratio --limit 5 
 ```
 
 Candle data loads once per distinct (symbol set, bar) and is window-sliced per
-combo — no per-combo reload.
+combo — no per-combo reload. Every report (text and `-F json`) uses one
+canonical metric set — Sharpe, Ann, MaxDD, Kurt, Skew, Win, Trades, Scaled —
+so columns and JSON keys never drift; the `params` column is one `k=v` per
+line, so a wide grid grows row height rather than line width. `-F json` emits
+the same per-run metric dict (incl. `kurtosis`, `skewness`, `scaled_trades`)
+under each result's `metrics`.
 
 ### `bt split` — IS/OOS walk-forward validation
 
@@ -484,10 +489,11 @@ uv run ibkr bt split strats/<bucket>/<config>.json --folds 4
 uv run ibkr bt split strats/<bucket>/<config>.json --is-end 2020-12-31 --format json
 ```
 
-Reports per-fold IS/OOS ann-return, Sharpe, maxDD, calmar, win-rate, plus a
-summary of mean/min OOS Sharpe and OOS→IS degradation. Useful to check whether
-a strategy's edge survives out-of-sample rather than being curve-fit to the
-training window.
+Reports per-fold IS/OOS cells for every canonical metric (Sharpe, Ann, MaxDD,
+Kurt, Skew, Win, Trades, Scaled), plus a summary of mean/min OOS Sharpe and
+OOS→IS degradation. `-F json` emits the same per-run metric dict per fold's
+`is`/`oos`. Useful to check whether a strategy's edge survives out-of-sample
+rather than being curve-fit to the training window.
 
 Run folds in parallel with `--workers N` — each IS/OOS window pair is an
 independent unit of work.
@@ -508,7 +514,8 @@ uv run ibkr bt optimize strats/<bucket>/<config>.json \
 Honest about overfitting: per-fold tuning curve-fits the IS window, and the OOS
 result prices that cost. If mean OOS Sharpe holds up across folds the edge is
 likely real; if IS is strong but OOS collapses, the grid is fitting noise.
-Reports perf-fold chosen params + IS/OOS metrics, plus mean/min OOS Sharpe.
+Reports perf-fold chosen params + IS/OOS canonical metrics (same columns as
+`bt split`, incl. Scaled), plus mean/min OOS Sharpe.
 
 **Neither `sweep`+`split` nor `optimize` is a clean test — both leak.**
 
@@ -536,9 +543,12 @@ shortfall SCALES a multi-open cohort (silent — entries land at `scale ×
 plan`), only a lone open rejects. Risk-sized entries then realize less $
 risk than authored. Cohort membership is order-sensitive (clock, data gaps,
 Stage 4 vs 6), so WHICH entries fill full / scaled / never depends on symbol
-list composition. `[bt] WARNING: N fill(s) rejected` or chronic
-over-subscription = metrics not comparable across symbol permutations or
-config edits. Fix sizing before quoting numbers.
+list composition. Each report carries a `Scaled` metric — the count of fills
+the engine dropped for genuine cash exhaustion — so a non-zero value is
+visible next to Sharpe/Kurt instead of buried in a stderr warning.
+`[bt] WARNING: N fill(s) rejected` or chronic over-subscription = metrics not
+comparable across symbol permutations or config edits. Fix sizing before
+quoting numbers.
 
 Run folds in parallel with `--workers N` — each fold tunes its IS and
 validates its OOS independently (combos inside a fold stay sequential).

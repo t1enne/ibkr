@@ -233,6 +233,10 @@ class PortfolioResult:
     stability: float = 0.0
     omega_ratio: float = 0.0
     capital_utilization: float = 0.0
+    # Fills dropped for genuine cash exhaustion (the engine's ``rejections``
+    # sink). Non-zero means cohort scaling was still not enough — the run is
+    # advisory across symbol permutations (see AGENTS.md "Fills").
+    scaled_trades: int = 0
 
 
 @dataclass(frozen=True)

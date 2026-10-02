@@ -33,17 +33,25 @@ def _pad(value: str, width: int, align: Align) -> str:
     return value + " " * fill  # "<"
 
 
+def _lines(cell: str) -> list[str]:
+    """Physical lines of a cell — embedded newlines expand the row height."""
+    return cell.split("\n")
+
+
 def render(table: Table, *, sep: str = "  ") -> list[str]:
     """Render a Table into lines. Returns list of str (no trailing newlines).
 
-    Column widths auto-expand to fit the widest cell (label or data).
+    Column widths auto-expand to fit the widest physical line (label or cell),
+    and a cell containing newlines grows its row to the tallest cell — each
+    physical line is padded independently, so short cells are blank-filled.
     """
     cols = table.columns
     widths = [len(c.label) for c in cols]
 
     for row in table.rows:
         for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+            for line in _lines(cell):
+                widths[i] = max(widths[i], len(line))
 
     lines: list[str] = []
 
@@ -52,12 +60,21 @@ def render(table: Table, *, sep: str = "  ") -> list[str]:
     lines.append(header)
     lines.append("-" * len(header))
 
-    # Data rows
+    # Data rows — one physical line per cell line, row height = tallest cell.
     for row in table.rows:
-        line = sep.join(
-            _pad(cell, widths[i], cols[i].align) for i, cell in enumerate(row)
-        )
-        lines.append(line)
+        cell_lines = [_lines(cell) for cell in row]
+        height = max((len(cl) for cl in cell_lines), default=1)
+        for r in range(height):
+            lines.append(
+                sep.join(
+                    _pad(
+                        cell_lines[i][r] if r < len(cell_lines[i]) else "",
+                        widths[i],
+                        cols[i].align,
+                    )
+                    for i in range(len(cols))
+                )
+            )
 
     return lines
 

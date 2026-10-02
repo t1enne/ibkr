@@ -229,7 +229,7 @@ def test_insufficient_cash_rejection_is_reported_to_stderr(capsys):
     cfg = _cfg(["AAA", "BBB"])
     run(Backtest(cfg), _feed(["AAA", "BBB"]), _FixtureMod(_oversize_entry))
     captured = capsys.readouterr()
-    assert "scaled due to insufficient cash" in captured.err
+    assert "rejected due to insufficient cash" in captured.err
     assert captured.err.count("[bt] WARNING") == 1  # summarised, not per-event
     assert captured.out == ""  # never contaminates stdout
 

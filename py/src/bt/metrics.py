@@ -323,6 +323,7 @@ def calculate_portfolio_result(
     initial_capital: float,
     benchmark_curve: pd.Series | None = None,
     equity_points: tuple[Any, ...] | None = None,
+    scaled_trades: int = 0,
 ) -> PortfolioResult:
     """Calculate portfolio result from equity curve and trades.
 
@@ -331,6 +332,9 @@ def calculate_portfolio_result(
         trades: Iterable of Trade objects
         initial_capital: Starting capital
         benchmark_curve: Optional benchmark equity curve for alpha/beta
+        equity_points: Optional per-candle EquityPoint snapshots
+        scaled_trades: Count of fills dropped for cash exhaustion (engine
+            ``rejections``); surfaced so the report shows a non-solid run.
 
     Returns:
         PortfolioResult with all calculated metrics
@@ -363,6 +367,7 @@ def calculate_portfolio_result(
         alpha=alpha,
         beta=beta,
         capital_utilization=capital_utilization(equity_points),
+        scaled_trades=int(scaled_trades),
     )
 
 
@@ -740,6 +745,7 @@ def get_backtest_results_analysis(
             ("Stability", f"{metrics.stability:.2f}") + tuple("—" for _ in bm_names),
             ("Skewness", f"{metrics.skewness:.2f}") + tuple("—" for _ in bm_names),
             ("Kurtosis", f"{metrics.kurtosis:.2f}") + tuple("—" for _ in bm_names),
+            ("Scaled Trades", str(result.scaled_trades)) + tuple("—" for _ in bm_names),
             ("Alpha", "—") + tuple(f"{bm_stats[s]['alpha']:.2f}" for s in bm_names),
             ("Beta", "—") + tuple(f"{bm_stats[s]['beta']:.2f}" for s in bm_names),
         )
@@ -757,6 +763,7 @@ def get_backtest_results_analysis(
             ("Stability", f"{metrics.stability:.2f}"),
             ("Skewness", f"{metrics.skewness:.2f}"),
             ("Kurtosis", f"{metrics.kurtosis:.2f}"),
+            ("Scaled Trades", str(result.scaled_trades)),
             ("Alpha", f"{metrics.alpha:.2f}"),
             ("Beta", f"{metrics.beta:.2f}"),
         )

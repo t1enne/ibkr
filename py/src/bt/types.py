@@ -69,6 +69,11 @@ class StrategyConfig:
     strategy_params: dict
     rolling_window_size: Optional[int] = None
     benchmark_symbols: list[str] = field(default_factory=lambda: ["SPY"])
+    # Research control: when False, a multi-open cohort that exceeds available
+    # cash is NOT uniformly scaled — fills settle sequentially and the
+    # over-cash tail is rejected (order-sensitive). Default True keeps the
+    # order-invariant cohort scaling that shipped. See ``_scale_opens``.
+    cohort_scaling: bool = True
 
 
 RiskEvent = Union[StopLossEvent, TakeProfitEvent]
