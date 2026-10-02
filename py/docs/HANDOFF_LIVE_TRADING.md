@@ -507,7 +507,8 @@ async def run_cycle(
     Not a loop. Caller (CLI / cron) drives cadence.
     Steps: fetch → assert data fresh (§1 decision 5) → live_signals →
     reconcile → for intent: await broker.place → on ok, record_open /
-    mark_closed per intent.action → ledger.touch_cycle.
+    mark_closed per intent.action → ledger.touch_cycle (all skipped when
+    ``dry_run``).
     The snapshot's ``PortfolioState`` feeds ``reconcile`` directly — no adapter
     between the live and backtest portfolio. Ownership is scoped by
     ``strategy_id`` so a cycle never closes lots opened by another config."""
@@ -571,7 +572,7 @@ main (click)
         → apply_fill(portfolio, fill): PortfolioState                 --> src/bt/portfolio/pure.py
       → on OrderResult.ok: ledger.record_open / ledger.mark_closed    --> src/live/ledger.py
         → get_connection(): sqlite3.Connection                        --> src/data/db.py
-      → ledger.touch_cycle(strategy_id, now)
+      → if not dry_run: ledger.touch_cycle(strategy_id, now)
       → broker.close()
       → build_report(...): CycleReport                                (pure)
     → render_report(report, fmt): str  → stdout
@@ -587,6 +588,8 @@ reconcile tests
     - side flip: close-then-open ordering asserted by index
     - position_id close targets one lot; absent closes all lots
     - no-signal symbol produces zero intents (HOLD)
+    - same-side signal HOLDs; empty owned closes nothing; a foreign-only book
+      HOLDs the opposite open instead of doubling gross exposure
     - unsized open raises ValueError
     - determinism: shuffled lot order -> same intents
 signals tests
@@ -604,6 +607,9 @@ engine tests
   → run_cycle with fake source + fake broker: CycleReport             --> tests/test_engine.py
     - end-to-end: mock pf + signals -> placed intents, order + count
     - open fill -> record_open; close fill -> mark_closed
+    - dry run places nothing AND writes nothing (no record, no cycle stamp)
+    - a foreign lot survives a cycle untouched; a changed config value
+      re-scopes ownership so a prior revision's lot is never closed
 ledger tests
   → SqliteLedger over a temp db: record_open/mark_closed/prune          --> tests/test_ledger.py
     - config_hash stable across key order; differs on value change
