@@ -95,8 +95,10 @@ def assert_data_fresh(
         raise StaleDataError(
             FeedError(kind="stale_data", message="no data for universe")
         )
-    newest = pd.Timestamp(int(newest_ms), unit="ms")
-    age = now - newest
+    # Compare like epochs: the DB stores ms-epoch UTC, so anchor both sides to
+    # UTC. A naive local ``now`` would skew the age by the host's UTC offset.
+    newest = pd.Timestamp(int(newest_ms), unit="ms", tz="UTC")
+    age = _utc(now) - newest
     if age > pd.Timedelta(days=max_age_days):
         raise StaleDataError(
             FeedError(
@@ -108,14 +110,24 @@ def assert_data_fresh(
         )
 
 
+def _utc(ts: pd.Timestamp) -> pd.Timestamp:
+    """Normalise *ts* to UTC: a naive timestamp is taken as UTC, not local."""
+    return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+
+
 def _newest_ms(symbols: tuple[str, ...], db_path: str | Path | None) -> int | None:
-    """Newest candle timestamp (ms epoch) across *symbols*, or ``None`` if none."""
-    placeholders = ",".join("?" * len(symbols))
+    """Newest candle timestamp (ms epoch) across *symbols*, or ``None`` if none.
+
+    ``candle.ticker`` is stored UPPERCASE, so upper-case the symbols before
+    binding — a lowercase config symbol must match, not yield a spurious empty.
+    """
+    upper = tuple(s.upper() for s in symbols)
+    placeholders = ",".join("?" * len(upper))
     con = get_connection(db_path)
     try:
         row = con.execute(
             f"SELECT MAX(timestamp) FROM candle WHERE ticker IN ({placeholders})",
-            tuple(symbols),
+            upper,
         ).fetchone()
     finally:
         con.close()
@@ -138,12 +150,12 @@ async def run_cycle(
 ) -> CycleReport:
     """One full batch pass. Not a loop; the caller drives cadence.
 
-    ``dry_run=True`` computes signals + intents but places NOTHING: the broker
-    loop is skipped, ``results`` is empty, and no ``record_open`` / ``mark_closed``
-    write happens (only ``touch_cycle``). Nothing is recorded, so the next cycle
-    recomputes the same intents.
+    ``dry_run=True`` computes signals + intents but places NOTHING and writes
+    NOTHING: the broker loop is skipped, ``results`` is empty, and no
+    ``record_open`` / ``mark_closed`` / ``touch_cycle`` write happens. Nothing
+    is recorded, so the next cycle recomputes the same intents.
     """
-    now_ts = now if now is not None else pd.Timestamp.now()
+    now_ts = now if now is not None else pd.Timestamp.now(tz="UTC")
     fetched = await source.fetch()
     if isinstance(fetched, Err):
         raise PortfolioFetchError(cast("FeedError", fetched.error))
@@ -161,7 +173,7 @@ async def run_cycle(
     results: tuple[OrderResult, ...] = ()
     if not dry_run:
         results = await _place_all(broker, ledger, intents, strategy_id, now_ts)
-    ledger.touch_cycle(strategy_id, now_ts)
+        ledger.touch_cycle(strategy_id, now_ts)
     await broker.close()
     return build_report(snapshot.portfolio, signals, intents, results, now_ts)
 

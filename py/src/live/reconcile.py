@@ -100,7 +100,11 @@ def reconcile(
     is the truth for what a symbol's net exposure is), while close intents are
     ownership-scoped by ``owned`` (a cycle must never close a lot it did not
     open). This asymmetry is deliberate: a foreign lot still counts toward the
-    symbol's posture, but is never emitted as a close.
+    symbol's posture, but is never emitted as a close. Its consequence is made
+    explicit here: when ``cur != "flat"`` but the ownership-scoped close list
+    for that symbol is EMPTY (the whole book on the symbol is foreign), an
+    opposite-side open is SKIPPED (HOLD) — opening it would double gross
+    exposure without ever reaching the target posture.
     """
     by_symbol = {sig.symbol: sig for sig in signals}
     extra = set(by_symbol) - set(config.symbols)
@@ -125,7 +129,13 @@ def reconcile(
             closes.extend(_close_intents(symbol, sig, lots, f"{cur}->flat"))
             continue
         if cur != "flat":
-            closes.extend(_close_intents(symbol, sig, lots, f"{cur}->{tgt}"))
+            flips = _close_intents(symbol, sig, lots, f"{cur}->{tgt}")
+            # Foreign-only book on this symbol: closing is not ours to do, so
+            # opening the opposite side would add exposure without closing the
+            # old one. HOLD instead of doubling gross exposure.
+            if not flips:
+                continue
+            closes.extend(flips)
         specs.append((sig, cur, tgt))
     view = _sizing_view(portfolio, closes)
     opens = [_open_intent(sig, view, config, cur, tgt) for sig, cur, tgt in specs]
@@ -133,13 +143,33 @@ def reconcile(
 
 
 def _sizing_view(portfolio: PortfolioView, closes: list[OrderIntent]) -> PortfolioView:
-    """The book an open is sized against: cash freed by this cycle's closes added."""
+    """The book an open is sized against: cash freed by this cycle's closes added.
+
+    The closing lots are also removed from ``positions``. Without that, the
+    freed cash (which stands in for their value) and the still-present lots
+    would both count toward equity — double-counting the same capital and
+    over-sizing the open. Empty symbol keys are dropped so
+    ``calculate_positions_value`` sees no phantom symbol.
+    """
     if not closes:
         return portfolio
     freed = sum(intent.qty * intent.ref_price for intent in closes)
+    closing: dict[str, set[str]] = {}
+    for intent in closes:
+        if intent.position_id:
+            closing.setdefault(intent.symbol, set()).add(intent.position_id)
+    positions: dict[str, tuple[Position, ...]] = {}
+    for symbol, lots in portfolio.positions.items():
+        dropped = closing.get(symbol)
+        if dropped is None:
+            positions[symbol] = lots
+            continue
+        kept = tuple(p for p in lots if p.position_id not in dropped)
+        if kept:
+            positions[symbol] = kept
     return _SizingView(
         cash=portfolio.cash + freed,
-        positions=portfolio.positions,
+        positions=positions,
         initial_capital=portfolio.initial_capital,
     )
 
