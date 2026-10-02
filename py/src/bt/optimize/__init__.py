@@ -278,51 +278,60 @@ def run_optimize(
     return results, agg
 
 
-def _fold_row(r: OptimizeResult) -> tuple[str, ...]:
-    """One fold's IS|OOS cells, interleaved from the canonical metric set.
+def _fold_rows(r: OptimizeResult) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """One fold's IS row and OOS row — never the same row.
 
-    The IS side is read from the serialized ``is_metrics`` dict (only the dict
-    survives a worker round-trip); the OOS side from the live result.
+    Side-by-side IS|OOS columns overflowed; stacking the pair keeps the table
+    readable. The IS row is read from the serialized ``is_metrics`` dict (only
+    the dict survives a worker round-trip), the OOS row from the live result;
+    both from the same canonical metric set, so the rows align column-wise.
     """
     f = r.fold
-    is_cells = metric_cells_from_dict(r.is_metrics)
-    oos_cells = metric_cells(r.oos)
-    interleaved = tuple(v for pair in zip(is_cells, oos_cells) for v in pair)
-    return (
-        str(f.index + 1),
+    fold_col = str(f.index + 1)
+    params = "\n".join(f"{k}={v}" for k, v in r.best_params.items()) or "—"
+    is_row = (
+        fold_col,
+        "IS",
         f"{f.is_start.date()}→{f.is_end.date()}",
-        f"{f.oos_start.date()}→{f.oos_end.date()}",
-        "\n".join(f"{k}={v}" for k, v in r.best_params.items()) or "—",
-        *interleaved,
+        params,
+        *metric_cells_from_dict(r.is_metrics),
     )
+    oos_row = (
+        "",
+        "OOS",
+        f"{f.oos_start.date()}→{f.oos_end.date()}",
+        "",
+        *metric_cells(r.oos),
+    )
+    return is_row, oos_row
 
 
 def _optimize_columns() -> tuple[tuple[str, str], ...]:
-    """Fold/window/params columns plus an IS|OOS pair per canonical metric."""
+    """Fold/phase/window/params columns plus the canonical metric columns."""
     cols: list[tuple[str, str]] = [
         ("Fold", "<"),
-        ("IS window", "<"),
-        ("OOS window", "<"),
+        ("Phase", "<"),
+        ("Window", "<"),
         ("Chosen params", "<"),
     ]
-    for label in metric_labels():
-        cols.append((f"IS {label}", ">"))
-        cols.append((f"OOS {label}", ">"))
+    cols.extend((label, ">") for label in metric_labels())
     return tuple(cols)
 
 
 def render_optimize_report(results: list[OptimizeResult], agg: dict[str, float]) -> str:
-    """Render every fold's IS-tuned/OOS-validated metrics as ONE wide table.
+    """Render every fold's IS-tuned/OOS-validated metrics as ONE table.
 
-    One row per fold; IS and OOS columns side by side so degradation is read
-    horizontally. Kurtosis/skewness/win-rate/trade-count (and scaled-fill
-    count) carry the tail risk and sample-size story a Sharpe-only view hides.
+    Two rows per fold — the tuned in-sample row then its out-of-sample row —
+    so degradation is read vertically without the column overflow of an
+    IS|OOS pair on a single row. Kurtosis/skewness/win-rate/trade-count (and
+    scaled-fill count) carry the tail risk and sample-size story a Sharpe-only
+    view hides.
     """
     from src.bt.table import Col, Table, render
 
     table = Table(
         columns=tuple(Col(label, align) for label, align in _optimize_columns()),
-        rows=tuple(_fold_row(r) for r in results),
+        rows=tuple(row for r in results for row in _fold_rows(r)),
     )
     lines = render(table)
     lines.append("")

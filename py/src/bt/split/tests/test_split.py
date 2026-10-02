@@ -314,8 +314,8 @@ def test_split_report_to_dict_counts_only_closed_trades() -> None:
     }
 
 
-def test_render_split_report_wide_table() -> None:
-    """Text report is ONE wide table row per fold, optimize-style."""
+def test_render_split_report_stacked_rows() -> None:
+    """Text report stacks IS and OOS on two rows per fold, optimize-style."""
     folds = (
         FoldMetrics(
             fold=_fold(0),
@@ -326,12 +326,13 @@ def test_render_split_report_wide_table() -> None:
     report = SplitReport(config_name="t", params={"momentum_lookback": 30}, folds=folds)
     text = split_mod.render_split_report(report)
     assert "Split: t" in text
-    assert "IS Sharpe" in text
-    assert "OOS Sharpe" in text
-    assert "OOS Kurt" in text
-    assert "OOS Trades" in text
-    assert "OOS Scaled" in text
-    assert "OOS Win" in text
+    assert "IS" in text
+    assert "OOS" in text
+    assert "Sharpe" in text
+    assert "Kurt" in text
+    assert "Trades" in text
+    assert "Scaled" in text
+    assert "Win" in text
     assert "2015-01-02→2020-01-01" in text
     assert "AGGREGATE: mean OOS Sharpe 1.50" in text
     assert "IS→OOS decay +0.50" in text

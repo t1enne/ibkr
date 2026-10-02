@@ -151,11 +151,17 @@ def test_optimize_agg_and_serialization():
     )
     agg = {"mean_oos_sharpe": 1.4, "min_oos_sharpe": 1.4, "folds": 1}
     text = render_optimize_report([r], agg)
+    lines = text.splitlines()
     assert "strategy_params.x=3" in text
-    assert "OOS Kurt" in text
-    assert "OOS Win" in text
-    assert "OOS Trades" in text
-    assert "OOS Scaled" in text
+    assert "Phase" in text
+    # Header, separator, then exactly two data lines: IS stacked over OOS.
+    is_row, oos_row = lines[2], lines[3]
+    assert is_row.split()[1] == "IS"
+    assert oos_row.split()[0] == "OOS"  # Fold cell blank on the OOS row
+    assert "strategy_params.x=3" in is_row and "strategy_params.x=3" not in oos_row
+    assert "1.90" in is_row and "1.90" not in oos_row  # IS metrics on the IS row
+    assert "1.40" in oos_row and "1.40" not in is_row  # OOS metrics on the OOS row
+    assert "IS Kurt" not in text  # IS/OOS never share a row/column pair
     assert "mean OOS Sharpe 1.40" in text
 
     js = optimize_report_to_json([r], agg)

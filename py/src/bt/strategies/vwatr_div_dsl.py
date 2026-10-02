@@ -1,5 +1,5 @@
-(
-    """VWATR divergence strategy -- long only. Three divergence exits over
+"""
+VWATR divergence strategy -- long only. Three divergence exits over
 vwatr_dsl; no entry filter (entry features correlate ~0 with trade return).
 `ctx.ta.vwatr`/`vwatr_baseline` are shared TA; ``atr_ratio`` uses PLAIN
 rolling-mean ATR (not Wilder) -- swapping in ``ctx.ta.atr`` changes every
@@ -20,12 +20,18 @@ SPY +118%, DD -50%, kurt 12.5.
   -- diversification + per-name risk cut, not signal.
 - Trade-count cohorts: highest cohort wins OOS; less trades is an in-sample
   trap.
+- Over-subscribed runs (cash-constrained cohorts) silently scale opens; the
+  events cluster on crowded up-legs, not in deep drawdowns, so the distortion
+  is a level tax, not a tail overlay -- results there are advisory.
+- Trailing de-risk controls (cash/DD/vol throttles) and concurrency caps only
+  trade away Sharpe/return; they do not add edge.
+- Full-window universe trimming cuts drawdown and over-subscription but is
+  universe fitting; the non-fit alternative is the rolling PIT fundamental
+  selector (`fund_min_pct` = revenue-YoY + operating-margin rank).
+- `max_positions`, `dd_damp_*`, `fund_min_pct` default OFF; 1d-only candidate.
 
 HYGIENE: single switch -- `decel_ratio=0` turns the divergence exit OFF.
-Grid over `strategy_params` only.
 """
-    ""
-)
 
 from __future__ import annotations
 

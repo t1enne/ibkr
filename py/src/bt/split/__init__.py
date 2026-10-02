@@ -336,44 +336,54 @@ def run_split(
 # ---------------------------------------------------------------------------
 
 
-def _fold_row(fm: FoldMetrics) -> tuple[str, ...]:
-    """One fold's IS|OOS cells, interleaved from the canonical metric set."""
+def _fold_rows(fm: FoldMetrics) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """One fold's IS row and OOS row — never the same row.
+
+    Side-by-side IS|OOS columns overflowed (one row per fold wrapped off the
+    terminal); stacking the pair keeps the table readable, matching
+    ``bt optimize``. Both rows use the same canonical metric set, so the
+    columns align and degradation is read vertically.
+    """
     from src.bt.report_metrics import metric_cells
 
     f = fm.fold
-    is_cells = metric_cells(fm.in_sample)
-    oos_cells = metric_cells(fm.out_of_sample)
-    interleaved = tuple(v for pair in zip(is_cells, oos_cells) for v in pair)
-    return (
-        str(f.index + 1),
+    fold_col = str(f.index + 1)
+    is_row = (
+        fold_col,
+        "IS",
         f"{f.is_start.date()}→{f.is_end.date()}",
-        f"{f.oos_start.date()}→{f.oos_end.date()}",
-        *interleaved,
+        *metric_cells(fm.in_sample),
     )
+    oos_row = (
+        "",
+        "OOS",
+        f"{f.oos_start.date()}→{f.oos_end.date()}",
+        *metric_cells(fm.out_of_sample),
+    )
+    return is_row, oos_row
 
 
 def _split_columns() -> tuple[tuple[str, str], ...]:
-    """Fold/window columns plus an IS|OOS pair per canonical metric."""
+    """Fold/phase/window columns plus the canonical metric columns."""
     from src.bt.report_metrics import metric_labels
 
     cols: list[tuple[str, str]] = [
         ("Fold", "<"),
-        ("IS window", "<"),
-        ("OOS window", "<"),
+        ("Phase", "<"),
+        ("Window", "<"),
     ]
-    for label in metric_labels():
-        cols.append((f"IS {label}", ">"))
-        cols.append((f"OOS {label}", ">"))
+    cols.extend((label, ">") for label in metric_labels())
     return tuple(cols)
 
 
 def render_split_report(report: SplitReport) -> str:
-    """Render every fold's IS vs OOS metrics as ONE wide table.
+    """Render every fold's IS vs OOS metrics as ONE table.
 
-    Same layout as `bt optimize`: one row per fold, IS and OOS columns side
-    by side so degradation is read horizontally. Kurtosis/skewness/win-rate/
-    trade-count (and scaled-fill count) carry the tail-risk and sample-size
-    story a Sharpe-only view hides.
+    Two rows per fold — the in-sample row then its out-of-sample row — so
+    degradation is read vertically without the column overflow of an IS|OOS
+    pair on a single row. Kurtosis/skewness/win-rate/trade-count (and
+    scaled-fill count) carry the tail-risk and sample-size story a Sharpe-only
+    view hides.
     """
     from src.bt.table import Col, Table, render
 
@@ -382,7 +392,7 @@ def render_split_report(report: SplitReport) -> str:
 
     table = Table(
         columns=tuple(Col(label, align) for label, align in _split_columns()),
-        rows=tuple(_fold_row(fm) for fm in report.folds),
+        rows=tuple(row for fm in report.folds for row in _fold_rows(fm)),
     )
     lines = [f"\nSplit: {report.config_name}"]
     lines.extend(render(table))
