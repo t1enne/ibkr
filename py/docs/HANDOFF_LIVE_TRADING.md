@@ -818,3 +818,93 @@ Implemented defaults (the §9 open decisions, as built):
 3. **Missing signal** — HOLD.
 4. **Execution** — `SimulatedBroker` only (no real IBKR routing).
 5. **Freshness** — fail the cycle on a stale feed.
+
+---
+
+## 11. Known gaps (post-implementation review, 2026-10-02)
+
+Defects found by an independent review of `origin/main..HEAD` and their status.
+Everything below is **open** unless marked fixed; each gap names the module and
+what would close it.
+
+### Fixed during review
+
+- **Sizing double-count on a close+open cycle** (`src/live/reconcile.py`,
+  `_sizing_view`). Close proceeds were added to `cash` while the closing lots
+  stayed in `positions`, so `calculate_positions_value` counted them again and
+  equity was inflated by the closed notional — a flip sized up to `(E+V)/E`
+  too large. Now the closing lots (symbol + `position_id`) are dropped from the
+  sizing view; regression test pins the exact qty
+  (`test_flip_sizes_open_against_freed_cash == 5.0`, was 10.0).
+- **`--dry-run` was not write-free**: `ledger.touch_cycle` still stamped
+  `last_cycle_at`. Now guarded by `if not dry_run` (`src/live/engine.py`).
+- **Freshness gate used raw symbols** while `query_candles` filters
+  `ticker = UPPER(...)`; a lowercase config symbol produced a bogus
+  `StaleDataError("no data for universe")`. Symbols are uppercased
+  (`src/live/engine.py::_newest_ms`).
+- **Freshness clock skew**: `pd.Timestamp.now()` is naive local while the
+  candle `timestamp` is UTC epoch-ms; age was off by the host's UTC offset. A
+  single UTC base is now used (`src/live/engine.py::_utc`); `now` injection
+  accepts naive or aware.
+- **Foreign-only book on a side flip** opened the opposite side without closing
+  anything (gross exposure doubled, target posture never reached). Now that
+  open is skipped (HOLD) and the asymmetry is documented in `reconcile`.
+
+### Open gaps (ordered by exposure)
+
+1. **Freshness slack is a day count, not one base interval.** §1.5 asks for one
+   base interval of slack; the CLI defaults to `--max-age 5` days, so a multi-day
+   `ibkr data dl` outage on a `1h` feed still passes the gate and trades a stale
+   tail. Close it by deriving the budget from `config.bars[0]` (resampled
+   interval x a small multiple) or by asserting the newest bar is the latest
+   expected session bar. `--max-age 0` disables the gate.
+2. **Multi-intent cohort parity.** `run_cycle` settles intents one at a time
+   through `apply_fill`; the backtest applies a multi-open cohort through
+   `apply_fills`, which **scales** an over-subscribed cohort while a sequential
+   `apply_fill` **rejects** its tail. So "paper and backtest accounting are
+   identical" holds only for single-intent cycles. Close it by grouping a
+   cycle's opens into one cohort and settling it with `apply_fills`.
+3. **Sizing clamp vs fill price (shared layer).** `compute_qty` clamps against
+   `ref_price`, but the broker fills at
+   `ref * (1 + spread_bps + 1.5 * slippage_bps) + commission`; a full-fraction
+   open (`size ≈ 1.0`, cash clamp binding) is then rejected by the guard and the
+   cycle trades nothing, with no explicit error. Property of
+   `src/bt/size/pure.py`, surfaced by live. Close it by clamping on a padded
+   price estimate or by sizing against available cash net of the cost model.
+4. **Close reconstruction is a heuristic.** A close is inferred from a `flat`
+   row that carries a `sig_ts`. A strategy that fired nothing on the newest bar
+   yields a `sig_ts` older than `--max-age` -> the row is dropped -> HOLD, so a
+   genuinely-desired exit on a stale decision bar is not taken (consistent with
+   default #3). `--max-age 0` disables the local filter and lets stale closes
+   fire.
+5. **Sizing cash base is an approximation.** `_SizingView` credits
+   `Σ qty * ref_price` for this cycle's closes — no commission or slippage, vs
+   `apply_fills`' actual-proceeds rule. Documented in `reconcile`.
+6. **Posture vs ownership ambiguity (partly mitigated).** `current_side` nets
+   the WHOLE broker book while closes are scoped by `owned` (ledger ids). A
+   foreign lot on the same symbol can suppress our open (`target == current` ->
+   HOLD). The opposite-side-with-no-owned-close case now HOLDs, but the
+   same-side suppression remains. Deliberate; unresolved.
+7. **`record_open` upserts**, so re-recording the same broker pid resurrects a
+   previously closed row and clears `closed_at`. Deliberate (a broker pid is
+   expected unique per lot), but it means a broker that recycles lot ids would
+   corrupt the audit trail.
+8. **No end-to-end CLI test.** `live_run` -> real screen needs the candle DB and
+   a full strategy run; tests cover the seam (config parse, temp projection,
+   render, cycle with fake source/broker) but not a real `ibkr live run`.
+   Manual smoke only: `ibkr live --help`, `ibkr live run --help`.
+9. **Freshness/infra gaps outside the module.** The worktree needed the
+   `../ib-rest-api-client` path dependency and a `uv`-usable `.venv`; resolved
+   outside the committed tree. Pre-existing untracked `data/data` symlink left
+   alone.
+10. **Params beyond the doc** (testability only, all keyword-only with
+    defaults, recorded here): `run_cycle` gained `dry_run`, `db_path`, `now`,
+    `signal_source`; `reconcile` gained `owned`.
+
+### Deliberately unchanged
+
+- Other `pd.Timestamp.now()` sites (`broker.py`, `cli.py`,
+  `portfolio_source.py`) stay naive-local: they are never compared against the
+  UTC epoch-ms candle DB, so there is no offset-skew defect there.
+- `make check` coverage: `Makefile` `SRC_DIRS` now includes `src/live`, so lint,
+  format, typecheck and `test-fast` all cover the package (commit `3f8908b`).
