@@ -147,6 +147,19 @@ def ledger_rows(path: Path) -> list[tuple[object, ...]]:
         con.close()
 
 
+def cycle_ts(path: Path, strategy_id: str) -> object:
+    """The strategy row's ``last_cycle_at`` (None if never touched)."""
+    con = get_connection(path)
+    try:
+        row = con.execute(
+            "SELECT last_cycle_at FROM live_strategy WHERE strategy_id=?",
+            (strategy_id,),
+        ).fetchone()
+    finally:
+        con.close()
+    return row[0] if row else None
+
+
 def _source_fn(acts: tuple[tuple[SignalAction, float], ...]):
     def _f(path: str, max_age: int | None = None) -> tuple[LiveSignal, ...]:
         return tuple(signal(a, q) for a, q in acts)
@@ -185,6 +198,22 @@ def test_assert_data_fresh_disabled_with_zero(tmp_path: Path) -> None:
     db = tmp_path / "c.sqlite"
     make_candle_db(db, None, None)
     assert_data_fresh(("AAPL",), 0, TS, db)  # gate off, no raise
+
+
+def test_assert_data_fresh_uppercases_symbol(tmp_path: Path) -> None:
+    # candle.ticker is UPPERCASE; a lowercase config symbol must still match
+    # (else a fresh feed would report a bogus "no data for universe").
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    assert_data_fresh(("aapl",), 5, TS, db)
+
+
+def test_assert_data_fresh_accepts_tz_aware_now(tmp_path: Path) -> None:
+    # now may be tz-aware UTC; the age is still 0 against a fresh ms-epoch bar.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    now_utc = TS.tz_localize("UTC")
+    assert_data_fresh(("AAPL",), 5, now_utc, db)
 
 
 # --- run_cycle --------------------------------------------------------------
@@ -291,6 +320,100 @@ async def test_rejected_close_records_nothing(tmp_path: Path) -> None:
         signal_source=_source_fn(CLOSE),
     )
 
+    assert [r.position_id for r in ledger.open_positions("S1")] == ["L1"]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger_path = tmp_path / "l.sqlite"
+    ledger = SqliteLedger(ledger_path)
+    ledger.ensure_strategy("S1", "s", "paper")
+    broker = FakeBroker()
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=broker,
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        dry_run=True,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert [i.action for i in report.intents] == [ActionType.long]  # still computes
+    assert report.results == ()
+    assert broker.placed == []  # nothing placed
+    assert ledger_rows(ledger_path) == []  # nothing recorded
+    assert cycle_ts(ledger_path, "S1") is None  # didn't even touch the cycle
+
+
+@pytest.mark.asyncio
+async def test_foreign_lot_survives_cycle_untouched(tmp_path: Path) -> None:
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger_path = tmp_path / "l.sqlite"
+    ledger = SqliteLedger(ledger_path)
+    ledger.record_open(_rec("L1"))  # ours; the book's OTHER lot is foreign
+    foreign = Position(
+        symbol="AAPL",
+        qty=7.0,
+        entry_price=100.0,
+        entry_time=TS,
+        stop_loss=None,
+        take_profit=None,
+        last_price=100.0,
+        type=ActionType.long,
+        position_id="OTHER",
+    )
+    broker = FakeBroker()
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book(foreign)),
+        broker=broker,
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    # Close is ownership-scoped: the foreign lot is neither closed nor adopted.
+    assert report.intents == ()
+    assert broker.placed == []
+    assert report.portfolio_before.positions["AAPL"] == (foreign,)
+    assert [r.position_id for r in ledger.open_positions("S1")] == ["L1"]
+
+
+@pytest.mark.asyncio
+async def test_changed_config_rescopes_ownership(tmp_path: Path) -> None:
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.record_open(_rec("L1"))  # lot opened under config revision A ("S1")
+    broker = FakeBroker()
+
+    # Revision B ("S2") sees the same book, but L1 is foreign to it: no close.
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book(lot("L1"))),
+        broker=broker,
+        ledger=ledger,
+        strategy_id="S2",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert report.intents == ()
+    assert broker.placed == []
     assert [r.position_id for r in ledger.open_positions("S1")] == ["L1"]
 
 

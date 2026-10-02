@@ -176,7 +176,10 @@ def test_flip_sizes_open_against_freed_cash() -> None:
     assert close.action is ActionType.close
     assert close.position_id == "S1"
     assert open_.action is ActionType.long
-    assert open_.qty > 0.0  # sized off the close's freed proceeds
+    # Equity after the close: cash 0 + freed 10*100 = 1000 (the short lot is
+    # gone from the sizing view, so it is NOT counted a second time).
+    # size 0.5 -> 1000*0.5/100 = 5 shares. Double-counting would give 10.
+    assert open_.qty == 5.0
 
 
 def test_size_qty_nan_price_is_zero() -> None:
@@ -240,3 +243,31 @@ def test_close_signal_targets_named_lot_only() -> None:
     (order,) = reconcile((sig("close", pid="L2"),), book, CFG)
     assert order.position_id == "L2"
     assert order.qty == 4.0
+
+
+def test_long_to_long_holds() -> None:
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
+    # Already long and asked for long: side-only reconcile HOLDs (no resize).
+    assert reconcile((sig("long", qty=5.0),), book, CFG) == ()
+
+
+def test_short_to_short_holds() -> None:
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.short, pid="S1"))
+    assert reconcile((sig("short", qty=5.0),), book, CFG) == ()
+
+
+def test_empty_owned_closes_nothing() -> None:
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
+    # Ownership scoped to the empty set: no lot is ours, so nothing closes.
+    assert reconcile((sig("close"),), book, CFG, owned=frozenset()) == ()
+
+
+def test_foreign_only_book_opposite_open_holds() -> None:
+    # The whole book on the symbol is foreign (not in ``owned``): a close is
+    # not ours to emit, so the opposite-side open must be skipped (HOLD) rather
+    # than doubling gross exposure without reaching the target posture.
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.short, pid="OTHER"))
+    assert reconcile((sig("long", qty=5.0),), book, CFG, owned=frozenset({"L1"})) == ()
+    # Same posture with no scoping: the lot is ours, so the flip proceeds.
+    flipped = reconcile((sig("long", qty=5.0),), book, CFG)
+    assert [i.action for i in flipped] == [ActionType.close, ActionType.long]

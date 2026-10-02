@@ -381,4 +381,4 @@ async def test_run_cycle_dry_run_places_nothing() -> None:
     assert report.results == ()  # but nothing placed
     assert broker.placed == []
     assert ledger.opens == [] and ledger.closed == []
-    assert ledger.touched == 1  # cycle still stamped
+    assert ledger.touched == 0  # write-free: not even the cycle stamp
