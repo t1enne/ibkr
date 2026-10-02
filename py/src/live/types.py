@@ -108,9 +108,10 @@ class LiveConfig:
     strategy_type: str
     symbols: tuple[str, ...]
     initial_capital: float
-    strategy_params: dict  # the screen's strategy params (verbatim)
+    strategy_params: dict[str, object]  # the screen's strategy params (verbatim)
     bars: tuple[str, ...]  # bars[0] = signal interval
     warmup: str  # screen warm-up window, e.g. "1y"
+    commission: float = 0.5  # fixed per-fill commission, matches StrategyConfig
     # sizing (used only when a LiveSignal.qty == 0.0)
     size_mode: Literal["equity", "cash", "fixed"] = "equity"
     size: float = 0.0

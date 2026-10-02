@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, fields
 from pathlib import Path
@@ -56,10 +58,13 @@ def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
+    # Scope key derives from the ORIGINAL raw config, never the temp projection
+    # (the strategy-only file lives at a random path and must not change scope).
     strategy_id = config_hash(raw)
     strategy = _strategy_config(config_path, raw)
     ledger = SqliteLedger()
-    ledger.ensure_strategy(strategy_id, strategy.name, cfg.mode)
+    if not dry_run:  # a dry run writes nothing (not even the strategy row)
+        ledger.ensure_strategy(strategy_id, strategy.name, cfg.mode)
     if not cfg.portfolio_path:
         raise click.UsageError(
             "config requires portfolio_path (mock portfolio fixture)"
@@ -67,37 +72,64 @@ def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
     source = MockPortfolioSource(cfg.portfolio_path)
     broker = SimulatedBroker(
         create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
-        create_execution_params(),
+        create_execution_params(fixed_commission=cfg.commission),
         click.echo,
     )
     try:
-        report = asyncio.run(
-            run_cycle(
-                cfg,
-                source=source,
-                broker=broker,
-                ledger=ledger,
-                strategy_id=strategy_id,
-                config_path=config_path,
-                max_age_days=max_age,
-                dry_run=dry_run,
+        # The live file is a strategy config PLUS live-only keys; the screen
+        # bridge (``load_strategy``) is strict and rejects those extras, so it
+        # gets a strategy-only projection written to a temp dir and cleaned up
+        # on exit.
+        with tempfile.TemporaryDirectory(prefix="ibkr-live-") as tmp:
+            normalized_path = _write_strategy_config(strategy, tmp)
+            report = asyncio.run(
+                run_cycle(
+                    cfg,
+                    source=source,
+                    broker=broker,
+                    ledger=ledger,
+                    strategy_id=strategy_id,
+                    config_path=normalized_path,
+                    max_age_days=max_age,
+                    dry_run=dry_run,
+                )
             )
-        )
-    except (StaleDataError, PortfolioFetchError) as exc:
+    except (StaleDataError, PortfolioFetchError, ValueError) as exc:
+        # ValueError: an unsized open raises by default policy — a traceback is
+        # not a CLI contract.
         raise click.ClickException(str(exc)) from exc
     click.echo(render_report(report, fmt))
-    _housekeeping(ledger)
+    _housekeeping(ledger, dry_run)
 
 
 live_group.add_command(live_run)
 
 
-def _housekeeping(ledger: SqliteLedger) -> None:
-    """Prune aged-out closed rows; never fail the cycle over cleanup."""
+def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
+    """Dump a strategy-only projection of *strategy* into *tmp*; return its path.
+
+    ``load_strategy`` validates through ``StrategyConfig(**data)`` and rejects
+    unknown top-level keys, so the screen bridge must see ONLY the keys
+    ``StrategyConfig`` defines. Live-only keys (``portfolio_path``, ``mode``,
+    sizing) never reach the temp file.
+    """
+    path = Path(tmp) / "strategy.json"
+    path.write_text(json.dumps(asdict(strategy), default=_json_default))
+    return str(path)
+
+
+def _housekeeping(ledger: SqliteLedger, dry_run: bool) -> None:
+    """Prune aged-out closed rows; never fail the cycle over cleanup.
+
+    A dry run writes nothing, so it skips the prune (the caller already skipped
+    ``ensure_strategy``).
+    """
+    if dry_run:
+        return
     try:
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=90)
         ledger.prune_closed(cast("pd.Timestamp", cutoff))
-    except Exception:  # housekeeping is non-fatal
+    except sqlite3.Error:  # housekeeping is non-fatal
         pass
 
 
@@ -118,6 +150,7 @@ def load_live_config(path: str) -> LiveConfig:
     if raw_mode not in ("paper", "live"):
         raise ValueError(f"mode must be 'paper' or 'live', got {raw_mode!r}")
     portfolio_path = _pick((raw, params), ("portfolio_path",), "")
+    commission = _float_or((raw, params), "commission", strategy.commission)
     return LiveConfig(
         strategy_type=strategy.strategy_type,
         symbols=tuple(strategy.symbols),
@@ -125,6 +158,7 @@ def load_live_config(path: str) -> LiveConfig:
         strategy_params=params,
         bars=tuple(strategy.bars),
         warmup=strategy.warmup,
+        commission=commission,
         size_mode=size_mode,
         size=size,
         max_symbol_allocation=alloc,

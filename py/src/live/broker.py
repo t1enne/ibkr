@@ -16,7 +16,7 @@ from typing import Protocol
 import pandas as pd
 
 from src.bt.execution.pure import execute_signal
-from src.bt.portfolio.pure import apply_fill
+from src.bt.portfolio.pure import apply_fill, describe_open_rejection
 from src.bt.state import (
     ActionType,
     Candle,
@@ -99,9 +99,13 @@ class SimulatedBroker:
         """Fill *intent* against a synthetic ref-price bar and settle it.
 
         The bar's OHLCV are all ``intent.ref_price`` (no tick data live), so the
-        fill is spread/slippage math only. A bad close (missing lot, no
-        ``position_id``) raises inside ``apply_fill`` and is caught here — one
-        rejected order must not abort the cycle.
+        fill is spread/slippage math only. Before settling an OPEN we consult the
+        shared cash guard ``describe_open_rejection`` — ``apply_fill`` silently
+        returns the book unchanged on a cash shortfall, so without this check a
+        dropped open would be reported as a phantom fill. A rejected open leaves
+        the held book untouched. A bad close (missing lot, no ``position_id``)
+        raises inside ``apply_fill`` and is caught here — one rejected order must
+        not abort the cycle.
         """
         ts = pd.Timestamp.now()
         ref = intent.ref_price
@@ -116,6 +120,19 @@ class SimulatedBroker:
             interval=None,
         )
         fill = execute_signal(intent_to_signal(intent, ts), candle, self._params)
+        rejection = describe_open_rejection(self._portfolio, fill)
+        if rejection is not None:
+            return Ok(
+                OrderResult(
+                    intent=intent,
+                    fill=None,
+                    ok=False,
+                    message=(
+                        f"open rejected: needs {rejection.cash_used} cash, "
+                        f"have {rejection.available_cash}"
+                    ),
+                )
+            )
         try:
             self._portfolio = apply_fill(self._portfolio, fill)
         except ValueError as exc:

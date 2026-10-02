@@ -125,7 +125,15 @@ VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,NULL)
 
 
 class SqliteLedger:
-    """sqlite3-backed Ledger. One short-lived connection per method, no held handle."""
+    """sqlite3-backed Ledger. One short-lived connection per method, no held handle.
+
+    ``record_open`` UPSERTs (``INSERT OR REPLACE`` on the ``(strategy_id,
+    position_id)`` primary key) and therefore **resurrects** a previously closed
+    row if the same broker ``position_id`` is re-recorded — the REPLACE clears
+    ``closed_at`` and resets ``status='open'``. This is deliberate: a broker id
+    is expected to be unique per lot, so re-seeing one means the lot is open
+    again (or was never truly closed).
+    """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._db_path = db_path
@@ -215,7 +223,24 @@ def _ms(ts: pd.Timestamp) -> int:
     return int(ts.timestamp() * _MS)
 
 
-def _row_to_record(row: tuple) -> PositionRecord:
+_Row = tuple[
+    str,  # strategy_id
+    str,  # position_id
+    str,  # symbol
+    str,  # side
+    float,  # qty
+    float,  # entry_price
+    int,  # entry_time (ms)
+    float | None,  # stop_loss
+    float | None,  # take_profit
+    str,  # tag
+    str,  # status
+    int,  # opened_at (ms)
+    int | None,  # closed_at (ms)
+]
+
+
+def _row_to_record(row: _Row) -> PositionRecord:
     (
         strategy_id,
         position_id,

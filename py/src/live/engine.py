@@ -208,6 +208,11 @@ def _record(
             ledger.mark_closed(strategy_id, intent.position_id, now_ts)
         return
     if intent.action in (ActionType.long, ActionType.short):
+        # A lot the broker did not name can never be targeted by a close
+        # (_close_position requires a position_id), so recording it would
+        # create an unclosable phantom row. Record nothing.
+        if not result.position_id:
+            return
         ledger.record_open(_open_record(strategy_id, intent, result, now_ts))
 
 
