@@ -379,11 +379,11 @@ def _split_columns() -> tuple[tuple[str, str], ...]:
 def render_split_report(report: SplitReport) -> str:
     """Render every fold's IS vs OOS metrics as ONE table.
 
-    Two rows per fold — the in-sample row then its out-of-sample row — so
-    degradation is read vertically without the column overflow of an IS|OOS
-    pair on a single row. Kurtosis/skewness/win-rate/trade-count (and
-    scaled-fill count) carry the tail-risk and sample-size story a Sharpe-only
-    view hides.
+    One row per fold, IS and OOS columns side by side so degradation is read
+    horizontally. (``bt optimize`` stacks the pair on two rows instead — its
+    extra params column overflowed.) Kurtosis/skewness/win-rate/trade-count
+    (and scaled-fill count) carry the tail-risk and sample-size story a
+    Sharpe-only view hides.
     """
     from src.bt.table import Col, Table, render
 
