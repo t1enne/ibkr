@@ -52,7 +52,10 @@ def test_parse_warmup_days_zero_is_legal() -> None:
 def test_bars_per_trading_day_interval_aware() -> None:
     assert bars_per_trading_day("1d") == 1.0
     assert bars_per_trading_day("1h") == 6.5
-    assert bars_per_trading_day("4h") == pytest.approx(1.625)
+    # Session-anchored resampling (src.data.resample) tiles the session into
+    # whole buckets: ceil(6.5 / hours), so "4h" is 2 bars/day, not 6.5/4.
+    assert bars_per_trading_day("4h") == 2.0
+    assert bars_per_trading_day("2h") == 4.0
     with pytest.raises(ValueError, match="unrecognised bar"):
         bars_per_trading_day("nonsense")
 
@@ -62,6 +65,8 @@ def test_parse_warmup_bars_reference_values() -> None:
     assert parse_warmup_bars("1y", "1d") == 261
     assert parse_warmup_bars("90d", "1d") == 65
     assert parse_warmup_bars("1y", "1h") == 1695
+    # 365d -> ~261 trading days -> x2 bars/day = 522
+    assert parse_warmup_bars("1y", "4h") == 522
 
 
 def test_parse_warmup_bars_counts_trading_days_not_calendar_days() -> None:

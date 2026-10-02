@@ -22,6 +22,7 @@ from typing import List, cast
 from src.bt.state import Candle
 from src.utils import get_local_candles
 from src.data import sync_data
+from src.data.xcal import is_non_trading_day
 
 # Maximum tolerated discontinuity between consecutive bars of a symbol.
 # Any gap strictly greater than this is treated as missing/corrupt data and
@@ -37,6 +38,23 @@ class GapBreak:
     prev_ts: pd.Timestamp
     next_ts: pd.Timestamp
     duration: pd.Timedelta
+
+
+def _trading_days_between(prev_ts: pd.Timestamp, next_ts: pd.Timestamp) -> int:
+    """NYSE trading days strictly between two bar timestamps.
+
+    A multi-day hole that lands entirely on weekends/holidays (e.g. the
+    Christmas/Thanksgiving long weekend) is a normal market closure, not
+    missing data, so the gap guard must not flag it.
+    """
+    day = cast(pd.Timestamp, prev_ts + pd.Timedelta(days=1)).normalize()
+    end = next_ts.normalize()
+    missing = 0
+    while day < end:
+        if not is_non_trading_day(day.to_pydatetime()):
+            missing += 1
+        day = cast(pd.Timestamp, day + pd.Timedelta(days=1))
+    return missing
 
 
 def detect_gaps(
@@ -75,12 +93,16 @@ def detect_gaps(
         breaks: list[GapBreak] = []
         for idx, delta in enumerate(deltas):
             assert isinstance(delta, pd.Timedelta)
-            if delta > max_gap:
+            prev_ts, next_ts = time_idx[idx], time_idx[idx + 1]
+            # Time threshold AND a genuinely skipped trading day: a long
+            # weekend (or holiday cluster) can exceed max_gap without any data
+            # being missing.
+            if delta > max_gap and _trading_days_between(prev_ts, next_ts) > 0:
                 breaks.append(
                     GapBreak(
                         symbol=symbol,
-                        prev_ts=time_idx[idx],
-                        next_ts=time_idx[idx + 1],
+                        prev_ts=prev_ts,
+                        next_ts=next_ts,
                         duration=delta,
                     )
                 )

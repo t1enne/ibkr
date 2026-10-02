@@ -79,6 +79,25 @@ def test_detect_gaps_reports_gap_over_threshold():
     assert b.duration == pd.Timedelta(hours=120)
 
 
+def test_detect_gaps_ignores_market_closures():
+    # Christmas: 12/24 half-day close -> 12/28 open is 4d0.5h (> 96h), but every
+    # day in between is a weekend/holiday -- that is a market closure, not a
+    # hole in the data.
+    def template(_s: str) -> list[str]:
+        return _hourly("2024-12-24 14:30", "2024-12-24 18:00", "2024-12-28 15:00")
+
+    assert detect_gaps(_frame(["A"], template), ["A"]) == {}
+
+
+def test_detect_gaps_flags_skipped_trading_days_only():
+    # 12/20 (Fri) -> 12/30 (Mon) crosses real trading days 12/23/24/26/27.
+    def template(_s: str) -> list[str]:
+        return _hourly("2024-12-20 14:30", "2024-12-30 14:30")
+
+    report = detect_gaps(_frame(["A"], template), ["A"])
+    assert len(report["A"]) == 1
+
+
 # ── load_candles guard ─────────────────────────────────────────────────
 def _load_df(*, hourly_spans: dict):
     def factory(symbol):

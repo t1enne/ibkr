@@ -24,6 +24,7 @@ by itself make an accumulator "ready".
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Final, cast
@@ -99,14 +100,19 @@ def bars_per_trading_day(bar: str) -> float:
     """Bars per *trading* day for ``bar`` — the interval-aware conversion rate.
 
     ``"1d"`` -> 1.0 (one daily bar is one trading day). ``"1h"`` -> 6.5 (the
-    regular session). ``"4h"`` -> 1.625. Any other intraday size is parsed from
-    its hour count, so an unsupported ``"7h"`` still converts rather than
-    silently degrading to 1 bar/day.
+    nominal regular session; 1h is the native granularity and is not resampled).
+    Coarser intraday sizes are resampled **session-anchored** (see
+    ``src.data.resample``), so a day yields ``ceil(session_hours / hours)`` whole
+    buckets — ``"4h"`` -> 2, not the nominal 6.5/4 = 1.625. Any other intraday
+    size is parsed from its hour count, so an unsupported ``"7h"`` still
+    converts rather than silently degrading to 1 bar/day.
     """
     if bar in _DAILY_INTERVALS:
         return 1.0
     hours = _parse_interval_hours(bar)
-    return TRADING_HOURS_PER_DAY / hours
+    if hours <= 1.0:
+        return TRADING_HOURS_PER_DAY / hours
+    return float(math.ceil(TRADING_HOURS_PER_DAY / hours))
 
 
 def parse_warmup_bars(warmup: str, bar: str) -> int:
