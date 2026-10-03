@@ -21,8 +21,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import Literal, Mapping, Any
 
-from src.bt.state.types import PortfolioState, TradeSignal, Candle
-from src.bt.portfolio.pure import calculate_equity
+from src.bt.state.types import PortfolioView, TradeSignal, Candle
+from src.bt.portfolio.pure import calculate_positions_value
 
 #: Allowed capital bases for size-based sizing.
 SizingMode = Literal["equity", "cash", "fixed"]
@@ -63,9 +63,16 @@ class SizingParams:
         )
 
 
-def equity_of(portfolio: PortfolioState) -> float:
-    """Total equity = cash + value of open positions."""
-    return calculate_equity(portfolio)
+def equity_of(portfolio: PortfolioView) -> float:
+    """Total equity = cash + value of open positions.
+
+    Accepts the minimal ``PortfolioView`` Protocol (``cash`` + ``positions``),
+    not only a concrete ``PortfolioState``, so the live reconcile sizing path
+    reuses the ONE equity implementation instead of re-deriving
+    ``cash + calculate_positions_value``. ``PortfolioState`` satisfies the
+    Protocol structurally, so every existing bt caller is unchanged.
+    """
+    return portfolio.cash + calculate_positions_value(portfolio.positions)
 
 
 def risk_sized_qty(

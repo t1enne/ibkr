@@ -6,38 +6,43 @@ side, per symbol, in ``config.symbols`` order. No I/O, no mutation, no broker.
 so cash freed by a close is available to an open in the same cycle.
 
 Absence of a signal is HOLD — never flatten. Only an explicit ``close`` (or a
-side flip) closes a live lot. Sizing is never re-derived here: an unsized open
-routes through the shared ``SizingParams``/``compute_qty`` layer, and an open
-that still sizes to ``<= 0`` raises rather than placing an accidental order.
+side flip) closes a live lot. Sizing is never re-derived here: opens are sized
+through the shared ``sized_signal``/``compute_qty`` layer, and an open that still
+sizes to ``<= 0`` raises rather than placing an accidental order.
+
+The book opens are sized against is this cycle's closes settled for real: the
+close intents are priced with the SAME ``execute_signal`` the broker fills with
+and folded through the shared ``apply_fills`` (non-opens-first), so the freed
+cash and dropped lots are the broker's actual accounting — not a
+``Σ qty*ref_price`` approximation of it.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
-from src.bt.portfolio.pure import calculate_positions_value
-from src.bt.size.pure import SizingParams, compute_qty
-from src.bt.state import ActionType, Position
+import pandas as pd
+
+from src.bt.execution.pure import execute_signal
+from src.bt.portfolio.pure import apply_fills
+from src.bt.size.pure import SizingParams, equity_of, sized_signal
+from src.bt.state import (
+    ActionType,
+    ExecutionParams,
+    PortfolioState,
+    Position,
+)
+from src.bt.state.factories import create_execution_params
+from src.live.broker import intent_to_signal, ref_candle, trade_signal
 from src.live.types import LiveConfig, LiveSignal, OrderIntent, PortfolioView
 
 Side = Literal["long", "short", "flat"]
 
-
-@dataclass(frozen=True)
-class _SizingView:
-    """``PortfolioView`` = the book plus this cycle's freed close proceeds.
-
-    ``cash`` adds ``sum(qty * ref_price)`` over the cycle's close intents — the
-    ref-price approximation of ``apply_fill``'s close proceeds (no
-    commission/slippage), mirroring ``apply_fills``' non-opens-first rule so a
-    close's freed cash is available to an open in the same cycle (doc §3).
-    """
-
-    cash: float
-    positions: dict[str, tuple[Position, ...]]
-    initial_capital: float
+#: Deterministic timestamp for the synthetic sizing fills. Only the discarded
+#: ``FillEvent``/trade timestamps depend on it — cash and positions do not — so a
+#: constant keeps reconcile pure and its sizing book reproducible.
+_SETTLE_TS = cast("pd.Timestamp", pd.Timestamp(0))
 
 
 def current_side(portfolio: PortfolioView, symbol: str) -> Side:
@@ -63,25 +68,30 @@ def target_side(sig: LiveSignal) -> Side:
 
 
 def size_qty(price: float, portfolio: PortfolioView, config: LiveConfig) -> float:
-    """Shares for an unsized open, via the shared sizing layer.
+    """Shares for an unsized open at *price*, via the shared sizing layer.
 
-    Equity is rebuilt as ``cash + calculate_positions_value(positions)`` rather
-    than calling ``equity_of`` — the latter takes the concrete ``PortfolioState``
-    and would not accept a ``PortfolioView``-typed book. Same arithmetic, still
-    the one sizing implementation. A non-finite price (NaN) or ``<= 0`` sizes to
-    ``0.0`` rather than passing a garbage qty downstream.
+    Delegates to ``sized_signal`` so there is ONE sizing rule; equity comes from
+    the shared ``equity_of``, which now accepts the ``PortfolioView`` Protocol.
+    A non-finite price (NaN) or ``<= 0`` sizes to ``0.0`` rather than passing
+    garbage downstream.
     """
     if not math.isfinite(price) or price <= 0:
         return 0.0
-    params = SizingParams.from_dict(
-        {
-            "sizing_mode": config.size_mode,
-            "size": config.size,
-            "max_symbol_allocation": config.max_symbol_allocation,
-        }
+    probe = trade_signal(
+        symbol="",
+        action=ActionType.long,
+        price=price,
+        qty=0.0,
+        ts=_SETTLE_TS,
     )
-    equity = portfolio.cash + calculate_positions_value(portfolio.positions)
-    return compute_qty(equity=equity, cash=portfolio.cash, price=price, params=params)
+    sized = sized_signal(
+        probe,
+        equity_of(portfolio),
+        portfolio.cash,
+        ref_candle(price, "", _SETTLE_TS),
+        _sizing_params(config),
+    )
+    return sized.qty
 
 
 def reconcile(
@@ -120,57 +130,88 @@ def reconcile(
         sig = by_symbol.get(symbol)
         if sig is None:
             continue
-        cur = current_side(portfolio, symbol)
-        tgt = target_side(sig)
-        if tgt == cur:
-            continue
-        lots = _lots(portfolio, symbol, owned)
-        if tgt == "flat":
-            closes.extend(_close_intents(symbol, sig, lots, f"{cur}->flat"))
-            continue
-        if cur != "flat":
-            flips = _close_intents(symbol, sig, lots, f"{cur}->{tgt}")
-            # Foreign-only book on this symbol: closing is not ours to do, so
-            # opening the opposite side would add exposure without closing the
-            # old one. HOLD instead of doubling gross exposure.
-            if not flips:
-                continue
-            closes.extend(flips)
-        specs.append((sig, cur, tgt))
-    view = _sizing_view(portfolio, closes)
+        symbol_closes, spec = _plan_symbol(portfolio, sig, owned)
+        closes.extend(symbol_closes)
+        if spec is not None:
+            specs.append(spec)
+    # Only settle this cycle's closes if an open actually needs sizing against
+    # them; a closes-only cycle never has to lift the (possibly minimal) view to
+    # a full PortfolioState.
+    view = _settled_book(portfolio, closes, config) if specs else portfolio
     opens = [_open_intent(sig, view, config, cur, tgt) for sig, cur, tgt in specs]
     return tuple(closes + opens)
 
 
-def _sizing_view(portfolio: PortfolioView, closes: list[OrderIntent]) -> PortfolioView:
-    """The book an open is sized against: cash freed by this cycle's closes added.
+def _plan_symbol(
+    portfolio: PortfolioView, sig: LiveSignal, owned: frozenset[str] | None
+) -> tuple[list[OrderIntent], tuple[LiveSignal, Side, Side] | None]:
+    """One symbol's posture diff: its close intents plus an open spec (or ``None``).
 
-    The closing lots are also removed from ``positions``. Without that, the
-    freed cash (which stands in for their value) and the still-present lots
-    would both count toward equity — double-counting the same capital and
-    over-sizing the open. Empty symbol keys are dropped so
-    ``calculate_positions_value`` sees no phantom symbol.
+    HOLD (``[], None``) when the target already matches the current side, or
+    when the whole book on the symbol is foreign and only a flip would reach the
+    target (opening would double gross exposure without closing anything).
+    """
+    symbol = sig.symbol
+    cur = current_side(portfolio, symbol)
+    tgt = target_side(sig)
+    if tgt == cur:
+        return [], None
+    lots = _lots(portfolio, symbol, owned)
+    if tgt == "flat":
+        return _close_intents(symbol, sig, lots, f"{cur}->flat"), None
+    if cur == "flat":
+        return [], (sig, cur, tgt)
+    flips = _close_intents(symbol, sig, lots, f"{cur}->{tgt}")
+    # Foreign-only book on this symbol: closing is not ours to do, so opening
+    # the opposite side would add exposure without closing the old one. HOLD
+    # instead of doubling gross exposure.
+    if not flips:
+        return [], None
+    return flips, (sig, cur, tgt)
+
+
+def _settled_book(
+    portfolio: PortfolioView, closes: list[OrderIntent], config: LiveConfig
+) -> PortfolioView:
+    """The book opens are sized against: this cycle's closes settled for real.
+
+    Each close is priced with the same ``execute_signal`` the broker fills with
+    and the whole set is folded through the shared ``apply_fills``
+    (non-opens-first), so freed cash is the broker's actual proceeds (spread /
+    slippage / commission included) and closed lots are dropped by the same code
+    path — one implementation of close proceeds, shared with settlement. Only
+    ``cash``/``positions`` are needed downstream, so the view is lifted to a
+    ``PortfolioState`` with empty trades/equity to reuse the shared settler.
     """
     if not closes:
         return portfolio
-    freed = sum(intent.qty * intent.ref_price for intent in closes)
-    closing: dict[str, set[str]] = {}
-    for intent in closes:
-        if intent.position_id:
-            closing.setdefault(intent.symbol, set()).add(intent.position_id)
-    positions: dict[str, tuple[Position, ...]] = {}
-    for symbol, lots in portfolio.positions.items():
-        dropped = closing.get(symbol)
-        if dropped is None:
-            positions[symbol] = lots
-            continue
-        kept = tuple(p for p in lots if p.position_id not in dropped)
-        if kept:
-            positions[symbol] = kept
-    return _SizingView(
-        cash=portfolio.cash + freed,
-        positions=positions,
+    state = PortfolioState(
+        cash=portfolio.cash,
+        positions=portfolio.positions,
+        trades=(),
+        equity_curve=(),
         initial_capital=portfolio.initial_capital,
+    )
+    params = _exec_params(config)
+    fills = tuple(
+        execute_signal(
+            intent_to_signal(intent, _SETTLE_TS),
+            ref_candle(intent.ref_price, intent.symbol, _SETTLE_TS),
+            params,
+        )
+        for intent in closes
+    )
+    settled, _rejections = apply_fills(state, fills)
+    # ``apply_fills`` stamps its settlements at ``_SETTLE_TS`` (the epoch probe),
+    # so the returned book's ``trades``/``equity_curve`` are artifacts. Only
+    # ``cash``/``positions`` are consumed downstream: re-emit a clean view so no
+    # epoch-0 trade can leak. ``initial_capital`` is unchanged by the settler.
+    return PortfolioState(
+        cash=settled.cash,
+        positions=settled.positions,
+        trades=(),
+        equity_curve=(),
+        initial_capital=settled.initial_capital,
     )
 
 
@@ -220,17 +261,41 @@ def _open_intent(
     cur: Side,
     tgt: Side,
 ) -> OrderIntent:
-    """A single open intent, sized from the signal or config; never <= 0 shares."""
-    qty = sig.qty if sig.qty > 0 else size_qty(sig.price, portfolio, config)
-    if qty <= 0:
+    """A single open intent, sized from the signal or config; never <= 0 shares.
+
+    Reuses ``sized_signal`` for the whole "explicit qty else compute it" rule so
+    the branch lives in ONE place (``src/bt/size/pure.py``), not here. An open
+    that still sizes to ``<= 0`` raises — never place an order sized by accident.
+    """
+    action = ActionType.long if tgt == "long" else ActionType.short
+    price = sig.price if math.isfinite(sig.price) and sig.price > 0 else 0.0
+    signal = trade_signal(
+        symbol=sig.symbol,
+        action=action,
+        price=price,
+        qty=sig.qty,
+        ts=_SETTLE_TS,
+        stop_loss=sig.stop_loss,
+        take_profit=sig.take_profit,
+        tag=sig.tag,
+        reason=f"open {tgt} ({cur}->{tgt})",
+    )
+    sized = sized_signal(
+        signal,
+        equity_of(portfolio),
+        portfolio.cash,
+        ref_candle(price, sig.symbol, _SETTLE_TS),
+        _sizing_params(config),
+    )
+    if sized.qty <= 0:
         raise ValueError(
-            f"unsized open {sig.symbol}: signal qty={sig.qty}, sized qty={qty} "
+            f"unsized open {sig.symbol}: signal qty={sig.qty}, sized qty={sized.qty} "
             f"(size_mode={config.size_mode!r}, size={config.size})"
         )
     return OrderIntent(
         symbol=sig.symbol,
-        action=ActionType.long if tgt == "long" else ActionType.short,
-        qty=qty,
+        action=action,
+        qty=sized.qty,
         ref_price=sig.price,
         reason=f"open {tgt} ({cur}->{tgt})",
         position_id=None,
@@ -238,3 +303,19 @@ def _open_intent(
         take_profit=sig.take_profit,
         tag=sig.tag,
     )
+
+
+def _sizing_params(config: LiveConfig) -> SizingParams:
+    """The shared ``SizingParams`` for this config (one sizing rule)."""
+    return SizingParams.from_dict(
+        {
+            "sizing_mode": config.size_mode,
+            "size": config.size,
+            "max_symbol_allocation": config.max_symbol_allocation,
+        }
+    )
+
+
+def _exec_params(config: LiveConfig) -> ExecutionParams:
+    """The execution params the broker fills with (same construction the CLI uses)."""
+    return create_execution_params(fixed_commission=config.commission)

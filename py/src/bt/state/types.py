@@ -10,7 +10,7 @@ All state is immutable (frozen dataclasses) to enable:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple, Dict, Optional, Any
+from typing import Tuple, Dict, Optional, Any, Protocol
 from enum import Enum
 
 import pandas as pd
@@ -112,6 +112,25 @@ class PortfolioState:
     trades: Tuple[Trade, ...]
     equity_curve: Tuple[EquityPoint, ...]
     initial_capital: float
+
+
+class PortfolioView(Protocol):
+    """Read-only portfolio surface shared by backtest and live.
+
+    ``PortfolioState`` satisfies this **structurally**, so the SAME ``reconcile``
+    and sizing code runs on a backtest book and a broker snapshot alike. Keep
+    this surface minimal: every field here is a contract both sides must keep.
+    Read-only by design — mutation goes through ``apply_fill``.
+    """
+
+    @property
+    def cash(self) -> float: ...
+
+    @property
+    def positions(self) -> Dict[str, Tuple[Position, ...]]: ...  # symbol -> LOTs
+
+    @property
+    def initial_capital(self) -> float: ...
 
 
 @dataclass(frozen=True)

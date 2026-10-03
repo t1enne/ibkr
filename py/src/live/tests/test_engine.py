@@ -120,6 +120,18 @@ class FakeBroker:
         )
         return Ok(OrderResult(intent=intent, fill=fill, ok=True, position_id=pid))
 
+    async def place_cohort(
+        self, intents: tuple[OrderIntent, ...]
+    ) -> (
+        Ok[tuple[OrderResult, ...], FeedError] | Err[tuple[OrderResult, ...], FeedError]
+    ):
+        results: list[OrderResult] = []
+        for intent in intents:
+            placed = await self.place(intent)
+            assert isinstance(placed, Ok)
+            results.append(cast("OrderResult", placed.value))
+        return Ok(tuple(results))
+
     async def close(self) -> Ok[None, FeedError]:
         return Ok(None)
 

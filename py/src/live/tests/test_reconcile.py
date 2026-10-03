@@ -176,10 +176,12 @@ def test_flip_sizes_open_against_freed_cash() -> None:
     assert close.action is ActionType.close
     assert close.position_id == "S1"
     assert open_.action is ActionType.long
-    # Equity after the close: cash 0 + freed 10*100 = 1000 (the short lot is
-    # gone from the sizing view, so it is NOT counted a second time).
-    # size 0.5 -> 1000*0.5/100 = 5 shares. Double-counting would give 10.
-    assert open_.qty == 5.0
+    # Opens are sized against the ACTUAL post-close book: the close is priced
+    # with the shared execute_signal and settled through apply_fills, so the
+    # short lot is gone and cash is its real proceeds (10*100 - slippage -
+    # commission = 999.3, not the old 10*100 ref-price approximation).
+    # size 0.5 -> 999.3*0.5/100 = 4.9965. Double-counting the lot would give 10.
+    assert open_.qty == 4.9965
 
 
 def test_size_qty_nan_price_is_zero() -> None:

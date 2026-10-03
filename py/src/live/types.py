@@ -10,34 +10,16 @@ depends only on the minimal :class:`PortfolioView` Protocol that
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal
 
 import pandas as pd
 
-from src.bt.state import ActionType, PortfolioState, Position
+from src.bt.state import ActionType, PortfolioState
+from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
 
 #: Actions the screen can emit that require a live decision. ``flat`` is never
 #: produced: absence of a signal is HOLD downstream.
 SignalAction = Literal["long", "short", "close"]
-
-
-class PortfolioView(Protocol):
-    """Read-only portfolio surface shared by backtest and live.
-
-    ``PortfolioState`` satisfies this **structurally**, so the SAME ``reconcile``
-    and sizing code runs on a backtest book and a broker snapshot alike. Keep
-    this surface minimal: every field here is a contract both sides must keep.
-    Read-only by design — mutation goes through ``apply_fill``.
-    """
-
-    @property
-    def cash(self) -> float: ...
-
-    @property
-    def positions(self) -> dict[str, tuple[Position, ...]]: ...  # symbol -> LOTs
-
-    @property
-    def initial_capital(self) -> float: ...
 
 
 @dataclass(frozen=True)

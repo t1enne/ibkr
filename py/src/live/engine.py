@@ -190,18 +190,22 @@ async def _place_all(
     strategy_id: str,
     now_ts: pd.Timestamp,
 ) -> tuple[OrderResult, ...]:
-    """Place every intent in order; a transport ``Err`` skips it and continues.
+    """Place the cycle's intents as ONE cohort; a cohort-level ``Err`` skips all.
 
-    An ``Err`` carries no ``OrderResult``, so nothing is recorded — the next
-    cycle recomputes the same intent.
+    The broker prices orders per-order but settles the whole cycle atomically
+    through the shared ``apply_fills``, so the settled book matches the
+    backtest's on the same fills. A transport ``Err`` carries no results, so
+    nothing is recorded — the next cycle recomputes the same intents.
     """
+    if not intents:
+        return ()
+    placed = await broker.place_cohort(tuple(intents))
+    if isinstance(placed, Err):
+        return ()
     results: list[OrderResult] = []
-    for intent in intents:
-        placed = await broker.place(intent)
-        if isinstance(placed, Err):
-            continue
-        results.append(placed.value)
-        _record(ledger, strategy_id, intent, placed.value, now_ts)
+    for result in placed.value:
+        results.append(result)
+        _record(ledger, strategy_id, result.intent, result, now_ts)
     return tuple(results)
 
 
