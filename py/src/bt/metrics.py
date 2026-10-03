@@ -792,20 +792,6 @@ def get_backtest_results_analysis(
             ("Beta", f"{metrics.beta:.2f}"),
         )
     lines.extend(render(Table(columns=metric_cols, rows=metric_rows)))
-
-    # Relative outperformance (after table, when benchmarks exist)
-    if benchmark_curves:
-        for sym in bm_names:
-            excess = metrics.annual_return - bm_stats[sym]["ann_ret"]
-            dd_imp = abs(bm_stats[sym]["max_dd"]) - abs(metrics.max_drawdown)
-            bm_alpha, bm_beta = alpha_beta(equity_curve, benchmark_curves[sym])
-            lines.append(
-                f"  vs {sym}: alpha={bm_alpha:+.2%}  "
-                f"beta={bm_beta:.2f}  "
-                f"excess_ann_ret={excess:+.2%}  "
-                f"DD_improvement={dd_imp:+.2%}"
-            )
-
     return "\n".join(lines)
 
 
