@@ -57,10 +57,14 @@ rows add no signal, and say when you cut it.
 
 Every report — `bt run|sweep|split|optimize`, text and `-F json` — draws its
 metric columns from one canonical set (Sharpe, Ann, MaxDD, Kurt, Skew, Win,
-Trades, Scaled) defined in `src/bt/report_metrics.py`, so text columns and
-JSON keys cannot drift. `Scaled` is the count of fills dropped for genuine
-cash exhaustion (`PortfolioResult.scaled_trades`) — non-zero means the run is
-advisory across symbol permutations (see Fills below).
+Trades, Scaled, Rejected) defined in `src/bt/report_metrics.py`, so text
+columns and JSON keys cannot drift. `Scaled` is the count of opening fills
+whose qty was reduced by a shared cohort cash scale (`PortfolioResult.scaled_trades`,
+from `portfolio.pure.ScaleRecord`); `Rejected` is the count of fills dropped
+for genuine cash exhaustion (`PortfolioResult.rejected_trades`). Either being
+non-zero means the run is advisory across symbol permutations (see Fills
+below). The `bt run` trade list is opt-in (`--trades`): off, every format
+still reports the count (text note / top-level `total_trades`).
 
 ```bash
 uv run ibkr bt run strats/trend.json       # CLI entry point
@@ -87,18 +91,24 @@ uv run ibkr bt optimize strats/trend.json '{...grid...}' --folds 4 --workers 4
 
 ### Fills: rejected or scaled = results not solid
 
-A cash shortfall SCALES a multi-open cohort (silent — entries land at
-`scale × plan`), only a lone open rejects (stderr warning). Cohort grouping
-is order-sensitive (clock, data gaps, Stage 4 vs 6), so with rejections or
-over-subscription active, results vary with `config.symbols` order —
-advisory, never quoted across permutations. See `src/bt/portfolio/pure.py`
-+ `src/bt/engine/backtest.py` docstrings.
+A cash shortfall SCALES a multi-open cohort (entries land at `scale × plan`),
+only a lone open rejects. Both are surfaced in the FINAL metrics (`Scaled`,
+`Rejected`) — no mid-run stderr warning. Cohort grouping is order-sensitive
+(clock, data gaps, Stage 4 vs 6), so with rejections or over-subscription
+active, results vary with `config.symbols` order — advisory, never quoted
+across permutations. See `src/bt/portfolio/pure.py` + `src/bt/engine/backtest.py`
+docstrings.
 
-## Running Screens (no CLI — run via Python)
+## Running Screens
 
 Screens are scoring layers that return 0..1 `ScreenResult`
 (`score` + `action` long/short/flat + reasons + `model_features`), NEVER fills.
-No `ibkr screen` CLI.
+The old `ibkr screen` CLI layer was deleted — screen scoring has no CLI. But
+there IS a live-intent CLI over a **real strategy**: `ibkr bt screen
+<strategy.json>` runs the strategy's own `on_candle` through the engine and
+surfaces its current-bar intent (opens AND closes), never fills. Append
+`--trades` (default off) to also print the run's executed trades — the engine's
+real fills, the final-bar flatten included (see SKILL.md § `bt screen`).
 
 - **Code:** `src/bt/screen/` (`types.py`, `runner.py`, `adapter.py`, `screens/*.py`).
 - **Discovery:** any `screens/*.py` with `SCREEN_TYPE` + `on_state(state, params)` — auto-`_discover()`ed, no registry.

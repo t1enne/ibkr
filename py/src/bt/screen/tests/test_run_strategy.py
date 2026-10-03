@@ -22,8 +22,16 @@ from src.bt.screen.run_strategy import (
     _resolve_posture,
     _side_of,
     render_screen_json,
+    trade_table_row,
 )
-from src.bt.state import ActionType, BacktestState, TradeSignal
+from src.bt.state import (
+    ActionType,
+    BacktestState,
+    Trade,
+    TradeExitReason,
+    TradeSignal,
+    TradeStatus,
+)
 from src.bt.types import StrategyConfig
 
 TS: pd.Timestamp = cast(pd.Timestamp, pd.Timestamp("2025-06-10"))
@@ -287,6 +295,59 @@ def test_render_screen_json_emits_only_actionable_rows():
     # flat excluded — a live consumer must not read it as "flatten"
     assert [s["symbol"] for s in payload["signals"]] == ["AAPL", "MSFT"]
     assert [s["action"] for s in payload["signals"]] == ["long", "close"]
+
+
+def test_screen_run_trades_default_to_empty():
+    # The new field is inert unless the driver populates it: a row-only
+    # ScreenRun still constructs and reports no trades (empty bound).
+    assert _run((_row("AAPL", TS),)).trades == ()
+
+
+def test_trade_table_row_blanks_none_exit_fields():
+    # An unclosed trade has no exit_*/close_reason; they must render blank, not
+    # the literal "None".
+    trade = Trade(
+        entry_time=TS,
+        entry_price=100.0,
+        exit_time=None,
+        exit_price=None,
+        last_price=101.0,
+        symbol="AAPL",
+        position=ActionType.long,
+        qty=10.0,
+        stop_loss=95.0,
+        take_profit=120.0,
+    )
+    row = trade_table_row(trade)
+    assert row["symbol"] == "AAPL"
+    assert row["position"] == "long"
+    assert row["entry_price"] == "100.00" and row["qty"] == "10.00"
+    assert row["exit_time"] == "" and row["exit_price"] == ""
+    assert row["close_reason"] == ""
+
+
+def test_trade_table_row_renders_closed_trade():
+    trade = Trade(
+        entry_time=TS,
+        entry_price=100.0,
+        exit_time=TS,
+        exit_price=110.0,
+        last_price=110.0,
+        symbol="MSFT",
+        position=ActionType.short,
+        qty=5.0,
+        stop_loss=0.0,
+        take_profit=0.0,
+        pnl=50.0,
+        status=TradeStatus.closed,
+        close_reason=TradeExitReason.tp,
+    )
+    row = trade_table_row(trade)
+    assert row["position"] == "short"
+    assert row["entry_price"] == "100.00" and row["exit_price"] == "110.00"
+    assert row["pnl"] == "50.00"
+    assert row["exit_time"] == str(TS)
+    assert row["close_reason"] == "tp"
 
 
 def test_render_screen_json_serializes_executable_fields():

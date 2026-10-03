@@ -90,11 +90,26 @@ def test_equity_points_dates_and_floats():
 
 def test_render_result_json_shape():
     r = render_result_json(type("R", (), {"pf": _pf(), "benchmark_curves": {}})())
-    assert set(r) == {"metrics", "trades", "equity_curve", "benchmark_curves"}
+    assert set(r) == {
+        "metrics",
+        "total_trades",
+        "trades",
+        "equity_curve",
+        "benchmark_curves",
+    }
     assert r["metrics"]["total_return"] == 0.005
+    assert r["total_trades"] == 1
     assert len(r["trades"]) == 1
     # benchmark_curves keyed by symbol -> list of points
     assert r["benchmark_curves"] == {}
+
+
+def test_render_result_json_trades_gated_by_flag():
+    obj = type("R", (), {"pf": _pf(), "benchmark_curves": {}})()
+    lean = render_result_json(obj, include_trades=False)
+    assert "trades" not in lean
+    assert lean["total_trades"] == 1  # count survives the omission
+    assert set(lean) == {"metrics", "total_trades", "equity_curve", "benchmark_curves"}
 
 
 def test_render_result_jsonl_ends_with_summary_record():
@@ -103,7 +118,15 @@ def test_render_result_jsonl_ends_with_summary_record():
     # 3 equity points + 1 summary
     assert len(lines) == 4
     assert set(lines[0]) == {"ts", "equity"}
-    assert set(lines[-1]) == {"metrics", "trades"}
+    assert set(lines[-1]) == {"metrics", "total_trades", "trades"}
+    assert lines[-1]["total_trades"] == 1
+
+
+def test_render_result_jsonl_trades_gated_by_flag():
+    obj = type("R", (), {"pf": _pf(), "benchmark_curves": {}})()
+    last = render_result_jsonl(obj, include_trades=False)[-1]
+    assert "trades" not in last
+    assert last["total_trades"] == 1
 
 
 def _candle_df(index, closes):
@@ -145,11 +168,13 @@ def test_render_plot_json_shape_and_interval_resolution():
     r = render_plot_json(obj)
     assert set(r) == {
         "metrics",
+        "total_trades",
         "symbols",
         "trades",
         "equity_curve",
         "benchmark_curves",
     }
+    assert r["total_trades"] == 1
     # two frames stored for AAPL (1h + 4h) come back as a list
     assert len(r["symbols"]["AAPL"]) == 2
     one_h = next(f for f in r["symbols"]["AAPL"] if f["interval"] == "1h")
@@ -158,6 +183,28 @@ def test_render_plot_json_shape_and_interval_resolution():
     assert len(bar) == 6 and bar[1] == 101.0 and bar[4] == 101.0
     # entry time on an index tick -> that frame's interval
     assert r["trades"][0]["interval"] == "1h"
+
+
+def test_render_plot_json_trades_gated_by_flag():
+    class FakeStore:
+        def __init__(self, store):
+            self._store = store
+
+        def keys(self):
+            return self._store.keys()
+
+        def __getitem__(self, key):
+            return self._store[key]
+
+    obj = type(
+        "R",
+        (),
+        {"pf": _pf(), "data": FakeStore(_fake_store()), "benchmark_curves": {}},
+    )()
+    lean = render_plot_json(obj, include_trades=False)
+    assert "trades" not in lean
+    assert lean["total_trades"] == 1
+    assert "symbols" in lean  # chart geometry still present
 
 
 def test_frame_interval_falls_back_to_first_frame():

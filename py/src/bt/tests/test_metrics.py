@@ -8,6 +8,7 @@ import pytest
 from src.bt.metrics import (
     capital_utilization,
     drawdown_periods,
+    get_backtest_results_analysis,
     trade_count,
     win_rate,
 )
@@ -107,6 +108,38 @@ def test_win_rate_zero_without_closed_trades() -> None:
     pf = _pf((_trade(1.0, TradeStatus.open),))
     assert trade_count(pf) == 0
     assert win_rate(pf) == 0.0
+
+
+def test_text_report_trades_default_to_full_table() -> None:
+    pf = _pf(
+        (
+            _trade(10.0, TradeStatus.closed),
+            _trade(-5.0, TradeStatus.closed),
+        )
+    )
+    report = get_backtest_results_analysis(pf)
+    assert "\nTrades" in report
+    assert "Exit Reason" in report  # the trade table header is rendered
+
+
+def test_text_report_omits_trade_list_keeps_count() -> None:
+    pf = _pf(
+        (
+            _trade(10.0, TradeStatus.closed),
+            _trade(-5.0, TradeStatus.closed),
+        )
+    )
+    lean = get_backtest_results_analysis(pf, include_trades=False)
+    # header survives, body collapses to one count note, no per-trade rows
+    assert "\nTrades" in lean
+    assert "2 trades — list omitted (pass --trades to print)" in lean
+    assert "Exit Reason" not in lean
+    assert "Cost$" not in lean  # no trade table columns at all
+
+
+def test_text_report_no_trades_still_says_none() -> None:
+    lean = get_backtest_results_analysis(_pf(()), include_trades=False)
+    assert "\nTrades\n  (none)" in lean
 
 
 # ---------------------------------------------------------------------------

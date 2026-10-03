@@ -92,14 +92,22 @@ def benchmark_json(benchmark_curves: dict[str, pd.Series]) -> dict[str, Any]:
     return {sym: equity_points(curve) for sym, curve in benchmark_curves.items()}
 
 
-def render_result_json(results: Any) -> dict[str, Any]:
-    """BacktestResults -> one JSON-ready dict (metrics + trades + equity + benchmarks)."""
-    return {
+def render_result_json(results: Any, *, include_trades: bool = True) -> dict[str, Any]:
+    """BacktestResults -> one JSON-ready dict.
+
+    Always carries a top-level ``total_trades``; the ``trades`` list itself is
+    emitted only when ``include_trades`` is True (default preserves the full
+    payload for existing callers).
+    """
+    out: dict[str, Any] = {
         "metrics": dict(_metric_pairs(results.pf)),
-        "trades": [trade_json(t) for t in results.pf.trades],
-        "equity_curve": equity_points(results.pf.equity_curve),
-        "benchmark_curves": benchmark_json(results.benchmark_curves),
+        "total_trades": len(results.pf.trades),
     }
+    if include_trades:
+        out["trades"] = [trade_json(t) for t in results.pf.trades]
+    out["equity_curve"] = equity_points(results.pf.equity_curve)
+    out["benchmark_curves"] = benchmark_json(results.benchmark_curves)
+    return out
 
 
 def _frame_interval(results: Any, symbol: str, entry_ts: Any) -> str | None:
@@ -123,7 +131,9 @@ def _frame_interval(results: Any, symbol: str, entry_ts: Any) -> str | None:
     return frames[0][0]
 
 
-def render_plot_json(results: Any, *, plot: bool = True) -> dict[str, Any]:
+def render_plot_json(
+    results: Any, *, plot: bool = True, include_trades: bool = True
+) -> dict[str, Any]:
     """BacktestResults -> one JSON doc shaped for candlestick charting.
 
     Extends the base json shape (metrics + trades + equity) with, per symbol,
@@ -163,18 +173,21 @@ def render_plot_json(results: Any, *, plot: bool = True) -> dict[str, Any]:
         )
     if plot:
         _splice_plot_specs(results, symbols)
-    trades = []
-    for t in results.pf.trades:
-        tj = trade_json(t)
-        tj["interval"] = _frame_interval(results, t.symbol, t.entry_time)
-        trades.append(tj)
-    return {
+    out: dict[str, Any] = {
         "metrics": dict(_metric_pairs(results.pf)),
+        "total_trades": len(results.pf.trades),
         "symbols": symbols,
-        "trades": trades,
-        "equity_curve": equity_points(results.pf.equity_curve),
-        "benchmark_curves": benchmark_json(results.benchmark_curves),
     }
+    if include_trades:
+        trades = []
+        for t in results.pf.trades:
+            tj = trade_json(t)
+            tj["interval"] = _frame_interval(results, t.symbol, t.entry_time)
+            trades.append(tj)
+        out["trades"] = trades
+    out["equity_curve"] = equity_points(results.pf.equity_curve)
+    out["benchmark_curves"] = benchmark_json(results.benchmark_curves)
+    return out
 
 
 def _splice_plot_specs(results: Any, symbols: dict[str, list[dict[str, Any]]]) -> None:
@@ -234,22 +247,26 @@ def _call_plot(
         logger.warning("plot spec failed for %s (%s); omitting", sym, exc)
 
 
-def render_result_jsonl(results: Any) -> list[dict[str, Any]]:
+def render_result_jsonl(
+    results: Any, *, include_trades: bool = True
+) -> list[dict[str, Any]]:
     """BacktestResults -> JSONL-shaped list.
 
-    One dict per equity-curve point, then a final ``{"metrics": ..., "trades":
-    ...}`` record for consumers that read to EOF.
+    One dict per equity-curve point, then a final ``metrics`` + ``total_trades``
+    record (plus ``trades`` unless ``include_trades`` is False) for consumers
+    that read to EOF.
     """
     points: list[dict[str, Any]] = [
         {"ts": _ts_str(ts) or str(ts), "equity": float(val)}
         for ts, val in results.pf.equity_curve.items()
     ]
-    points.append(
-        {
-            "metrics": dict(_metric_pairs(results.pf)),
-            "trades": [trade_json(t) for t in results.pf.trades],
-        }
-    )
+    record: dict[str, Any] = {
+        "metrics": dict(_metric_pairs(results.pf)),
+        "total_trades": len(results.pf.trades),
+    }
+    if include_trades:
+        record["trades"] = [trade_json(t) for t in results.pf.trades]
+    points.append(record)
     return points
 
 

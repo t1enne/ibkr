@@ -5,6 +5,7 @@ from typing import List, Optional, Any, cast
 from scipy import stats
 
 from src.bt.types import PortfolioResult, ActionType
+from src.bt.state import Trade
 from src.bt.table import Col, Table, render
 
 
@@ -324,6 +325,7 @@ def calculate_portfolio_result(
     benchmark_curve: pd.Series | None = None,
     equity_points: tuple[Any, ...] | None = None,
     scaled_trades: int = 0,
+    rejected_trades: int = 0,
 ) -> PortfolioResult:
     """Calculate portfolio result from equity curve and trades.
 
@@ -333,7 +335,10 @@ def calculate_portfolio_result(
         initial_capital: Starting capital
         benchmark_curve: Optional benchmark equity curve for alpha/beta
         equity_points: Optional per-candle EquityPoint snapshots
-        scaled_trades: Count of fills dropped for cash exhaustion (engine
+        scaled_trades: Count of opening fills whose qty was reduced by the
+            shared cohort cash scale (engine ``ScaleRecord`` members); surfaced
+            so the report shows a partially-scaled (advisory) run.
+        rejected_trades: Count of fills dropped for cash exhaustion (engine
             ``rejections``); surfaced so the report shows a non-solid run.
 
     Returns:
@@ -368,6 +373,7 @@ def calculate_portfolio_result(
         beta=beta,
         capital_utilization=capital_utilization(equity_points),
         scaled_trades=int(scaled_trades),
+        rejected_trades=int(rejected_trades),
     )
 
 
@@ -491,11 +497,69 @@ def _safe_date_str(date: object | None) -> str:
     return str(date)[:10]
 
 
+def _trade_row(t: Trade) -> tuple[str, ...]:
+    """One trade -> a row of cells for the text ``Trades`` table."""
+    exit_price = f"{t.exit_price:.2f}" if t.exit_price is not None else "—"
+    pos_str = "L" if t.position == ActionType.long else "S"
+    reason = str(t.close_reason)
+    if len(reason) > 30:
+        reason = reason[:27] + "..."
+    sl_tp = (
+        f"{t.stop_loss:.2f}/{t.take_profit:.2f}"
+        if t.stop_loss and t.take_profit
+        else "—"
+    )
+    return (
+        t.symbol,
+        f"{t.entry_price * t.qty:.2f}",
+        _safe_date_str(t.entry_time),
+        _safe_date_str(t.exit_time),
+        f"{t.entry_price:.2f}",
+        exit_price,
+        f"{t.pnl:.2f}",
+        pos_str,
+        reason,
+        sl_tp,
+    )
+
+
+def _render_trades_section(
+    trades: tuple[Trade, ...], include_trades: bool
+) -> list[str]:
+    """The ``Trades`` block: full table, a count-only note, or ``(none)``.
+
+    With ``include_trades`` False the header is kept and the body collapses to
+    one count line, so a suppressed run stays readable.
+    """
+    if not trades:
+        return ["\nTrades", "  (none)"]
+    if not include_trades:
+        return [
+            "\nTrades",
+            f"  {len(trades):,} trades — list omitted (pass --trades to print)",
+        ]
+    trade_cols = (
+        Col("Sym", "<"),
+        Col("Cost$", ">"),
+        Col("Entry", ">"),
+        Col("Exit", ">"),
+        Col("Entry$", ">"),
+        Col("Exit$", ">"),
+        Col("PnL$", ">"),
+        Col("Pos", ">"),
+        Col("Exit Reason", "<"),
+        Col("SL/TP", "<"),
+    )
+    rows = tuple(_trade_row(t) for t in trades)
+    return ["\nTrades", *render(Table(columns=trade_cols, rows=rows))]
+
+
 def get_backtest_results_analysis(
     result: PortfolioResult,
     metrics: Optional[PerformanceMetrics] = None,
     title: str = "Backtest Results",
     benchmark_curves: dict[str, pd.Series] | None = None,
+    include_trades: bool = True,
 ) -> str:
     if metrics is None:
         metrics = analyze_portfolio(result)
@@ -548,50 +612,7 @@ def get_backtest_results_analysis(
         lines.append("  (none)")
 
     # --- Trades ---
-    if trades:
-        lines.append("\nTrades")
-        trade_cols = (
-            Col("Sym", "<"),
-            Col("Cost$", ">"),
-            Col("Entry", ">"),
-            Col("Exit", ">"),
-            Col("Entry$", ">"),
-            Col("Exit$", ">"),
-            Col("PnL$", ">"),
-            Col("Pos", ">"),
-            Col("Exit Reason", "<"),
-            Col("SL/TP", "<"),
-        )
-        trade_rows: list[tuple[str, ...]] = []
-        for t in trades:
-            exit_price_str = f"{t.exit_price:.2f}" if t.exit_price is not None else "—"
-            pos_str = "L" if t.position == ActionType.long else "S"
-            reason = str(t.close_reason)
-            if len(reason) > 30:
-                reason = reason[:27] + "..."
-            sl_tp = (
-                f"{t.stop_loss:.2f}/{t.take_profit:.2f}"
-                if t.stop_loss and t.take_profit
-                else "—"
-            )
-            trade_rows.append(
-                (
-                    t.symbol,
-                    f"{t.entry_price * t.qty:.2f}",
-                    _safe_date_str(t.entry_time),
-                    _safe_date_str(t.exit_time),
-                    f"{t.entry_price:.2f}",
-                    exit_price_str,
-                    f"{t.pnl:.2f}",
-                    pos_str,
-                    reason,
-                    sl_tp,
-                )
-            )
-        lines.extend(render(Table(columns=trade_cols, rows=tuple(trade_rows))))
-    else:
-        lines.append("\nTrades")
-        lines.append("  (none)")
+    lines.extend(_render_trades_section(trades, include_trades))
 
     # --- Trading Statistics ---
     lines.append("\nTrading Statistics")
@@ -746,6 +767,8 @@ def get_backtest_results_analysis(
             ("Skewness", f"{metrics.skewness:.2f}") + tuple("—" for _ in bm_names),
             ("Kurtosis", f"{metrics.kurtosis:.2f}") + tuple("—" for _ in bm_names),
             ("Scaled Trades", str(result.scaled_trades)) + tuple("—" for _ in bm_names),
+            ("Rejected Trades", str(result.rejected_trades))
+            + tuple("—" for _ in bm_names),
             ("Alpha", "—") + tuple(f"{bm_stats[s]['alpha']:.2f}" for s in bm_names),
             ("Beta", "—") + tuple(f"{bm_stats[s]['beta']:.2f}" for s in bm_names),
         )
@@ -764,6 +787,7 @@ def get_backtest_results_analysis(
             ("Skewness", f"{metrics.skewness:.2f}"),
             ("Kurtosis", f"{metrics.kurtosis:.2f}"),
             ("Scaled Trades", str(result.scaled_trades)),
+            ("Rejected Trades", str(result.rejected_trades)),
             ("Alpha", f"{metrics.alpha:.2f}"),
             ("Beta", f"{metrics.beta:.2f}"),
         )

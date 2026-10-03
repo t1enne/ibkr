@@ -18,30 +18,17 @@ from __future__ import annotations
 from src.bt.warmup import parse_warmup_bars
 
 from dataclasses import dataclass, replace
-from typing import Literal, Mapping, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Mapping, TypedDict, cast
 
-import numpy as np
+if TYPE_CHECKING:
+    from src.bt.state.types import Trade
+
 import pandas as pd
 
 from src.bt import Backtest, init_strat, load_strategy, run
 from src.bt.data_feed import load_candles
 from src.bt.state import ActionType, BacktestState, TradeSignal
 from src.bt.types import StrategyConfig
-
-#: Common metrics shown as extra table columns, uniform with the old screen.
-#: ``rsi_14`` was replaced by ``mfi_14`` (money-flow index — blends volume into
-#: its value), and the two raw volume stats were collapsed into one ``obv_z``:
-#: the direct cumulative-flow channel a trader can actually weight (sign =
-#: flow direction, magnitude = strength vs the name's own recent pattern).
-COMMON_COLS = [
-    "ema_50",
-    "ema_100",
-    "atr_14",
-    "mfi_14",
-    "obv_z",
-    "hi_52w",
-    "lo_52w",
-]
 
 #: ``long``/``short`` open or reorient a side, ``close`` is an explicit exit
 #: directive, ``flat`` means no signal / no position (context only, never an
@@ -111,6 +98,11 @@ class ScreenRun:
     rows: tuple[ScreenRow, ...]
     state: BacktestState
     config: StrategyConfig
+    # The run's executed trades (open -> close). A screen runs the real engine,
+    # so its own ``on_candle`` fills are recorded here — INCLUDING the fills
+    # ``_finalize`` uses to flatten the book at the final bar, which are not
+    # strategy intent. Empty by default so row-only callers/tests stay inert.
+    trades: tuple[Trade, ...] = ()
 
 
 def run_screen_from_strategy(
@@ -168,7 +160,11 @@ def run_screen_from_strategy(
     }
     rows = _project(collector, tuple(config.symbols), posture, latest)
     rows = _filter_recent(rows, max_age_days)
-    return ScreenRun(rows=rows, state=final, config=config)
+    # The observer feed is pure intent; the engine's own book is the trade log.
+    # Flat after ``_finalize`` (see module docstring) — carried as executed fills.
+    return ScreenRun(
+        rows=rows, state=final, config=config, trades=tuple(results.pf.trades)
+    )
 
 
 def _filter_recent(
@@ -459,6 +455,34 @@ def render_screen_json(
     }
 
 
+def trade_table_row(t: Trade) -> dict[str, str]:
+    """One executed ``Trade`` -> its printed trade-table row (all strings).
+
+    ``exit_time``/``exit_price``/``close_reason`` render blank when ``None``
+    (an unclosed trade) rather than the literal ``"None"``; every other field
+    is non-optional on ``Trade``. Kept pure so the formatting is unit-testable
+    without a live run (empty trades, None exits).
+    """
+    return {
+        "symbol": t.symbol,
+        "position": str(getattr(t.position, "value", t.position)),
+        "qty": f"{t.qty:.2f}",
+        "entry_time": str(t.entry_time),
+        "entry_price": f"{t.entry_price:.2f}",
+        "exit_time": "" if t.exit_time is None else str(t.exit_time),
+        "exit_price": "" if t.exit_price is None else f"{t.exit_price:.2f}",
+        "pnl": f"{t.pnl:.2f}",
+        "close_reason": _reason_str(t.close_reason),
+    }
+
+
+def _reason_str(v: object) -> str:
+    """Close reason (enum or scalar or ``None``) -> printable string."""
+    if v is None:
+        return ""
+    return str(getattr(v, "value", v))
+
+
 def _signal_json(r: ScreenRow) -> ScreenSignalJson:
     """Lift one actionable row into its JSON representation."""
     return {
@@ -474,109 +498,4 @@ def _signal_json(r: ScreenRow) -> ScreenSignalJson:
         "take_profit": r.take_profit,
         "position_id": r.position_id,
         "tag": r.tag,
-    }
-
-
-# ---------------------------------------------------------------------------
-# common per-symbol metrics (re-homed from the deleted screen scoring layer);
-# diagnostics/context for the printed table only, never scoring inputs
-# ---------------------------------------------------------------------------
-
-COMMON_METRIC_KEYS = tuple(COMMON_COLS)
-
-
-def _ta_ema(closes: pd.Series, span: int) -> float:
-    """Lazy ``ta.ema`` — avoid pulling ``src.indicators`` at bt bootstrap."""
-    from src.indicators.ta import ema
-
-    try:
-        v = float(ema(closes, span).iloc[-1])
-    except IndexError, ValueError:
-        return float("nan")
-    return v if np.isfinite(v) else float("nan")
-
-
-def _ta_atr(frame: pd.DataFrame) -> float:
-    """ATR(14) over a frame's OHLC — closest to price diagonal."""
-    closes = frame["close"]
-    high = frame["high"] if "high" in frame.columns else closes
-    low = frame["low"] if "low" in frame.columns else closes
-    if len(high) < 1:
-        return float("nan")
-    from src.indicators.ta import atr
-
-    try:
-        v = float(atr(high, low, closes, window=14).iloc[-1])
-    except IndexError, ValueError:
-        return float("nan")
-    return v if np.isfinite(v) else float("nan")
-
-
-def _ta_mfi(frame: pd.DataFrame) -> float:
-    """MFI(14) — money-flow index; volume-weighted, distinct from the plain
-    volume reads below."""
-
-    def _col(name: str) -> pd.Series:
-        return frame[name] if name in frame.columns else frame["close"]
-
-    from src.indicators.ta import mfi
-
-    try:
-        v = float(
-            mfi(_col("high"), _col("low"), _col("close"), _col("volume")).iloc[-1]
-        )
-    except IndexError, ValueError:
-        return float("nan")
-    return v if np.isfinite(v) else float("nan")
-
-
-def _obv_z(frame: pd.DataFrame) -> float:
-    """Cumulative-flow channel, single column. OBV over the frame, then its
-    current level expressed as a z-score against its own trailing-40 pattern
-    (rolling mean/std of the OBV level). Sign = money-flow direction; |value|
-    = strength off the name's own noise floor (~+1.5/-1.5 starts to be
-    notable). A long printing while this sits near/below zero is unconfirmed
-    flow — the price/OBV divergence tell. Nan without enough bars to warm the
-    OBV z-window."""
-    if "volume" not in frame.columns or len(frame) < 41:
-        return float("nan")
-    from src.indicators.ta import obv
-
-    try:
-        obv_series = obv(frame["close"], frame["volume"])
-    except IndexError, ValueError:
-        return float("nan")
-    if len(obv_series) < 41:
-        return float("nan")
-    win = obv_series.rolling(window=40)
-    m = float(win.mean().iloc[-1])
-    s = float(win.std().iloc[-1])
-    if not np.isfinite(m) or not np.isfinite(s) or s == 0:
-        return float("nan")
-    last = float(obv_series.iloc[-1])
-    return (last - m) / s if np.isfinite(last) else float("nan")
-
-
-def common_metrics(frame: pd.DataFrame) -> dict[str, float]:
-    """Compute the common metric set for a symbol frame (flat dict, float values,
-    ``nan`` on missing data). Calendar-aware 52-week high/low over the index."""
-    closes = frame["close"] if "close" in frame.columns else None
-    if closes is None or len(closes) == 0:
-        return {k: float("nan") for k in COMMON_METRIC_KEYS}
-
-    hi_52w = lo_52w = float("nan")
-    if isinstance(closes.index, pd.DatetimeIndex) and len(closes) > 0:
-        hi = closes.rolling("365D", min_periods=1).max()
-        lo = closes.rolling("365D", min_periods=1).min()
-        hi_52w = float(hi.iloc[-1]) if np.isfinite(hi.iloc[-1]) else float("nan")
-        lo_52w = float(lo.iloc[-1]) if np.isfinite(lo.iloc[-1]) else float("nan")
-
-    return {
-        "ema_50": _ta_ema(closes, 50),
-        "ema_100": _ta_ema(closes, 100),
-        "atr_14": _ta_atr(frame),
-        "mfi_14": _ta_mfi(frame),
-        "obv_z": _obv_z(frame),
-        "hi_52w": hi_52w,
-        "lo_52w": lo_52w,
     }

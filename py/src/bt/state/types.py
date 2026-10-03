@@ -233,9 +233,15 @@ class PortfolioResult:
     stability: float = 0.0
     omega_ratio: float = 0.0
     capital_utilization: float = 0.0
-    # Fills dropped for genuine cash exhaustion (the engine's ``rejections``
-    # sink). Non-zero means cohort scaling was still not enough — the run is
-    # advisory across symbol permutations (see AGENTS.md "Fills").
+    # Fills dropped for GENUINE cash exhaustion (the engine's ``rejections``
+    # sink): a lone open that does not fit even after cohort scaling. Non-zero
+    # means the run is advisory across symbol permutations (see AGENTS.md
+    # "Fills").
+    rejected_trades: int = 0
+    # Opening fills whose qty was REDUCED by the shared cohort cash scale in
+    # ``portfolio.pure._scale_opens`` (a multi-open cohort that over-requested).
+    # Silent before — such an entry lands at ``scale × plan``. Counted apart
+    # from ``rejected_trades``; together they tell the whole cash story.
     scaled_trades: int = 0
 
 

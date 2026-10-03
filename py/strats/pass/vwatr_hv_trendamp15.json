@@ -1,12 +1,14 @@
 {
-  "name": "vwatr_hv_amp20",
+  "name": "vwatr_hv_gated",
   "warmup": "300d",
   "trading_start": "2020-09-01",
   "trading_end": "2026-09-01",
   "commission": 0.05,
   "initial_capital": 50000,
   "strategy_type": "vwatr_div_dsl",
-  "bars": ["1d"],
+  "bars": [
+    "1d"
+  ],
   "strategy_params": {
     "risk_pct": 0.006,
     "risk_trend_amp": 2.5

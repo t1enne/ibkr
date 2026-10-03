@@ -7,6 +7,7 @@ Modular CLI toolkit for quantitative trading: data synchronization, indicator co
 ```bash
 uv sync
 uv run ibkr bt run strats/pass/<config>.json
+uv run ibkr bt run strats/pass/<config>.json --trades   # full trade list (default off)
 make run bt run strats/pass/<config>.json   # same, via Make shortcut
 ```
 
@@ -211,11 +212,13 @@ src/
 
 ```bash
 # Backtesting
-uv run ibkr bt run <strategy.json> [--format jsonl]
+uv run ibkr bt run <strategy.json> [--format jsonl] [--trades]   # --trades = full trade list (off by default)
 uv run ibkr bt split <strategy.json> --folds 4          # IS/OOS walk-forward
 uv run ibkr bt split <strategy.json> --is-end 2020-12-31  # single anchor split
 uv run ibkr bt sweep <strategy.json> '{...grid...}'     # hyperparameter sweep
 uv run ibkr bt optimize <strategy.json> '{...grid...}' --folds 4  # per-fold IS tune → OOS validate
+uv run ibkr bt screen <strategy.json>                   # current-bar intent (opens AND closes)
+uv run ibkr bt screen <strategy.json> --trades          # + executed-trade table (default off)
 # All three parallelize units across worker processes with:
 #   --workers N   (default 1 = sequential)
 

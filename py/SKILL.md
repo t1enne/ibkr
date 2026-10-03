@@ -201,7 +201,7 @@ classification bucket they earn — see `strats/README.md`):
 
 ```bash
 cd /home/nasrt/Documents/code/dev/ibkr/py
-uv run ibkr bt run strats/<bucket>/<name>.json
+uv run ibkr bt run strats/<bucket>/<name>.json --trades   # full trade list (off by default)
 make run bt run strats/<bucket>/<name>.json   # same, via Make shortcut
 ```
 
@@ -230,7 +230,7 @@ results = run(bt, df, strat_mod=strat_mod)
 The `bt run` report contains:
 
 - **Drawdown periods** — worst 5 drawdowns with dates and duration
-- **Trade log** — every trade with entry/exit times, prices, PnL, direction, reason, SL/TP levels
+- **Trade log** — every trade with entry/exit times, prices, PnL, direction, reason, SL/TP levels. **Omitted by default** (big runs can hold thousands): pass `--trades` to print/serialize the full list. Off, every format still reports the count — text keeps the `Trades` header as a one-line note, `json`/`jsonl`/`plot` carry a top-level `total_trades`.
 - **Statistics** — win rate, total trades, starting capital, total P&L, backtest duration
 - **Metrics table** — annual return, volatility, Sharpe, Calmar, Sortino, Omega, max drawdown, stability, skewness, kurtosis, alpha, beta, plus **Scaled Trades** (fills dropped for cash exhaustion). `sweep`/`split`/`optimize` reports use the shared canonical set (Sharpe, Ann, MaxDD, Kurt, Skew, Win, Trades, Scaled) and their `-F json` emits the identical per-run metric dict.
 
@@ -455,7 +455,7 @@ All CLI groups under the `py` root command — also callable via `make run <subc
 | Group  | Commands                                    | Description                                                                  |
 | ------ | ------------------------------------------- | ---------------------------------------------------------------------------- |
 | `data` | `dl`, `query`, `preview`, `fundamentals dl` | Sync/download OHLCV from IBKR, query local DB; SEC EDGAR fundamentals        |
-| `bt`   | `run`, `sweep`, `split`, `optimize`         | Backtesting engine, hyperparam sweep, IS/OOS validation, walk-forward tuning |
+| `bt`   | `run`, `sweep`, `split`, `optimize`, `screen` | Backtesting engine, hyperparam sweep, IS/OOS validation, walk-forward tuning, live-intent screening |
 
 ### `bt sweep` — hyperparameter sweep
 
@@ -552,6 +552,39 @@ quoting numbers.
 
 Run folds in parallel with `--workers N` — each fold tunes its IS and
 validates its OOS independently (combos inside a fold stay sequential).
+
+### `bt screen` — current-bar intent from a real strategy
+
+Runs a strategy's own `on_candle` through the real engine over a trailing
+warm-up window ending at the newest data bar, then surfaces **intent**, not
+fills: each symbol's latest emitted posture as an action + score. Actions are
+`long`/`short` (open or reorient), `close` (explicit exit) and `flat` (no
+signal — text only). Ranked by score desc.
+
+The intent table is an order ticket, not a metric sheet: signal-time price,
+qty, stop-loss, take-profit, and the bar it fired on. Output is an intent rank
+only — a high score means "the condition fired", never "expected profit".
+
+```bash
+uv run ibkr bt screen strats/pass/<config>.json            # ranked intent table
+uv run ibkr bt screen strats/pass/<config>.json -F json    # live-consumer payload
+uv run ibkr bt screen strats/pass/<config>.json --trades   # + executed-trade table
+```
+
+`-F json` emits only actionable (`long`/`short`/`close`) rows under `signals`
+(with `position_id`/`tag`), so a live layer can act without replaying the
+engine; a no-signal `flat` row is never emitted as an instruction to flatten.
+
+`--trades` (default **off**) additionally surfaces the run's executed trades,
+from the engine's real fills (open → close). Text mode prints a second table
+after the intent table (symbol, position, qty, entry/exit time and price, pnl,
+close_reason; blank for an unclosed trade). JSON mode adds a `trades` key — one
+dict per trade (`trade_json`): the full fill record incl. `stop_loss`,
+`take_profit`, `commission`, `slippage`, `status`, `close_reason`, `reason`.
+The run flattens its book at the final bar, so the last fills are `_finalize`,
+**not** strategy intent — read them as the engine's realized book, not as
+signals to act on. Off by default so payloads and byte-for-byte output are
+unchanged for existing intent consumers.
 
 ### Parallelism (`--workers`)
 

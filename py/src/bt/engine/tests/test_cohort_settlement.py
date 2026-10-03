@@ -224,20 +224,21 @@ def _oversize_entry(ctx: StrategyContext):
         ctx.long("AAA", size=50.0, reason="oversize", size_mode="capital")
 
 
-def test_insufficient_cash_rejection_is_reported_to_stderr(capsys):
-    """A dropped fill emits one aggregated STDERR warning."""
+def test_insufficient_cash_rejection_reported_in_metrics(capsys):
+    """A dropped fill surfaces as ``PortfolioResult.rejected_trades``, silently."""
     cfg = _cfg(["AAA", "BBB"])
-    run(Backtest(cfg), _feed(["AAA", "BBB"]), _FixtureMod(_oversize_entry))
+    result = run(Backtest(cfg), _feed(["AAA", "BBB"]), _FixtureMod(_oversize_entry))
+    assert result.pf.rejected_trades >= 1
     captured = capsys.readouterr()
-    assert "rejected due to insufficient cash" in captured.err
-    assert captured.err.count("[bt] WARNING") == 1  # summarised, not per-event
+    assert captured.err == ""  # no mid-run stderr warning
     assert captured.out == ""  # never contaminates stdout
 
 
-def test_no_rejection_warning_when_everything_fits(capsys):
+def test_no_rejection_when_everything_fits(capsys):
     cfg = _cfg(["AAA", "BBB"])
-    run(Backtest(cfg), _feed(["AAA", "BBB"]), _mod())
-    assert "rejected" not in capsys.readouterr().err
+    result = run(Backtest(cfg), _feed(["AAA", "BBB"]), _mod())
+    assert result.pf.rejected_trades == 0
+    assert capsys.readouterr().err == ""
 
 
 @strategy(bars="1d", stateful=True)

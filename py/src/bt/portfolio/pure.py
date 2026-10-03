@@ -43,6 +43,24 @@ class FillRejection:
     available_cash: float
 
 
+@dataclass(frozen=True)
+class ScaleRecord:
+    """Pure record of a cohort that was PARTIALLY scaled for cash.
+
+    Emitted by ``_scale_opens`` when a multi-open cohort's requested notional
+    exceeds the post-close cash budget. Distinct from ``FillRejection``: a
+    scaled fill still lands, just at ``scale × plan`` (silent before this
+    record). ``members`` lists the symbol of every opening fill actually
+    reduced; ``scale`` is the shared factor, ``requested`` the pre-scale
+    notional and ``budget`` the cash available to fund it.
+    """
+
+    scale: float
+    requested: float
+    budget: float
+    members: tuple[str, ...]
+
+
 def describe_open_rejection(
     portfolio: PortfolioState,
     fill: FillEvent,
@@ -101,7 +119,7 @@ def apply_fills(
     portfolio: PortfolioState,
     fills: tuple[FillEvent, ...],
     scale_cohorts: bool = True,
-) -> tuple[PortfolioState, TupleT[FillRejection, ...]]:
+) -> tuple[PortfolioState, TupleT[FillRejection, ...], TupleT[ScaleRecord, ...]]:
     """Apply a whole timestamp cohort of fills atomically. Pure.
 
     One call settles every fill that executes at the SAME phase of the same bar
@@ -135,12 +153,14 @@ def apply_fills(
     it exists to separate the cash-constraint effect from the specific
     uniform-scaling rule.
 
-    Returns the new portfolio plus the rejections for "genuine exhaustion"
-    (an open that still does not fit at the shared scale) — the engine reports
-    those; this function never does I/O.
+    Returns the new portfolio, the rejections for "genuine exhaustion" (an open
+    that still does not fit at the shared scale) and the ``ScaleRecord`` list for
+    cohorts that were partially scaled — the engine reports all three; this
+    function never does I/O.
 
     Caveat — scaling is NOT rejection. An over-cash multi-open cohort is
-    divided by one shared ``scale`` (silent); only a lone open rejects. A
+    divided by one shared ``scale`` (reported as a ``ScaleRecord``); only a lone
+    open rejects. A
     risk-sized entry lands at ``scale × plan`` — $ risk/reward, risk budget
     and cost-adjusted RR off-plan, per-share R unchanged. Grouping, not
     arithmetic, is order-sensitive: results under rejections are advisory,
@@ -160,31 +180,36 @@ def apply_fills(
     # ``scale_cohorts=False`` is the research counterfactual: skip the shared
     # cash scale and let the sorted opens settle one by one, rejecting any that
     # no longer fit. Order-sensitive by construction — advisory only.
+    scales: list[ScaleRecord] = []
     if scale_cohorts:
-        opens = _scale_opens(portfolio, opens)
+        opens, record = _scale_opens(portfolio, opens)
+        if record is not None:
+            scales.append(record)
     rejections: list[FillRejection] = []
     for fill in sorted(opens, key=lambda f: f.signal.symbol):
         rejected = describe_open_rejection(portfolio, fill)
         if rejected is not None:
             rejections.append(rejected)
         portfolio = _open_position(portfolio, fill)
-    return portfolio, tuple(rejections)
+    return portfolio, tuple(rejections), tuple(scales)
 
 
 def _scale_opens(
     portfolio: PortfolioState, opens: tuple[FillEvent, ...]
-) -> tuple[FillEvent, ...]:
+) -> tuple[tuple[FillEvent, ...], Optional[ScaleRecord]]:
     """Divide a cohort's opens by one shared, pre-execution cash scale.
 
-    Returns ``opens`` unchanged for a lone open (or none) — the legacy path that
-    keeps single-signal strategies bit-identical. Otherwise scales each open's
-    qty by ``scale = min(1, cash / requested)`` and floors to 4 dp so the scaled
-    result is deterministic and can never round UP past the cash edge.
+    Returns ``opens`` unchanged and ``None`` for a lone open (or none) — the
+    legacy path that keeps single-signal strategies bit-identical — or when the
+    cohort already fits. Otherwise scales each open's qty by
+    ``scale = min(1, cash / requested)``, floors to 4 dp so the scaled result is
+    deterministic and can never round UP past the cash edge, and returns a
+    ``ScaleRecord`` of what it did (reporting only; the fill math is unchanged).
     """
     if len(opens) <= 1:
         # Lone-open guard: full-size-or-reject, never scaled. Same intent
         # fills full alone, "scale × plan" with a peer (see ``apply_fills``).
-        return opens
+        return opens, None
     # Reserve the fixed commission of every open up front: scaling the notional
     # by ``(cash - total_commission) / requested`` makes the cohort's total cost
     # (notional + commission) land exactly on ``cash``. Without the reservation a
@@ -193,18 +218,38 @@ def _scale_opens(
     commission = sum(f.commission for f in opens)
     requested = sum(max(f.signal.qty, 0.0) * f.executed_price for f in opens)
     budget = portfolio.cash - commission
+    # ``budget / requested`` is NaN when either side is NaN; ``min(1.0, nan)``
+    # keeps 1.0, so a NaN cohort falls through to the unscaled return below.
     if requested <= 0 or budget <= 0:
-        return opens
+        return opens, None
     scale = min(1.0, budget / requested)
     if scale >= 1.0:
-        return opens
-    return tuple(
+        return opens, None
+    scaled = tuple(
         replace(
             f,
             signal=replace(f.signal, qty=math.floor(f.signal.qty * scale * 1e4) / 1e4),
         )
         for f in opens
     )
+    # Only fills whose qty the floor actually moved count as "reduced" — a
+    # scale within a float epsilon of 1.0 reduces nothing.
+    members = tuple(
+        sorted(
+            new.signal.symbol
+            for new, old in zip(scaled, opens)
+            if new.signal.qty != old.signal.qty
+        )
+    )
+    if not members:
+        return opens, None
+    record = ScaleRecord(
+        scale=scale,
+        requested=requested,
+        budget=budget,
+        members=members,
+    )
+    return scaled, record
 
 
 def next_position_id(symbol: str, ts: pd.Timestamp, seq: int) -> str:

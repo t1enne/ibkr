@@ -3,9 +3,10 @@
 One source of truth — :data:`CANONICAL_METRICS` — drives both the text cells
 (:func:`metric_cells`) and the JSON records (:func:`metric_dict`) so the sweep,
 split and optimize reports (and their ``-F json`` outputs) can never drift.
-The canonical set is Sharpe, Ann, MaxDD, Kurt, Skew, Win, Trades, Scaled
-(kurtosis + skewness tell the tail story; Scaled flags a run where cash
-scaling dropped fills — see AGENTS.md "Fills").
+The canonical set is Sharpe, Ann, MaxDD, Kurt, Skew, Win, Trades, Scaled,
+Rejected (kurtosis + skewness tell the tail story; Scaled is the count of
+partially-scaled entries, Rejected the count dropped for genuine cash
+exhaustion — see AGENTS.md "Fills").
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ CANONICAL_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("win_rate", "Win", lambda v: f"{v:.0%}"),
     MetricSpec("trade_count", "Trades", lambda v: str(int(v)), as_int=True),
     MetricSpec("scaled_trades", "Scaled", lambda v: str(int(v)), as_int=True),
+    MetricSpec("rejected_trades", "Rejected", lambda v: str(int(v)), as_int=True),
 )
 
 

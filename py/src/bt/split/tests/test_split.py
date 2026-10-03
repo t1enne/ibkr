@@ -311,6 +311,7 @@ def test_split_report_to_dict_counts_only_closed_trades() -> None:
         "win_rate",
         "trade_count",
         "scaled_trades",
+        "rejected_trades",
     }
 
 
@@ -332,6 +333,7 @@ def test_render_split_report_stacked_rows() -> None:
     assert "Kurt" in text
     assert "Trades" in text
     assert "Scaled" in text
+    assert "Rejected" in text
     assert "Win" in text
     assert "2015-01-02→2020-01-01" in text
     assert "AGGREGATE: mean OOS Sharpe 1.50" in text

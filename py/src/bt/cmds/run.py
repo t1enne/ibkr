@@ -19,7 +19,8 @@ from src.bt.cmds._shared import _json_default
     type=click.Choice(["jsonl", "json", "text", "plot"]),
     default="text",
     help="Output format: jsonl (equity curve lines), json (full result), "
-    "text (summary), or plot (chart payload inline for dashboards)",
+    "text (summary), or plot (chart payload inline for dashboards). Trade "
+    "list gated by --trades (default off).",
 )
 @click.option(
     "-o",
@@ -37,6 +38,13 @@ from src.bt.cmds._shared import _json_default
     help="Run the backtest then open the Streamlit dashboard over the result.",
 )
 @click.option(
+    "--trades",
+    "trades",
+    is_flag=True,
+    default=False,
+    help="Include the full trade list in the output.",
+)
+@click.option(
     "--no-plot-spec",
     "no_plot_spec",
     is_flag=True,
@@ -49,6 +57,7 @@ def run(
     fmt: str,
     output: str | None,
     plot: bool,
+    trades: bool,
     no_plot_spec: bool,
 ):
     """Run a backtest from a strategy JSON config file.
@@ -56,7 +65,13 @@ def run(
     STRATEGY_FILE: JSON config with symbols, dates, strategy params.
 
     --plot runs the backtest then launches the Streamlit dashboard over the
-    result (overrides --format/--output).
+    result (overrides --format/--output); the dashboard always gets the full
+    trade set (chart markers need it).
+
+    --trades (default off) gates the trade LIST in every format.
+    Off, the list is omitted but the trade COUNT is always reported (text
+    keeps the ``Trades`` header with a one-line note; json/jsonl/plot carry a
+    top-level ``trade_count``).
 
     When the strategy defines a module-level ``plot(ctx, params)``, its
     declarative spec is included in the plot payload; ``--no-plot-spec`` (or
@@ -87,18 +102,20 @@ def run(
         launch_dashboard(render_plot_json(results, plot=spec))
         return
     if fmt == "plot":
-        payload = render_plot_json(results, plot=spec)
+        payload = render_plot_json(results, plot=spec, include_trades=trades)
     elif fmt == "json":
-        payload = render_result_json(results)
+        payload = render_result_json(results, include_trades=trades)
     elif fmt == "jsonl":
-        lines = render_result_jsonl(results)
+        lines = render_result_jsonl(results, include_trades=trades)
         text = "\n".join(json.dumps(line, default=_json_default) for line in lines)
         _emit(text + "\n", output)
         return
     else:
         click.echo(
             get_backtest_results_analysis(
-                results.pf, benchmark_curves=results.benchmark_curves
+                results.pf,
+                benchmark_curves=results.benchmark_curves,
+                include_trades=trades,
             )
         )
         return

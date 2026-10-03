@@ -16,16 +16,29 @@ from typing import TYPE_CHECKING
 import click
 
 from src.bt.cmds._shared import _json_default
+from src.bt.output import trade_json
 from src.bt.table import render_from_dicts
 
 if TYPE_CHECKING:
-    from src.bt.engine.candle_store import CandleStore
+    from src.bt.screen.run_strategy import ScreenRow
+    from src.bt.state.types import Trade
 
-#: Column order for the printed table (common metrics appended after the core).
-#: ``date`` shows the bar the live posture came from (the signal's generation
-#: date), so a stale/retained setup is instantly visible as an old date next
-#: to current price context. Blank when a symbol has no posture (flat).
-TABLE_COLS = ["symbol", "action", "score", "signals", "date"]
+#: Column order for the printed table: the executable fields of the posture-
+#: setting signal, so the row is an order ticket, not a metric sheet. ``date``
+#: is the bar the signal fired on (a stale/retained setup shows an old date).
+#: ``price`` is the signal-time price; ``qty`` absolute shares (0 = engine-
+#: sized); ``sl``/``tp`` blank when the strategy set none.
+TABLE_COLS = [
+    "symbol",
+    "action",
+    "score",
+    "price",
+    "qty",
+    "sl",
+    "tp",
+    "date",
+    "signals",
+]
 
 
 @click.command(name="screen")
@@ -58,7 +71,12 @@ TABLE_COLS = ["symbol", "action", "score", "signals", "date"]
     help="Output format: text (ranked table) or json (machine-readable intent "
     "for a live trading system; actionable long/short/close signals only).",
 )
-def screen(strategy_file: str, warmup: int | None, max_age: int, fmt: str) -> None:
+def screen(
+    strategy_file: str,
+    warmup: int | None,
+    max_age: int,
+    fmt: str,
+) -> None:
     """Run a strategy and surface its current-bar intent (opens AND closes).
 
     STRATEGY_FILE: the same JSON strategy config a ``bt run`` consumes. The
@@ -68,16 +86,22 @@ def screen(strategy_file: str, warmup: int | None, max_age: int, fmt: str) -> No
     reorient), ``close`` (explicit exit) and ``flat`` (no signal — text only).
     Ranked by score desc.
 
-    Output is an intent rank only — screens never trade, so a high score means
-    "the condition fired", not "expected profit" (pre-cost by design).
+    Each row prints the setting signal's executable fields — signal-time price,
+    qty, stop-loss, take-profit, and the bar it fired on — so the table is a
+    ticket, not a metric sheet. Output is an intent rank only: screens never
+    trade, so a high score means "the condition fired", not "expected profit"
+    (pre-cost by design).
 
     ``-F json`` emits only actionable (``long``/``short``/``close``) rows with
-    the setting signal's executable fields (price, qty, stop_loss, take_profit,
-    position_id, tag) so a live layer can act without replaying the engine.
+    the same executable fields plus ``position_id``/``tag``, so a live layer
+    can act without replaying the engine.
+
+    ``--trades`` (default off) additionally surfaces the run's executed trades:
+    a second text table after the intent table, or a ``trades`` key in the json
+    payload. The screen runs the real engine, so these are its fills — the
+    final-bar ``_finalize`` flatten included, not strategy intent.
     """
     from src.bt.screen.run_strategy import (
-        COMMON_COLS,
-        common_metrics,
         render_screen_json,
         run_screen_from_strategy,
     )
@@ -88,60 +112,41 @@ def screen(strategy_file: str, warmup: int | None, max_age: int, fmt: str) -> No
     )
 
     if fmt == "json":
-        payload = render_screen_json(run, strategy=strategy_file)
+        payload: dict[str, object] = dict(
+            render_screen_json(run, strategy=strategy_file)
+        )
         click.echo(json.dumps(payload, indent=2, default=_json_default))
         return
 
-    rows, state = run.rows, run.state
-    table_rows: list[dict[str, str]] = []
-    for r in rows:
-        frame = _symbol_frame(state.candles, r.symbol)
-        feats = common_metrics(frame) if frame is not None else {}
-        # Posture-stale on purpose: ``date`` shows the LAST posture-setting
-        # bar (where the signal actually fired), not newest tape, so retained
-        # reason strings can't be read as fresh signals.
-        shown = str(r.sig_ts) if r.sig_ts is not None else str(r.ts)
-        table_rows.append(
-            {
-                "symbol": r.symbol,
-                "action": r.action,
-                "score": f"{r.score:.3f}",
-                "signals": ", ".join(r.signals),
-                "date": shown,
-                **{k: _fmt(feats.get(k)) for k in COMMON_COLS},
-            }
-        )
-
+    table_rows = [_ticket_row(r) for r in run.rows]
     if not table_rows:
         click.echo("No recent signals.")
-        return
-
-    for line in render_from_dicts(
-        TABLE_COLS + list(COMMON_COLS), table_rows, align="<"
-    ):
-        click.echo(line)
+    else:
+        for line in render_from_dicts(TABLE_COLS, table_rows, align="<"):
+            click.echo(line)
 
 
-def _symbol_frame(candles: "CandleStore", symbol: str):
-    """:return: the symbol's base-interval frame from the store, or ``None``."""
-    base_iv = next((iv for (_, iv) in candles.keys()), "1d")
-    try:
-        return candles.get((symbol, base_iv))
-    except KeyError:
-        return None
+def _ticket_row(r: "ScreenRow") -> dict[str, str]:
+    """One screen row -> the signal's executable fields (blank on non-signal)."""
+    # Posture-stale on purpose: ``date`` shows the LAST posture-setting bar
+    # (where the signal actually fired), not newest tape, so retained reason
+    # strings can't be read as fresh signals.
+    return {
+        "symbol": r.symbol,
+        "action": r.action,
+        "score": f"{r.score:.3f}",
+        "price": _num(r.price),
+        "qty": _num(r.qty),
+        "sl": _num(r.stop_loss),
+        "tp": _num(r.take_profit),
+        "date": str(r.sig_ts) if r.sig_ts is not None else str(r.ts),
+        "signals": ", ".join(r.signals),
+    }
 
 
-def _fmt(v: float | None) -> str:
-    """Format a metric float; None/NaN renders as empty."""
-    if v is None or _isna(v):
-        return ""
-    return f"{v:.2f}"
-
-
-def _isna(f: float) -> bool:
-    import pandas as pd
-
-    return bool(pd.isna(f))
+def _num(v: float | None) -> str:
+    """Price/level float -> fixed decimals; None renders blank (no sl/tp)."""
+    return "" if v is None else f"{v:.2f}"
 
 
 def register(group: click.Group) -> None:

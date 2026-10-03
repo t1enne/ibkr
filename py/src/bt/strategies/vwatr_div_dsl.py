@@ -1,8 +1,12 @@
-"""VWATR divergence strategy -- long only, single unconditional entry, two-stage exit.
+"""VWATR divergence strategy -- long only, one unconditional breakout entry.
 
-Entry: rising VWATR expansion on a breakout above the recent high. The rule is
-unconditional by design -- entry-side features carry no measurable edge on this
-population, so name selection lives in sizing instead.
+Entry: rising VWATR expansion on a breakout above the recent high, taken only
+while the tradable universe is in a breadth leg up (``_trend_cross_section``).
+Within that gate the trigger is unconditional by design -- entry-side features
+carry no measurable edge on this population, so name selection lives in sizing
+instead. The gate cuts the 2022-style drawdown depth and lifts Sharpe/Ann
+out of sample (mean OOS 1.37 -> 1.46, min -1.11 -> -0.91); it does not shorten
+recovery time -- a 575d underwater span is the bear's, not the rule's.
 
 Exit, in order:
 
@@ -15,7 +19,9 @@ Exit, in order:
 Sizing: flat ``risk_pct`` of LIVE equity times the amplifiers, so the risk
 budget re-levers as the book compounds. Sizing off a frozen capital base
 instead cuts cash-exhaustion fill scaling but caps compounding, and therefore
-caps return.
+caps return. A structural book-slot cap (``_BOOK_SLOTS``) throttles per-name
+size once open names plus the bar's cohort exceed 10, so a dense trend tape
+self-scales instead of leaving it to the engine's silent cohort scale.
 
 Amplifiers, both neutral by default:
 
@@ -193,6 +199,54 @@ def _fred_band_score(ctx: StrategyContext) -> float:
 _TREND_LOOK: int = 50
 _TREND_GATE_LO: float = 0.5
 _TREND_CACHE_KEY = "vwatr_div_trend"
+_COHORT_CACHE_KEY = "vwatr_div_cohort"
+#: Book-slot cap: per-name risk is scaled by ``_BOOK_SLOTS / book`` once the book
+#: (open names + this bar's cohort) exceeds it, so a dense trend tape throttles
+#: size BEFORE the engine silently cohort-scales. Lets risk_pct/amp rise without
+#: cash-exhaustion scaling. Plateau over 8-12 slots; 10 is the flat middle.
+_BOOK_SLOTS: int = 10
+
+
+def _breakout_count(ctx: StrategyContext, p: Params) -> int:
+    """Number of flat symbols that fire an entry on THIS bar (cohort size).
+
+    Cached per timestamp; bounded. Approximates the cohort the engine will
+    execute in one bar cycle, so size can be damped before the engine silently
+    scales it.
+    """
+    cache: dict[object, int] = ctx.shared.setdefault(_COHORT_CACHE_KEY, {})
+    ts = ctx.candle.timestamp
+    if ts in cache:
+        return cache[ts]
+    need = max(p.breakout_look + 1, 2 * p.slope_bars + 1)
+    count = 0
+    for sym in ctx.symbols:
+        if sym.startswith("GATE_") or ctx.quantity(sym) != 0:
+            continue
+        o = ctx.ohlcv(sym)
+        if o is None:
+            continue
+        close = o.close.to_array()
+        m = len(close)
+        if m < need:
+            continue
+        px = float(close[-1])
+        v = ctx.ta.vwatr(sym, p.vwatr_period).to_array()
+        if m == 0 or not np.isfinite(px) or px <= 0:
+            continue
+        v_now = float(v[-1])
+        v_prev = float(v[m - 1 - p.slope_bars])
+        if not (np.isfinite(v_now) and np.isfinite(v_prev)) or not (v_now > v_prev):
+            continue
+        prior = close[m - 1 - p.breakout_look : m - 1]
+        if len(prior) < p.breakout_look or not np.all(np.isfinite(prior)):
+            continue
+        if px > float(np.max(prior)):
+            count += 1
+    if len(cache) > 8:
+        cache.clear()
+    cache[ts] = count
+    return count
 
 
 def _trend_cross_section(
@@ -307,8 +361,7 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
             and _slope_decelerating(vwatr_arr, n, p.slope_bars, p.decel_ratio)
         ):
             reason = (
-                f"[vwatr-div] slope decel {sym}: close {px:.2f} at best, "
-                f"slope below {p.decel_ratio:.2f}x prior"
+                f"decel {sym}: {px:.2f} at best, slope < {p.decel_ratio:.2f}× prior"
             )
         if reason is not None:
             put(best=None)
@@ -322,8 +375,8 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
             ctx.close(
                 sym,
                 reason=(
-                    f"[vwatr] trail {sym}: close {px:.2f} "
-                    f"{stop_distance:.2f} ({stop_distance / px:.2%}) off best {best:.2f}"
+                    f"trail {sym}: {px:.2f} −{stop_distance:.2f} "
+                    f"({stop_distance / px:.2%}) off best {best:.2f}"
                 ),
             )
         return
@@ -347,11 +400,22 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if not (px > prior_high):
         return
 
+    # Breadth gate: only take breakouts while the universe is in a leg up
+    # (>= _TREND_GATE_LO above their own SMA). Structural, no param -- the
+    # same ``leg_up`` the trend amp uses, so a bear tape stops new risk.
+    _, leg_up = _trend_cross_section(ctx, p)
+    if not leg_up:
+        return
+
     stop_price = p.vwatr_mult * vwatr
     # Size off LIVE EQUITY: the risk budget re-levers with the book, which is
     # what keeps deployment (and therefore Ann) up as equity compounds.
     equity = ctx.current_equity()
     score = _fred_band_score(ctx) * _trend_risk_score(p, ctx, sym)
+    cohort = _breakout_count(ctx, p)
+    book = cohort + sum(1 for s in ctx.symbols if ctx.quantity(s) != 0)
+    if book > _BOOK_SLOTS:
+        score *= _BOOK_SLOTS / book
     risk_eff = p.risk_pct * score
     qty = risk_sized_qty(
         equity=equity, price=px, stop_dist=stop_price, risk_pct=risk_eff
@@ -362,12 +426,11 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if size <= 0:
         return
 
-    risk_note = f"risk {risk_eff:.1%} (x{score:.2f}) qty {qty:.2f}"
     reason = (
-        f"[vwatr-div] entry {sym}: close {px:.2f} > {prior_high:.2f}, "
-        f"vwatr {vwatr:.3f} ({vwatr / base_now:.2f}x base {base_now:.3f}), "
-        f"rising vs {vwatr_prev:.3f} over {p.slope_bars}b, "
-        f"{risk_note} stop {stop_price:.2f}"
+        f"{sym}: {px:.2f} > {prior_high:.2f}, "
+        f"vwatr {vwatr:.3f} {vwatr / base_now:.2f}× base {base_now:.3f}, "
+        f"↑ {vwatr_prev:.3f}/{p.slope_bars}b, "
+        f"risk {risk_eff:.1%} ×{score:.2f}, stop {stop_price:.2f}"
     )
 
     put(best=px)

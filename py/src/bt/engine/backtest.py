@@ -39,7 +39,6 @@ Usage:
 
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING
 
 from src.bt.engine.candle_store import CandleStore, CandleRows
@@ -52,7 +51,6 @@ import numpy as np
 import pandas as pd
 
 from src.bt.metrics import calculate_portfolio_result
-from src.bt.table import Col, Table, render
 from src.bt.strategies import resolve_params
 from src.bt.strategies.ta_context import TaContext
 from src.bt.warmup import parse_warmup_bars
@@ -74,7 +72,7 @@ from src.bt.state import (
     TradeExitReason,
 )
 from src.bt.size.pure import SizingParams, equity_of, sized_signal
-from src.bt.portfolio.pure import FillRejection, apply_fills
+from src.bt.portfolio.pure import FillRejection, ScaleRecord, apply_fills
 from src.bt.types import StrategyConfig, EngineWindow, BacktestResults
 from src.bt.engine.handlers import ExecutionHandler, RiskHandler
 from src.utils import parse_timestamp
@@ -187,11 +185,12 @@ def run_backtest(
     # in ``update_prices``). Seeded with the initial equity point; frozen to a
     # tuple on the final PortfolioState at ``_finalize``.
     eq_buffer: list = list(state.portfolio.equity_curve)
-    # Engine-owned rejection sink: fills dropped for insufficient cash are
-    # collected as pure ``FillRejection`` records and summarised to stderr ONCE
-    # at run end. Not one line per rejection — a heavily over-subscribed config
-    # rejects most attempted entries, and per-rejection spam is unusable.
+    # Engine-owned sinks: fills dropped for insufficient cash land in
+    # ``rejections`` and cohorts PARTIALLY scaled for cash land in ``scales``
+    # (both pure records). They are surfaced as final ``PortfolioResult`` counts
+    # (Rejected / Scaled), never as run-time stderr noise.
     rejections: list = []
+    scales: list = []
 
     # Create CandleStore once — wraps rows by reference, mutates in-place.
     # Strategies access it as state.candles (Mapping interface) + .latest()/.count().
@@ -235,6 +234,7 @@ def run_backtest(
                 rows,
                 eq_buffer,
                 rejections,
+                scales,
                 signal_observer,
             )
             bar = []
@@ -267,16 +267,12 @@ def run_backtest(
             rows,
             eq_buffer,
             rejections,
+            scales,
             signal_observer,
         )
 
     # Finalize: close positions, build results
     state = _finalize(state, bt.execution_params, equity_points=eq_buffer)
-
-    # Report dropped fills once, at the run's edge (the engine owns run-level
-    # I/O; the portfolio layer stays pure). Silent rejection is what made the
-    # cash race invisible — a strategy never learned its entry never happened.
-    _warn_rejections(rejections, config)
 
     # Build equity series, deduplicating by timestamp (equity curve
     # accumulates one point per candle = N points per timestamp).
@@ -305,7 +301,8 @@ def run_backtest(
         state.portfolio.initial_capital,
         benchmark_curve=first_bm,
         equity_points=state.portfolio.equity_curve,
-        scaled_trades=len(rejections),
+        scaled_trades=sum(len(record.members) for record in scales),
+        rejected_trades=len(rejections),
     )
 
     return (
@@ -404,7 +401,7 @@ def _execute_cohort(
     sizing: SizingParams,
     skip_next_open: bool,
     scale_cohorts: bool = True,
-) -> tuple[BacktestState, tuple[FillRejection, ...]]:
+) -> tuple[BacktestState, tuple[FillRejection, ...], tuple[ScaleRecord, ...]]:
     """Build one phase's fills and settle them atomically in ONE pure call.
 
     ``cohort`` is ``(signal, candle)`` pairs for every symbol that has a pending
@@ -420,7 +417,7 @@ def _execute_cohort(
     fills at its next one). Returns the new state and the drained symbols.
     """
     if not cohort:
-        return state, ()
+        return state, (), ()
     equity = equity_of(state.portfolio)
     fills: list[FillEvent] = []
     drained: list[str] = []
@@ -431,46 +428,14 @@ def _execute_cohort(
             signal = sized_signal(signal, equity, state.portfolio.cash, candle, sizing)
         fills.append(exec_handler.execute_signal(signal, candle, exec_params))
         drained.append(signal.symbol)
-    portfolio, rejections = apply_fills(
+    portfolio, rejections, scales = apply_fills(
         state.portfolio, tuple(fills), scale_cohorts=scale_cohorts
     )
     pending = dict(state.pending_signals)
     for sym in drained:
         pending.pop(sym, None)
     state = merge_bt_state(state, dict(portfolio=portfolio, pending_signals=pending))
-    return state, tuple(rejections)
-
-
-def _warn_rejections(rejections: list, config: StrategyConfig) -> None:
-    """Summarise dropped fills to stderr once per run.
-
-    Policy: a single run-end summary, not a line per rejection — a heavily
-    over-subscribed config rejects most attempted entries, so per-event output
-    would bury the report. A per-symbol table (same ``Table``/``render`` as the
-    metrics report) plus the worst example keeps the signal ("your strategy is
-    over-subscribed") without the volume. Writes to STDERR: a warning must not
-    contaminate stdout (JSONL/JSON CLI output).
-    """
-    if not rejections:
-        return
-    per_symbol: dict[str, int] = {}
-    for r in rejections:
-        per_symbol[r.symbol] = per_symbol.get(r.symbol, 0) + 1
-
-    def _emit(line: str = "") -> None:
-        print(line, file=sys.stderr)
-
-    _emit(
-        f"[bt] WARNING: {len(rejections)} fill(s) rejected due to insufficient "
-        "cash (cohort scaling already applied) "
-    )
-    rows = tuple(
-        (sym, str(n)) for sym, n in sorted(per_symbol.items(), key=lambda kv: -kv[1])
-    )
-    for line in render(
-        Table(columns=(Col("symbol", "<"), Col("rejected", ">")), rows=rows)
-    ):
-        _emit(line)
+    return state, tuple(rejections), tuple(scales)
 
 
 def _mark_bar(state: BacktestState, bar: list[Candle]) -> BacktestState:
@@ -510,6 +475,7 @@ def _flush_bar(
     rows: CandleRows,
     eq_buffer: list,
     rejections: list,
+    scales: list,
     signal_observer: Optional[Callable],
 ) -> BacktestState:
     """Run one timestamp's base candles through Stages 3-8, cohort-atomic.
@@ -542,7 +508,7 @@ def _flush_bar(
         for candle in bar
         for sig in state.pending_signals.get(candle.symbol, ())
     ]
-    state, rejected = _execute_cohort(
+    state, rejected, scaled = _execute_cohort(
         state,
         cohort4,
         exec_handler,
@@ -552,6 +518,7 @@ def _flush_bar(
         bt.config.cohort_scaling,
     )
     rejections.extend(rejected)
+    scales.extend(scaled)
 
     # Mark EVERY symbol of the bar at THIS bar before the strategy runs. Stage 8
     # marks positions only AFTER Stage 5, so at evaluation time the symbols the
@@ -580,7 +547,7 @@ def _flush_bar(
         for sig in state.pending_signals.get(candle.symbol, ())
     ]
     if cohort6:
-        state, rejected = _execute_cohort(
+        state, rejected, scaled = _execute_cohort(
             state,
             cohort6,
             exec_handler,
@@ -590,6 +557,7 @@ def _flush_bar(
             bt.config.cohort_scaling,
         )
         rejections.extend(rejected)
+        scales.extend(scaled)
 
     for candle in bar:
         state = _check_risk(
