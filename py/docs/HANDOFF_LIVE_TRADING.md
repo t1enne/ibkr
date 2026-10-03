@@ -21,7 +21,7 @@ ibkr live run <config.json>  (one-shot cycle; cron it)
   2. fetch pf — PortfolioSource.fetch() → PortfolioSnapshot (shared PortfolioState)
   3. signals  — run the strategy-as-screen → actionable LiveSignals
   4. reconcile— pure diff: target posture vs live book → OrderIntents
-  5. execute  — Broker.place(intent)   (SIMULATED for v1)
+  5. execute  — Broker.place_cohort(intents), settled atomically (SIMULATED for v1)
   6. record   — Ledger: mark opened lots / mark-closed filled closes
 ```
 
@@ -119,7 +119,7 @@ config JSON)`. Re-running a mutated config gets a new id, so lots from an
 
 | Module                         | Owns                                                            |
 | ------------------------------ | --------------------------------------------------------------- |
-| `src/live/types.py`            | Shared domain dataclasses + `PortfolioView` + `LiveConfig`      |
+| `src/live/types.py`            | Domain dataclasses + `PortfolioView` **re-export** + `LiveConfig` |
 | `src/live/result.py`           | `Ok`/`Err` `Result` building block (~15 lines, no dep)          |
 | `src/live/portfolio_source.py` | `PortfolioSource` Protocol + `MockPortfolioSource`              |
 | `src/live/signals.py`          | Bridge: screen run → `tuple[LiveSignal, ...]`                   |
@@ -170,17 +170,12 @@ from src.bt.state import ActionType, PortfolioState, Position
 
 SignalAction = Literal["long", "short", "close"]
 
-class PortfolioView(Protocol):
-    """Read-only portfolio surface shared by backtest and live.
-
-    ``PortfolioState`` satisfies this **structurally**, so the SAME ``reconcile``
-    and sizing code runs on a backtest book and a broker snapshot alike. Keep
-    this surface minimal: every field here is a contract both sides must keep.
-    Read-only by design — mutation goes through ``apply_fill``.
-    """
-    cash: float
-    positions: dict[str, tuple[Position, ...]]   # symbol -> tuple of LOTs
-    initial_capital: float
+# The ``PortfolioView`` Protocol lives in ``src/bt/state/types.py`` — beside
+# ``PortfolioState``, the concrete type it abstracts — and is re-exported here so
+# the shared bt layer never imports the live package. Same members (`cash`,
+# `positions`, `initial_capital`), read-only by design; mutation goes through
+# ``apply_fill``.
+from src.bt.state import PortfolioView as PortfolioView
 
 @dataclass(frozen=True)
 class PortfolioSnapshot:
@@ -262,7 +257,11 @@ class OrderResult:
     position_id: str | None = None   # broker lot id assigned on an OPEN; None on close
 
 class Broker(Protocol):
+    def seed(self, portfolio: PortfolioState) -> None: ...
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]: ...
+    async def place_cohort(
+        self, intents: tuple[OrderIntent, ...]
+    ) -> Result[tuple[OrderResult, ...], FeedError]: ...
     async def close(self) -> Result[None, FeedError]: ...
 ```
 
@@ -407,21 +406,29 @@ def load_mock_portfolio(raw: Mapping[str, object], as_of: pd.Timestamp) -> Portf
 
 # src/live/broker.py
 class SimulatedBroker:
-    """No real routing. Holds a ``PortfolioState`` and folds each fill through
-    the SAME backtest primitive ``apply_fill``, so paper and backtest book
-    accounting are identical."""
+    """No real routing. Prices each intent per-order, then settles the whole
+    cycle through the SAME atomic backtest primitive ``apply_fills``, so paper and
+    backtest book accounting are identical — an over-subscribed multi-open cycle
+    SCALES by one shared cash factor, exactly as a backtest cohort does."""
     def __init__(
         self, portfolio: PortfolioState, params: ExecutionParams,
         log: Callable[[str], None],
+        handler: ExecutionHandler | None = None,  # default: default_execution_handler()
     ) -> None: ...
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]: ...
+    async def place_cohort(
+        self, intents: tuple[OrderIntent, ...]
+    ) -> Result[tuple[OrderResult, ...], FeedError]: ...
     async def close(self) -> Result[None, FeedError]: ...
     def portfolio(self) -> PortfolioState: ...
 
 def intent_to_signal(intent: OrderIntent, ts: pd.Timestamp) -> TradeSignal
-    """Pure: OrderIntent -> TradeSignal so ``execute_signal``/``apply_fill``
+    """Pure: OrderIntent -> TradeSignal so ``execute_signal``/``apply_fills``
     (the backtest primitives) price and settle the simulated fill identically.
-    A close intent carries ``position_id`` (required by ``_close_position``)."""
+    Delegates to ``trade_signal`` — the ONE probe-signal factory, beside the ONE
+    ``ref_candle`` bar factory; ``reconcile`` imports both instead of rebuilding
+    its own. A close intent carries ``position_id`` (required by
+    ``_close_position``)."""
 ```
 
 ### Ledger — `src/live/ledger.py` (live-only persistence)
@@ -507,7 +514,8 @@ async def run_cycle(
     Not a loop. Caller (CLI / cron) drives cadence.
     Steps: fetch → assert data fresh (§1 decision 5) → live_signals →
     reconcile → for intent: await broker.place → on ok, record_open /
-    mark_closed per intent.action → ledger.touch_cycle.
+    mark_closed per intent.action → ledger.touch_cycle (all skipped when
+    ``dry_run``).
     The snapshot's ``PortfolioState`` feeds ``reconcile`` directly — no adapter
     between the live and backtest portfolio. Ownership is scoped by
     ``strategy_id`` so a cycle never closes lots opened by another config."""
@@ -564,14 +572,16 @@ main (click)
       → reconcile(signals, snapshot.portfolio, config): OrderIntents  --> src/live/reconcile.py
         → current_side(portfolio, symbol) / target_side(sig)          (pure)
         → size_qty(price, portfolio, config)                          --> src/bt/size/pure.py
-          → equity_of(portfolio: PortfolioState)                      --> src/bt/size/pure.py
-      → for intent: broker.place(intent): Result[OrderResult,...]     --> src/live/broker.py
-        → intent_to_signal(intent, ts): TradeSignal                   (pure)
+          → equity_of(portfolio: PortfolioView)                       --> src/bt/size/pure.py
+      → broker.place_cohort(intents): Result[tuple[OrderResult,...],..] --> src/live/broker.py
+        → intent_to_signal / trade_signal / ref_candle               (pure, one home)
         → execute_signal(signal, ref_candle, params): FillEvent       --> src/bt/execution/pure.py
-        → apply_fill(portfolio, fill): PortfolioState                 --> src/bt/portfolio/pure.py
+        → apply_fills(portfolio, fills): (PortfolioState, rejections) --> src/bt/portfolio/pure.py
+      → sizing: sized_signal(signal, equity_of(view), cash, bar, params) --> src/bt/size/pure.py
+        → equity_of(portfolio: PortfolioView) / compute_qty           --> src/bt/size/pure.py
       → on OrderResult.ok: ledger.record_open / ledger.mark_closed    --> src/live/ledger.py
         → get_connection(): sqlite3.Connection                        --> src/data/db.py
-      → ledger.touch_cycle(strategy_id, now)
+      → if not dry_run: ledger.touch_cycle(strategy_id, now)
       → broker.close()
       → build_report(...): CycleReport                                (pure)
     → render_report(report, fmt): str  → stdout
@@ -587,6 +597,8 @@ reconcile tests
     - side flip: close-then-open ordering asserted by index
     - position_id close targets one lot; absent closes all lots
     - no-signal symbol produces zero intents (HOLD)
+    - same-side signal HOLDs; empty owned closes nothing; a foreign-only book
+      HOLDs the opposite open instead of doubling gross exposure
     - unsized open raises ValueError
     - determinism: shuffled lot order -> same intents
 signals tests
@@ -597,13 +609,19 @@ portfolio_source tests
   → load_mock_portfolio(raw, as_of): PortfolioSnapshot                --> tests/test_portfolio_source.py
     - builds a real PortfolioState; Position.type side; empty positions
 broker tests
-  → SimulatedBroker.place(intent): Result[OrderResult,...]            -->
+  → SimulatedBroker.place_cohort(intents): Result[tuple[OrderResult,...]]
     - synthetic fill price = ref_price ± spread/slippage
-    - apply_fill updates the held PortfolioState (parity with backtest)
+    - apply_fills updates the held PortfolioState (parity with backtest)
+    - multi-open cohort SCALES like a backtest cohort (no reject-tail);
+      a lone open is bit-identical to a bare apply_fill
+    - a flip open sized by reconcile survives settlement
 engine tests
   → run_cycle with fake source + fake broker: CycleReport             --> tests/test_engine.py
     - end-to-end: mock pf + signals -> placed intents, order + count
     - open fill -> record_open; close fill -> mark_closed
+    - dry run places nothing AND writes nothing (no record, no cycle stamp)
+    - a foreign lot survives a cycle untouched; a changed config value
+      re-scopes ownership so a prior revision's lot is never closed
 ledger tests
   → SqliteLedger over a temp db: record_open/mark_closed/prune          --> tests/test_ledger.py
     - config_hash stable across key order; differs on value change
@@ -772,3 +790,244 @@ follow-on.
 5. **Freshness gate** — fail-on-stale (default) vs trade-anyway?
 
 Confirm these and the plan is fully implementable as written.
+
+---
+
+## 10. Implementation addendum (doc-vs-reality, recorded after implementation)
+
+Where the built code differs from this doc, and the defaults actually wired:
+
+- **No `ScreenRun`.** The driver returns `(rows, final_state)`, not an object.
+- **`ScreenRow`** carries only `symbol`, `action` (`∈ long|short|flat`),
+  `score`, `signals`, `ts`, `sig_ts` — there is no `"close"` in the vocabulary.
+- **The driver's `max_age_days` filter deletes the flat rows** close must be
+  derived from, so live calls it with `max_age_days=None` and filters locally.
+  Closes are reconstructed from `flat` rows that carry a `sig_ts` (a flat row
+  with no `sig_ts` never signalled -> HOLD).
+- **`SizingParams.sizing_mode`, not `size_mode`** (the live config accepts flat
+  `size_mode`/`sizing` as the public spelling and maps it).
+- **`equity_of` takes the `PortfolioView` Protocol** (widened in the
+  shared-execution pass), so `reconcile` reuses the ONE equity implementation
+  instead of re-deriving `cash + calculate_positions_value(positions)`.
+- **`execute_signal` takes a `Candle`** (the broker builds a synthetic
+  ref-price bar: all OHLCV = `intent.ref_price`).
+- **`Broker` gained `seed(portfolio)`** — the engine aligns the simulated book
+  with the freshly fetched snapshot before reconciling/settling it.
+- **`PortfolioView` uses `@property` members** and now lives in
+  `src/bt/state/types.py` (re-exported by `src/live/types.py`), so the shared bt
+  layer never imports the live package; a frozen `PortfolioState` still conforms
+  structurally with no cast.
+- **Live-only top-level config keys** (`portfolio_path`, `mode`, sizing) are
+  projected through a **temp strategy-only file** for the screen bridge, because
+  `load_strategy` = `StrategyConfig(**data)` rejects unknown keys. `strategy_id`
+  stays the hash of the ORIGINAL raw config (temp path never affects scope).
+- **`SimulatedBroker` settles through the shared `apply_fills`** (via
+  `place_cohort`); the cash guard lives inside it as `describe_open_rejection`, so
+  a dropped open is never recorded as a phantom fill and genuine exhaustion is
+  reported from the shared `FillRejection` records.
+
+Implemented defaults (the §9 open decisions, as built):
+
+1. **Sizing** — explicit `qty` else `SizingParams` from config else `ValueError`.
+2. **Reconcile** — side-only HOLD (a side flip closes then reopens).
+3. **Missing signal** — HOLD.
+4. **Execution** — `SimulatedBroker` only (no real IBKR routing).
+5. **Freshness** — fail the cycle on a stale feed.
+
+---
+
+## 11. Known gaps (post-implementation review, 2026-10-02)
+
+Defects found by an independent review of `origin/main..HEAD` and their status.
+Everything below is **open** unless marked fixed; each gap names the module and
+what would close it. The open list was renumbered by the 2026-10-03
+shared-execution pass, which moved the cohort-parity and close-proceeds gaps into
+the fixed section below.
+
+### Fixed during review
+
+- **Sizing double-count on a close+open cycle** (`src/live/reconcile.py`,
+  originally `_sizing_view`). Close proceeds were added to `cash` while the
+  closing lots stayed in `positions`, so `calculate_positions_value` counted them
+  again and equity was inflated by the closed notional — a flip sized up to
+  `(E+V)/E` too large. Fixed once, then superseded by the shared-execution pass
+  below: `_settled_book` prices the closes with `execute_signal` and settles them
+  through `apply_fills`, so the closing lot is dropped by the very code path that
+  produces the proceeds. Regression test pins the exact qty
+  (`test_flip_sizes_open_against_freed_cash == 4.9965`, was 5.0, was 10.0).
+- **`--dry-run` was not write-free**: `ledger.touch_cycle` still stamped
+  `last_cycle_at`. Now guarded by `if not dry_run` (`src/live/engine.py`).
+- **Freshness gate used raw symbols** while `query_candles` filters
+  `ticker = UPPER(...)`; a lowercase config symbol produced a bogus
+  `StaleDataError("no data for universe")`. Symbols are uppercased
+  (`src/live/engine.py::_newest_ms`).
+- **Freshness clock skew**: `pd.Timestamp.now()` is naive local while the
+  candle `timestamp` is UTC epoch-ms; age was off by the host's UTC offset. A
+  single UTC base is now used (`src/live/engine.py::_utc`); `now` injection
+  accepts naive or aware.
+- **Foreign-only book on a side flip** opened the opposite side without closing
+  anything (gross exposure doubled, target posture never reached). Now that
+  open is skipped (HOLD) and the asymmetry is documented in `reconcile`.
+
+### Fixed after the review — shared-execution pass (2026-10-03)
+
+The accidental divergences between the bt execution/sizing core and the live
+edge. Live reuses the shared unit wherever one exists; the ownership ledger stays
+the only intended divergence. Verification: `make check` green at 678 passed.
+
+- **Cohort settlement (was gap 2).** `run_cycle` settled intents one at a time
+  through `apply_fill`, so an over-subscribed multi-open cycle REJECTED its tail
+  while a backtest cohort SCALES. `Broker` gained `place_cohort`; the simulated
+  book prices orders per-order (`execute_signal`) and settles the cycle ONCE
+  through the shared `apply_fills`, so the settled book equals the backtest's on
+  the same fills. `place` is the single-order wrapper (cohort of one, which hits
+  `apply_fills`' lone-open guard, so a lone open is numerically unchanged).
+  Trade-off: a cohort-level transport `Err` now skips the whole cycle rather than
+  one intent — the next cycle recomputes the same intents.
+- **Duplicated equity rebuild.** `equity_of` accepts the `PortfolioView`
+  Protocol, so `reconcile` calls it instead of re-deriving
+  `cash + calculate_positions_value(positions)`.
+- **Duplicated close-proceeds math (was gap 5).** `_SizingView`'s
+  `Σ qty * ref_price` approximation and its hand-built positions-dropping loop
+  are deleted. `_settled_book` derives the cycle's close fills, settles them
+  through `apply_fills`, then sizes opens against that real book — one
+  implementation of close proceeds, shared with settlement. The flip test's qty
+  therefore moved from the approximation to the real proceeds (5.0 -> 4.9965).
+- **Duplicated sizing rule.** `_open_intent` calls the shared `sized_signal` for
+  the whole "explicit qty else compute it" rule; an open that still sizes to
+  `<= 0` still raises `ValueError` rather than placing an accidental order.
+- **One ref-bar / probe-signal factory.** `ref_candle` and `trade_signal` live in
+  `src/live/broker.py`; `intent_to_signal` delegates to the latter and
+  `reconcile` imports both instead of rebuilding its own pair.
+- **Layering.** `PortfolioView` moved to `src/bt/state/types.py` — the shared bt
+  layer no longer type-imports the live package (verified: zero `src.live`
+  imports under `src/bt`).
+- **Execution seam (partial).** `SimulatedBroker` takes an injectable
+  `ExecutionHandler` (default `default_execution_handler()`) for
+  `execute_signal`. `apply_fills` stays a direct import — `ExecutionHandler` has
+  no such field and bt's engine imports it directly too.
+- **Epoch-0 probe artifacts.** `_settled_book` re-emits a clean view
+  (`trades=()`, `equity_curve=()`), so no `pd.Timestamp(0)` trade can leak
+  downstream.
+
+### Open gaps (ordered by exposure)
+
+1. **Freshness slack is a day count, not one base interval.** §1.5 asks for one
+   base interval of slack; the CLI defaults to `--max-age 5` days, so a multi-day
+   `ibkr data dl` outage on a `1h` feed still passes the gate and trades a stale
+   tail. Close it by deriving the budget from `config.bars[0]` (resampled
+   interval x a small multiple) or by asserting the newest bar is the latest
+   expected session bar. `--max-age 0` disables the gate. **Worse than the doc
+   says:** the gate is a universe-wide `MAX(timestamp)`, so one fresh symbol
+   clears the whole universe, and the local per-row filter cannot catch the
+   difference — a symbol frozen for weeks has a posture age of ~0 against its own
+   last bar and trades at that stale close. Close it by requiring EVERY
+   `config.symbols` member to be fresh (`GROUP BY ticker`) and by measuring the
+   budget against the screen's decision bar (`row.ts`), not the DB max.
+2. **Sizing clamp vs fill price (shared layer).** `compute_qty` clamps against
+   `ref_price`, but the broker fills at
+   `ref * (1 + spread_bps + slippage_bps) + commission` — the 1.5x adverse
+   multiplier never applies to a live fill, because the synthetic ref bar has
+   `open == close` so `calculate_adverse_selection` returns False; a full-fraction
+   open (`size ≈ 1.0`, cash clamp binding) is then rejected by the guard and the
+   cycle trades nothing, with no explicit error. Property of
+   `src/bt/size/pure.py`, surfaced by live. Close it by clamping on a padded
+   price estimate or by sizing against available cash net of the cost model.
+3. **Close reconstruction is a heuristic.** A close is inferred from a `flat`
+   row that carries a `sig_ts`. A strategy that fired nothing on the newest bar
+   yields a `sig_ts` older than `--max-age` -> the row is dropped -> HOLD, so a
+   genuinely-desired exit on a stale decision bar is not taken (consistent with
+   default #3). `--max-age 0` disables the local filter and lets stale closes
+   fire.
+4. **Posture vs ownership ambiguity (partly mitigated).** `current_side` nets
+   the WHOLE broker book while closes are scoped by `owned` (ledger ids). A
+   foreign lot on the same symbol can suppress our open (`target == current` ->
+   HOLD). The opposite-side-with-no-owned-close case now HOLDs, but the
+   same-side suppression remains. Deliberate; unresolved.
+5. **`record_open` upserts**, so re-recording the same broker pid resurrects a
+   previously closed row and clears `closed_at`. Deliberate (a broker pid is
+   expected unique per lot), but it means a broker that recycles lot ids would
+   corrupt the audit trail.
+6. **No end-to-end CLI test.** `live_run` -> real screen needs the candle DB and
+   a full strategy run; tests cover the seam (config parse, temp projection,
+   render, cycle with fake source/broker) but not a real `ibkr live run`.
+   Manual smoke only: `ibkr live --help`, `ibkr live run --help`.
+7. **Freshness/infra gaps outside the module.** The worktree needed the
+   `../ib-rest-api-client` path dependency and a `uv`-usable `.venv`; resolved
+   outside the committed tree. Pre-existing untracked `data/data` symlink left
+   alone.
+8. **Params beyond the doc** (testability only, all keyword-only with
+    defaults, recorded here): `run_cycle` gained `dry_run`, `db_path`, `now`,
+    `signal_source`; `reconcile` gained `owned`.
+
+### Open gaps — independent architecture review (2026-10-03)
+
+Found by a read-only architecture review of the live cycle (sync / screen /
+reconcile). Ranked by expected loss; each names the smallest change that closes
+it. All are **open**.
+
+9. **Live cannot honour the strategy's exit semantics (largest loss, silent).**
+   `_to_live_signal` drops `sl`/`tp` (`signals.py`), no module under `src/live`
+   imports `check_risk`/`RiskConfig`, and bt enforces the levels every candle
+   (Stage 8). A bracket-bounded strategy is unbounded live. Sharper than that:
+   the SCREEN is the same hole, because `_resolve_posture` replays only emitted
+   `TradeSignal`s and an engine-side risk exit never is one — so a position the
+   screen's own engine already stopped out still reports its original side, and
+   live would keep holding it. Close it by carrying `sl`/`tp` onto `LiveSignal`
+   and running one `check_risk(book, decision_bar, risk_config)` pass per cycle;
+   until then, guard in the bridge: fail loudly when captured signals carry
+   levels so nobody runs a bracketed strategy live believing it is bracketed.
+10. **Explicit strategy qty is dropped, so live silently re-sizes.** `ScreenRow`
+    has no qty field and `LiveSignal.qty` is hard-coded `0.0`, so `sized_signal`
+    always applies the live config's `size_mode`/`size`. A risk-sized
+    (`sizing_mode: "risk"`) or fixed-size strategy is re-sized to a fraction of
+    equity. Not forced — the collector holds the full `TradeSignal`.
+11. **`partial_close` / `rebalance` are silently discarded.** `_side_of` returns
+    `None` for `rebalance`, so a trim never reaches posture and the live position
+    keeps full size until a full close fires (live strategies use it:
+    `shannons_demon_dsl`, `pf_equal_weight`).
+12. **No idempotency key, no lock, and the sim book never persists.** Every cycle
+    re-seeds the broker from the static fixture, `broker.portfolio()` has no
+    production caller, `live_strategy.last_cycle_at` is written and never read,
+    and there is no `flock`/`BEGIN IMMEDIATE` — so overlapping cron runs both
+    place, and N runs on an unchanged fixture pile up unclosable ledger rows.
+    Close it with a per-`strategy_id` lock, a decision-bar dedupe, and writing the
+    settled book back at cycle end.
+13. **Config-hash scoping orphans the live book, with no orphan detection.**
+    Every parameter edit yields a new `strategy_id`, instantly making prior lots
+    foreign: the new revision opens on top of them or HOLDs forever, and
+    `prune_closed` only deletes CLOSED rows. The same hole covers a crash between
+    `broker.place_cohort` and `_record`. Close it with an orphan check at cycle
+    start (book lots vs `open_positions()` across all scopes) that warns or
+    flattens.
+14. **`mode: "live"` silently runs the simulated broker.** `cfg.mode` is only
+    persisted; the CLI always builds `SimulatedBroker`, so a config declaring
+    live mode exits 0 with paper fills. Refuse the mode until `IBKRBroker` exists.
+15. **A scaled-to-zero open is recorded as a phantom lot.** When `apply_fills`
+    floors an open to 0 shares nothing is recorded as a `FillRejection`, so
+    `_result` falls back to the pre-scale qty with a predicted pid and `_record`
+    writes a row for a lot that is not in the book — unclosable, since
+    `_close_error` rejects every retry. Narrow (`qty*scale < 1e-4`), 2-line fix:
+    treat "lot not found after settlement" as `ok=False`.
+16. **Two handoff docs.** The committed root `HANDOFF_LIVE_TRADING.md` is a
+    superseded tick-driven design (`feed.py`, `baragg.py`, `/ws` poller); the live
+    one is `docs/HANDOFF_LIVE_TRADING.md`. Delete or redirect the root file.
+
+Unverified assumption behind the ownership model: that a real broker read can
+supply per-LOT ids. IBKR positions are net per instrument (conid identifies the
+instrument), so either the adapter mints lot ids — making the adapter, not the
+broker, the lot-id source of truth — or lot identity has to move into the ledger.
+Check the real positions payload before `IBKRBroker`.
+
+Deliberately NOT defects: batch-not-loop, side-only HOLD, absence = HOLD,
+ownership scoping, `Broker.seed`, and `fill_at_next_open=False` (forced — a batch
+has no next bar to price; note it means live paper fills are not trade-for-trade
+price-comparable to a `bt run` of the same strategy).
+
+### Deliberately unchanged
+
+- Other `pd.Timestamp.now()` sites (`broker.py`, `cli.py`,
+  `portfolio_source.py`) stay naive-local: they are never compared against the
+  UTC epoch-ms candle DB, so there is no offset-skew defect there.
+- `make check` coverage: `Makefile` `SRC_DIRS` now includes `src/live`, so lint,
+  format, typecheck and `test-fast` all cover the package (commit `3f8908b`).
