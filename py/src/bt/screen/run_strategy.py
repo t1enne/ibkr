@@ -15,7 +15,7 @@ this driver only hands it an observer so intent survives ``_finalize``.
 """
 
 from __future__ import annotations
-from src.bt.warmup import parse_warmup_bars
+from src.bt.warmup import parse_warmup
 
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, Mapping, TypedDict, cast
@@ -126,8 +126,11 @@ def run_screen_from_strategy(
     """
     cfg = load_strategy(config_path)
     data_end = _data_end(cfg)
-    warmup_days = parse_warmup_bars(cfg.warmup, "1d")
-    warm_start = cast(pd.Timestamp, data_end - pd.Timedelta(days=warmup_days))
+    # Calendar span, not bar count: the trailing window is a real date range on
+    # the constant ``1d`` grid, so ``parse_warmup``'s ``days`` is the unit for
+    # date subtraction (``bars`` would be 5/7 of it and under-load history).
+    warmup_span = parse_warmup(cfg.warmup, "1d")
+    warm_start = cast(pd.Timestamp, data_end - pd.Timedelta(days=warmup_span.days))
 
     # A screen does not trade and has no IS/OOS split: it runs over a trailing
     # warm-up window ending at the newest data bar and treats the WHOLE tail as
@@ -151,6 +154,11 @@ def run_screen_from_strategy(
         df,
         strat_mod=strat_mod,
         signal_observer=collector.on_signal,
+        # A screen's trailing window starts trading exactly at the first loaded
+        # bar, so the tail-symbol clock-coverage assertion (a truncation guard
+        # for full-history backtests) is a false positive here. Generate signals
+        # through the final bar instead of tripping on the leading bar-grid snap.
+        evaluation_clock_check=False,
     )
     final = results.final_state
     # Freshness bar is each symbol's OWN last loaded bar (stale/delisted names

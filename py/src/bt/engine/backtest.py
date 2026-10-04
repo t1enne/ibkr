@@ -969,6 +969,8 @@ def run(
     benchmark_curves: Optional[Mapping[str, pd.Series]] = None,
     signal_observer: Optional[Callable] = None,
     fundamentals: Any = None,
+    *,
+    evaluation_clock_check: bool = True,
 ) -> BacktestResults:
     """Convenience function for running backtest with defaults.
 
@@ -979,6 +981,11 @@ def run(
     ``load_fundamentals``); it is attached to the CandleStore so decorated
     strategies reach it via ``ctx.fundamentals``. Typed ``Any`` on purpose:
     the engine never imports the concrete DSL context.
+
+    ``evaluation_clock_check`` opts out of the tail-symbol clock-coverage
+    assertion — the screen driver passes ``False`` because its trailing
+    ``trading_start`` intentionally begins at the first loaded bar (see
+    ``_assert_evaluation_clock_covers_window``).
     """
     from src.bt.engine.handlers import default_execution_handler, default_risk_handler
 
@@ -989,7 +996,11 @@ def run(
     # trading window — the engine fires only on it, so the run would be silently
     # truncated to the tail symbol's calendar (see the assertion's docstring).
     # Checked here (not in run_backtest) because only ``run`` holds the feed.
-    _assert_evaluation_clock_covers_window(data, bt.config)
+    # The screen opts out: its trailing window starts trading exactly at the
+    # first loaded bar, so the check is a false positive (bar-grid snap), not a
+    # truncation guard.
+    if evaluation_clock_check:
+        _assert_evaluation_clock_covers_window(data, bt.config)
 
     gen = candle_generator(data, bt.config)
     exec_handler = default_execution_handler()
