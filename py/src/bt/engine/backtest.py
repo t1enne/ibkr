@@ -62,9 +62,11 @@ from src.bt.state import (
     ActionType,
     BacktestState,
     Candle,
+    EquityPoint,
     TradeSignal,
     FillEvent,
     ExecutionParams,
+    PortfolioState,
     RiskConfig,
     create_initial_backtest_state,
     create_execution_params,
@@ -72,8 +74,19 @@ from src.bt.state import (
     TradeExitReason,
 )
 from src.bt.size.pure import SizingParams, equity_of, sized_signal
-from src.bt.portfolio.pure import FillRejection, ScaleRecord, apply_fills
-from src.bt.types import StrategyConfig, EngineWindow, BacktestResults
+from src.bt.portfolio.pure import (
+    FillRejection,
+    ScaleRecord,
+    apply_fill,
+    apply_fills,
+)
+from src.bt.execution.pure import execute_signal
+from src.bt.types import (
+    StrategyConfig,
+    EngineWindow,
+    BacktestResults,
+    commission_model_from_config,
+)
 from src.bt.engine.handlers import ExecutionHandler, RiskHandler
 from src.utils import parse_timestamp
 
@@ -99,7 +112,10 @@ class Backtest:
             test_end=parse_timestamp(self.config.trading_end),
         )
         self.execution_params = create_execution_params(
-            fixed_commission=self.config.commission
+            spread_bps=self.config.spread_bps,
+            slippage_bps=self.config.slippage_bps,
+            fixed_commission=self.config.commission,
+            commission_model=commission_model_from_config(self.config),
         )
         # SL/TP is strategy-owned (set per-trade on TradeSignal from
         # strategy_params). No config-level fallback: zero pct means the risk
@@ -393,6 +409,21 @@ def _bucket_signals(
     return {sym: tuple(v) for sym, v in buckets.items()}
 
 
+def _close_fill_qty(signal: TradeSignal, portfolio: PortfolioState) -> float:
+    """Share count a close signal will actually flatten.
+
+    Close signals from the DSL carry ``qty=0`` (the portfolio flattens the
+    targeted lot); stamping the real lot size lets ``execute_signal`` scale the
+    spread/slippage dollar cost by the shares actually traded.
+    """
+    lots = portfolio.positions.get(signal.symbol, ())
+    if signal.position_id is not None:
+        for pos in lots:
+            if pos.position_id == signal.position_id:
+                return abs(pos.qty)
+    return sum(abs(pos.qty) for pos in lots)
+
+
 def _execute_cohort(
     state: BacktestState,
     cohort: list[tuple[TradeSignal, Candle]],
@@ -426,10 +457,15 @@ def _execute_cohort(
             continue
         if signal.action in (ActionType.long, ActionType.short):
             signal = sized_signal(signal, equity, state.portfolio.cash, candle, sizing)
+        elif signal.action == ActionType.close and signal.qty <= 0:
+            signal = replace(signal, qty=_close_fill_qty(signal, state.portfolio))
         fills.append(exec_handler.execute_signal(signal, candle, exec_params))
         drained.append(signal.symbol)
     portfolio, rejections, scales = apply_fills(
-        state.portfolio, tuple(fills), scale_cohorts=scale_cohorts
+        state.portfolio,
+        tuple(fills),
+        scale_cohorts=scale_cohorts,
+        commission_model=exec_params.commission_model,
     )
     pending = dict(state.pending_signals)
     for sym in drained:
@@ -741,23 +777,50 @@ def _finalize(
                 price=position.last_price,
                 reason=TradeExitReason.end,
                 position_id=position.position_id,
+                position_side=position.type,
+                qty=abs(position.qty),
+                fill_at_next_open=False,
             )
 
-            fill = FillEvent(
-                signal=close_signal,
-                filled_qty=abs(position.qty),
-                executed_price=position.last_price,
-                commission=exec_params.fixed_commission,
-                slippage=0.0,
-                timestamp=close_signal.timestamp,
+            # Route the end-of-run flatten through the SAME friction path as
+            # every other fill, so a closed book pays the spread/slippage it
+            # really would and records the costs the report reconciles against.
+            fill = execute_signal(
+                close_signal,
+                Candle(
+                    timestamp=close_signal.timestamp,
+                    symbol=symbol,
+                    open=position.last_price,
+                    high=position.last_price,
+                    low=position.last_price,
+                    close=position.last_price,
+                    volume=0.0,
+                ),
+                exec_params,
             )
-
-            from src.bt.portfolio.pure import apply_fill
 
             portfolio = apply_fill(portfolio, fill)
 
     # Freeze the engine-buffered equity curve onto the final portfolio.
     if equity_points is not None:
+        # The end-of-run flatten pays real friction (it routes through
+        # ``execute_signal``), so the book's post-close cash is NOT the last
+        # bar's mark-to-market equity. Stamp one final point AFTER the flatten
+        # settles so the frozen curve's last value equals the post-close book
+        # — otherwise the trades include the end-of-run friction while the
+        # equity-based Net (curve[-1] - curve[0]) misses it, and the report's
+        # reconciliation identity (Net = Gross - Commission - Spread/Slip)
+        # breaks by exactly that cost.
+        equity_points = list(equity_points)
+        ts = state.timestamp or pd.Timestamp.now()
+        equity_points.append(
+            EquityPoint(
+                timestamp=ts,
+                equity=portfolio.cash,
+                cash=portfolio.cash,
+                positions_value=0.0,
+            )
+        )
         portfolio = replace(portfolio, equity_curve=tuple(equity_points))
 
     return merge_bt_state(

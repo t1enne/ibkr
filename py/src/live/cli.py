@@ -22,7 +22,11 @@ import pandas as pd
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
 from src.bt.state import PortfolioState
-from src.bt.state.factories import create_execution_params, create_initial_portfolio
+from src.bt.state.factories import (
+    create_execution_params,
+    create_initial_portfolio,
+    build_commission_model,
+)
 from src.bt.types import StrategyConfig
 from src.live.broker import OrderResult, SimulatedBroker
 from src.live.engine import (
@@ -72,7 +76,17 @@ def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
     source = MockPortfolioSource(cfg.portfolio_path)
     broker = SimulatedBroker(
         create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
-        create_execution_params(fixed_commission=cfg.commission),
+        create_execution_params(
+            spread_bps=cfg.spread_bps,
+            slippage_bps=cfg.slippage_bps,
+            fixed_commission=cfg.commission,
+            commission_model=build_commission_model(
+                cfg.commission,
+                cfg.commission_per_share,
+                cfg.commission_min,
+                cfg.commission_max_pct,
+            ),
+        ),
         click.echo,
     )
     try:
@@ -151,6 +165,15 @@ def load_live_config(path: str) -> LiveConfig:
         raise ValueError(f"mode must be 'paper' or 'live', got {raw_mode!r}")
     portfolio_path = _pick((raw, params), ("portfolio_path",), "")
     commission = _float_or((raw, params), "commission", strategy.commission)
+    spread_bps = _float_or((raw, params), "spread_bps", strategy.spread_bps)
+    slippage_bps = _float_or((raw, params), "slippage_bps", strategy.slippage_bps)
+    per_share = _float_or_none(
+        (raw, params), "commission_per_share", strategy.commission_per_share
+    )
+    commission_min = _float_or((raw, params), "commission_min", strategy.commission_min)
+    commission_max_pct = _float_or_none(
+        (raw, params), "commission_max_pct", strategy.commission_max_pct
+    )
     return LiveConfig(
         strategy_type=strategy.strategy_type,
         symbols=tuple(strategy.symbols),
@@ -159,6 +182,11 @@ def load_live_config(path: str) -> LiveConfig:
         bars=tuple(strategy.bars),
         warmup=strategy.warmup,
         commission=commission,
+        spread_bps=spread_bps,
+        slippage_bps=slippage_bps,
+        commission_per_share=per_share,
+        commission_min=commission_min,
+        commission_max_pct=commission_max_pct,
         size_mode=size_mode,
         size=size,
         max_symbol_allocation=alloc,
@@ -296,4 +324,16 @@ def _float_or(
     value = _pick(sources, (key,), default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number, got {value!r}")
+    return float(value)
+
+
+def _float_or_none(
+    sources: Sequence[Mapping[str, object]], key: str, default: float | None
+) -> float | None:
+    """Like ``_float_or`` but tolerates a null/absent value (optional knob)."""
+    value = _pick(sources, (key,), default)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number or null, got {value!r}")
     return float(value)

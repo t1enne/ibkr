@@ -23,7 +23,10 @@ from src.bt.state.types import (
     ActionType,
     TradeStatus,
     TradeExitReason,
+    CommissionModel,
+    FixedCommission,
 )
+from src.bt.execution.pure import commission_for_fill
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ def apply_fills(
     portfolio: PortfolioState,
     fills: tuple[FillEvent, ...],
     scale_cohorts: bool = True,
+    commission_model: CommissionModel = FixedCommission(0.5),
 ) -> tuple[PortfolioState, TupleT[FillRejection, ...], TupleT[ScaleRecord, ...]]:
     """Apply a whole timestamp cohort of fills atomically. Pure.
 
@@ -182,7 +186,7 @@ def apply_fills(
     # no longer fit. Order-sensitive by construction — advisory only.
     scales: list[ScaleRecord] = []
     if scale_cohorts:
-        opens, record = _scale_opens(portfolio, opens)
+        opens, record = _scale_opens(portfolio, opens, commission_model)
         if record is not None:
             scales.append(record)
     rejections: list[FillRejection] = []
@@ -194,8 +198,21 @@ def apply_fills(
     return portfolio, tuple(rejections), tuple(scales)
 
 
+def estimate_open_commission(
+    opens: tuple[FillEvent, ...], model: CommissionModel
+) -> float:
+    """Total commission a cohort of opens will pay under ``model``.
+
+    Recomputed from the model rather than trusting ``FillEvent.commission`` so
+    a per-share scale that lowers the funded qty is priced by the same rule.
+    """
+    return sum(
+        commission_for_fill(model, f.filled_qty, f.executed_price) for f in opens
+    )
+
+
 def _scale_opens(
-    portfolio: PortfolioState, opens: tuple[FillEvent, ...]
+    portfolio: PortfolioState, opens: tuple[FillEvent, ...], model: CommissionModel
 ) -> tuple[tuple[FillEvent, ...], Optional[ScaleRecord]]:
     """Divide a cohort's opens by one shared, pre-execution cash scale.
 
@@ -210,12 +227,13 @@ def _scale_opens(
         # Lone-open guard: full-size-or-reject, never scaled. Same intent
         # fills full alone, "scale × plan" with a peer (see ``apply_fills``).
         return opens, None
-    # Reserve the fixed commission of every open up front: scaling the notional
-    # by ``(cash - total_commission) / requested`` makes the cohort's total cost
-    # (notional + commission) land exactly on ``cash``. Without the reservation a
-    # batch that fits to the cent still leaves the last fill a commission short
-    # and it is rejected — a rounding artefact, not genuine exhaustion.
-    commission = sum(f.commission for f in opens)
+    # Reserve the commission of every open up front: scaling the notional by
+    # ``(cash - total_commission) / requested`` makes the cohort's total cost
+    # (notional + commission) land no higher than ``cash``. Without the
+    # reservation a batch that fits to the cent still leaves the last fill a
+    # commission short and it is rejected — a rounding artefact, not genuine
+    # exhaustion.
+    commission = estimate_open_commission(opens, model)
     requested = sum(max(f.signal.qty, 0.0) * f.executed_price for f in opens)
     budget = portfolio.cash - commission
     # ``budget / requested`` is NaN when either side is NaN; ``min(1.0, nan)``
@@ -336,6 +354,7 @@ def _open_position(
         pnl=0.0,
         commission=fill.commission,
         slippage=fill.slippage,
+        spread=fill.spread,
         reason=signal.reason,
         status=TradeStatus.open,
         close_reason=None,
@@ -454,8 +473,9 @@ def _rebalance_position(
 
     Cash bookkeeping (P0-2):
       - add     (delta>0): cash -= delta*price + commission; no PnL realized.
-      - reduce  (delta<0): cash += reduce_qty*price - commission;
-                           realizes PnL on the reduced shares only.
+      - reduce  (delta<0): cash += release_value - commission; a long releases
+                           qty*price, a short the mirror basis qty*(2*entry - fill)
+                           the open required; realizes PnL on the reduced shares.
 
     Realized P&L is booked only on an actual full close (``new_qty <= 0``),
     so strategy-level per-trade PnL reflects true round-trips, not
@@ -538,9 +558,17 @@ def _rebalance_position(
         reduce_qty = abs(delta)
         if is_long:
             realized = (fill.executed_price - target.entry_price) * reduce_qty
+            # A long cover releases the covered shares' market value.
+            cash_change = reduce_qty * fill.executed_price - fill.commission
         else:
+            # A short cover releases the mirror basis the open required (qty*entry)
+            # plus the realized short PnL (entry - fill) on the covered shares,
+            # i.e. qty*(2*entry - fill) — the ``_close_position`` convention.
             realized = (target.entry_price - fill.executed_price) * reduce_qty
-        cash_change = reduce_qty * fill.executed_price - fill.commission
+            cash_change = (
+                reduce_qty * (2 * target.entry_price - fill.executed_price)
+                - fill.commission
+            )
         new_entry = target.entry_price
         new_entry_time = target.entry_time
 
@@ -572,6 +600,7 @@ def _rebalance_position(
                 pnl=trade.pnl + (realized if delta < 0 else 0.0),
                 commission=trade.commission + fill.commission,
                 slippage=trade.slippage + fill.slippage,
+                spread=trade.spread + fill.spread,
                 status=trade.status,
                 close_reason=trade.close_reason,
                 position_id=trade.position_id,
@@ -649,12 +678,14 @@ def _close_trade(trade: Trade, fill: FillEvent, pnl: float) -> Trade:
         qty=trade.qty,
         stop_loss=trade.stop_loss,
         take_profit=trade.take_profit,
-        # Accumulate: any PnL realized on earlier partial reduces (already
-        # folded into ``trade.pnl``) plus this full-close PnL on the remaining
-        # basis forms the true round-trip result.
-        pnl=trade.pnl + pnl,
+        # Net: the accumulated realized P&L (raw fill-price moves only) minus
+        # every commission the round trip paid — entry, any partial reduces,
+        # and this close. Sharing the basis this way, ``trade.pnl`` is the
+        # realized equity change for the trade.
+        pnl=trade.pnl + pnl - trade.commission - fill.commission,
         commission=trade.commission + fill.commission,
         slippage=trade.slippage + fill.slippage,
+        spread=trade.spread + fill.spread,
         status=TradeStatus.closed,
         close_reason=fill.signal.reason or TradeExitReason.none,
         position_id=trade.position_id,

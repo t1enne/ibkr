@@ -17,6 +17,8 @@ from src.bt.state import (  # noqa: F401
     TradeStatus,
     TradeExitReason,
     RiskConfig,
+    CommissionModel,
+    build_commission_model,
 )
 from src.bt.state import RiskEvent as StateRiskEvent
 
@@ -74,6 +76,30 @@ class StrategyConfig:
     # over-cash tail is rejected (order-sensitive). Default True keeps the
     # order-invariant cohort scaling that shipped. See ``_scale_opens``.
     cohort_scaling: bool = True
+    # Execution friction. ``spread_bps``/``slippage_bps`` are the config-visible
+    # levers for the hardcoded execution defaults; ``commission_per_share`` opts
+    # into the IBKR-style per-share charge (with ``commission_min`` floor and
+    # ``commission_max_pct`` percent-of-value cap). ``None`` keeps the legacy
+    # flat ``commission`` fallback, so existing strategy JSONs are unaffected.
+    spread_bps: float = 5.0
+    slippage_bps: float = 2.0
+    commission_per_share: float | None = None
+    commission_min: float = 0.0
+    commission_max_pct: float | None = None
+
+
+def commission_model_from_config(cfg: StrategyConfig) -> CommissionModel:
+    """Resolve the strategy config's commission shape into a tagged model.
+
+    ``commission_per_share`` set -> per-share model; otherwise the flat
+    ``commission`` fallback, keeping every legacy JSON numerically unchanged.
+    """
+    return build_commission_model(
+        cfg.commission,
+        cfg.commission_per_share,
+        cfg.commission_min,
+        cfg.commission_max_pct,
+    )
 
 
 RiskEvent = Union[StopLossEvent, TakeProfitEvent]

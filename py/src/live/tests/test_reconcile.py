@@ -178,10 +178,12 @@ def test_flip_sizes_open_against_freed_cash() -> None:
     assert open_.action is ActionType.long
     # Opens are sized against the ACTUAL post-close book: the close is priced
     # with the shared execute_signal and settled through apply_fills, so the
-    # short lot is gone and cash is its real proceeds (10*100 - slippage -
-    # commission = 999.3, not the old 10*100 ref-price approximation).
-    # size 0.5 -> 999.3*0.5/100 = 4.9965. Double-counting the lot would give 10.
-    assert open_.qty == 4.9965
+    # short lot is gone and cash is its real proceeds. The short close is a
+    # BUY-to-cover, so friction leans up: 100 + 0.025 (half-spread) + 0.02
+    # (slip) = 100.045. Short settlement: 10*100 + (100-100.045)*10 - 0.5
+    # (commission) = 1000 - 0.45 - 0.5 = 999.05. size 0.5 -> 999.05*0.5/100
+    # = 4.99525 -> 4.9952 (4 dp). Double-counting the lot would give 10.
+    assert open_.qty == 4.9952
 
 
 def test_size_qty_nan_price_is_zero() -> None:

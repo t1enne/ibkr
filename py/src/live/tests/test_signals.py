@@ -9,7 +9,7 @@ import pandas as pd
 
 import src.live.signals as signals
 from src.bt.engine.candle_store import CandleStore
-from src.bt.screen import ScreenRow
+from src.bt.screen import ScreenRow, ScreenRun
 from src.bt.state import BacktestState, PortfolioState
 from src.bt.types import StrategyConfig
 
@@ -76,7 +76,9 @@ def _config() -> StrategyConfig:
 
 def _stub(monkeypatch, rows: tuple[ScreenRow, ...], state: BacktestState) -> None:
     monkeypatch.setattr(
-        signals, "run_screen_from_strategy", lambda *a, **k: (rows, state)
+        signals,
+        "run_screen_from_strategy",
+        lambda *a, **k: ScreenRun(rows=rows, state=state, config=_config()),
     )
     monkeypatch.setattr(signals, "load_strategy", lambda *a, **k: _config())
 
@@ -135,7 +137,7 @@ def test_live_signals_forwards_max_age_days_as_none(monkeypatch) -> None:
 
     def _capture(config_path: str, max_age_days: int | None = None):
         seen["max_age_days"] = max_age_days
-        return (), _state(_store({}))
+        return ScreenRun(rows=(), state=_state(_store({})), config=_config())
 
     monkeypatch.setattr(signals, "run_screen_from_strategy", _capture)
     monkeypatch.setattr(signals, "load_strategy", lambda *a, **k: _config())

@@ -11,6 +11,9 @@ from src.bt.state.types import (
     EquityPoint,
     ExecutionParams,
     RiskConfig,
+    CommissionModel,
+    FixedCommission,
+    PerShareCommission,
 )
 
 
@@ -50,14 +53,46 @@ def create_initial_backtest_state(
     )
 
 
+def build_commission_model(
+    flat: float,
+    per_share: float | None,
+    min_per_fill: float,
+    max_pct_of_value: float | None,
+) -> CommissionModel:
+    """Pick the commission shape: per-share when ``per_share`` is set, else flat.
+
+    ``per_share=None`` keeps the legacy flat ``commission`` knob working, so
+    existing strategy JSONs are unaffected.
+    """
+    if per_share is None:
+        return FixedCommission(flat)
+    return PerShareCommission(
+        per_share=per_share,
+        min_per_fill=min_per_fill,
+        max_pct_of_value=max_pct_of_value,
+    )
+
+
 def create_execution_params(
-    spread_bps: float = 5.0, slippage_bps: float = 2.0, fixed_commission: float = 0.5
+    spread_bps: float = 5.0,
+    slippage_bps: float = 2.0,
+    fixed_commission: float = 0.5,
+    commission_model: CommissionModel | None = None,
 ) -> ExecutionParams:
-    """Create execution parameters."""
+    """Create execution parameters.
+
+    ``commission_model`` wins when given; otherwise a flat ``fixed_commission``
+    model is built, preserving the pre-union behavior for bare callers.
+    """
+    model = (
+        commission_model
+        if commission_model is not None
+        else FixedCommission(fixed_commission)
+    )
     return ExecutionParams(
         spread_bps=spread_bps,
         slippage_bps=slippage_bps,
-        fixed_commission=fixed_commission,
+        commission_model=model,
     )
 
 

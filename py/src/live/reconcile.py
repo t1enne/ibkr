@@ -33,7 +33,7 @@ from src.bt.state import (
     PortfolioState,
     Position,
 )
-from src.bt.state.factories import create_execution_params
+from src.bt.state.factories import create_execution_params, build_commission_model
 from src.live.broker import intent_to_signal, ref_candle, trade_signal
 from src.live.types import LiveConfig, LiveSignal, OrderIntent, PortfolioView
 
@@ -195,13 +195,15 @@ def _settled_book(
     params = _exec_params(config)
     fills = tuple(
         execute_signal(
-            intent_to_signal(intent, _SETTLE_TS),
+            intent_to_signal(intent, _SETTLE_TS, state),
             ref_candle(intent.ref_price, intent.symbol, _SETTLE_TS),
             params,
         )
         for intent in closes
     )
-    settled, _rejections = apply_fills(state, fills)
+    settled, _rejections, _scales = apply_fills(
+        state, fills, commission_model=params.commission_model
+    )
     # ``apply_fills`` stamps its settlements at ``_SETTLE_TS`` (the epoch probe),
     # so the returned book's ``trades``/``equity_curve`` are artifacts. Only
     # ``cash``/``positions`` are consumed downstream: re-emit a clean view so no
@@ -318,4 +320,14 @@ def _sizing_params(config: LiveConfig) -> SizingParams:
 
 def _exec_params(config: LiveConfig) -> ExecutionParams:
     """The execution params the broker fills with (same construction the CLI uses)."""
-    return create_execution_params(fixed_commission=config.commission)
+    return create_execution_params(
+        spread_bps=config.spread_bps,
+        slippage_bps=config.slippage_bps,
+        fixed_commission=config.commission,
+        commission_model=build_commission_model(
+            config.commission,
+            config.commission_per_share,
+            config.commission_min,
+            config.commission_max_pct,
+        ),
+    )

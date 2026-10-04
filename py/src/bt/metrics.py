@@ -445,6 +445,45 @@ def build_period_attribution(
     return tuple(results)
 
 
+@dataclass(frozen=True)
+class CostBreakdown:
+    """Reconciled P&L split: net = gross − commission − (spread + slippage)."""
+
+    gross_pnl: float
+    commission: float
+    spread: float
+    slippage: float
+    net_pnl: float
+
+
+def build_cost_breakdown(
+    trades: tuple[Trade, ...], equity_curve: pd.Series
+) -> CostBreakdown:
+    """Split realized P&L into gross and each friction, reconciled to equity.
+
+    ``trade.pnl`` is net of every friction, so adding the recorded costs back
+    recovers the frictionless gross; subtracting them again returns net. Net
+    equals the equity change across the run by construction.
+    """
+    commission = sum(t.commission or 0.0 for t in trades)
+    spread = sum(t.spread or 0.0 for t in trades)
+    slippage = sum(t.slippage or 0.0 for t in trades)
+    gross_pnl = sum(
+        (t.pnl or 0.0) + (t.commission or 0.0) + (t.spread or 0.0) + (t.slippage or 0.0)
+        for t in trades
+    )
+    if equity_curve.empty:
+        return CostBreakdown(0.0, commission, spread, slippage, 0.0)
+    net_pnl = float(equity_curve.iloc[-1] - equity_curve.iloc[0])
+    return CostBreakdown(
+        gross_pnl=gross_pnl,
+        commission=commission,
+        spread=spread,
+        slippage=slippage,
+        net_pnl=net_pnl,
+    )
+
+
 def build_symbol_attribution(
     trades: tuple[Any, ...],
 ) -> tuple[SymbolAttribution, ...]:
@@ -540,7 +579,7 @@ def _render_trades_section(
         ]
     trade_cols = (
         Col("Sym", "<"),
-        Col("Cost$", ">"),
+        Col("Notional$", ">"),
         Col("Entry", ">"),
         Col("Exit", ">"),
         Col("Entry$", ">"),
@@ -618,21 +657,19 @@ def get_backtest_results_analysis(
     lines.append("\nTrading Statistics")
     stat_cols = (Col("Metric", "<"), Col("Value", ">"))
     total_pnl = equity_curve.iloc[-1] - equity_curve.iloc[0]
-    total_commission = (
-        sum(t.commission for t in closed_trades) if closed_trades else 0.0
-    )
-    total_slippage = sum(t.slippage for t in closed_trades) if closed_trades else 0.0
-    total_costs = total_commission + total_slippage
+    breakdown = build_cost_breakdown(trades, equity_curve)
+    spread_slip = breakdown.spread + breakdown.slippage
     stat_rows: tuple[tuple[str, ...], ...] = (
         ("Starting Capital", f"{equity_curve.iloc[0]:,.2f}"),
         ("Total Trades", str(len(trades))),
         ("Closed Trades", str(len(closed_trades))),
         ("Win Rate", f"{win_rate:.2%}"),
-        ("Total P&L", f"{total_pnl:,.2f}"),
+        ("Total P&L (Net)", f"{total_pnl:,.2f}"),
+        ("Gross P&L", f"{breakdown.gross_pnl:,.2f}"),
+        ("Commission Costs", f"{breakdown.commission:,.2f}"),
+        ("Spread+Slippage Costs", f"{spread_slip:,.2f}"),
+        ("Net P&L", f"{breakdown.net_pnl:,.2f}"),
         ("Capital Utilization", f"{result.capital_utilization:.1%}"),
-        ("Commission Costs", f"{total_commission:,.2f}"),
-        ("Slippage Costs", f"{total_slippage:,.2f}"),
-        ("Total Costs", f"{total_costs:,.2f}"),
     )
     lines.extend(render(Table(columns=stat_cols, rows=stat_rows)))
 

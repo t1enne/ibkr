@@ -72,7 +72,14 @@ class Position:
 
 @dataclass
 class Trade:
-    """A completed trade record."""
+    """A completed trade record.
+
+    ``pnl`` is NET of every friction the round trip paid: it already reflects
+    the spread/slippage embedded in the fill prices AND the commission charged
+    on each fill, so ``sum(trade.pnl)`` is the realized equity change. The
+    ``commission``/``spread``/``slippage`` fields accumulate the qty-scaled
+    dollar costs so a report can split the gross P&L back out.
+    """
 
     entry_time: pd.Timestamp
     entry_price: float
@@ -87,6 +94,7 @@ class Trade:
     pnl: float = 0.0
     commission: float = 0.0
     slippage: float = 0.0
+    spread: float = 0.0
     reason: Optional[str] = ""
     status: TradeStatus = TradeStatus.open
     close_reason: Optional[Any] = None
@@ -160,6 +168,42 @@ class TradeSignal:
     # delayed fill never improves on the intended intra-bar stop exit.
     fill_guard_price: Optional[float] = None
     fill_guard_is_long: Optional[bool] = None
+    # Position side the fill acts on, used to resolve friction direction for a
+    # close (a long closes by selling, a short by buying to cover). Without it
+    # a close fill cannot know which way ``apply_friction`` should lean.
+    position_side: Optional[ActionType] = None
+
+
+@dataclass(frozen=True)
+class FixedCommission:
+    """Flat $ charge per fill; independent of qty and price."""
+
+    amount: float
+
+
+@dataclass(frozen=True)
+class PerShareCommission:
+    """IBKR-style per-share charge with a per-fill floor and optional cap.
+
+    ``max_pct_of_value`` is a percent (not fraction) of the fill's traded
+    value; ``None`` disables the cap.
+    """
+
+    per_share: float
+    min_per_fill: float = 0.0
+    max_pct_of_value: float | None = None
+
+
+CommissionModel = FixedCommission | PerShareCommission
+
+
+@dataclass(frozen=True)
+class FrictionResult:
+    """Executed price plus the qty-scaled dollar cost of each friction."""
+
+    executed_price: float
+    spread_cost: float  # qty-scaled $ (never a per-share fraction)
+    slippage_cost: float  # qty-scaled $
 
 
 @dataclass(frozen=True)
@@ -170,8 +214,9 @@ class FillEvent:
     filled_qty: float
     executed_price: float
     commission: float
-    slippage: float
+    slippage: float  # qty-scaled $, not a per-share fraction
     timestamp: pd.Timestamp
+    spread: float = 0.0  # qty-scaled $ half-spread cost
 
 
 @dataclass(frozen=True)
@@ -205,11 +250,16 @@ RiskEvent = Tuple[StopLossEvent, TakeProfitEvent]
 
 @dataclass(frozen=True)
 class ExecutionParams:
-    """Parameters for execution."""
+    """Parameters for execution.
+
+    ``commission_model`` is the tagged union of commission shapes; the default
+    keeps the legacy flat per-fill charge. Friction bps drive both exec paths
+    through the single ``apply_friction`` helper.
+    """
 
     spread_bps: float = 5.0
     slippage_bps: float = 2.0
-    fixed_commission: float = 0.5
+    commission_model: CommissionModel = FixedCommission(0.5)
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,70 @@ from src.bt.state.types import (
     FillEvent,
     ExecutionParams,
     ActionType,
+    CommissionModel,
+    FixedCommission,
+    FrictionResult,
 )
+
+
+def commission_for_fill(model: CommissionModel, qty: float, price: float) -> float:
+    """Charge $ for one fill under ``model``.
+
+    Flat models ignore qty/price. Per-share models charge ``per_share * |qty|``,
+    raise to the per-fill floor, then cap at ``max_pct_of_value`` percent of the
+    traded value (when set).
+    """
+    if isinstance(model, FixedCommission):
+        return model.amount
+    charge = abs(qty) * model.per_share
+    if charge < model.min_per_fill:
+        charge = model.min_per_fill
+    if model.max_pct_of_value is not None:
+        cap = abs(qty) * price * model.max_pct_of_value / 100.0
+        charge = min(charge, cap)
+    return charge
+
+
+def is_buy_fill(action: ActionType, position_side: ActionType | None) -> bool:
+    """Whether a fill *adds* (buys) rather than reduces (sells).
+
+    Opens are decided by the action; a close/rebalance is a buy iff it acts on a
+    short (buy-to-cover), else a sell. ``position_side=None`` defaults to a sell.
+    """
+    if action == ActionType.long:
+        return True
+    if action == ActionType.short:
+        return False
+    return position_side == ActionType.short
+
+
+def apply_friction(
+    base_price: float,
+    *,
+    is_buy: bool,
+    spread_bps: float,
+    slippage_bps: float,
+    qty: float,
+    adverse_multiplier: float = 1.0,
+) -> FrictionResult:
+    """Shift ``base_price`` by half-spread plus slippage; report qty-scaled $.
+
+    A buyer pays above the mid, a seller receives below it, so the half-spread
+    and slippage always lean against the fill. ``adverse_multiplier`` scales the
+    slippage (both exec paths share this one knob). All recorded costs are
+    dollar amounts scaled by ``qty``, never per-share fractions.
+    """
+    half_spread = base_price * (spread_bps / 2.0) / 10000.0
+    slip = base_price * (slippage_bps * adverse_multiplier) / 10000.0
+    if is_buy:
+        executed_price = base_price + half_spread + slip
+    else:
+        executed_price = base_price - half_spread - slip
+    return FrictionResult(
+        executed_price=executed_price,
+        spread_cost=abs(half_spread) * qty,
+        slippage_cost=abs(slip) * qty,
+    )
 
 
 def execute_signal(
@@ -37,36 +100,42 @@ def execute_signal(
             base_price = min(signal.fill_guard_price, tick.open)
         else:
             base_price = max(signal.fill_guard_price, tick.open)
-    spread_bps = params.spread_bps or 0.01
-    base_spread = base_price * (spread_bps / 10000)
 
-    # Calculate base price with spread
-    if signal.action == ActionType.long:
-        fill_base = base_price + base_spread
-    elif signal.action == ActionType.short:
-        fill_base = base_price - base_spread
+    qty = signal.qty
+    side = signal.position_side
+    if side is None and signal.fill_guard_is_long is not None:
+        side = ActionType.long if signal.fill_guard_is_long else ActionType.short
+    if signal.action == ActionType.rebalance:
+        is_buy = signal.qty > 0  # a rebalance adds when its delta is positive
     else:
-        fill_base = base_price
+        is_buy = is_buy_fill(signal.action, side)
 
-    # Calculate slippage
     adverse = calculate_adverse_selection(signal, tick)
-    slippage_bps = params.slippage_bps * (1.5 if adverse else 1.0)
-    slippage = base_price * (slippage_bps / 10000)
-
-    executed_price = fill_base + slippage
-    commission = params.fixed_commission
+    friction = apply_friction(
+        base_price,
+        is_buy=is_buy,
+        spread_bps=params.spread_bps,
+        slippage_bps=params.slippage_bps,
+        qty=qty,
+        adverse_multiplier=1.5 if adverse else 1.0,
+    )
 
     return FillEvent(
         signal=signal,
-        filled_qty=signal.qty if signal.qty > 0 else 1.0,
-        executed_price=executed_price,
-        commission=commission,
-        slippage=slippage,
+        filled_qty=qty,
+        executed_price=friction.executed_price,
+        commission=commission_for_fill(
+            params.commission_model, qty, friction.executed_price
+        ),
+        slippage=friction.slippage_cost,
+        spread=friction.spread_cost,
         timestamp=tick.timestamp,
     )
 
 
-def execute_risk_event(event, tick: Candle, params: ExecutionParams) -> FillEvent:
+def execute_risk_event(
+    event: object, tick: Candle, params: ExecutionParams
+) -> FillEvent:
     """Convert risk event (SL/TP) into fill event, modeling intra-bar gaps.
 
     A stop-loss/take-profit event fires because the bar's high/low crossed
@@ -89,7 +158,7 @@ def execute_risk_event(event, tick: Candle, params: ExecutionParams) -> FillEven
     qty = getattr(event, "position_qty", 0.0)
     position_type = getattr(event, "position_type", None)
 
-    trigger = event.trigger_price
+    trigger = getattr(event, "trigger_price")
     is_stop = getattr(event, "reason", "") == "sl"
     is_long = position_type == ActionType.long
 
@@ -114,32 +183,37 @@ def execute_risk_event(event, tick: Candle, params: ExecutionParams) -> FillEven
             # Short TP: open below target is a favorable gap.
             fill_base = min(trigger, tick.open)
 
-    # Apply spread + adverse slippage on top of the resolved base price.
-    # Direction matters: a long closes *by selling* (receive less), a short
-    # closes *by buying to cover* (pay more).
-    base_spread = fill_base * (params.spread_bps / 10000)
-    slippage_bps = params.slippage_bps * 2.0
-    slippage = fill_base * (slippage_bps / 10000)
-    if is_long:
-        executed_price = fill_base - base_spread - slippage
-    else:
-        executed_price = fill_base + base_spread + slippage
+    # A stop/take-profit always closes against the position, so the fill is a
+    # sell for a long and a buy-to-cover for a short; slippage is always adverse.
+    friction = apply_friction(
+        fill_base,
+        is_buy=not is_long,
+        spread_bps=params.spread_bps,
+        slippage_bps=params.slippage_bps,
+        qty=qty,
+        adverse_multiplier=1.5,
+    )
 
     signal = TradeSignal(
         action=ActionType.close,
-        symbol=event.symbol,
-        timestamp=event.timestamp,
-        price=event.trigger_price,
-        reason=event.reason,
+        symbol=getattr(event, "symbol"),
+        timestamp=getattr(event, "timestamp"),
+        price=trigger,
+        reason=getattr(event, "reason", None),
         position_id=pid,
+        position_side=position_type,
+        qty=qty,
     )
 
     return FillEvent(
         signal=signal,
         filled_qty=qty,
-        executed_price=executed_price,
-        commission=params.fixed_commission,
-        slippage=slippage,
+        executed_price=friction.executed_price,
+        commission=commission_for_fill(
+            params.commission_model, qty, friction.executed_price
+        ),
+        slippage=friction.slippage_cost,
+        spread=friction.spread_cost,
         timestamp=tick.timestamp,
     )
 

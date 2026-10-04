@@ -48,7 +48,8 @@ def live_signals(
     base-interval frame is missing/empty or whose last close is non-finite or
     ``<= 0`` is dropped. Pure mapping; the only I/O is the screen run.
     """
-    rows, state = run_screen_from_strategy(config_path, max_age_days=None)
+    screen = run_screen_from_strategy(config_path, max_age_days=None)
+    rows, state = screen.rows, screen.state
     base_iv = load_strategy(config_path).bars[0]
     out: list[LiveSignal] = []
     for row in rows:

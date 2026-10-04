@@ -16,12 +16,10 @@ from typing import TYPE_CHECKING
 import click
 
 from src.bt.cmds._shared import _json_default
-from src.bt.output import trade_json
 from src.bt.table import render_from_dicts
 
 if TYPE_CHECKING:
     from src.bt.screen.run_strategy import ScreenRow
-    from src.bt.state.types import Trade
 
 #: Column order for the printed table: the executable fields of the posture-
 #: setting signal, so the row is an order ticket, not a metric sheet. ``date``

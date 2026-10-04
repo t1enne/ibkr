@@ -20,10 +20,15 @@ from src.bt.portfolio.pure import (
 from src.bt.state import (
     ActionType,
     FillEvent,
+    FixedCommission,
     PortfolioState,
     TradeSignal,
     create_initial_portfolio,
 )
+
+
+#: Flat commission model the scale-reserve tests exercise.
+_MODEL = FixedCommission(0.5)
 
 
 def _ts(val: str) -> pd.Timestamp:
@@ -97,15 +102,15 @@ def test_two_opens_share_cash_and_both_fill():
     assert rejections == ()
     assert set(result.positions) == {"AAA", "BBB"}
     for lots in result.positions.values():
-        assert lots[0].qty == pytest.approx(50.0, abs=1e-4)
+        assert lots[0].qty == pytest.approx(49.995, abs=1e-4)
     assert result.cash >= 0
     # The cohort WAS scaled — reported, not silent, and counted per member.
     assert len(scales) == 1
     (record,) = scales
-    assert record.scale == pytest.approx(0.5, abs=1e-6)
+    assert record.scale == pytest.approx(0.49995, abs=1e-6)
     assert record.members == ("AAA", "BBB")
     assert record.requested == pytest.approx(20_000.0)
-    assert record.budget == pytest.approx(10_000.0)
+    assert record.budget == pytest.approx(9_999.0)
 
 
 def test_scale_cohorts_false_rejects_overflow_instead_of_scaling():
@@ -238,10 +243,10 @@ def test_scale_record_members_are_reduced_fills_only():
         _open("BBB", 100.0, 100.0),
         _open("CCC", 100.0, 100.0),
     )
-    scaled, record = _scale_opens(portfolio, opens)
+    scaled, record = _scale_opens(portfolio, opens, _MODEL)
     assert record is not None
     assert isinstance(record, ScaleRecord)
-    assert record.scale == pytest.approx(1.0 / 3.0, abs=1e-6)
+    assert record.scale == pytest.approx(0.3332833333333333, abs=1e-6)
     assert record.members == ("AAA", "BBB", "CCC")
     assert all(new.signal.qty < old.signal.qty for new, old in zip(scaled, opens))
 
@@ -249,13 +254,13 @@ def test_scale_record_members_are_reduced_fills_only():
 def test_lone_open_is_unscaled_and_unrecorded():
     portfolio = _portfolio(cash=1_000.0)
     opens = (_open("AAA", 100.0, 100.0),)  # requests 10_000 > cash
-    scaled, record = _scale_opens(portfolio, opens)
+    scaled, record = _scale_opens(portfolio, opens, _MODEL)
     assert scaled == opens
     assert record is None
 
 
 def test_empty_opens_yield_no_record():
-    scale_result, record = _scale_opens(_portfolio(), ())
+    scale_result, record = _scale_opens(_portfolio(), (), _MODEL)
     assert scale_result == ()
     assert record is None
 
@@ -263,7 +268,7 @@ def test_empty_opens_yield_no_record():
 def test_zero_requested_yields_no_record():
     portfolio = _portfolio(cash=10_000.0)
     opens = (_open("AAA", 0.0, 100.0), _open("BBB", 0.0, 100.0))
-    scaled, record = _scale_opens(portfolio, opens)
+    scaled, record = _scale_opens(portfolio, opens, _MODEL)
     assert scaled == opens
     assert record is None
 
@@ -271,25 +276,31 @@ def test_zero_requested_yields_no_record():
 def test_non_positive_budget_yields_no_record():
     portfolio = _portfolio(cash=0.0)
     opens = (_open("AAA", 100.0, 100.0), _open("BBB", 100.0, 100.0))
-    scaled, record = _scale_opens(portfolio, opens)
+    scaled, record = _scale_opens(portfolio, opens, _MODEL)
     assert scaled == opens
     assert record is None
 
 
-def test_exact_fit_is_not_scaled():
-    """requested == budget -> scale == 1.0, no record, no qty change."""
+def test_exact_fit_is_scaled_for_commission_reserve():
+    """Notional == cash still scales: the commission reserve lowers the budget.
+
+    The cohort's total cost is notional + commission, so an exact notional fit
+    leaves the commission unfunded and the tail is scaled to land within cash.
+    """
     portfolio = _portfolio(cash=10_000.0)
     opens = (_open("AAA", 50.0, 100.0), _open("BBB", 50.0, 100.0))  # 5_000 each
-    scaled, record = _scale_opens(portfolio, opens)
-    assert scaled == opens
-    assert record is None
+    scaled, record = _scale_opens(portfolio, opens, _MODEL)
+    assert record is not None
+    assert record.scale == pytest.approx(0.9999, abs=1e-6)
+    assert scaled[0].signal.qty == pytest.approx(49.995, abs=1e-4)
+    assert scaled[1].signal.qty == pytest.approx(49.995, abs=1e-4)
 
 
 def test_nan_requested_is_guarded():
     """A NaN leg poisons ``requested``; min(1.0, nan) keeps 1.0 -> no scale."""
     portfolio = _portfolio(cash=10_000.0)
     opens = (_open("AAA", float("nan"), 100.0), _open("BBB", 100.0, 100.0))
-    scaled, record = _scale_opens(portfolio, opens)
+    scaled, record = _scale_opens(portfolio, opens, _MODEL)
     assert scaled == opens
     assert record is None
 

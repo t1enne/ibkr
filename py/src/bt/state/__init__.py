@@ -9,6 +9,10 @@ from src.bt.state.types import (
     PortfolioView,
     TradeSignal,
     FillEvent,
+    FixedCommission,
+    PerShareCommission,
+    CommissionModel,
+    FrictionResult,
     StopLossEvent,
     TakeProfitEvent,
     RiskEvent,
@@ -27,6 +31,7 @@ from src.bt.state.factories import (
     create_initial_backtest_state,
     create_execution_params,
     create_risk_config,
+    build_commission_model,
 )
 
 __all__ = [
@@ -39,6 +44,10 @@ __all__ = [
     "PortfolioView",
     "TradeSignal",
     "FillEvent",
+    "FixedCommission",
+    "PerShareCommission",
+    "CommissionModel",
+    "FrictionResult",
     "StopLossEvent",
     "TakeProfitEvent",
     "RiskEvent",
@@ -55,4 +64,5 @@ __all__ = [
     "create_initial_backtest_state",
     "create_execution_params",
     "create_risk_config",
+    "build_commission_model",
 ]

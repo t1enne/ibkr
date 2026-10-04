@@ -18,7 +18,7 @@ from typing import Protocol, cast
 import pandas as pd
 
 from src.bt.engine.handlers import ExecutionHandler, default_execution_handler
-from src.bt.portfolio.pure import FillRejection, apply_fills
+from src.bt.portfolio.pure import FillRejection, apply_fills, next_position_id
 from src.bt.state import (
     ActionType,
     Candle,
@@ -29,7 +29,7 @@ from src.bt.state import (
     TradeSignal,
 )
 from src.live.result import Ok, Result
-from src.live.types import FeedError, OrderIntent
+from src.live.types import FeedError, OrderIntent, PortfolioView
 
 
 @dataclass(frozen=True)
@@ -71,12 +71,15 @@ def trade_signal(
     stop_loss: float | None = None,
     take_profit: float | None = None,
     tag: str = "",
+    position_side: ActionType | None = None,
 ) -> TradeSignal:
     """The ONE probe-``TradeSignal`` factory for the live execution path.
 
     ``fill_at_next_open=False`` so ``execute_signal`` prices at ``price`` rather
     than a next-open tick. Shared by ``intent_to_signal`` (a real order) and
     reconcile's synthetic sizing probes, so the signal shape is defined once.
+    ``position_side`` is the side the fill acts on, feeding ``is_buy_fill`` for a
+    close; opens are decided by ``action`` alone.
     """
     return TradeSignal(
         action=action,
@@ -89,14 +92,46 @@ def trade_signal(
         stop_loss=stop_loss,
         take_profit=take_profit,
         tag=tag,
+        position_side=position_side,
         fill_at_next_open=False,
     )
 
 
-def intent_to_signal(intent: OrderIntent, ts: pd.Timestamp) -> TradeSignal:
+def position_side_of(
+    portfolio: PortfolioView | None, intent: OrderIntent
+) -> ActionType | None:
+    """The side of the lot a close targets, read from the book by ``position_id``.
+
+    ``execute_signal`` needs the position's side to lean friction the right way
+    (a long closes by selling, a short by buying to cover) and an ``OrderIntent``
+    carries only the lot id. ``None`` for a non-close, an unset id, or a book
+    holding no such lot — the broker reports those separately (``_close_error``),
+    so this never invents a side it cannot prove.
+    """
+    if portfolio is None or intent.action is not ActionType.close:
+        return None
+    pid = intent.position_id
+    if not pid:
+        return None
+    return next(
+        (
+            pos.type
+            for pos in portfolio.positions.get(intent.symbol, ())
+            if pos.position_id == pid
+        ),
+        None,
+    )
+
+
+def intent_to_signal(
+    intent: OrderIntent, ts: pd.Timestamp, portfolio: PortfolioView | None = None
+) -> TradeSignal:
     """Pure: ``OrderIntent`` → ``TradeSignal`` for the shared execution path.
 
-    A close intent carries ``position_id``, which ``_close_position`` requires.
+    A close intent carries ``position_id``, which ``_close_position`` requires;
+    passing the pre-cycle book resolves that lot's side (``position_side_of``) so
+    the close's friction leans against the position rather than defaulting to a
+    sell. Opens ignore the book.
     """
     return trade_signal(
         symbol=intent.symbol,
@@ -109,6 +144,7 @@ def intent_to_signal(intent: OrderIntent, ts: pd.Timestamp) -> TradeSignal:
         stop_loss=intent.stop_loss,
         take_profit=intent.take_profit,
         tag=intent.tag,
+        position_side=position_side_of(portfolio, intent),
     )
 
 
@@ -126,9 +162,21 @@ def ref_candle(price: float, symbol: str, ts: pd.Timestamp) -> Candle:
     )
 
 
-def _open_lot_id(intent: OrderIntent, ts: pd.Timestamp) -> str:
-    """The lot id ``_open_position`` mints for an unnamed open (mirror that scheme)."""
-    return f"{intent.symbol}_{ts.timestamp()}"
+def _open_ranks(
+    intents: tuple[OrderIntent, ...], open_indexes: tuple[int, ...]
+) -> dict[int, int]:
+    """Map each open intent to its application index among the cohort's opens.
+
+    ``apply_fills`` settles its (long/short) opens sorted by ``signal.symbol``
+    (stable), so open ``j`` in that sorted order mints its ``position_id`` from
+    seq ``base + j`` where ``base`` is the pre-cohort trade count (see
+    ``next_position_id``). Reproducing that index here lets the broker report
+    the EXACT id settlement minted, so the ledger owns a truly reachable lot.
+    """
+    sorted_by_symbol = sorted(
+        range(len(open_indexes)), key=lambda j: intents[open_indexes[j]].symbol
+    )
+    return {open_indexes[j]: k for k, j in enumerate(sorted_by_symbol)}
 
 
 def _close_error(portfolio: PortfolioState, intent: OrderIntent) -> str | None:
@@ -241,17 +289,32 @@ class SimulatedBroker:
                     rejected[i] = error
                     continue
             fills[i] = self._handler.execute_signal(
-                intent_to_signal(intent, ts),
+                intent_to_signal(intent, ts, self._portfolio),
                 ref_candle(intent.ref_price, intent.symbol, ts),
                 self._params,
             )
-        settled, rejections = apply_fills(
-            self._portfolio, tuple(fills[i] for i in sorted(fills))
+        # The pre-cohort trade count is the ``base`` the next open's position_id
+        # seq builds from (``next_position_id``); opens settle sorted by symbol.
+        open_base = len(self._portfolio.trades)
+        open_rank = _open_ranks(
+            intents,
+            tuple(
+                i
+                for i, intent in enumerate(intents)
+                if intent.action in (ActionType.long, ActionType.short)
+            ),
+        )
+        settled, rejections, _scales = apply_fills(
+            self._portfolio,
+            tuple(fills[i] for i in sorted(fills)),
+            commission_model=self._params.commission_model,
         )
         self._portfolio = settled
         exhausted = {r.symbol: r for r in rejections}
         results = tuple(
-            self._result(intent, i, ts, fills, rejected, exhausted)
+            self._result(
+                intent, i, ts, fills, rejected, exhausted, open_base, open_rank
+            )
             for i, intent in enumerate(intents)
         )
         return Ok(results)
@@ -264,6 +327,8 @@ class SimulatedBroker:
         fills: dict[int, FillEvent],
         rejected: dict[int, str],
         exhausted: dict[str, FillRejection],
+        open_base: int,
+        open_rank: dict[int, int],
     ) -> OrderResult:
         """Per-order outcome after the cohort settled (scaled qty for applied opens)."""
         if index in rejected:
@@ -282,7 +347,9 @@ class SimulatedBroker:
                     ok=False,
                     message=_rejection_message(failure),
                 )
-            position_id = _open_lot_id(intent, ts)
+            position_id = next_position_id(
+                intent.symbol, ts, open_base + open_rank[index]
+            )
             lot = _named_lot(self._portfolio, intent.symbol, position_id)
             # The cohort's shared scale only moves qty (SL/TP/price untouched), so
             # report the SETTLED qty, not the pre-scale request.

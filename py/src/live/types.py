@@ -94,6 +94,13 @@ class LiveConfig:
     bars: tuple[str, ...]  # bars[0] = signal interval
     warmup: str  # screen warm-up window, e.g. "1y"
     commission: float = 0.5  # fixed per-fill commission, matches StrategyConfig
+    # Execution friction mirroring StrategyConfig: per-share commission opts in
+    # via ``commission_per_share``; ``None`` keeps the flat ``commission``.
+    spread_bps: float = 5.0
+    slippage_bps: float = 2.0
+    commission_per_share: float | None = None
+    commission_min: float = 0.0
+    commission_max_pct: float | None = None
     # sizing (used only when a LiveSignal.qty == 0.0)
     size_mode: Literal["equity", "cash", "fixed"] = "equity"
     size: float = 0.0

@@ -117,7 +117,7 @@ def test_close_long_position():
     new = apply_fill(portfolio, fill)
     assert "AAPL" not in new.positions
     assert new.trades[0].status == TradeStatus.closed
-    assert new.trades[0].pnl == 100.0  # (110-100)*10 - 1
+    assert new.trades[0].pnl == 99.0  # (110-100)*10 - 1 close commission
     assert "AAPL" in portfolio.positions  # immutable
 
 
@@ -413,9 +413,8 @@ def test_partial_close_full_release_closes_lot():
     assert lots[0].position_id == "AAPL_2"
     closed = [t for t in portfolio.trades if t.position_id == "AAPL_1"][0]
     assert closed.status == TradeStatus.closed
-    # PnL reflects the gross round-trip on the closed lot; commission is tracked
-    # separately on the trade (consistent with test_close_long_position).
-    assert closed.pnl == pytest.approx((110.0 - 100.0) * 10.0)
+    # PnL is net of the round-trip commissions (entry 1.0 + close 1.0).
+    assert closed.pnl == pytest.approx((110.0 - 100.0) * 10.0 - 2.0)
 
 
 def test_open_short_stored_as_negative_net_bearing_magnitude():
@@ -476,6 +475,108 @@ def test_partial_close_releases_fraction_of_short():
     # Realized PnL on the covered shares; commission tracked separately on the
     # trade (matching test_close_long_position's convention).
     assert trade.pnl == pytest.approx((100.0 - 90.0) * 4.0)
+    # CASH + EQUITY, not just pnl/qty (that gap let the mirror-basis bug slip):
+    # a short partial cover must release the open's mirror cash
+    # qty*(2*entry - fill) - comm, not qty*fill - comm. Reference: entry 10@100
+    # comm 1, cover 4@90 comm 1 -> cash 99438, equity = 100000 + realized 40
+    # + unrealized 60 - 2 comm = 100098.
+    from src.bt.portfolio.pure import calculate_equity
+
+    assert portfolio.cash == pytest.approx(
+        100000 - (10 * 100.0 + 1) + (4 * (2 * 100.0 - 90.0) - 1)
+    )
+    assert calculate_equity(portfolio) == pytest.approx(100098.0)
+
+
+def test_short_partial_then_full_cover_mirror_equity():
+    """Full short cover after an earlier partial: equity closes the round trip.
+
+    Pins the numeric target the mirror basis implies: after the partial cover
+    equity is 100098 (realized 40 + unrealized 60 - 2 comm); the final cover of
+    the remaining 6 realizes the other 60 and one more commission -> 100097.
+    A stale "qty*fill" cover would leave equity hundreds off and never catch it.
+    """
+    from src.bt.portfolio.pure import calculate_equity
+
+    portfolio = create_initial_portfolio(
+        initial_capital=100000, start_timestamp=_ts("2024-01-01")
+    )
+    portfolio = apply_fill(portfolio, _fill_short(10.0, 100.0, "SNPS_1"))
+    partial = FillEvent(
+        signal=TradeSignal(
+            action=ActionType.rebalance,
+            symbol="AAPL",
+            timestamp=_ts("2024-01-02"),
+            price=90.0,
+            qty=-4.0,
+            reason="partial-cover",
+            position_id="SNPS_1",
+        ),
+        filled_qty=4.0,
+        executed_price=90.0,
+        commission=1.0,
+        slippage=0.0,
+        timestamp=_ts("2024-01-02"),
+    )
+    portfolio = apply_fill(portfolio, partial)
+    assert calculate_equity(portfolio) == pytest.approx(100098.0)
+
+    final = FillEvent(
+        signal=TradeSignal(
+            action=ActionType.rebalance,
+            symbol="AAPL",
+            timestamp=_ts("2024-01-03"),
+            price=90.0,
+            qty=-6.0,
+            reason="full-cover",
+            position_id="SNPS_1",
+        ),
+        filled_qty=6.0,
+        executed_price=90.0,
+        commission=1.0,
+        slippage=0.0,
+        timestamp=_ts("2024-01-03"),
+    )
+    portfolio = apply_fill(portfolio, final)
+    assert "AAPL" not in portfolio.positions
+    assert portfolio.cash == pytest.approx(100097.0)
+    assert calculate_equity(portfolio) == pytest.approx(100097.0)
+
+
+def test_long_partial_reduce_cash_and_equity():
+    """Long partial reduce cash/equity is exact already; pin the symmetry.
+
+    Long and short covers of the same realized + unrealized path land the same
+    equity (100098 here) — a regression tripping only the short branch must not
+    silently move the long side.
+    """
+    from src.bt.portfolio.pure import calculate_equity
+
+    portfolio = create_initial_portfolio(
+        initial_capital=100000, start_timestamp=_ts("2024-01-01")
+    )
+    portfolio = apply_fill(portfolio, _fill_long(10.0, 100.0, "AAPL_1"))
+    reduce = FillEvent(
+        signal=TradeSignal(
+            action=ActionType.rebalance,
+            symbol="AAPL",
+            timestamp=_ts("2024-01-02"),
+            price=110.0,
+            qty=-4.0,
+            reason="partial",
+            position_id="AAPL_1",
+        ),
+        filled_qty=4.0,
+        executed_price=110.0,
+        commission=1.0,
+        slippage=0.0,
+        timestamp=_ts("2024-01-02"),
+    )
+    portfolio = apply_fill(portfolio, reduce)
+    # cash = 100000 - open (10*100+1) + cover (4*110-1) = 99438.
+    assert portfolio.cash == pytest.approx(99438.0)
+    # remaining 6@100 last 110 -> value 660; equity = 99438 + 660 = 100098.
+    assert calculate_equity(portfolio) == pytest.approx(100098.0)
 
 
 def test_partial_close_full_cover_closes_short():
@@ -508,7 +609,8 @@ def test_partial_close_full_cover_closes_short():
     assert net_quantity(portfolio, "AAPL") == 0.0
     closed = [t for t in portfolio.trades if t.position_id == "SNPS_1"][0]
     assert closed.status == TradeStatus.closed
-    assert closed.pnl == pytest.approx((100.0 - 90.0) * 10.0)
+    # PnL is net of the round-trip commissions (entry 1.0 + close 1.0).
+    assert closed.pnl == pytest.approx((100.0 - 90.0) * 10.0 - 2.0)
 
 
 def test_net_quantity_and_avg_entry():

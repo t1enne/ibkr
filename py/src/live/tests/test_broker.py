@@ -205,6 +205,55 @@ async def test_open_assigns_synthetic_position_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_open_position_id_round_trips_to_close() -> None:
+    # BUG-1 regression: the reported open id must equal the settled lot id, so
+    # the ledger owns a REACHABLE lot and a later cycle can close it. A phantom
+    # ``SYM_{ts}`` id (settlement mints ``SYM_{ts}_{seq}``) makes ``_owned_ids``
+    # filter every real lot out, so a close targeting our lot is never emitted
+    # and the position is silently unclosable.
+    broker = _broker()
+    placed: PlaceResult = await broker.place(_open_intent(qty=10.0))
+    assert isinstance(placed, Ok)
+    opened = cast(OrderResult, placed.value)
+    assert opened.ok
+    pid = opened.position_id
+    assert pid is not None
+    live = broker.portfolio()
+    # The reported id resolves to the actual settled lot (no phantom).
+    assert {p.position_id for p in live.positions["AAPL"]} == {pid}
+    cfg = LiveConfig(
+        strategy_type="m",
+        symbols=("AAPL",),
+        initial_capital=100000.0,
+        strategy_params={},
+        bars=("1d",),
+        warmup="1y",
+    )
+    close_sig = LiveSignal(
+        symbol="AAPL",
+        action="close",
+        score=1.0,
+        reasons=(),
+        signal_ts=TS,
+        price=100.0,
+        qty=0.0,
+    )
+    # Ownership scoping (the ledger ``_owned_ids`` view) sees the lot, so a
+    # close intent targeting it is emitted.
+    (close_intent,) = reconcile((close_sig,), live, cfg, owned=frozenset({pid}))
+    assert close_intent.action is ActionType.close
+    assert close_intent.position_id == pid
+    # And the broker settles that close: the lot is gone, not left orphaned.
+    placed: Result[tuple[OrderResult, ...], FeedError] = await broker.place_cohort(
+        (close_intent,)
+    )
+    assert isinstance(placed, Ok)
+    (closed,) = cast("tuple[OrderResult, ...]", placed.value)
+    assert closed.ok
+    assert "AAPL" not in broker.portfolio().positions
+
+
+@pytest.mark.asyncio
 async def test_flip_open_sized_by_reconcile_survives_settlement() -> None:
     # reconcile sizes the open against this cycle's close settled for real; the
     # broker's cohort settlement must land that exact qty — the sizing book and
@@ -279,7 +328,7 @@ async def test_multi_open_cohort_scales_like_backtest() -> None:
         execute_signal(intent_to_signal(i, TS), _ref_candle_of(i), ExecutionParams())
         for i in intents
     )
-    expected, rejections = apply_fills(book, expected_fills)
+    expected, rejections, _scales = apply_fills(book, expected_fills)
     assert rejections == ()
     settled = broker.portfolio()
     assert settled.cash == expected.cash
@@ -288,7 +337,16 @@ async def test_multi_open_cohort_scales_like_backtest() -> None:
     # Both scaled below the 1.0 request: the tail was scaled, not dropped.
     assert all(lots[0].qty < 1.0 for lots in settled.positions.values())
     assert all(order.fill is not None for order in orders)
-    assert all(order.fill.filled_qty < 1.0 for order in orders if order.fill)
+    # The reported id resolves to the real settled lot (BUG-1 fix), so the
+    # result carries the SETTLED (post-scale) qty, exactly the interplay
+    # ``_result``'s settled-qty lookback is for — never the 1.0 pre-scale
+    # request.
+    for order in orders:
+        assert order.fill is not None
+        assert order.position_id is not None
+        (lot,) = settled.positions[order.intent.symbol]
+        assert lot.position_id == order.position_id
+        assert order.fill.filled_qty == lot.qty
 
 
 @pytest.mark.asyncio
