@@ -23,15 +23,16 @@ caps return. A structural book-slot cap (``_BOOK_SLOTS``) throttles per-name
 size once open names plus the bar's cohort exceed 10, so a dense trend tape
 self-scales instead of leaving it to the engine's silent cohort scale.
 
-Amplifiers, both neutral by default:
-
-- Cross-sectional trend score (``_trend_risk_score``): only a slow SMA slope
-  pays. Short-lookback slopes screen at ~zero rank IC, and an EMA variant
-  loses in every tested cell -- EMA vs EMA over overlapping windows compares
-  decayed points, while SMA compares two disjoint windows.
-- Portfolio vol-regime factor (``_fred_band_score``): shrink the low-vol bucket
-  only. Rising vol is not the risk on this population, and the older mid-band
-  shrink cut the second-best bucket while leaving the weakest at full size.
+Amplifier, one knob, neutral by default (``_amp_score``): ``risk_amp`` is a
+non-conserved cross-sectional trend re-lever (only a slow SMA slope pays;
+short slopes and EMA variants screen at ~zero rank IC) gated to the leg-up,
+and ``risk_topk`` is a conserved concentration onto the most-liquid names by
+trailing dollar volume (the OOS-stable predictor of which names carry the
+realized PnL; per-trade RETURN is unpredictable at ~0 IC). They multiply:
+the re-lever lifts return, the concentration re-deploys the same budget onto
+the payers without extra cash-exhaustion scaling. Portfolio vol-regime factor
+(``_fred_band_score``) is structural, no param: shrink the low-vol bucket
+only; rising vol is not the risk on this population.
 
 The binding constraint is cash-exhaustion fill scaling (see AGENTS.md § Fills),
 not Sharpe: every extra unit of return at fixed per-name risk is bought with
@@ -55,6 +56,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 
@@ -91,7 +93,11 @@ class Params(StrategyParams):
     breakout_look: int = 20
     # -- sizing: flat risk budget times ONE trend amplifier --
     risk_pct: float = 0.004
-    risk_trend_amp: float = 0.0  # 0 = flat sizing; see _trend_risk_score
+    risk_amp: float = 0.0  # 0 = flat; see _amp_score (non-conserved re-lever)
+    risk_topk: int = 0  # >0 = also concentrate onto the top-K by dollar vol
+    # -- rolling universe selection (0 = OFF: trade every configured symbol) --
+    select_top_n: int = 0  # >0 -> trade only the rolling top-N survivors
+    select_bars: int = 126  # re-selection period in bars (~6 months)
     # -- exit --
     decel_ratio: float = 0.1  # VWATR slope-divergence exit; 0 turns it OFF
 
@@ -212,16 +218,28 @@ def _breakout_count(ctx: StrategyContext, p: Params) -> int:
 
     Cached per timestamp; bounded. Approximates the cohort the engine will
     execute in one bar cycle, so size can be damped before the engine silently
-    scales it.
+    scales it. With rolling selection ON, the cohort counts ONLY the selected
+    names -- the engine sees nothing else open, and counting the whole universe
+    overstates the cohort ~4x and pins the book-slot throttle permanently on.
     """
     cache: dict[object, int] = ctx.shared.setdefault(_COHORT_CACHE_KEY, {})
     ts = ctx.candle.timestamp
     if ts in cache:
         return cache[ts]
     need = max(p.breakout_look + 1, 2 * p.slope_bars + 1)
+    # The engine only executes signals for symbols that clear the rolling
+    # universe selection, so the cohort the book-slot cap must absorb is the
+    # breakout count WITHIN that selected set -- not the whole configured
+    # universe. Counting all 147 names overstates the cohort ~4x and keeps the
+    # throttle (<_BOOK_SLOTS) permanently engaged, halving deployment on the
+    # broad-universe configs. Missing names are deselected, so they open nothing
+    # and must not inflate the damp.
+    tradable = _selection(ctx, p) if p.select_top_n > 0 else None
     count = 0
     for sym in ctx.symbols:
         if sym.startswith("GATE_") or ctx.quantity(sym) != 0:
+            continue
+        if tradable is not None and sym not in tradable:
             continue
         o = ctx.ohlcv(sym)
         if o is None:
@@ -300,18 +318,181 @@ def _trend_cross_section(
     return out
 
 
-def _trend_risk_score(p: Params, ctx: StrategyContext, sym: str) -> float:
-    """Cross-sectional trend amp: ``1 + amp*(2*pct-1)`` inside a leg up, else 1.
+def _amp_score(p: Params, ctx: StrategyContext, sym: str) -> float:
+    """One amplifier knob: non-conserved trend re-lever inside a leg up, plus
+    an optional conserved dollar-volume top-K concentration.
 
-    Neutral when the amp is off, the gate is shut, or the symbol has no slope
-    at this bar -- a missing trend read is not a weak trend.
+    The two effects multiply and each is load-bearing:
+
+    1. Re-lever (``risk_amp``): ``1 + amp*(2*trend_pct - 1)`` inside a leg-up
+       breadth gate. Boosting ALL names in a strong tape by their trend rank is
+       what lifts return (the top names also carry the PnL); gating it to the
+       leg-up is what keeps it from blowing up in a bear. ``amp=0`` or gate
+       shut -> 1.0 (flat).
+    2. Concentration (``risk_topk > 0``, ``_DV_CONC`` strength): the top-K
+       names by trailing-60d dollar volume get ``x(1+conc)`` and the rest a
+       compensating cut so the cohort budget is unchanged. Dollar volume is the
+       OOS-stable predictor of which names carry the realized PnL (per-trade
+       RETURN is unpredictable at ~0 IC); this re-deploys the same budget onto
+       them. ``risk_topk=0`` -> no concentration.
+
+    Both neutral when off. A missing trend read is not a weak trend.
     """
-    if p.risk_trend_amp == 0:
+    if p.risk_amp == 0 and p.risk_topk == 0:
         return 1.0
-    pcts, leg_up = _trend_cross_section(ctx, p)
-    if not leg_up or sym not in pcts:
+    score = 1.0
+    if p.risk_amp != 0:
+        pcts, leg_up = _trend_cross_section(ctx, p)
+        if leg_up and sym in pcts:
+            score *= 1.0 + p.risk_amp * (2.0 * pcts[sym] - 1.0)
+    if p.risk_topk > 0:
+        score *= _dv_topk_score(ctx, p, sym)
+    return score
+
+
+#: Dollar-volume concentration. Cross-sectional percentile of trailing 60d
+#: dollar volume. Unlike trend slope it is a SIZE/participation signal: names
+#: with heavy recent dollar flow are the ones that carry the realized PnL in
+#: this long-only breakout book (per-trade-PnL rank IC ~ +0.09 is the single
+#: most OOS-stable predictor measured; per-trade RETURN is unpredictable at
+#: ~0 IC across every trailing stat). Sized onto live equity, a high-dv name
+#: is where a breakout is actually being paid for -- that's the size target.
+#: top-K names draw more, the rest a compensating cut, so total deployment
+#: (and so cash-exhaustion scaling) is unchanged. Consumed by _dv_topk_score.
+_DV_LOOK: int = 60
+_DV_CACHE_KEY = "vwatr_div_dv"
+#: Conserved top-K concentration strength (structural). Boosting more leaks
+#: cash-exhaustion scaling; the shipped value was A/B'd on the broad book.
+_DV_CONC: float = 1.0
+
+
+def _dv_cross_section(ctx: StrategyContext) -> dict[str, float]:
+    """Per-symbol trailing-60d dollar-volume percentile within the universe,
+    computed ONCE per timestamp and cached in ``ctx.shared`` (bounded)."""
+    cache: dict[object, dict[str, float]] = ctx.shared.setdefault(_DV_CACHE_KEY, {})
+    ts = ctx.candle.timestamp
+    if ts in cache:
+        return cache[ts]
+    dv: dict[str, float] = {}
+    for sym in ctx.symbols:
+        if sym.startswith("GATE_"):
+            continue
+        o = ctx.ohlcv(sym)
+        if o is None:
+            continue
+        close = o.close.to_array()
+        volume = o.volume.to_array()
+        if len(close) < _DV_LOOK or len(volume) < _DV_LOOK:
+            continue
+        d = float(np.mean(close[-_DV_LOOK:] * volume[-_DV_LOOK:]))
+        if np.isfinite(d) and d > 0:
+            dv[sym] = d
+    pcts: dict[str, float] = {}
+    for sym, v in dv.items():
+        below = sum(1 for u in dv.values() if u < v)
+        ties = sum(1 for u in dv.values() if u == v) - 1
+        pcts[sym] = (below + 0.5 * ties) / max(1, len(dv) - 1) if len(dv) > 1 else 0.5
+    if len(cache) > 8:  # keep the per-run cache bounded
+        cache.clear()
+    cache[ts] = pcts
+    return pcts
+
+
+def _dv_topk_score(ctx: StrategyContext, p: Params, sym: str) -> float:
+    """Conserved top-K concentration on trailing-60d dollar volume.
+
+    The top-``risk_topk`` most-liquid names of the cohort get ``x(1+conc)``
+    and the rest a compensating cut ``x(1 - conc*k/rest)`` so the cohort's
+    total risk budget sums to ~n (same deployment, no added cash-exhaustion
+    scaling). Dollar volume is the OOS-stable predictor of which names carry
+    the realized PnL, so the budget is re-deployed onto them. Neutral (1.0)
+    when the symbol has no dv read or the cohort is empty.
+    """
+    picks = _selection(ctx, p) if p.select_top_n > 0 else None
+    pcts = _dv_cross_section(ctx)
+    if picks is not None:
+        cohort = sorted((s for s in picks if s in pcts), key=lambda s: pcts[s])
+    else:
+        cohort = sorted((s for s, v in pcts.items() if v > 0), key=lambda s: pcts[s])
+    n = len(cohort)
+    if not cohort or n == 0:
         return 1.0
-    return 1.0 + p.risk_trend_amp * (2.0 * pcts[sym] - 1.0)
+    pos = cohort.index(sym) if sym in cohort else -1
+    if pos < 0:
+        return 1.0
+    m = n - pos  # 1..n, larger = more $ flow
+    k = min(p.risk_topk, n)
+    if m <= k:
+        return 1.0 + _DV_CONC
+    rest = n - k
+    if rest <= 0:
+        return 1.0
+    return 1.0 - _DV_CONC * (k / rest)
+
+
+#: Rolling selection: the top-``select_top_n`` names by the combined rank of
+#: trailing dollar volume and realized vol -- the two features that separate a
+#: live, actively traded high-vol book from the rest of a research universe.
+#: Selection is recomputed every ``select_bars`` bars and held in ``ctx.shared``
+#: (per-run by construction). Deselected names are NOT force-closed: the trail
+#: and the divergence exit still own every open position.
+_SELECT_CACHE_KEY = "vwatr_div_selection"
+_SELECT_LOOK: int = 60
+
+
+def _pct_rank(vals: dict[str, float], sym: str) -> float:
+    """Fraction of the cross-section strictly below ``vals[sym]`` (0..1)."""
+    v = vals[sym]
+    below = sum(1 for u in vals.values() if u < v)
+    ties = sum(1 for u in vals.values() if u == v) - 1
+    return (below + 0.5 * ties) / max(1, len(vals) - 1)
+
+
+def _selection(ctx: StrategyContext, p: Params) -> frozenset[str]:
+    """Tradable set for the current bar: the last rebalance's picks.
+
+    Re-selects when ``select_bars`` base bars have elapsed (tracked by the
+    reference symbol's bar count, so the period is exact in bars, not wall
+    days). Names without ``_SELECT_LOOK`` bars of history are never picked --
+    a fresh listing is not a liquidity signal.
+    """
+    holder: dict[str, object] = ctx.shared.setdefault(_SELECT_CACHE_KEY, {})
+    ref = next((s for s in ctx.symbols if not s.startswith("GATE_")), None)
+    frame = ctx.ohlcv(ref) if ref is not None else None
+    bars = 0 if frame is None else len(frame.close)
+    last_bars = holder.get("bars")
+    if isinstance(last_bars, int) and bars - last_bars < p.select_bars:
+        return cast("frozenset[str]", holder["picks"])
+
+    dv: dict[str, float] = {}
+    vol: dict[str, float] = {}
+    for sym in ctx.symbols:
+        if sym.startswith("GATE_"):
+            continue
+        o = ctx.ohlcv(sym)
+        if o is None:
+            continue
+        close = o.close.to_array()
+        volume = o.volume.to_array()
+        if len(close) < _SELECT_LOOK + 1 or len(volume) < _SELECT_LOOK:
+            continue
+        logret = np.diff(np.log(close[-(_SELECT_LOOK + 1) :]))
+        rvol = float(np.std(logret, ddof=1))
+        dollar = float(np.mean(close[-_SELECT_LOOK:] * volume[-_SELECT_LOOK:]))
+        if np.isfinite(rvol) and np.isfinite(dollar) and dollar > 0:
+            vol[sym] = rvol
+            dv[sym] = dollar
+    common = sorted(set(dv) & set(vol))
+    if len(common) <= p.select_top_n:
+        picks = frozenset(common)
+    else:
+        ranked = sorted(
+            common, key=lambda s: (-(_pct_rank(dv, s) + _pct_rank(vol, s)), s)
+        )
+        picks = frozenset(ranked[: p.select_top_n])
+    holder["bars"] = bars
+    holder["picks"] = picks
+    return picks
 
 
 def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
@@ -407,11 +588,16 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if not leg_up:
         return
 
+    # Rolling universe selection: only names picked at the last rebalance may
+    # open. Off by default, so the tuned configs are byte-for-byte unchanged.
+    if p.select_top_n > 0 and sym not in _selection(ctx, p):
+        return
+
     stop_price = p.vwatr_mult * vwatr
     # Size off LIVE EQUITY: the risk budget re-levers with the book, which is
     # what keeps deployment (and therefore Ann) up as equity compounds.
     equity = ctx.current_equity()
-    score = _fred_band_score(ctx) * _trend_risk_score(p, ctx, sym)
+    score = _fred_band_score(ctx) * _amp_score(p, ctx, sym)
     cohort = _breakout_count(ctx, p)
     book = cohort + sum(1 for s in ctx.symbols if ctx.quantity(s) != 0)
     if book > _BOOK_SLOTS:

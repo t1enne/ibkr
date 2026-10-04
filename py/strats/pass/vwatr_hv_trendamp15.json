@@ -6,12 +6,10 @@
   "commission": 0.05,
   "initial_capital": 50000,
   "strategy_type": "vwatr_div_dsl",
-  "bars": [
-    "1d"
-  ],
+  "bars": ["1d"],
   "strategy_params": {
     "risk_pct": 0.006,
-    "risk_trend_amp": 2.5
+    "risk_amp": 2.5
   },
   "symbols": [
     "SRPT",
