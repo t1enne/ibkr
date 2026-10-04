@@ -1,0 +1,127 @@
+=== FUND start Sat Oct  3 10:56:46 PM CEST 2026
+Uninstalled 1 package in 1ms
+Installed 1 package in 8ms
+121 symbols, 165125 rows written to the local DB
+
+AAPL: up to date  75 fiscal periods  filed 2009-07-22 -> 2026-07-31
+ADBE: up to date  75 fiscal periods  filed 2009-06-26 -> 2026-06-15
+ADPT: 1177 rows  36 fiscal periods  filed 2019-08-13 -> 2026-08-04
+ADSK: up to date  77 fiscal periods  filed 2009-06-03 -> 2026-08-28
+ALGN: 3104 rows  72 fiscal periods  filed 2010-08-05 -> 2026-08-05
+ALLT: 637 rows  18 fiscal periods  filed 2012-04-17 -> 2026-03-26
+AME: 3175 rows  76 fiscal periods  filed 2009-08-05 -> 2026-08-04
+AMZN: up to date  78 fiscal periods  filed 2009-07-24 -> 2026-07-31
+AQB: 1586 rows  44 fiscal periods  filed 2017-05-09 -> 2026-08-06
+ARCT: 1217 rows  35 fiscal periods  filed 2019-08-14 -> 2026-08-06
+AUDC: 717 rows  18 fiscal periods  filed 2012-04-19 -> 2026-03-30
+AVAV: 2280 rows  74 fiscal periods  filed 2011-09-08 -> 2026-09-10
+BAIDF: 577 rows  20 fiscal periods  filed 2010-03-26 -> 2026-03-17
+BBAAY: 485 rows  15 fiscal periods  filed 2015-06-25 -> 2026-05-20
+BYDDF: no SEC fundamentals
+CAT: 3216 rows  82 fiscal periods  filed 2009-10-30 -> 2026-08-05
+CDNA: 2056 rows  57 fiscal periods  filed 2014-08-28 -> 2026-07-30
+CDXS: 2287 rows  67 fiscal periods  filed 2011-08-03 -> 2026-08-11
+CERS: 2300 rows  66 fiscal periods  filed 2011-11-03 -> 2026-07-30
+CGEN: 640 rows  25 fiscal periods  filed 2012-03-14 -> 2026-03-02
+CRM: 3861 rows  77 fiscal periods  filed 2009-08-25 -> 2026-08-27
+CRNT: 645 rows  18 fiscal periods  filed 2012-04-05 -> 2026-04-15
+CRS: 3461 rows  70 fiscal periods  filed 2010-11-05 -> 2026-08-12
+CRSP: up to date  48 fiscal periods  filed 2016-11-22 -> 2026-08-03
+CRWD: up to date  35 fiscal periods  filed 2019-07-19 -> 2026-08-27
+CSTL: 1376 rows  35 fiscal periods  filed 2019-09-03 -> 2026-07-30
+DD: 1627 rows  49 fiscal periods  filed 2017-11-06 -> 2026-08-04
+DDD: 2641 rows  68 fiscal periods  filed 2011-07-28 -> 2026-08-03
+DOCU: 1570 rows  40 fiscal periods  filed 2018-06-08 -> 2026-09-04
+EDIT: 1635 rows  48 fiscal periods  filed 2016-05-13 -> 2026-08-05
+EMN: 3416 rows  74 fiscal periods  filed 2009-07-30 -> 2026-07-31
+ESLT: 655 rows  17 fiscal periods  filed 2013-03-13 -> 2026-03-17
+EVGN: no SEC fundamentals
+FATE: 1793 rows  63 fiscal periods  filed 2013-11-13 -> 2026-08-13
+FVRR: 322 rows  10 fiscal periods  filed 2020-03-31 -> 2026-03-12
+GE: 2769 rows  75 fiscal periods  filed 2009-08-03 -> 2026-07-16
+GH: 1187 rows  38 fiscal periods  filed 2018-11-19 -> 2026-07-30
+GILT: 673 rows  18 fiscal periods  filed 2012-04-02 -> 2026-03-16
+GOOGN: 2050 rows  50 fiscal periods  filed 2015-10-29 -> 2026-07-23
+GWRE: 2685 rows  65 fiscal periods  filed 2012-03-14 -> 2026-09-11
+HDB: 647 rows  19 fiscal periods  filed 2010-09-30 -> 2025-07-14
+HPQ: 3038 rows  74 fiscal periods  filed 2009-12-17 -> 2026-08-27
+HUBS: 2000 rows  56 fiscal periods  filed 2014-11-13 -> 2026-08-05
+HUYA: 371 rows  11 fiscal periods  filed 2019-04-26 -> 2026-04-27
+IBKR: 1614 rows  70 fiscal periods  filed 2010-11-09 -> 2026-08-06
+ICE: 2492 rows  60 fiscal periods  filed 2013-08-07 -> 2026-07-30
+ILMN: 3093 rows  72 fiscal periods  filed 2010-08-04 -> 2026-07-31
+INCY: 2259 rows  68 fiscal periods  filed 2011-05-03 -> 2026-04-28
+INMD: 332 rows  10 fiscal periods  filed 2020-02-18 -> 2026-02-10
+INTU: up to date  74 fiscal periods  filed 2009-12-04 -> 2026-09-09
+IONS: 2616 rows  72 fiscal periods  filed 2010-08-09 -> 2026-07-29
+IOVA: 2048 rows  68 fiscal periods  filed 2011-11-21 -> 2026-08-06
+IRDM: 2666 rows  67 fiscal periods  filed 2011-08-08 -> 2026-07-22
+ISRG: up to date  75 fiscal periods  filed 2009-07-23 -> 2026-07-21
+JD: 445 rows  15 fiscal periods  filed 2015-04-17 -> 2026-04-16
+KALU: 3479 rows  72 fiscal periods  filed 2010-08-03 -> 2026-07-23
+KMDA: 1 rows  1 fiscal periods  filed 2021-02-24 -> 2021-02-24
+LECO: 2872 rows  71 fiscal periods  filed 2010-08-05 -> 2026-07-30
+MCRB: 1709 rows  52 fiscal periods  filed 2015-08-10 -> 2026-08-05
+MDT: 2304 rows  56 fiscal periods  filed 2015-02-27 -> 2026-09-03
+MELI: up to date  72 fiscal periods  filed 2010-08-06 -> 2026-08-06
+MMM: 3809 rows  75 fiscal periods  filed 2009-07-31 -> 2026-07-21
+MOG-B: 3451 rows  71 fiscal periods  filed 2010-08-10 -> 2026-07-31
+MSFT: up to date  77 fiscal periods  filed 2009-10-23 -> 2026-07-29
+MTLS: no SEC fundamentals
+NCSYF: 722 rows  19 fiscal periods  filed 2011-03-31 -> 2026-02-26
+NFLX: up to date  76 fiscal periods  filed 2009-07-31 -> 2026-07-17
+NIU: 340 rows  11 fiscal periods  filed 2019-04-25 -> 2026-04-17
+NNDM: 109 rows  7 fiscal periods  filed 2026-03-31 -> 2026-08-07
+NTLA: up to date  48 fiscal periods  filed 2016-06-03 -> 2026-08-06
+NVDA: up to date  78 fiscal periods  filed 2009-08-20 -> 2026-08-26
+OKTA: 1595 rows  44 fiscal periods  filed 2017-06-08 -> 2026-08-27
+PD: 1375 rows  36 fiscal periods  filed 2019-06-07 -> 2026-08-27
+PERI: 614 rows  18 fiscal periods  filed 2012-03-22 -> 2026-03-16
+PHR: 1112 rows  36 fiscal periods  filed 2019-12-10 -> 2026-09-03
+PINS: 1226 rows  36 fiscal periods  filed 2019-05-17 -> 2026-08-04
+PRLB: 2631 rows  64 fiscal periods  filed 2012-05-04 -> 2026-07-31
+PSNL: 1234 rows  36 fiscal periods  filed 2019-08-13 -> 2026-08-04
+PTC: 2998 rows  71 fiscal periods  filed 2010-08-12 -> 2026-07-31
+PYPD: 225 rows  9 fiscal periods  filed 2021-03-05 -> 2026-02-25
+PYPL: up to date  51 fiscal periods  filed 2015-07-29 -> 2026-05-05
+RDHL: no SEC fundamentals
+RDWR: 686 rows  18 fiscal periods  filed 2012-03-28 -> 2026-03-31
+ROK: 3122 rows  75 fiscal periods  filed 2009-08-04 -> 2026-08-04
+ROKU: up to date  44 fiscal periods  filed 2017-11-09 -> 2026-08-06
+SE: 342 rows  12 fiscal periods  filed 2018-04-11 -> 2026-04-17
+SHOP: up to date  22 fiscal periods  filed 2016-02-17 -> 2026-08-05
+SILC: 714 rows  18 fiscal periods  filed 2012-03-20 -> 2026-04-28
+SNAP: 1730 rows  44 fiscal periods  filed 2017-05-11 -> 2026-08-04
+SNOW: 1092 rows  31 fiscal periods  filed 2020-12-03 -> 2026-09-04
+SNPS: up to date  71 fiscal periods  filed 2010-09-08 -> 2026-08-26
+SPCE: 1545 rows  40 fiscal periods  filed 2017-11-14 -> 2026-08-12
+SSYS: 565 rows  17 fiscal periods  filed 2013-03-07 -> 2026-03-05
+SYK: 3660 rows  75 fiscal periods  filed 2009-11-09 -> 2026-07-31
+TDOC: 1685 rows  51 fiscal periods  filed 2015-08-12 -> 2026-07-30
+TEAM: 851 rows  22 fiscal periods  filed 2022-11-04 -> 2026-08-14
+TER: up to date  81 fiscal periods  filed 2010-08-12 -> 2026-07-31
+TEVA: 2091 rows  52 fiscal periods  filed 2010-02-22 -> 2026-07-29
+TKPHF: no SEC fundamentals
+TMO: up to date  75 fiscal periods  filed 2009-07-31 -> 2026-07-31
+TREE: 2856 rows  67 fiscal periods  filed 2011-08-15 -> 2026-07-31
+TRMB: 3190 rows  72 fiscal periods  filed 2010-08-10 -> 2026-08-12
+TRU: 2424 rows  58 fiscal periods  filed 2013-11-13 -> 2026-04-28
+TSEM: 659 rows  18 fiscal periods  filed 2012-04-30 -> 2026-04-30
+TSLA: up to date  68 fiscal periods  filed 2011-08-12 -> 2026-07-23
+TTD: 1707 rows  46 fiscal periods  filed 2016-11-10 -> 2026-08-06
+TWLO: 1770 rows  47 fiscal periods  filed 2016-08-09 -> 2026-08-07
+TWST: 1299 rows  37 fiscal periods  filed 2019-02-11 -> 2026-08-03
+TXG: 1298 rows  37 fiscal periods  filed 2019-11-12 -> 2026-08-07
+U: 1096 rows  31 fiscal periods  filed 2020-11-13 -> 2026-08-06
+UCTT: 2560 rows  70 fiscal periods  filed 2011-08-03 -> 2026-08-04
+UPS: 3034 rows  75 fiscal periods  filed 2009-08-07 -> 2026-08-05
+URGN: 1428 rows  41 fiscal periods  filed 2018-03-15 -> 2026-08-05
+VCYT: 1895 rows  60 fiscal periods  filed 2013-11-25 -> 2026-07-31
+VRSK: 2693 rows  70 fiscal periods  filed 2011-05-03 -> 2026-04-29
+WDAY: up to date  65 fiscal periods  filed 2012-12-07 -> 2026-08-27
+WIX: 542 rows  16 fiscal periods  filed 2014-03-20 -> 2026-03-05
+WKHS: 2290 rows  70 fiscal periods  filed 2011-08-15 -> 2026-08-13
+XRXDW: 1221 rows  33 fiscal periods  filed 2019-11-06 -> 2026-08-06
+Z: 1833 rows  53 fiscal periods  filed 2015-05-12 -> 2026-08-05
+ZS: up to date  40 fiscal periods  filed 2018-06-07 -> 2026-09-03
+=== FUND exit 0 Sat Oct  3 10:58:47 PM CEST 2026
