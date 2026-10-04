@@ -303,18 +303,26 @@ class Fundamentals:
     strategy.
     """
 
-    __slots__ = ("_rows", "_cursor", "_cache")
+    __slots__ = ("_rows", "_cursor", "_cache", "_names", "_loader")
 
     def __init__(
         self,
-        rows_by_symbol: Mapping[str, Sequence[FundamentalRow]],
+        rows_by_symbol: Mapping[str, Sequence[FundamentalRow]] | None = None,
         cursor: Callable[[], Cursor] | None = None,
+        names: Sequence[str] | None = None,
+        loader: Callable[[str], Sequence[FundamentalRow]] | None = None,
     ) -> None:
         self._rows: dict[str, tuple[FundamentalRow, ...]] = {
-            sym.upper(): tuple(rows) for sym, rows in rows_by_symbol.items()
+            sym.upper(): tuple(rows) for sym, rows in (rows_by_symbol or {}).items()
         }
         self._cursor = cursor
         self._cache: dict[tuple[Statement, str, str], SeriesPIT] = {}
+        # Lazy mode: `names` is the configured universe, `loader` fetches one
+        # symbol's rows on first read. Rows are memoised in `_rows`, so a symbol
+        # is queried at most once per run -- a run that never reads fundamentals
+        # never touches the DB.
+        self._names: tuple[str, ...] = tuple(s.upper() for s in (names or ()))
+        self._loader = loader
 
     @classmethod
     def build(
@@ -340,8 +348,21 @@ class Fundamentals:
 
     @property
     def symbols(self) -> tuple[str, ...]:
-        """Symbols with fundamentals loaded (insertion order, deduped)."""
-        return tuple(self._rows)
+        """Configured symbols in lazy mode, else symbols already loaded."""
+        return self._names if self._names else tuple(self._rows)
+
+    def _rows_for(self, symbol: str) -> tuple[FundamentalRow, ...]:
+        """Rows for ``symbol``, loading and sorting them on first read."""
+        sym = symbol.upper()
+        rows = self._rows.get(sym)
+        if rows is None:
+            if self._loader is None:
+                return ()
+            rows = tuple(
+                sorted(self._loader(sym), key=lambda r: (r.period_end, r.filed))
+            )
+            self._rows[sym] = rows
+        return rows
 
     def bind_cursor(self, cursor: Callable[[], Cursor]) -> None:
         """Bind the engine cursor reader (set once by the engine at run start).
@@ -376,7 +397,7 @@ class Fundamentals:
         after the cursor are excluded, so ``latest`` leaks nothing either.
         """
         sym = symbol.upper()
-        visible = [r for r in self._rows.get(sym, ()) if self._filed_by(r)]
+        visible = [r for r in self._rows_for(sym) if self._filed_by(r)]
         if not visible:
             return None
         periods = [r.period_end for r in visible if r.statement == statement]
@@ -398,7 +419,7 @@ class Fundamentals:
 
     def _statement_series(self, statement: Statement, symbol: str) -> StatementSeries:
         sym = symbol.upper()
-        rows = self._rows.get(sym, ())
+        rows = self._rows_for(sym)
         series = {
             name: self._series(statement, sym, name) for name in _field_names(statement)
         }
@@ -408,7 +429,7 @@ class Fundamentals:
         key = (statement, symbol, field)
         cached = self._cache.get(key)
         if cached is None:
-            cached = build_series(self._rows.get(symbol, ()), statement, field)
+            cached = build_series(self._rows_for(symbol), statement, field)
             self._cache[key] = cached
         # Always (re)bind the live cursor: the cached entry holds the series data,
         # but which periods are visible must be read from the current engine
@@ -429,14 +450,15 @@ def init_fundamentals(
 
 
 def load_fundamentals(symbols: Sequence[str]) -> Fundamentals:
-    """Load and assemble the as-first-stated store for ``symbols``.
+    """Lazy as-first-stated store for ``symbols`` -- nothing is read here.
 
-    The one I/O call in the fundamentals read path: one local query per symbol,
-    once per run. Symbols without stored fundamentals simply have empty series
-    (a strategy reading them sees ``len(...) == 0``), so a partially covered
-    universe still runs.
+    Rows for a symbol are fetched on first read of that symbol and memoised for
+    the rest of the run, so the DB cost is paid only by runs that actually read
+    fundamentals (and only for the symbols they read). Symbols without stored
+    fundamentals simply have empty series (a strategy reading them sees
+    ``len(...) == 0``), so a partially covered universe still runs.
     """
-    return Fundamentals.build({sym: load_stated(sym) for sym in symbols})
+    return Fundamentals(names=symbols, loader=load_stated)
 
 
 __all__ = [

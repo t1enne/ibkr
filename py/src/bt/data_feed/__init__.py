@@ -14,6 +14,7 @@ Usage:
         process(candle)
 """
 
+import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from pandas import Timestamp
@@ -86,26 +87,33 @@ def detect_gaps(
         # symbols' timestamps appear as all-NaN rows in this block. Only the
         # symbol's own (non-NaN) bars are real — drop the padding before
         # measuring continuity.
-        time_idx = pd.DatetimeIndex(block.dropna(subset=["close"]).index)
+        time_idx = pd.DatetimeIndex(block["close"].dropna().index)
         if len(time_idx) < 2:
             continue
-        deltas = time_idx[1:] - time_idx[:-1]
+        # Vectorized delta scan: one int64 diff per symbol instead of a
+        # Timedelta-index subtraction plus a Python loop over every bar. Only
+        # the candidate breaks (rare) fall through to the trading-day check.
+        ns = time_idx.to_numpy(dtype="datetime64[ns]").astype("int64")
+        deltas_ns = np.diff(ns)
+        over = np.flatnonzero(deltas_ns > max_gap.value)
         breaks: list[GapBreak] = []
-        for idx, delta in enumerate(deltas):
-            assert isinstance(delta, pd.Timedelta)
-            prev_ts, next_ts = time_idx[idx], time_idx[idx + 1]
+        for i in over:
+            prev_ts, next_ts = time_idx[int(i)], time_idx[int(i) + 1]
             # Time threshold AND a genuinely skipped trading day: a long
             # weekend (or holiday cluster) can exceed max_gap without any data
             # being missing.
-            if delta > max_gap and _trading_days_between(prev_ts, next_ts) > 0:
-                breaks.append(
-                    GapBreak(
-                        symbol=symbol,
-                        prev_ts=prev_ts,
-                        next_ts=next_ts,
-                        duration=delta,
-                    )
+            if _trading_days_between(prev_ts, next_ts) == 0:
+                continue
+            breaks.append(
+                GapBreak(
+                    symbol=symbol,
+                    prev_ts=prev_ts,
+                    next_ts=next_ts,
+                    duration=cast(
+                        pd.Timedelta, pd.Timedelta(int(deltas_ns[i]), unit="ns")
+                    ),
                 )
+            )
         if breaks:
             report[symbol] = tuple(breaks)
     return report
