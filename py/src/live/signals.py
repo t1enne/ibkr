@@ -21,7 +21,6 @@ with ``max_age_days=None`` (all rows) and apply the age filter locally, on the
 from __future__ import annotations
 
 import math
-from typing import cast
 
 import pandas as pd
 
@@ -68,12 +67,14 @@ def live_signals(
 def _action_of(row: ScreenRow) -> SignalAction | None:
     """Live action for a row, or ``None`` to HOLD.
 
-    ``long``/``short`` pass through. A ``flat`` row with a ``sig_ts`` came from a
+    ``long``/``short`` pass through, and the driver's explicit ``close`` action
+    (a ``ctx.close`` signal, ``_side_of`` in the screen driver) maps to ``close``
+    too. The older shape survives: a ``flat`` row with a ``sig_ts`` came from a
     close -> ``close``. A ``flat`` row with no ``sig_ts`` never signalled ->
     ``None`` (HOLD, drop).
     """
-    if row.action in ("long", "short"):
-        return cast("SignalAction", row.action)
+    if row.action in ("long", "short", "close"):
+        return row.action
     if row.action == "flat" and row.sig_ts is not None:
         return "close"
     return None

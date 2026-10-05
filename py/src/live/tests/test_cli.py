@@ -443,11 +443,63 @@ def test_resolve_adapter_live_mode_must_name_its_adapter() -> None:
         resolve_adapter(None, {}, _cfg(mode="live"))
 
 
-def test_ibkr_without_dry_run_is_refused(tmp_path: Path) -> None:
-    path = write_config(tmp_path, broker="ibkr", portfolio_path="pf.json")
-    out = CliRunner().invoke(live_group, ["run", path])
-    assert out.exit_code != 0
-    assert "phase 3" in out.output
+def test_ibkr_non_dry_run_builds_the_placing_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 3: an ibkr cycle without --dry-run reaches the real routing edge."""
+    from src.live.adapters.ibkr.broker import IbkrBroker
+
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("src.live.cli.IbkrGateway", _FakeGateway)
+    monkeypatch.setattr("src.live.cli.IbkrClient", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.IbkrPortfolioSource", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        seen["broker"] = k.get("broker")
+        seen["dry_run"] = k.get("dry_run")
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, broker="ibkr", mode="paper")
+    out = CliRunner().invoke(live_group, ["run", path, "--adapter", "ibkr"])
+    assert out.exit_code == 0, out.output
+    assert isinstance(seen["broker"], IbkrBroker)
+    assert seen["dry_run"] is False
+
+
+def test_ibkr_dry_run_broker_still_refuses_to_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defence in depth: the dry-run broker refuses even if the CLI guard is skipped."""
+    import asyncio
+
+    from src.live.adapters.ibkr.broker import IbkrBroker
+    from src.live.result import Err
+
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("src.live.cli.IbkrGateway", _FakeGateway)
+    monkeypatch.setattr("src.live.cli.IbkrClient", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.IbkrPortfolioSource", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        seen["broker"] = k.get("broker")
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, broker="ibkr", mode="paper")
+    out = CliRunner().invoke(
+        live_group, ["run", path, "--dry-run", "--adapter", "ibkr"]
+    )
+    assert out.exit_code == 0, out.output
+    broker = seen["broker"]
+    assert isinstance(broker, IbkrBroker)
+    placed = asyncio.run(broker.place(_intent()))
+    assert isinstance(placed, Err)
+    assert cast("FeedError", placed.error).kind == "auth"
 
 
 def test_sim_path_never_builds_a_gateway(

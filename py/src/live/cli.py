@@ -31,8 +31,9 @@ from src.bt.types import StrategyConfig
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.gateway import IbkrGateway
 from src.live.adapters.ibkr.authz import authorize
+from src.live.adapters.ibkr.broker import IbkrBroker
 from src.live.adapters.ibkr.portfolio_source import IbkrPortfolioSource
-from src.live.broker import OrderResult, SimulatedBroker
+from src.live.broker import LiveBroker, OrderResult, SimulatedBroker
 from src.live.engine import (
     CycleReport,
     PortfolioFetchError,
@@ -96,12 +97,6 @@ def live_run(
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
     resolved = resolve_adapter(adapter, raw, cfg)
-    # Phase 2 is READ-ONLY: an ibkr cycle that may place is refused outright.
-    if resolved == "ibkr" and not dry_run:
-        raise click.UsageError(
-            "--adapter ibkr is read-only until phase 3 (order placement): "
-            "re-run with --dry-run. This phase can never place anything."
-        )
     # Scope key derives from the ORIGINAL raw config, never the temp projection
     # (the strategy-only file lives at a random path and must not change scope).
     strategy_id = config_hash(raw)
@@ -110,10 +105,19 @@ def live_run(
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
         ledger.ensure_strategy(strategy_id, strategy.name, cfg.mode)
     gateway: IbkrGateway | None = None
+    broker: LiveBroker
     if resolved == "ibkr":
         gateway = IbkrGateway(IbkrClient())
         source: PortfolioSource = IbkrPortfolioSource(
             gateway.client, _ref_prefix(strategy_id)
+        )
+        # The real routing edge. ``dry_run`` is passed through as defence in
+        # depth: even if the guard below were skipped, this broker places nothing.
+        broker = IbkrBroker(
+            gateway.client,
+            strategy_id=strategy_id,
+            dry_run=dry_run,
+            log=click.echo,
         )
     else:
         if not cfg.portfolio_path:
@@ -121,21 +125,21 @@ def live_run(
                 "config requires portfolio_path (mock portfolio fixture)"
             )
         source = MockPortfolioSource(cfg.portfolio_path)
-    broker = SimulatedBroker(
-        create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
-        create_execution_params(
-            spread_bps=cfg.spread_bps,
-            slippage_bps=cfg.slippage_bps,
-            fixed_commission=cfg.commission,
-            commission_model=build_commission_model(
-                cfg.commission,
-                cfg.commission_per_share,
-                cfg.commission_min,
-                cfg.commission_max_pct,
+        broker = SimulatedBroker(
+            create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
+            create_execution_params(
+                spread_bps=cfg.spread_bps,
+                slippage_bps=cfg.slippage_bps,
+                fixed_commission=cfg.commission,
+                commission_model=build_commission_model(
+                    cfg.commission,
+                    cfg.commission_per_share,
+                    cfg.commission_min,
+                    cfg.commission_max_pct,
+                ),
             ),
-        ),
-        click.echo,
-    )
+            click.echo,
+        )
     try:
         # The live file is a strategy config PLUS live-only keys; the screen
         # bridge (``load_strategy``) is strict and rejects those extras, so it
@@ -169,7 +173,7 @@ async def _run_cycle(
     cfg: LiveConfig,
     *,
     source: PortfolioSource,
-    broker: SimulatedBroker,
+    broker: LiveBroker,
     ledger: SqliteLedger,
     strategy_id: str,
     config_path: str,
@@ -178,11 +182,12 @@ async def _run_cycle(
     gateway: IbkrGateway | None,
     allow_live: bool,
 ) -> CycleReport:
-    """Read-only gate, then the cycle: gateway ready + authz before any read.
+    """Gate the cycle, then run it: resolve account + authz before any read.
 
-    The gateway adapter is the ONLY thing this adds over the sim path, and it
-    runs BEFORE ``run_cycle``: a cycle that cannot reach an authenticated broker
-    session must fail without ever touching the screen or the book.
+    The gateway adapter is what this adds over the sim path, and it runs BEFORE
+    ``run_cycle``: a cycle that cannot reach an authenticated broker session, or
+    that is not permitted to trade the account it found, must fail without ever
+    touching the screen or the book.
     """
     if gateway is not None:
         try:

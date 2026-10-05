@@ -176,6 +176,29 @@ def test_live_signals_reconstructs_close_from_flat_with_sig_ts(monkeypatch) -> N
     assert out[0].price == 2.0
 
 
+def test_live_signals_maps_driver_close_action(monkeypatch) -> None:
+    """The driver emits an explicit ``close`` action (ctx.close); keep it."""
+    ts = _ts("2024-06-03")
+    sig_ts = _ts("2024-06-02")
+    rows = (
+        ScreenRow(
+            symbol="AAA",
+            action="close",
+            score=0.8,
+            signals=("trail exit",),
+            ts=ts,
+            sig_ts=sig_ts,
+        ),
+    )
+    candles = _store({"AAA": _frame([1.0, 2.0])})
+    _stub(monkeypatch, rows, _state(candles))
+
+    out = signals.live_signals("ignored.json")
+
+    assert tuple((s.symbol, s.action) for s in out) == (("AAA", "close"),)
+    assert out[0].price == 2.0
+
+
 def test_live_signals_local_age_filter_drops_stale(monkeypatch) -> None:
     ts = _ts("2024-06-03")
     fresh = ScreenRow(

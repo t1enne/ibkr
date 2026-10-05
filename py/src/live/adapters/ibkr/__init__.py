@@ -1,9 +1,18 @@
-"""IBKR read path (plan phase 2): client/gateway wiring, mapping, trade replay.
+"""IBKR adapter (plan phases 2-3): client/gateway wiring, replay, order placement.
 
-Read-only. Order placement, LMT and stops are phase 3/4 and are deliberately
-absent here — ``--adapter ibkr`` refuses to run without ``--dry-run``.
+Phase 2 shipped the read path (mapping, trade replay, portfolio source); phase 3
+adds ``orders`` (pure intent -> ticket mapping + status decoding) and ``broker``
+(``IbkrBroker``: MKT submission, the reply-confirmation loop, the bounded fill
+wait). LMT carry-over, cancel/modify, resting stops and brackets stay phase 4.
 """
 
+from src.live.adapters.ibkr.broker import IbkrBroker
 from src.live.adapters.ibkr.trades import BrokerSnapshot, Execution, ReplayedLot, replay
 
-__all__ = ["BrokerSnapshot", "Execution", "ReplayedLot", "replay"]
+__all__ = [
+    "BrokerSnapshot",
+    "Execution",
+    "IbkrBroker",
+    "ReplayedLot",
+    "replay",
+]

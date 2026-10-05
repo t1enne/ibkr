@@ -71,7 +71,7 @@ def opt_str(value: object) -> str:
     return "" if value is None else (value if isinstance(value, str) else str(value))
 
 
-def _canonical_order_id(value: object) -> str:
+def canonical_order_id(value: object) -> str:
     """Canonical ``order_id``: a numeric id becomes ``str(int)``, else the string.
 
     IBKR may serve the same id as ``"97932"`` or ``97932.0``; both must mint the
@@ -205,7 +205,7 @@ def parse_executions(
     for index, entry in enumerate(raw):
         body = _mapping(entry)
         execution_id = opt_str(body.get("execution_id"))
-        order_id = _canonical_order_id(body.get("order_id"))
+        order_id = canonical_order_id(body.get("order_id"))
         if not order_id:
             warnings.append(f"trade[{index}] {execution_id}: no order_id; skipped")
             continue
@@ -241,6 +241,7 @@ def parse_executions(
 __all__ = [
     "IbkrPosition",
     "IbkrSummary",
+    "canonical_order_id",
     "parse_executions",
     "parse_positions",
     "parse_summary",

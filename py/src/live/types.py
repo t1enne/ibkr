@@ -16,6 +16,7 @@ import pandas as pd
 
 from src.bt.state import ActionType, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
+from src.exec.types import OrderType
 
 #: Actions the screen can emit that require a live decision. ``flat`` is never
 #: produced: absence of a signal is HOLD downstream.
@@ -72,20 +73,41 @@ class OrderIntent:
     stop_loss: float | None = None
     take_profit: float | None = None
     tag: str = ""
+    #: The shared order vocabulary. Phase 3 places MKT only; an LMT intent is
+    #: refused by the IBKR adapter until carry-over policy exists (phase 4).
+    order_type: OrderType = OrderType.MKT
 
 
 @dataclass(frozen=True)
 class FeedError:
     """A typed edge failure (portfolio fetch / order placement / data staleness)."""
 
-    kind: Literal["auth", "rate_limit", "transport", "bad_fixture", "stale_data"]
+    kind: Literal[
+        "auth",
+        "rate_limit",
+        "transport",
+        "bad_fixture",
+        "stale_data",
+        "rejected",
+        "unfilled",
+        "timeout",
+    ]
     message: str
     symbol: str | None = None
 
 
 #: Every ``FeedError.kind`` a value may carry.
 _FEED_KINDS = frozenset(
-    {"auth", "rate_limit", "transport", "bad_fixture", "stale_data"}
+    {
+        "auth",
+        "rate_limit",
+        "transport",
+        "bad_fixture",
+        "stale_data",
+        "rejected",
+        "unfilled",
+        "timeout",
+    }
 )
 
 
@@ -101,7 +123,7 @@ def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
     resolved = kind if kind in _FEED_KINDS else "transport"
     return FeedError(
         kind=cast(
-            "Literal['auth', 'rate_limit', 'transport', 'bad_fixture', 'stale_data']",
+            "Literal['auth', 'rate_limit', 'transport', 'bad_fixture', 'stale_data', 'rejected', 'unfilled', 'timeout']",
             resolved,
         ),
         message=message,
