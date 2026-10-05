@@ -20,7 +20,8 @@ import pandas as pd
 import pytest
 
 from src.bt.engine.backtest import Backtest, run_backtest
-from src.bt.engine.handlers import default_execution_handler, default_risk_handler
+from src.bt.exchange import default_exchange
+from src.bt.risk.handlers import default_risk_handler
 from src.bt.engine.utils import candle_generator
 from src.bt.output import render_plot_json
 from src.bt.strategies.dsl import StrategyContext, strategy
@@ -127,7 +128,7 @@ def _run(adapter: object, strategy_type: str) -> object:
     results, _ = run_backtest(
         bt,
         gen,
-        default_execution_handler(),
+        default_exchange(),
         default_risk_handler(),
         strategy_mod=SimpleNamespace(on_candle=adapter),
         ta=ta,

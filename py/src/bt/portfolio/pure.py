@@ -26,7 +26,7 @@ from src.bt.state.types import (
     CommissionModel,
     FixedCommission,
 )
-from src.bt.execution.pure import commission_for_fill
+from src.exec.friction import commission_for_fill
 
 
 @dataclass(frozen=True)

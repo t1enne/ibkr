@@ -4,10 +4,14 @@ from src.bt.cli import bt_group
 
 from src.bt.strategies import init_strat
 from src.bt.engine.backtest import Backtest, candle_generator, run_backtest, run
-from src.bt.engine.handlers import (  # noqa: F401
-    ExecutionHandler,
+from src.bt.exchange import (  # noqa: F401
+    SimExchange,
+    default_exchange,
+    execute_risk_event,
+    execute_signal,
+)
+from src.bt.risk.handlers import (  # noqa: F401
     RiskHandler,
-    default_execution_handler,
     default_risk_handler,
 )
 from src.bt.metrics import get_backtest_results_analysis, build_symbol_attribution

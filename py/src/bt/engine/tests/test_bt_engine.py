@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import pandas as pd
 import pytest
 from src.bt.engine.backtest import Backtest, run_backtest, candle_generator, run
-from src.bt.engine.handlers import default_execution_handler, default_risk_handler
+from src.bt.exchange import default_exchange
+from src.bt.risk.handlers import default_risk_handler
 from src.bt.types import StrategyConfig
 from src.utils import parse_timestamp
 from src.bt.strategies.dsl import StrategyContext, strategy
@@ -163,7 +164,7 @@ def test_run_backtest_rejects_plain_strategy_mod():
         run_backtest(
             bt,
             gen,
-            default_execution_handler(),
+            default_exchange(),
             default_risk_handler(),
             strategy_mod=cl,
         )
@@ -184,9 +185,7 @@ def test_run_backtest_no_crash():
     )
     bt = Backtest(cfg)
     gen = candle_generator(_daily_df(["AAPL"]), bt.config)
-    results, state = run_backtest(
-        bt, gen, default_execution_handler(), default_risk_handler()
-    )
+    results, state = run_backtest(bt, gen, default_exchange(), default_risk_handler())
     assert results is not None
     assert state is not None
     assert state.portfolio is not None

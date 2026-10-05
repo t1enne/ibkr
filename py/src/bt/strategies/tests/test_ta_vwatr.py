@@ -16,7 +16,8 @@ import pandas as pd
 import pytest
 
 from src.bt.engine.backtest import Backtest, run_backtest
-from src.bt.engine.handlers import default_execution_handler, default_risk_handler
+from src.bt.exchange import default_exchange
+from src.bt.risk.handlers import default_risk_handler
 from src.bt.engine.utils import candle_generator
 from src.bt.strategies.dsl import StrategyContext, strategy
 from src.bt.strategies.ta_context import TaContext, init_ta
@@ -211,7 +212,7 @@ def test_vwatr_read_never_exposes_future_bars(monkeypatch: pytest.MonkeyPatch) -
     run_backtest(
         bt,
         candle_generator(data, bt.config),
-        default_execution_handler(),
+        default_exchange(),
         default_risk_handler(),
         strategy_mod=SimpleNamespace(on_candle=adapter),
         ta=ctx,

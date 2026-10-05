@@ -17,8 +17,8 @@ from typing import Protocol, cast
 
 import pandas as pd
 
-from src.bt.engine.handlers import ExecutionHandler, default_execution_handler
-from src.bt.portfolio.pure import FillRejection, apply_fills, next_position_id
+from src.bt.exchange import SimExchange, default_exchange
+from src.bt.portfolio.pure import FillRejection, next_position_id
 from src.bt.state import (
     ActionType,
     Candle,
@@ -232,8 +232,8 @@ class SimulatedBroker:
     Keeps a held ``PortfolioState`` as the paper book. ``seed`` replaces it so
     the engine can align the simulated book with a freshly fetched snapshot.
     ``place_cohort`` prices orders per-order through the injected
-    ``ExecutionHandler`` seam and settles them atomically via the shared
-    ``apply_fills``; ``place`` is the single-order convenience wrapper.
+    ``SimExchange`` and settles them atomically via its cohort settler;
+    ``place`` is the single-order convenience wrapper.
     """
 
     def __init__(
@@ -241,12 +241,12 @@ class SimulatedBroker:
         portfolio: PortfolioState,
         params: ExecutionParams,
         log: Callable[[str], None],
-        handler: ExecutionHandler | None = None,
+        exchange: SimExchange | None = None,
     ) -> None:
         self._portfolio = portfolio
         self._params = params
         self._log = log
-        self._handler = handler if handler is not None else default_execution_handler()
+        self._exchange = exchange if exchange is not None else default_exchange()
 
     def seed(self, portfolio: PortfolioState) -> None:
         """Replace the held book (engine aligns it with the fetched snapshot)."""
@@ -268,8 +268,8 @@ class SimulatedBroker:
         """Price every intent, then settle the whole cycle in ONE cohort.
 
         Each intent is priced per-order via ``execute_signal`` (real routing is
-        per-order), but the book is settled once through the shared
-        ``apply_fills`` — the SAME atomic primitive the backtest uses — so an
+        per-order), but the book is settled once through the exchange's
+        ``settle_cohort`` — the SAME atomic primitive the backtest uses — so an
         over-subscribed multi-open cycle SCALES by one shared cash factor rather
         than rejecting the tail, and the settled book equals the backtest's on
         the same fills. A single-intent cycle hits ``apply_fills``' lone-open
@@ -288,7 +288,7 @@ class SimulatedBroker:
                 if error is not None:
                     rejected[i] = error
                     continue
-            fills[i] = self._handler.execute_signal(
+            fills[i] = self._exchange.execute_signal(
                 intent_to_signal(intent, ts, self._portfolio),
                 ref_candle(intent.ref_price, intent.symbol, ts),
                 self._params,
@@ -304,7 +304,7 @@ class SimulatedBroker:
                 if intent.action in (ActionType.long, ActionType.short)
             ),
         )
-        settled, rejections, _scales = apply_fills(
+        settled, rejections, _scales = self._exchange.settle_cohort(
             self._portfolio,
             tuple(fills[i] for i in sorted(fills)),
             commission_model=self._params.commission_model,

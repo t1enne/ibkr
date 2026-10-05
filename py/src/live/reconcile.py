@@ -24,7 +24,7 @@ from typing import Literal, cast
 
 import pandas as pd
 
-from src.bt.execution.pure import execute_signal
+from src.bt.exchange import execute_signal
 from src.bt.portfolio.pure import apply_fills
 from src.bt.size.pure import SizingParams, equity_of, sized_signal
 from src.bt.state import (

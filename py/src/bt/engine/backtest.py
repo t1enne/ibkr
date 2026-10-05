@@ -30,11 +30,12 @@ Pipeline invariants:
 
 Usage:
     from src.bt.engine.backtest import Backtest, candle_generator, run_backtest
-    from src.bt.engine.handlers import default_execution_handler, default_risk_handler
+    from src.bt.exchange import default_exchange
+    from src.bt.risk.handlers import default_risk_handler
 
     bt = Backtest(config)
     gen = candle_generator(df, config.symbols)
-    results, state = run_backtest(bt, gen, exec_handler, risk_handler)
+    results, state = run_backtest(bt, gen, exchange, risk_handler)
 """
 
 from __future__ import annotations
@@ -77,17 +78,15 @@ from src.bt.size.pure import SizingParams, equity_of, sized_signal
 from src.bt.portfolio.pure import (
     FillRejection,
     ScaleRecord,
-    apply_fill,
-    apply_fills,
 )
-from src.bt.execution.pure import execute_signal
+from src.bt.exchange.sim import SimExchange
 from src.bt.types import (
     StrategyConfig,
     EngineWindow,
     BacktestResults,
     commission_model_from_config,
 )
-from src.bt.engine.handlers import ExecutionHandler, RiskHandler
+from src.bt.risk.handlers import RiskHandler
 from src.utils import parse_timestamp
 
 
@@ -131,7 +130,7 @@ class Backtest:
 def run_backtest(
     bt: Backtest,
     candle_gen: Generator[Candle, None, None],
-    exec_handler: ExecutionHandler,
+    exchange: SimExchange,
     risk_handler: RiskHandler,
     initial_state: Optional[BacktestState] = None,
     strategy_mod: Any = None,
@@ -149,7 +148,9 @@ def run_backtest(
     Args:
         bt: Backtest config
         candle_gen: Generator yielding Candles (OHLCV bars)
-        exec_handler: Execution handler with execute_signal, execute_risk_event, apply_fill
+        exchange: Simulated broker (SimExchange) — prices fills via
+            execute_signal/execute_risk_event, applies single fills, and
+            settles cohorts
         risk_handler: Risk handler with check_risk
         initial_state: Optional initial state (default: create from config)
         strategy_mod: Optional strategy module — must be a ``@strategy`` adapter;
@@ -240,7 +241,7 @@ def run_backtest(
             state = _flush_bar(
                 bar,
                 state,
-                exec_handler,
+                exchange,
                 risk_handler,
                 config,
                 bt,
@@ -273,7 +274,7 @@ def run_backtest(
         state = _flush_bar(
             bar,
             state,
-            exec_handler,
+            exchange,
             risk_handler,
             config,
             bt,
@@ -288,7 +289,7 @@ def run_backtest(
         )
 
     # Finalize: close positions, build results
-    state = _finalize(state, bt.execution_params, equity_points=eq_buffer)
+    state = _finalize(state, exchange, bt.execution_params, equity_points=eq_buffer)
 
     # Build equity series, deduplicating by timestamp (equity curve
     # accumulates one point per candle = N points per timestamp).
@@ -427,7 +428,7 @@ def _close_fill_qty(signal: TradeSignal, portfolio: PortfolioState) -> float:
 def _execute_cohort(
     state: BacktestState,
     cohort: list[tuple[TradeSignal, Candle]],
-    exec_handler: ExecutionHandler,
+    exchange: SimExchange,
     exec_params: ExecutionParams,
     sizing: SizingParams,
     skip_next_open: bool,
@@ -439,9 +440,10 @@ def _execute_cohort(
     fill in this phase of the bar, in ``config.symbols`` order. Each pair is
     sized (qty <= 0 opens only) against the SAME bar-start equity and priced with
     ``execute_signal`` against its own candle, then the whole batch is handed to
-    ``apply_fills`` — which scales opens by one shared cash factor and applies
-    non-opens first. Because the batch is complete before the first fill,
-    ``config.symbols`` order cannot reach the result.
+    ``SimExchange.settle_cohort`` (``apply_fills``) — which scales opens by one
+    shared cash factor and applies non-opens first. Because the batch is
+    complete before the first fill, ``config.symbols`` order cannot reach the
+    result.
 
     Only the symbols present in ``cohort`` have their buckets drained; every
     other symbol keeps its pending signals (a symbol with no bar this timestamp
@@ -459,9 +461,9 @@ def _execute_cohort(
             signal = sized_signal(signal, equity, state.portfolio.cash, candle, sizing)
         elif signal.action == ActionType.close and signal.qty <= 0:
             signal = replace(signal, qty=_close_fill_qty(signal, state.portfolio))
-        fills.append(exec_handler.execute_signal(signal, candle, exec_params))
+        fills.append(exchange.execute_signal(signal, candle, exec_params))
         drained.append(signal.symbol)
-    portfolio, rejections, scales = apply_fills(
+    portfolio, rejections, scales = exchange.settle_cohort(
         state.portfolio,
         tuple(fills),
         scale_cohorts=scale_cohorts,
@@ -501,7 +503,7 @@ def _mark_bar(state: BacktestState, bar: list[Candle]) -> BacktestState:
 def _flush_bar(
     bar: list[Candle],
     state: BacktestState,
-    exec_handler: ExecutionHandler,
+    exchange: SimExchange,
     risk_handler: RiskHandler,
     config: StrategyConfig,
     bt: Backtest,
@@ -547,7 +549,7 @@ def _flush_bar(
     state, rejected, scaled = _execute_cohort(
         state,
         cohort4,
-        exec_handler,
+        exchange,
         bt.execution_params,
         bt.sizing,
         False,
@@ -586,7 +588,7 @@ def _flush_bar(
         state, rejected, scaled = _execute_cohort(
             state,
             cohort6,
-            exec_handler,
+            exchange,
             bt.execution_params,
             bt.sizing,
             True,
@@ -599,7 +601,7 @@ def _flush_bar(
         state = _check_risk(
             state,
             candle,
-            exec_handler,
+            exchange,
             risk_handler,
             bt.execution_params,
             bt.risk_config,
@@ -674,7 +676,7 @@ def _generate_signals(
 def _check_risk(
     state: BacktestState,
     candle: Candle,
-    exec_handler: ExecutionHandler,
+    exchange: SimExchange,
     risk_handler: RiskHandler,
     exec_params: ExecutionParams,
     risk_config: RiskConfig,
@@ -690,8 +692,8 @@ def _check_risk(
     )
 
     for event in risk_events:
-        fill = exec_handler.execute_risk_event(event, candle, exec_params)
-        portfolio = exec_handler.apply_fill(portfolio, fill)
+        fill = exchange.execute_risk_event(event, candle, exec_params)
+        portfolio = exchange.apply_fill(portfolio, fill)
 
     return merge_bt_state(state, dict(portfolio=portfolio, risk_events=risk_events))
 
@@ -757,6 +759,7 @@ def _append_candle(
 
 def _finalize(
     state: BacktestState,
+    exchange: SimExchange,
     exec_params: ExecutionParams,
     equity_points: list | tuple | None = None,
 ) -> BacktestState:
@@ -785,7 +788,7 @@ def _finalize(
             # Route the end-of-run flatten through the SAME friction path as
             # every other fill, so a closed book pays the spread/slippage it
             # really would and records the costs the report reconciles against.
-            fill = execute_signal(
+            fill = exchange.execute_signal(
                 close_signal,
                 Candle(
                     timestamp=close_signal.timestamp,
@@ -799,7 +802,7 @@ def _finalize(
                 exec_params,
             )
 
-            portfolio = apply_fill(portfolio, fill)
+            portfolio = exchange.apply_fill(portfolio, fill)
 
     # Freeze the engine-buffered equity curve onto the final portfolio.
     if equity_points is not None:
@@ -987,7 +990,8 @@ def run(
     ``trading_start`` intentionally begins at the first loaded bar (see
     ``_assert_evaluation_clock_covers_window``).
     """
-    from src.bt.engine.handlers import default_execution_handler, default_risk_handler
+    from src.bt.exchange import default_exchange
+    from src.bt.risk.handlers import default_risk_handler
 
     # Enforce the DSL-only contract: ``strat_mod`` must be a ``@strategy``
     # adapter (required positional — every live caller passes ``init_strat``).
@@ -1003,7 +1007,7 @@ def run(
         _assert_evaluation_clock_covers_window(data, bt.config)
 
     gen = candle_generator(data, bt.config)
-    exec_handler = default_execution_handler()
+    exchange = default_exchange()
     risk_handler = default_risk_handler()
 
     # Every strategy here is a ``@strategy`` adapter, so a TaContext is always
@@ -1029,7 +1033,7 @@ def run(
     results, _ = run_backtest(
         bt,
         gen,
-        exec_handler,
+        exchange,
         risk_handler,
         strategy_mod=strat_mod,
         benchmark_curves=benchmark_curves,

@@ -10,16 +10,17 @@ from src.bt.state import (
     create_execution_params,
 )
 
-# Pure functions
-from src.bt.execution.pure import (
+# Pure functions — implementations now live on the SimExchange adapter; these
+# are the module-level re-exports (see ``src/bt/exchange/sim.py``).
+from src.bt.exchange.sim import (
     execute_signal,
     execute_risk_event,
     calculate_adverse_selection,
 )
 
-# For backward compatibility - these are deprecated
-# Use the functional versions above instead
-ExecutionHandler = None  # Removed - use pure functions
+# Deprecated no-op: ``ExecutionHandler`` was replaced by ``SimExchange``
+# (``src/bt/exchange``). Kept as a name for import compatibility only.
+ExecutionHandler = None  # Removed - compose SimExchange instead
 
 __all__ = [
     # State types

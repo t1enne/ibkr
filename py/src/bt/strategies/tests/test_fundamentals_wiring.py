@@ -23,7 +23,8 @@ import pandas as pd
 import pytest
 
 from src.bt.engine.backtest import Backtest, run_backtest
-from src.bt.engine.handlers import default_execution_handler, default_risk_handler
+from src.bt.exchange import default_exchange
+from src.bt.risk.handlers import default_risk_handler
 from src.bt.engine.utils import candle_generator
 from src.bt.state import Candle, TradeSignal
 from src.bt.strategies.dsl import StrategyContext, strategy
@@ -103,7 +104,7 @@ def _run_with(adapter: object, fund: Fundamentals | None) -> None:
     run_backtest(
         bt,
         candle_generator(data, bt.config),
-        default_execution_handler(),
+        default_exchange(),
         default_risk_handler(),
         strategy_mod=SimpleNamespace(on_candle=adapter),
         ta=init_ta(data, bt.config.symbols, bt.config.bars[0]),
@@ -259,7 +260,7 @@ def test_signals_still_flow_with_fundamentals_attached() -> None:
     results, _ = run_backtest(
         bt,
         candle_generator(data, bt.config),
-        default_execution_handler(),
+        default_exchange(),
         default_risk_handler(),
         strategy_mod=SimpleNamespace(on_candle=on_candle),
         ta=init_ta(data, bt.config.symbols, bt.config.bars[0]),

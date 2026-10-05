@@ -6,9 +6,13 @@ from src.bt.engine.backtest import (  # noqa: F401
     run_backtest,
     run,
 )
-from src.bt.engine.handlers import (  # noqa: F401
-    ExecutionHandler,
+from src.bt.exchange import (  # noqa: F401
+    SimExchange,
+    default_exchange,
+    execute_risk_event,
+    execute_signal,
+)
+from src.bt.risk.handlers import (  # noqa: F401
     RiskHandler,
-    default_execution_handler,
     default_risk_handler,
 )

@@ -7,7 +7,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.engine.handlers import ExecutionHandler
+from src.bt.exchange import SimExchange
 from src.bt.execution.pure import execute_signal
 from src.bt.portfolio.pure import apply_fill, apply_fills
 from src.bt.state import (
@@ -350,19 +350,18 @@ async def test_multi_open_cohort_scales_like_backtest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_injected_handler_prices_fills() -> None:
-    # The ExecutionHandler seam is injectable: a swapped execute_signal is used
-    # instead of the module-level default.
+async def test_injected_handler_prices_fills(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The SimExchange seam is injectable: a swapped ``execute_signal`` method on
+    # the exchange is used instead of the default.
     calls: list[str] = []
 
     def _spy(signal: TradeSignal, candle: Candle, params: ExecutionParams) -> FillEvent:
         calls.append(signal.symbol)
         return execute_signal(signal, candle, params)
 
-    handler = ExecutionHandler(
-        execute_signal=_spy, execute_risk_event=None, apply_fill=apply_fill
-    )
-    broker = SimulatedBroker(_book(), ExecutionParams(), lambda _m: None, handler)
+    exchange = SimExchange()
+    monkeypatch.setattr(exchange, "execute_signal", _spy)
+    broker = SimulatedBroker(_book(), ExecutionParams(), lambda _m: None, exchange)
     result: PlaceResult = await broker.place(_open_intent())
     assert isinstance(result, Ok)
     assert calls == ["AAPL"]
