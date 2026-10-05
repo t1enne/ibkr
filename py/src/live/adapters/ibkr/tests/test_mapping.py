@@ -57,6 +57,51 @@ def test_parse_positions_tolerates_string_numbers() -> None:
     assert positions[0].avg_cost == 10.25
 
 
+def test_parse_positions_keeps_mkt_price() -> None:
+    positions, _ = parse_positions(
+        [{"conid": 1, "contractDesc": "AAPL", "position": 5, "mktPrice": 123.5}]
+    )
+    assert positions[0].mkt_price == 123.5
+
+
+def test_parse_executions_canonicalises_float_order_id() -> None:
+    """A float-shaped order_id and its int form mint the SAME lot handle."""
+    records, _ = parse_executions(
+        [
+            {
+                "execution_id": "e1",
+                "order_id": "97932.0",
+                "side": "B",
+                "size": 1,
+                "trade_time_r": 1,
+            },
+            {
+                "execution_id": "e2",
+                "order_id": 97932,
+                "side": "B",
+                "size": 1,
+                "trade_time_r": 1,
+            },
+        ]
+    )
+    assert [e.order_id for e in records] == ["97932", "97932"]
+
+
+def test_parse_executions_keeps_non_numeric_order_id() -> None:
+    records, _ = parse_executions(
+        [
+            {
+                "execution_id": "e",
+                "order_id": "o1",
+                "side": "B",
+                "size": 1,
+                "trade_time_r": 1,
+            }
+        ]
+    )
+    assert records[0].order_id == "o1"
+
+
 def test_parse_summary_amounts_and_fallback() -> None:
     summary, warnings = parse_summary(
         {

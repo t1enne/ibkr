@@ -24,6 +24,7 @@ Base url / account come from the repo's env conventions (``IBKR_GATEWAY_URL``,
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 import httpx
@@ -39,6 +40,35 @@ ErrorKind = Literal["auth", "rate_limit", "transport"]
 
 #: HTTP statuses that mean "slow down", not "you are broken".
 _RATE_LIMIT_STATUSES = frozenset({429, 503})
+
+#: Positions-per-page the gateway serves; a shorter page ends the walk.
+_POSITIONS_PAGE_SIZE = 30
+
+#: Hosts for which the self-signed-cert ``verify=False`` policy is legitimate.
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_authenticated(body: object) -> bool:
+    """True only when a session body reports an authenticated session.
+
+    Accepts BOTH shapes the gateway serves:
+
+    - flat ``{"authenticated": true}`` — ``/iserver/auth/status`` in this build;
+    - nested ``{"iserver": {"authStatus": {"authenticated": true}}}`` — ``/tickle``.
+
+    Strict ``is True`` is deliberate: a string ``"false"`` (or ``"true"``) must
+    NOT read as authenticated, so a truthiness check is wrong here.
+    """
+    if not isinstance(body, Mapping):
+        return False
+    if body.get("authenticated") is True:
+        return True
+    iserver = body.get("iserver")
+    if isinstance(iserver, Mapping):
+        status = iserver.get("authStatus")
+        if isinstance(status, Mapping):
+            return status.get("authenticated") is True
+    return False
 
 
 class IbkrError(Exception):
@@ -78,6 +108,15 @@ class IbkrClient:
         verify: bool = False,
     ) -> None:
         self.base_url = base_url or _default_base_url()
+        # ``verify=False`` exists ONLY because the local gateway ships a self-signed
+        # cert. Make that a code fact, not a silent default: a non-localhost url
+        # must not be talked to with TLS verification off.
+        if not verify:
+            host = httpx.URL(self.base_url).host
+            assert host in _LOCAL_HOSTS, (
+                f"verify=False is localhost-only; refusing {host!r} "
+                f"(set verify=True for a remote gateway)"
+            )
         self.account = account if account is not None else _default_account()
         self._verify = verify
         self._http = httpx.AsyncClient(
@@ -163,11 +202,22 @@ class IbkrClient:
     # -- read endpoints this phase needs ----------------------------------
 
     async def auth_status(self) -> dict[str, Any]:
-        """``/iserver/auth/status`` — connected/authenticated/competing flags."""
+        """``/iserver/auth/status`` — connected/authenticated/competing flags.
+
+        GET in this build (spec says POST-only; the fronting server answers a
+        POST with 411, so the spec is unenforced). The body is the flat
+        ``{"authenticated": ...}`` shape :func:`is_authenticated` reads.
+        """
         return cast("dict[str, Any]", await self._get("iserver/auth/status"))
 
     async def tickle(self) -> dict[str, Any]:
-        """``/tickle`` — keepalive; also the canonical session probe."""
+        """``/tickle`` — keepalive; also the canonical session probe.
+
+        This build serves it over GET (a POST returns 411 from the fronting
+        server even though ``openapi.spec.json`` declares the endpoint
+        POST-only — that declaration is NOT enforced here). GET both keeps the
+        session alive and returns the session/``iserver.authStatus`` shape.
+        """
         return cast("dict[str, Any]", await self._get("tickle"))
 
     async def accounts(self) -> list[dict[str, Any] | str]:
@@ -211,6 +261,23 @@ class IbkrClient:
         account = self._require_account(account)
         body = await self._get(f"portfolio/{account}/positions/{page}")
         return cast("list[dict[str, Any]]", _as_list(body, "positions"))
+
+    async def positions_all(self, account: str | None = None) -> list[dict[str, Any]]:
+        """Every page of net positions: walk until a SHORT page ends the book.
+
+        Reading page 0 only silently truncates a book of more than one page, so
+        paginate until a page carries fewer than the expected page size (IBKR
+        pages ~30 rows). A hard page cap guards against a gateway that never
+        returns a short page.
+        """
+        account = self._require_account(account)
+        out: list[dict[str, Any]] = []
+        for page in range(1000):
+            rows = await self.positions(account, page)
+            out.extend(rows)
+            if len(rows) < _POSITIONS_PAGE_SIZE:
+                break
+        return out
 
     async def trades(self) -> list[dict[str, Any]]:
         """``/iserver/account/trades`` — per-execution trade history (7d window)."""

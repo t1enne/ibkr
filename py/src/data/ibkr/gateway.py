@@ -5,37 +5,31 @@ an :class:`~src.data.ibkr.client.IbkrClient` and answers two questions with type
 values, never exceptions: *may I read the book right now?* (``is_ready``) and
 *make it so, or tell me why not* (``ensure_ready``).
 
-``ensure_ready`` performs the session check + keepalive: a ``/tickle`` POST keeps
+``ensure_ready`` performs the session check + keepalive: a ``GET /tickle`` keeps
 the session from idling out, and ``/iserver/auth/status`` decides readiness. It
 deliberately does NOT start the docker container or drive a browser — that is
-``sync_market_data`` / ``login``'s job, and a cycle that finds the gateway down
-should fail fast with an ``auth``/``transport`` reason rather than open a socket
-it cannot open. A caller that *can* log in (cron) injects a ``login`` callable and
-``ensure_ready`` re-probes after it.
+``sync_market_data`` / ``login``'s job (the compose-side keepalive lives in
+``docker-compose.yml``'s healthcheck; ``data.ibkr.sync`` drives login). A cycle
+that finds the gateway down fails fast with an ``auth``/``transport`` reason
+rather than opening a socket it cannot open.
+
+GET, not POST: this gateway build serves ``/tickle`` and ``/iserver/auth/status``
+over GET. ``openapi.spec.json`` declares them POST-only, but a POST answers 411
+from the fronting server, so the spec is unenforced and GET is correct here.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from typing import Any
 
-from src.data.ibkr.client import ErrorKind, IbkrClient, IbkrError
+from src.data.ibkr.client import IbkrClient, IbkrError, is_authenticated
 from src.live.result import Err, Ok, Result
-from src.live.types import FeedError
-
-#: The kinds ``FeedError`` can carry that a gateway failure maps onto.
-_KIND_MAP = {"auth": "auth", "rate_limit": "rate_limit", "transport": "transport"}
-
-
-def feed_error(error: IbkrError) -> FeedError:
-    """Map a client :class:`IbkrError` onto the live ``FeedError`` vocabulary."""
-    kind = cast("ErrorKind", _KIND_MAP.get(error.kind, "transport"))
-    return FeedError(kind=kind, message=str(error))
+from src.live.types import FeedError, feed_error
 
 
 def _authenticated(status: dict[str, Any]) -> bool:
-    """Read the auth flag from an ``/iserver/auth/status`` body, tolerating shape."""
-    return bool(status.get("authenticated"))
+    """Read the auth flag from a status body, tolerating both gateway shapes."""
+    return is_authenticated(status)
 
 
 class IbkrGateway:
@@ -50,7 +44,7 @@ class IbkrGateway:
         return self._client
 
     async def aclose(self) -> None:
-        """Release the client's connection pool."""
+        """Release the client's connection pool (a cycle's writer is done with it)."""
         await self._client.aclose()
 
     async def is_ready(self) -> Result[bool, FeedError]:
@@ -63,45 +57,27 @@ class IbkrGateway:
         try:
             status = await self._client.auth_status()
         except IbkrError as exc:
-            return Err(feed_error(exc))
+            return Err(feed_error(exc.kind, str(exc)))
         return Ok(_authenticated(status))
 
-    async def ensure_ready(
-        self,
-        *,
-        login: Callable[[], Awaitable[None]] | None = None,
-    ) -> Result[None, FeedError]:
-        """Keepalive + auth check; optionally log in, then re-probe.
+    async def ensure_ready(self) -> Result[None, FeedError]:
+        """Keepalive + auth check.
 
-        Order: ``/tickle`` first (a session that is about to idle out gets poked
-        before we read its status), then ``/iserver/auth/status``. When the
-        session is not authenticated and a ``login`` callable is supplied it is
-        awaited and the status re-checked once. Returns ``Ok(None)`` only when
-        the session is authenticated; every other path is a typed ``Err``.
+        Order: ``GET /tickle`` first (a session about to idle out gets poked
+        before we read its status), then ``/iserver/auth/status``. Returns
+        ``Ok(None)`` only when the session is authenticated; a logged-out session
+        is a typed ``auth`` failure (never a generic transport one).
         """
         try:
             await self._client.tickle()
             status = await self._client.auth_status()
         except IbkrError as exc:
-            return Err(feed_error(exc))
-        if _authenticated(status):
-            return Ok(None)
-        if login is None:
-            return Err(
-                FeedError(
-                    kind="auth",
-                    message="gateway session not authenticated (no login provided)",
-                )
-            )
-        try:
-            await login()
-            status = await self._client.auth_status()
-        except IbkrError as exc:
-            return Err(feed_error(exc))
+            return Err(feed_error(exc.kind, str(exc)))
         if _authenticated(status):
             return Ok(None)
         return Err(
             FeedError(
-                kind="auth", message="login completed but session is not authenticated"
+                kind="auth",
+                message="gateway session not authenticated (login via `ibkr login`/cron)",
             )
         )

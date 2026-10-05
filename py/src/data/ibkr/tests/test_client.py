@@ -115,7 +115,13 @@ def test_base_url_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IBKR_GATEWAY_URL", raising=False)
     assert IbkrClient(base_url=None).base_url == BASE
     monkeypatch.setenv("IBKR_GATEWAY_URL", "https://example.test/v1/api/")
-    assert IbkrClient().base_url == "https://example.test/v1/api/"
+    # A remote base url must not use the localhost-only ``verify=False`` default.
+    assert IbkrClient(verify=True).base_url == "https://example.test/v1/api/"
+
+
+def test_client_refuses_verify_false_off_localhost() -> None:
+    with pytest.raises(AssertionError):
+        IbkrClient(base_url="https://example.test/v1/api/", verify=False)
 
 
 def test_httpx_client_uses_the_configured_base_url() -> None:

@@ -342,6 +342,8 @@ class _FakeBroker:
 
 
 class _FakeSource:
+    owns_book = True
+
     async def fetch(self) -> Result[PortfolioSnapshot, FeedError]:
         book = PortfolioState(
             cash=50000.0,
@@ -486,6 +488,9 @@ class _FakeGateway:
     async def ensure_ready(self, *a: object, **k: object) -> Result[None, FeedError]:
         self.ready_calls += 1
         return Ok(None)
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def test_ibkr_ensures_ready_before_the_cycle(

@@ -14,7 +14,7 @@ records :mod:`~src.live.adapters.ibkr.trades` and the portfolio source consume.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
@@ -34,6 +34,7 @@ class IbkrPosition:
     qty: float
     avg_cost: float
     currency: str = ""
+    mkt_price: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -49,11 +50,6 @@ class IbkrSummary:
 def _mapping(value: object) -> Mapping[str, object]:
     """Narrow a JSON value to a mapping (JSON objects are the only shape we accept)."""
     return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else {}
-
-
-def _seq(value: object) -> Sequence[object]:
-    """Narrow a JSON value to a sequence (a bare list; anything else is empty)."""
-    return cast("Sequence[object]", value) if isinstance(value, list) else ()
 
 
 def num(value: object, default: float = 0.0) -> float:
@@ -73,6 +69,29 @@ def num(value: object, default: float = 0.0) -> float:
 def opt_str(value: object) -> str:
     """Best-effort string: whatever is there, stringified; absent -> ``""``."""
     return "" if value is None else (value if isinstance(value, str) else str(value))
+
+
+def _canonical_order_id(value: object) -> str:
+    """Canonical ``order_id``: a numeric id becomes ``str(int)``, else the string.
+
+    IBKR may serve the same id as ``"97932"`` or ``97932.0``; both must mint the
+    SAME lot handle, so a float-shaped id is normalised (``"97932.0"`` ->
+    ``"97932"``) to match a ledger-shaped one. A non-numeric id is kept verbatim.
+    Phase 3 needs this: the lot handle must be stable across endpoints.
+    """
+    if isinstance(value, bool) or value is None:
+        return opt_str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value))
+    if isinstance(value, str):
+        token = value.strip()
+        try:
+            return str(int(float(token)))
+        except ValueError:
+            return token
+    return opt_str(value)
 
 
 def _amount(body: Mapping[str, object], key: str) -> tuple[float, bool]:
@@ -117,6 +136,7 @@ def parse_positions(
                 qty=qty,
                 avg_cost=num(body.get("avgCost")),
                 currency=opt_str(body.get("currency")),
+                mkt_price=num(body.get("mktPrice")),
             )
         )
     return tuple(records), tuple(warnings)
@@ -185,7 +205,7 @@ def parse_executions(
     for index, entry in enumerate(raw):
         body = _mapping(entry)
         execution_id = opt_str(body.get("execution_id"))
-        order_id = opt_str(body.get("order_id"))
+        order_id = _canonical_order_id(body.get("order_id"))
         if not order_id:
             warnings.append(f"trade[{index}] {execution_id}: no order_id; skipped")
             continue
@@ -201,9 +221,7 @@ def parse_executions(
         if ts is None:
             warnings.append(f"trade[{index}] {execution_id}: bad timestamp; skipped")
             continue
-        symbol = opt_str(body.get("symbol")) or opt_str(
-            body.get("contract_description")
-        )
+        symbol = opt_str(body.get("symbol"))
         records.append(
             Execution(
                 execution_id=execution_id,
@@ -220,11 +238,6 @@ def parse_executions(
     return tuple(records), tuple(warnings)
 
 
-def warn(*parts: object) -> str:  # pragma: no cover - tiny helper for callers
-    """Join a cross-check warning's parts with single spaces."""
-    return " ".join(str(p) for p in parts if p not in ("", None))
-
-
 __all__ = [
     "IbkrPosition",
     "IbkrSummary",
@@ -233,5 +246,4 @@ __all__ = [
     "parse_summary",
     "num",
     "opt_str",
-    "warn",
 ]

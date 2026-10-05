@@ -77,10 +77,6 @@ class BrokerSnapshot:
     foreign: tuple[Execution, ...]
     warnings: tuple[str, ...]
 
-    def open_lots(self) -> tuple[ReplayedLot, ...]:
-        """Only the lots still open (the tradable book)."""
-        return tuple(lot for lot in self.lots if lot.status == "open")
-
 
 def _signed(execution: Execution) -> float:
     """Signed quantity: a BUY adds, a SELL subtracts."""
@@ -129,10 +125,9 @@ def replay(executions: tuple[Execution, ...], *, ref_prefix: str) -> BrokerSnaps
         )
         opening = tuple(e for e in ordered if e.side is opening_side)
         qty = abs(net)
-        if qty == 0:
-            warnings.append(
-                f"order {order_id} nets to zero from {len(ordered)} execution(s)"
-            )
+        # ``ts`` is the OPENING executions' time — it is the lot's entry_time, so
+        # the closing execution's (later) stamp must not overwrite it.
+        entry_ts = opening[0].ts if opening else ordered[0].ts
         lots.append(
             ReplayedLot(
                 order_id=order_id,
@@ -142,8 +137,9 @@ def replay(executions: tuple[Execution, ...], *, ref_prefix: str) -> BrokerSnaps
                 qty=qty,
                 entry_price=_vwap(opening),
                 commission=sum(e.commission for e in ordered),
+                # A net-zero group is a fully CLOSED lot — normal, not a warning.
                 status="open" if net != 0 else "closed",
-                ts=ordered[-1].ts,
+                ts=entry_ts,
             )
         )
     return BrokerSnapshot(

@@ -200,16 +200,22 @@ async def _run_cycle(
         ready = await gateway.ensure_ready()
         if isinstance(ready, Err):
             raise GatewayNotReady(cast("FeedError", ready.error))
-    return await run_cycle(
-        cfg,
-        source=source,
-        broker=broker,
-        ledger=ledger,
-        strategy_id=strategy_id,
-        config_path=config_path,
-        max_age_days=max_age_days,
-        dry_run=dry_run,
-    )
+    try:
+        return await run_cycle(
+            cfg,
+            source=source,
+            broker=broker,
+            ledger=ledger,
+            strategy_id=strategy_id,
+            config_path=config_path,
+            max_age_days=max_age_days,
+            dry_run=dry_run,
+        )
+    finally:
+        # The client is shared with the portfolio source and outlives the read;
+        # close it when the cycle is done rather than leaking the pool.
+        if gateway is not None:
+            await gateway.aclose()
 
 
 def resolve_adapter(
@@ -227,7 +233,7 @@ def resolve_adapter(
     """
     if cli_adapter in _ADAPTERS:
         return cli_adapter
-    named = "broker" in raw or "broker" in cfg.strategy_params
+    _, named = resolve_broker(raw, cfg.strategy_params)
     if named:
         return cfg.broker
     if cfg.mode == "live":
@@ -236,6 +242,29 @@ def resolve_adapter(
             "'broker' in the config (no default is assumed for a live run)"
         )
     return cfg.broker
+
+
+def resolve_broker(
+    raw: Mapping[str, object], params: Mapping[str, object]
+) -> tuple[str, bool]:
+    """The ONE read of the config's ``broker`` key: ``(name, was_named_explicitly)``.
+
+    ``StrategyConfig.broker`` (the phase-1.5 field), ``LiveConfig.broker`` and
+    ``resolve_adapter``'s "was it named?" probe previously resolved the key in
+    three places and disagreed when it lived in ``strategy_params``. They now all
+    go through this: flat/top-level wins, then ``strategy_params``, then the
+    ``sim`` default. The explicit-named flag comes from the same scan, so it can
+    never contradict the resolved name.
+    """
+    for source in (raw, params):
+        if "broker" in source:
+            value = source["broker"]
+            if value not in _ADAPTERS:
+                raise ValueError(
+                    f"broker must be one of {sorted(_ADAPTERS)}, got {value!r}"
+                )
+            return cast("str", value), True
+    return "sim", False
 
 
 def _ref_prefix(strategy_id: str) -> str:
@@ -290,11 +319,7 @@ def load_live_config(path: str) -> LiveConfig:
     raw_mode = _pick((raw, params), ("mode",), "paper")
     if raw_mode not in ("paper", "live"):
         raise ValueError(f"mode must be 'paper' or 'live', got {raw_mode!r}")
-    raw_broker = _pick((raw, params), ("broker",), "sim")
-    if raw_broker not in _ADAPTERS:
-        raise ValueError(
-            f"broker must be one of {sorted(_ADAPTERS)}, got {raw_broker!r}"
-        )
+    raw_broker, _ = resolve_broker(raw, params)
     portfolio_path = _pick((raw, params), ("portfolio_path",), "")
     commission = _float_or((raw, params), "commission", strategy.commission)
     spread_bps = _float_or((raw, params), "spread_bps", strategy.spread_bps)

@@ -86,6 +86,8 @@ def signal(action: SignalAction, qty: float = 0.0) -> LiveSignal:
 
 
 class FakeSource:
+    owns_book = True
+
     def __init__(self, portfolio: PortfolioState) -> None:
         self._portfolio = portfolio
 
@@ -430,6 +432,40 @@ async def test_changed_config_rescopes_ownership(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_self_owned_source_closes_replayed_lot_with_empty_ledger(
+    tmp_path: Path,
+) -> None:
+    """S2: an ibkr-style book is already ours — closes must not need the ledger.
+
+    The IBKR execution replay excludes foreign orders, so its book carries only
+    our lots (``owns_book = False``). With an EMPTY ledger (a dry run writes
+    nothing) a close signal must still yield a close intent for the replayed lot.
+    """
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")  # no rows recorded
+
+    class SelfOwnedSource(FakeSource):
+        owns_book = False
+
+    report = await run_cycle(
+        CFG,
+        source=SelfOwnedSource(book(lot("97932"))),
+        broker=FakeBroker(),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert len(report.intents) == 1
+    assert report.intents[0].action is ActionType.close
+    assert report.intents[0].position_id == "97932"
+
+
+@pytest.mark.asyncio
 async def test_run_cycle_stale_data_raises(tmp_path: Path) -> None:
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", OLD)
@@ -450,6 +486,8 @@ async def test_run_cycle_stale_data_raises(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_cycle_fetch_error_raises(tmp_path: Path) -> None:
     class DeadSource:
+        owns_book = True
+
         async def fetch(self) -> FetchResult:
             return Err(FeedError(kind="transport", message="down"))
 

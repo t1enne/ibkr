@@ -20,7 +20,7 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-from src.data.ibkr.client import IbkrClient, IbkrError
+from src.data.ibkr.client import IbkrClient, IbkrError, is_authenticated
 from src.data.ibkr.login import login_from_env
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -44,14 +44,17 @@ def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 async def tickle_auth(client: IbkrClient) -> bool:
-    """True if the gateway is up AND reports an authenticated session."""
+    """True if the gateway is up AND reports an authenticated session.
+
+    ``is_authenticated`` accepts both gateway shapes (the flat ``authenticated``
+    of /iserver/auth/status and the nested ``iserver.authStatus.authenticated``
+    of /tickle) and requires a strict JSON ``true``.
+    """
     try:
         body = await client.tickle()
     except IbkrError:
         return False
-    iserver = body.get("iserver") if isinstance(body, dict) else None
-    status = iserver.get("authStatus") if isinstance(iserver, dict) else None
-    return bool(status.get("authenticated")) if isinstance(status, dict) else False
+    return is_authenticated(body)
 
 
 async def gw_responding(client: IbkrClient) -> bool:
@@ -105,10 +108,11 @@ async def ensure_gateway_async() -> None:
             ]
         )
 
-    # Wait for the server to answer.
+    # Wait for the server to answer. ``asyncio.sleep`` (not ``time.sleep``) so
+    # the coroutine yields instead of blocking the loop it runs on.
     waited = 0
     while waited < GATEWAY_TIMEOUT and not await gw_responding(client):
-        time.sleep(2)
+        await asyncio.sleep(2)
         waited += 2
     if not await gw_responding(client):
         sys.exit(f"Gateway did not become reachable within {GATEWAY_TIMEOUT}s.")
@@ -119,10 +123,12 @@ async def ensure_gateway_async() -> None:
         return
 
     log("No authenticated session — running the Playwright login.")
-    asyncio.run(login_from_env(env_path=ENV_PATH))
-    time.sleep(3)
+    # ``login_from_env`` is a coroutine: AWAIT it. Calling ``asyncio.run`` here
+    # would nest event loops inside this running loop and raise RuntimeError.
+    await login_from_env(env_path=ENV_PATH)
+    await asyncio.sleep(3)
     if not await tickle_auth(client):
-        time.sleep(3)
+        await asyncio.sleep(3)
         sys.exit("Login ran but /tickle still reports unauthenticated.")
     await client.aclose()
 
@@ -172,7 +178,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"Command failed ({e.returncode}): {e.cmd}")
+    # ``subprocess`` failures are already surfaced by ``run()`` (``check=True``);
+    # nothing here catches ``CalledProcessError`` (the old handler was dead).
+    main()

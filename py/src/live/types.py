@@ -10,7 +10,7 @@ depends only on the minimal :class:`PortfolioView` Protocol that
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import pandas as pd
 
@@ -81,6 +81,32 @@ class FeedError:
     kind: Literal["auth", "rate_limit", "transport", "bad_fixture", "stale_data"]
     message: str
     symbol: str | None = None
+
+
+#: Every ``FeedError.kind`` a value may carry.
+_FEED_KINDS = frozenset(
+    {"auth", "rate_limit", "transport", "bad_fixture", "stale_data"}
+)
+
+
+def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
+    """Build a typed ``FeedError`` from a client ``ErrorKind`` (a validating identity).
+
+    The client's kinds (``auth``/``rate_limit``/``transport``) are a subset of
+    ``FeedError``'s, so this is the ONE definition of the mapping — previously
+    duplicated in ``data.ibkr.gateway`` and ``adapters.ibkr.portfolio_source``.
+    An unknown kind degrades to ``transport`` (never invent a kind the type
+    forbids).
+    """
+    resolved = kind if kind in _FEED_KINDS else "transport"
+    return FeedError(
+        kind=cast(
+            "Literal['auth', 'rate_limit', 'transport', 'bad_fixture', 'stale_data']",
+            resolved,
+        ),
+        message=message,
+        symbol=symbol,
+    )
 
 
 @dataclass(frozen=True)

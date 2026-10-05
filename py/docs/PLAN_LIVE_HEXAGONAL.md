@@ -137,6 +137,16 @@ def replay(executions: tuple[Execution, ...], *, ref_prefix: str) -> BrokerSnaps
 This deletes from rev 2: `join_book` and its six drift rules, close grouping,
 `OrderResult.closed_position_ids`, the cost-tolerance knob, and the tiered repair policy.
 
+**Phase-3 constraint — `order_id` vs `order_ref`.** The lot handle this phase
+mints is the broker's numeric `order_id` (`ReplayedLot.position_id` IS
+`order_id`), canonicalised with `str(int(...))` so a `"97932.0"` payload and a
+`"97932"` ledger row are the SAME lot. Phase 3 owns the local metadata table,
+which this section specifies is keyed by `order_ref` (the `cOID` we set), NOT by
+`order_id`: a placement returns the broker's `order_id` only after it fills, so
+the metadata write must carry both — the deterministic `order_ref` at submit
+time and the `order_id` the fill later reports — and the two must join on the
+canonicalised `order_id`.
+
 ## 4. Order identity and re-run safety
 
 ```python
@@ -224,7 +234,7 @@ multi-account allocation, IBKR market data.
 4. **`mode` doubles as gateway login toggle and live guard** (`LiveConfig.mode`). Default: reuse it.
 5. **Who starts the gateway.** Default: `ensure_ready` in the cycle, flag to disable for cron.
 6. **`--allow-live` naming and no env var.** Default: as stated.
-7. **`adapter: "auto"`** for `mode: "paper"` only; `mode: "live"` must name its adapter. Default: as stated.
+7. **`adapter: "auto"`** — SHIPPED AS: there is NO `auto` token. `--adapter` accepts only `sim`/`ibkr`; `mode: "live"` must NAME its adapter (`--adapter` or a `broker` key) and a live run with neither hard-errors rather than defaulting to `sim`. `resolve_broker` reads the `broker` key once (top-level, then `strategy_params`) so the adapter choice and the "was it named?" flag cannot disagree.
 8. **New `FeedError` kinds.** Now only `rejected`, `unfilled`, `timeout` needed —
    `position_drift` is gone with the ledger-of-truth. Confirm the widened literal.
 9. **Golden-report parity artifact.** Where does the phase-1 baseline get stored so the

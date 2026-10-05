@@ -168,7 +168,15 @@ async def run_cycle(
     # Align the simulated book with the fetched read so the SAME book is both
     # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
     broker.seed(snapshot.portfolio)
-    owned = _owned_ids(ledger, strategy_id)
+    # Ownership scoping (plan §3): the ledger owns the mock book's closes, but the
+    # IBKR execution replay ALREADY excludes foreign orders, so its book is
+    # entirely ours — scoping by the (empty on a dry run) ledger would make every
+    # replayed lot unclosable. ``owns_book`` is the source's own answer.
+    owned = (
+        None
+        if not getattr(source, "owns_book", True)
+        else _owned_ids(ledger, strategy_id)
+    )
     intents = reconcile(signals, snapshot.portfolio, config, owned)
     results: tuple[OrderResult, ...] = ()
     if not dry_run:

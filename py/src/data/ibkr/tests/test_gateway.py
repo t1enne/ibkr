@@ -75,18 +75,25 @@ async def test_ensure_ready_unauthenticated_without_login_is_auth_error() -> Non
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_ensure_ready_runs_login_then_reprobes() -> None:
+async def test_ensure_ready_accepts_nested_tickle_shape() -> None:
+    """The /tickle body nests authentication under iserver.authStatus."""
     respx.get(f"{BASE}tickle").mock(return_value=httpx.Response(200, json={}))
-    route = respx.get(f"{BASE}iserver/auth/status")
-    route.side_effect = [
-        httpx.Response(200, json={"authenticated": False}),
-        httpx.Response(200, json={"authenticated": True}),
-    ]
-    calls: list[int] = []
-
-    async def login() -> None:
-        calls.append(1)
-
-    result = await _gateway().ensure_ready(login=login)
+    respx.get(f"{BASE}iserver/auth/status").mock(
+        return_value=httpx.Response(
+            200, json={"iserver": {"authStatus": {"authenticated": True}}}
+        )
+    )
+    result = await _gateway().ensure_ready()
     assert isinstance(result, Ok)
-    assert calls == [1]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_authenticated_string_false_is_not_authenticated() -> None:
+    """A string "false" must NOT read as authenticated (strict `is True`)."""
+    respx.get(f"{BASE}iserver/auth/status").mock(
+        return_value=httpx.Response(200, json={"authenticated": "false"})
+    )
+    result = await _gateway().is_ready()
+    assert isinstance(result, Ok)
+    assert result.value is False

@@ -94,8 +94,9 @@ class StrategyConfig:
     # ``SimExchange`` backtest adapter) or ``"ibkr"`` (the live edge). Default
     # preserves every existing JSON's behaviour. An unrecognised value fails
     # loudly at construction rather than silently falling back to the sim.
-    # NOTE: no consumer reads this yet — it is reserved for the phase-2 adapter
-    # selection; deleting it would drop a field already present in the schema.
+    # NOTE: the live CLI (``ibkr live run``) resolves its adapter from the
+    # config's ``broker`` key through ``resolve_broker`` (phase 2); it reads the
+    # key once, not this field.
     broker: BrokerName = "sim"
 
     def __post_init__(self) -> None:

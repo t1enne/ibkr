@@ -20,7 +20,17 @@ from src.live.types import FeedError, PortfolioSnapshot
 
 
 class PortfolioSource(Protocol):
-    """Async read of the current book. Failure is a value, never a raise."""
+    """Async read of the current book. Failure is a value, never a raise.
+
+    ``owns_book`` tells ``run_cycle`` how to scope close intents: ``True`` (the
+    mock ledger-backed book) means closes must be filtered to lots the strategy
+    is recorded as owning; ``False`` means the book ALREADY contains only this
+    strategy's lots (the IBKR execution replay excludes foreign orders in
+    ``trades.replay``), so every lot present is closable and the (possibly empty
+    on a dry run) ledger must not blank them out.
+    """
+
+    owns_book: bool
 
     async def fetch(self) -> Result[PortfolioSnapshot, FeedError]: ...
 
@@ -139,7 +149,12 @@ def _timestamp(value: object, as_of: pd.Timestamp) -> pd.Timestamp:
 
 
 class MockPortfolioSource:
-    """Reads a JSON fixture. Async to match the Protocol; no network."""
+    """Reads a JSON fixture. Async to match the Protocol; no network.
+
+    The mock book may hold exogenous lots, so closes are ledger-scoped.
+    """
+
+    owns_book = True
 
     def __init__(self, path: str) -> None:
         self._path = path

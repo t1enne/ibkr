@@ -14,16 +14,22 @@ services:
     restart: unless-stopped
     networks:
       - ib-network
+    # Keepalive + session-validity check, both inside the image (curl + grep; the
+    # image has no jq/python). The GET /tickle IS the keepalive: poking it every
+    # interval keeps the Client Portal session from idling out. The grep then
+    # asserts the session is actually authenticated -- this build answers
+    # /tickle with HTTP 200 even when logged out, so a bare `curl -f` used to mark
+    # the container healthy while the session was dead. `is True` matters: the
+    # nested `iserver.authStatus.authenticated` must be JSON true, and the
+    # pipeline exits non-zero (unhealthy) whenever it is not. GET is what this
+    # build serves -- the openapi spec declares /tickle and /iserver/auth/status
+    # POST-only, but a POST here returns 411 from the fronting server, so the
+    # spec is NOT enforced and GET is correct.
     healthcheck:
       test:
         [
-          "CMD",
-          "curl",
-          "-f",
-          "-k",
-          "--max-time",
-          "5",
-          "https://localhost:5000/v1/api/tickle",
+          "CMD-SHELL",
+          "curl -fsk --max-time 5 https://localhost:5000/v1/api/tickle | grep -q '\"authenticated\":true'",
         ]
       interval: 30s
       timeout: 5s
