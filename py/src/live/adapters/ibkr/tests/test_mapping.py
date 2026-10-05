@@ -71,6 +71,7 @@ def test_parse_executions_canonicalises_float_order_id() -> None:
             {
                 "execution_id": "e1",
                 "order_id": "97932.0",
+                "conid": 265598,
                 "side": "B",
                 "size": 1,
                 "trade_time_r": 1,
@@ -78,6 +79,7 @@ def test_parse_executions_canonicalises_float_order_id() -> None:
             {
                 "execution_id": "e2",
                 "order_id": 97932,
+                "conid": 265598,
                 "side": "B",
                 "size": 1,
                 "trade_time_r": 1,
@@ -93,6 +95,7 @@ def test_parse_executions_keeps_non_numeric_order_id() -> None:
             {
                 "execution_id": "e",
                 "order_id": "o1",
+                "conid": 265598,
                 "side": "B",
                 "size": 1,
                 "trade_time_r": 1,
@@ -127,6 +130,7 @@ def test_parse_executions_happy_and_side_spellings() -> None:
             {
                 "execution_id": "e1",
                 "order_id": "o1",
+                "conid": 265598,
                 "order_ref": "abc12345-deadbeef-20240101T0900-000",
                 "symbol": "AAPL",
                 "side": "BOT",
@@ -138,6 +142,7 @@ def test_parse_executions_happy_and_side_spellings() -> None:
             {
                 "execution_id": "e2",
                 "order_id": "o1",
+                "conid": 265598,
                 "order_ref": "abc12345-deadbeef-20240101T0900-000",
                 "symbol": "AAPL",
                 "side": "SLD",
@@ -165,6 +170,7 @@ def test_parse_executions_skips_malformed_rows() -> None:
             {
                 "execution_id": "b",
                 "order_id": "o",
+                "conid": 265598,
                 "side": "?",
                 "size": 1,
                 "trade_time_r": 1,
@@ -172,6 +178,7 @@ def test_parse_executions_skips_malformed_rows() -> None:
             {
                 "execution_id": "c",
                 "order_id": "o",
+                "conid": 265598,
                 "side": "B",
                 "size": 0,
                 "trade_time_r": 1,
@@ -179,6 +186,7 @@ def test_parse_executions_skips_malformed_rows() -> None:
             {
                 "execution_id": "d",
                 "order_id": "o",
+                "conid": 265598,
                 "side": "B",
                 "size": 1,
                 "trade_time_r": 0,

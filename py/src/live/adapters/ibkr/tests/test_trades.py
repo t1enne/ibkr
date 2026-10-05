@@ -1,15 +1,15 @@
-"""Execution replay: net/VWAP, foreign exclusion, open/closed — all pure."""
+"""Per-scope book reconciliation: open/add/reduce/close/reopen/flip — all pure."""
 
 from __future__ import annotations
 
-import pandas as pd
-import pytest
 from typing import cast
 
-from src.exec.types import OrderSide
-from src.live.adapters.ibkr.trades import Execution, ReplayedLot, replay
+import pandas as pd
 
-PREFIX = "abc12345"
+from src.exec.types import OrderSide
+from src.live.adapters.ibkr.trades import Execution, StrategyBook, is_ours, reconcile
+
+SCOPE = "momentum"
 
 
 def _exec(
@@ -18,15 +18,18 @@ def _exec(
     side: OrderSide,
     qty: float,
     price: float,
-    ref: str = f"{PREFIX}-deadbeef-20240101T0900-000",
+    ref: str = f"{SCOPE}-20240102T093000-000",
     ts: str = "2024-01-02T09:30:00Z",
     commission: float = 1.0,
     symbol: str = "AAPL",
+    conid: int = 265598,
+    execution_id: str | None = None,
 ) -> Execution:
     return Execution(
-        execution_id=f"exec-{order_id}-{ts}",
+        execution_id=execution_id or f"exec-{order_id}-{ts}",
         order_id=order_id,
         order_ref=ref,
+        conid=conid,
         symbol=symbol,
         side=side,
         qty=qty,
@@ -36,130 +39,118 @@ def _exec(
     )
 
 
-def test_single_buy_is_an_open_lot() -> None:
-    book = replay(
-        (_exec("o1", side=OrderSide.BUY, qty=10, price=100),), ref_prefix=PREFIX
+def test_is_ours_uses_the_scope_slug_prefix() -> None:
+    assert is_ours(SCOPE, _exec("o", side=OrderSide.BUY, qty=1, price=1))
+    foreign = _exec(
+        "o", side=OrderSide.BUY, qty=1, price=1, ref="other-20240102T093000-000"
     )
-    assert len(book.lots) == 1
-    lot = book.lots[0]
-    assert isinstance(lot, ReplayedLot)
-    assert lot.status == "open"
-    assert lot.side is OrderSide.BUY
-    assert lot.qty == 10
-    assert lot.entry_price == 100
-    assert lot.position_id == "o1"
+    assert not is_ours(SCOPE, foreign)
 
 
-def test_entry_price_is_vwap_of_opening_executions_only() -> None:
-    # Open 10@100 then 10@120, partial close 5@130. Entry VWAP ignores the close.
-    book = replay(
-        (
-            _exec(
-                "o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"
-            ),
-            _exec(
-                "o1", side=OrderSide.BUY, qty=10, price=120, ts="2024-01-02T09:40:00Z"
-            ),
-            _exec(
-                "o1", side=OrderSide.SELL, qty=5, price=130, ts="2024-01-02T10:00:00Z"
-            ),
-        ),
-        ref_prefix=PREFIX,
+def test_single_buy_opens_one_row() -> None:
+    book, warnings = reconcile(
+        SCOPE, (_exec("o1", side=OrderSide.BUY, qty=10, price=100),), StrategyBook()
     )
-    lot = book.lots[0]
-    assert lot.qty == 15  # net
-    assert lot.entry_price == pytest.approx(110.0)  # (10*100 + 10*120) / 20
-    assert lot.status == "open"
+    assert warnings == ()
+    (row,) = book.rows
+    assert row.conid == 265598
+    assert row.side == "long"
+    assert row.qty == 10
+    assert row.entry_price == 100
+    assert row.is_open
 
 
-def test_scaled_out_to_zero_is_closed() -> None:
-    book = replay(
-        (
-            _exec(
-                "o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"
-            ),
-            _exec(
-                "o1", side=OrderSide.SELL, qty=10, price=110, ts="2024-01-02T15:00:00Z"
-            ),
-        ),
-        ref_prefix=PREFIX,
+def test_round_trip_leaves_one_closed_row_not_two_lots() -> None:
+    executions = (
+        _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
+        _exec("o2", side=OrderSide.SELL, qty=10, price=110, ts="2024-01-02T15:00:00Z"),
     )
-    lot = book.lots[0]
-    assert lot.status == "closed"
-    assert lot.qty == 0
-    assert lot.entry_price == 100  # the opening (buy) executions
+    book, _ = reconcile(SCOPE, executions, StrategyBook())
+    assert len(book.rows) == 1
+    (row,) = book.rows
+    assert row.qty == 0
+    assert not row.is_open
+    assert row.closed_at == pd.Timestamp("2024-01-02T15:00:00Z")
+    assert row.entry_price == 100
 
 
-def test_short_position_is_negative_net() -> None:
-    book = replay(
-        (_exec("s1", side=OrderSide.SELL, qty=25, price=50),), ref_prefix=PREFIX
+def test_entry_price_is_vwap_of_the_open_interval() -> None:
+    executions = (
+        _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
+        _exec("o2", side=OrderSide.BUY, qty=10, price=120, ts="2024-01-02T09:40:00Z"),
+        _exec("o3", side=OrderSide.SELL, qty=5, price=130, ts="2024-01-02T10:00:00Z"),
     )
-    lot = book.lots[0]
-    assert lot.side is OrderSide.SELL
-    assert lot.qty == 25
-    assert lot.status == "open"
+    book, _ = reconcile(SCOPE, executions, StrategyBook())
+    (row,) = book.rows
+    assert row.qty == 15
+    assert row.entry_price == 110.0  # (10*100 + 10*120) / 20
 
 
-def test_one_lot_per_order_id() -> None:
-    book = replay(
-        (
-            _exec("o1", side=OrderSide.BUY, qty=10, price=100),
-            _exec("o2", side=OrderSide.BUY, qty=3, price=90),
-        ),
-        ref_prefix=PREFIX,
+def test_reapplying_the_window_is_a_noop() -> None:
+    executions = (_exec("o1", side=OrderSide.BUY, qty=10, price=100),)
+    book, _ = reconcile(SCOPE, executions, StrategyBook())
+    again, warnings = reconcile(SCOPE, executions, book)
+    assert again == book
+    assert warnings == ()
+
+
+def test_reopen_after_flat_is_reported() -> None:
+    executions = (
+        _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
+        _exec("o2", side=OrderSide.SELL, qty=10, price=110, ts="2024-01-02T10:00:00Z"),
+        _exec("o3", side=OrderSide.BUY, qty=7, price=120, ts="2024-01-02T11:00:00Z"),
     )
-    assert {lot.order_id for lot in book.lots} == {"o1", "o2"}
+    book, warnings = reconcile(SCOPE, executions, StrategyBook())
+    (row,) = book.rows
+    assert row.is_open and row.qty == 7 and row.entry_price == 120
+    assert row.opened_at == pd.Timestamp("2024-01-02T11:00:00Z")
+    assert any("reopened" in w for w in warnings)
 
 
-def test_foreign_orders_are_excluded_and_reported() -> None:
-    book = replay(
-        (
-            _exec("mine", side=OrderSide.BUY, qty=10, price=100),
-            _exec(
-                "theirs",
-                side=OrderSide.BUY,
-                qty=99,
-                price=1,
-                ref="otherstr-corrupt-20240101T0900-000",
-            ),
-        ),
-        ref_prefix=PREFIX,
+def test_flip_is_reported_and_resets_the_interval() -> None:
+    executions = (
+        _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
+        _exec("o2", side=OrderSide.SELL, qty=15, price=110, ts="2024-01-02T10:00:00Z"),
     )
-    assert [lot.order_id for lot in book.lots] == ["mine"]
-    assert [e.order_id for e in book.foreign] == ["theirs"]
-    # A foreign execution never reaches the strategy book.
-    assert all(lot.order_id != "theirs" for lot in book.lots)
+    book, warnings = reconcile(SCOPE, executions, StrategyBook())
+    (row,) = book.rows
+    assert row.side == "short" and row.qty == 5 and row.entry_price == 110
+    assert any("flip" in w for w in warnings)
 
 
-def test_commission_is_summed_per_order() -> None:
-    book = replay(
-        (
-            _exec("o1", side=OrderSide.BUY, qty=10, price=100, commission=1.5),
-            _exec("o1", side=OrderSide.SELL, qty=10, price=110, commission=2.5),
-        ),
-        ref_prefix=PREFIX,
+def test_foreign_executions_are_ignored_without_warning() -> None:
+    foreign = _exec(
+        "o1",
+        side=OrderSide.BUY,
+        qty=99,
+        price=1,
+        ref="someone-else-20240102T093000-000",
     )
-    assert book.lots[0].commission == 4.0
+    book, warnings = reconcile(SCOPE, (foreign,), StrategyBook())
+    assert book.rows == () and warnings == ()
 
 
 def test_input_order_does_not_matter() -> None:
-    first = _exec(
-        "o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"
-    )
-    second = _exec(
-        "o1", side=OrderSide.SELL, qty=4, price=130, ts="2024-01-02T11:00:00Z"
-    )
-    assert (
-        replay((first, second), ref_prefix=PREFIX).lots
-        == replay((second, first), ref_prefix=PREFIX).lots
+    a = _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z")
+    b = _exec("o2", side=OrderSide.SELL, qty=10, price=110, ts="2024-01-02T10:00:00Z")
+    assert reconcile(SCOPE, (a, b), StrategyBook()) == reconcile(
+        SCOPE, (b, a), StrategyBook()
     )
 
 
-def test_empty_executions_yield_empty_book() -> None:
-    book = replay((), ref_prefix=PREFIX)
-    assert book.lots == () and book.foreign == () and book.warnings == ()
+def test_empty_scope_is_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="scope"):
+        reconcile("", (), StrategyBook())
 
 
-def test_empty_ref_prefix_is_rejected() -> None:
-    with pytest.raises(ValueError, match="ref_prefix"):
-        replay((), ref_prefix="")
+def test_separate_scopes_keep_separate_books() -> None:
+    a = _exec(
+        "o1", side=OrderSide.BUY, qty=10, price=100, ref="alpha-20240102T093000-000"
+    )
+    b = _exec("o2", side=OrderSide.BUY, qty=5, price=50, ref="beta-20240102T093000-000")
+    abook, _ = reconcile("alpha", (a, b), StrategyBook())
+    bbook, _ = reconcile("beta", (a, b), StrategyBook())
+    assert [r.qty for r in abook.rows] == [10]
+    assert [r.qty for r in bbook.rows] == [5]

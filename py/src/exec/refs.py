@@ -1,38 +1,74 @@
 """The single definition of the order-ref scheme, shared by both sides.
 
-``SimExchange`` uses it for stable ids in tests; a real broker adapter uses it
-as the order's client id (``cOID``), so a re-sent cycle re-uses the same ref and
-the broker dedupes. The ref is deterministic in its inputs and contains no
-prices or sizes, so a resized order is not silently treated as a new order.
+A ref is ``f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M%S}-{seq:03d}"`` (plan rev 4.1
+§4). ``scope`` is a stable strategy identity that survives a config edit (the
+live config's ``scope`` key, defaulting to the strategy name), and its ``slug``
+prefix is ALSO the attribution key: a strategy recognises its own executions on a
+shared account by that whole-slug prefix (never a slice of a hash).
+
+``seq`` is keyed on the intent's **stable identity** (symbol + action + lot), not
+its position in the batch. That is the fix for the shifted-batch trap: a close
+filling removes an intent from the next cycle's batch, so a positional seq would
+let the following open inherit the close's already-seen ref and be deduped away.
+Keying on identity mints the same ref for the same intent across runs, and a
+different one for a different intent, regardless of who else is in the batch.
 """
 
 from __future__ import annotations
 
-import hashlib
+import re
+import zlib
 
 import pandas as pd
 
 
-def _identity_digest(strategy_id: str) -> str:
-    """Short stable digest of the FULL strategy id (8 hex chars).
+def slug(scope: str) -> str:
+    """Broker-safe, lowercase prefix for *scope* (ref's attribution key).
 
-    Two strategies whose ids share a first-8-chars prefix would otherwise mint
-    identical refs, letting a real broker silently dedupe a legitimate order.
-    The digest of the whole id disambiguates them while staying deterministic.
+    Non-alphanumerics collapse to ``-`` so the token is safe as an IBKR client
+    id prefix. An empty/degenerate scope falls back to ``"scope"`` rather than
+    minting an empty prefix (which would claim every order).
     """
-    return hashlib.blake2b(strategy_id.encode("utf-8"), digest_size=4).hexdigest()
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "-", scope).strip("-").lower()
+    return cleaned or "scope"
 
 
-def order_ref(strategy_id: str, cycle_ts: pd.Timestamp, seq: int) -> str:
-    """Stable order ref: ``<strategy8>-<digest8>-<YYYYMMDDTHHMM>-<seq3>``.
+def _seq_of(identity: str) -> int:
+    """Deterministic seq in ``[0, 99999]`` from an intent's stable identity.
 
-    ``strategy_id`` is truncated to 8 chars for the human-readable prefix (kept
-    first so ``startswith(strategy_id[:8])`` ownership scoping still holds), the
-    full id's 4-byte digest disambiguates shared prefixes, ``cycle_ts`` is
-    formatted to the minute, and ``seq`` the zero-padded 3-digit intent index
-    within the cycle. No prices or sizes, so a resized order is the same order.
+    A hash (not a batch index): the same intent always gets the same seq, so a
+    re-run of the same cycle re-mints the same ref and a batch whose membership
+    changed cannot hand one intent another's ref. The space is wide enough that
+    a within-cycle collision is negligible; :func:`assign_seqs` breaks any that
+    does occur deterministically.
     """
-    return (
-        f"{strategy_id[:8]}-{_identity_digest(strategy_id)}-"
-        f"{cycle_ts:%Y%m%dT%H%M}-{seq:03d}"
-    )
+    return zlib.crc32(identity.encode("utf-8")) % 100000
+
+
+def assign_seqs(identities: list[str]) -> list[int]:
+    """Seq per identity, collision-broken deterministically within the batch.
+
+    ``_seq_of`` is already stable across runs; on the (rare) collision of two
+    identities mapping to the same seq, the *later* one in sorted identity order
+    is bumped until free — a function of the identity SET, so a re-run of the
+    same set assigns identically.
+    """
+    assigned: dict[str, int] = {}
+    taken: set[int] = set()
+    for identity in identities:
+        seq = _seq_of(identity)
+        while seq in taken:
+            seq = (seq + 1) % 100000
+        taken.add(seq)
+        assigned[identity] = seq
+    return [assigned[identity] for identity in identities]
+
+
+def order_ref(scope: str, cycle_ts: pd.Timestamp, seq: int) -> str:
+    """Stable order ref: ``<slug(scope)>-<YYYYMMDDTHHMMSS>-<seq:03d>``.
+
+    ``cycle_ts`` is second-granular so two different cycles can never share a
+    timestamp; no prices or sizes enter the ref, so a resized order is the same
+    order and a re-sent cycle dedupes at the broker.
+    """
+    return f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M%S}-{seq:03d}"

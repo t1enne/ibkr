@@ -159,3 +159,6 @@ class LiveConfig:
     # (phase 1.5) and is the field ``ibkr live run`` resolves its adapter from
     # when no ``--adapter`` flag is given.
     broker: Literal["sim", "ibkr"] = "sim"
+    #: Stable strategy identity (plan rev 4.1 §4). Defaults to the strategy name;
+    #: the per-scope sqlite book key and the cOID prefix for fill attribution.
+    scope: str = ""

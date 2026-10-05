@@ -14,10 +14,9 @@ from typing import Protocol, cast
 
 import pandas as pd
 
-from src.bt.state import ActionType, PortfolioState
+from src.bt.state import PortfolioState
 from src.data.db import get_connection
 from src.live.broker import LiveBroker, OrderResult
-from src.live.ledger import Ledger, PositionRecord
 from src.live.portfolio_source import PortfolioSource
 from src.live.reconcile import reconcile
 from src.live.result import Err
@@ -58,6 +57,12 @@ class SignalSource(Protocol):
     def __call__(
         self, config_path: str, max_age_days: int | None = None
     ) -> tuple[LiveSignal, ...]: ...
+
+
+class CycleLedger(Protocol):
+    """The only ledger capability ``run_cycle`` needs: stamp the cycle (audit)."""
+
+    def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None: ...
 
 
 def build_report(
@@ -139,7 +144,7 @@ async def run_cycle(
     *,
     source: PortfolioSource,
     broker: LiveBroker,
-    ledger: Ledger,
+    ledger: CycleLedger,
     strategy_id: str,
     config_path: str | None = None,
     max_age_days: int = 5,
@@ -152,8 +157,8 @@ async def run_cycle(
 
     ``dry_run=True`` computes signals + intents but places NOTHING and writes
     NOTHING: the broker loop is skipped, ``results`` is empty, and no
-    ``record_open`` / ``mark_closed`` / ``touch_cycle`` write happens. Nothing
-    is recorded, so the next cycle recomputes the same intents.
+    ``touch_cycle`` write happens. Nothing is recorded, so the next cycle
+    recomputes the same intents.
     """
     now_ts = now if now is not None else pd.Timestamp.now(tz="UTC")
     fetched = await source.fetch()
@@ -168,97 +173,30 @@ async def run_cycle(
     # Align the simulated book with the fetched read so the SAME book is both
     # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
     broker.seed(snapshot.portfolio)
-    # Ownership scoping (plan §3): the ledger owns the mock book's closes, but the
-    # IBKR execution replay ALREADY excludes foreign orders, so its book is
-    # entirely ours — scoping by the (empty on a dry run) ledger would make every
-    # replayed lot unclosable. ``owns_book`` is the source's own answer.
-    owned = (
-        None
-        if not getattr(source, "owns_book", True)
-        else _owned_ids(ledger, strategy_id)
-    )
-    intents = reconcile(signals, snapshot.portfolio, config, owned)
+    # The fetched book is already this scope's own book (the IBKR source advances
+    # the per-scope sqlite rows from the trades window), so every lot in it is
+    # closable — no ledger-side ownership filter is needed (plan rev 4.1 §3).
+    intents = reconcile(signals, snapshot.portfolio, config)
     results: tuple[OrderResult, ...] = ()
     if not dry_run:
-        results = await _place_all(broker, ledger, intents, strategy_id, now_ts)
+        results = await _place_all(broker, intents)
         ledger.touch_cycle(strategy_id, now_ts)
     await broker.close()
     return build_report(snapshot.portfolio, signals, intents, results, now_ts)
 
 
-def _owned_ids(ledger: Ledger, strategy_id: str) -> frozenset[str]:
-    """Broker lot ids this strategy currently owns (scopes close intents)."""
-    return frozenset(r.position_id for r in ledger.open_positions(strategy_id))
-
-
 async def _place_all(
     broker: LiveBroker,
-    ledger: Ledger,
     intents: tuple[OrderIntent, ...],
-    strategy_id: str,
-    now_ts: pd.Timestamp,
 ) -> tuple[OrderResult, ...]:
     """Place the cycle's intents as ONE cohort; a cohort-level ``Err`` skips all.
 
-    The broker prices orders per-order but settles the whole cycle atomically
-    through the shared ``apply_fills``, so the settled book matches the
-    backtest's on the same fills. A transport ``Err`` carries no results, so
-    nothing is recorded — the next cycle recomputes the same intents.
+    The book is NOT written from the placement result: it is advanced from the
+    broker's own execution stream by the next cycle's ``reconcile`` (plan §3).
     """
     if not intents:
         return ()
     placed = await broker.place_cohort(tuple(intents))
     if isinstance(placed, Err):
         return ()
-    results: list[OrderResult] = []
-    for result in placed.value:
-        results.append(result)
-        _record(ledger, strategy_id, result.intent, result, now_ts)
-    return tuple(results)
-
-
-def _record(
-    ledger: Ledger,
-    strategy_id: str,
-    intent: OrderIntent,
-    result: OrderResult,
-    now_ts: pd.Timestamp,
-) -> None:
-    """Ledger the write points. A failed/rejected result records NOTHING."""
-    if not result.ok:
-        return
-    if intent.action is ActionType.close:
-        if intent.position_id:
-            ledger.mark_closed(strategy_id, intent.position_id, now_ts)
-        return
-    if intent.action in (ActionType.long, ActionType.short):
-        # A lot the broker did not name can never be targeted by a close
-        # (_close_position requires a position_id), so recording it would
-        # create an unclosable phantom row. Record nothing.
-        if not result.position_id:
-            return
-        ledger.record_open(_open_record(strategy_id, intent, result, now_ts))
-
-
-def _open_record(
-    strategy_id: str,
-    intent: OrderIntent,
-    result: OrderResult,
-    now_ts: pd.Timestamp,
-) -> PositionRecord:
-    """Build the ledger row for a confirmed open, preferring the fill's numbers."""
-    fill = result.fill
-    return PositionRecord(
-        strategy_id=strategy_id,
-        position_id=result.position_id or "",
-        symbol=intent.symbol,
-        side="long" if intent.action is ActionType.long else "short",
-        qty=fill.filled_qty if fill else intent.qty,
-        entry_price=fill.executed_price if fill else intent.ref_price,
-        entry_time=fill.timestamp if fill else now_ts,
-        stop_loss=intent.stop_loss,
-        take_profit=intent.take_profit,
-        tag=intent.tag,
-        status="open",
-        opened_at=now_ts,
-    )
+    return tuple(placed.value)

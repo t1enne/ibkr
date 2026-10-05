@@ -101,21 +101,27 @@ def live_run(
     # (the strategy-only file lives at a random path and must not change scope).
     strategy_id = config_hash(raw)
     strategy = _strategy_config(config_path, raw)
+    scope = cfg.scope or strategy.name
     ledger = SqliteLedger()
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
-        ledger.ensure_strategy(strategy_id, strategy.name, cfg.mode)
+        ledger.ensure_strategy(strategy_id, scope, strategy.name, cfg.mode)
+        ledger.ensure_cash(scope, cfg.initial_capital)
     gateway: IbkrGateway | None = None
     broker: LiveBroker
     if resolved == "ibkr":
         gateway = IbkrGateway(IbkrClient())
         source: PortfolioSource = IbkrPortfolioSource(
-            gateway.client, _ref_prefix(strategy_id)
+            gateway.client,
+            scope=scope,
+            ledger=ledger,
+            initial_capital=cfg.initial_capital,
+            dry_run=dry_run,
         )
         # The real routing edge. ``dry_run`` is passed through as defence in
         # depth: even if the guard below were skipped, this broker places nothing.
         broker = IbkrBroker(
             gateway.client,
-            strategy_id=strategy_id,
+            scope=scope,
             dry_run=dry_run,
             log=click.echo,
         )
@@ -272,11 +278,6 @@ def resolve_broker(
     return "sim", False
 
 
-def _ref_prefix(strategy_id: str) -> str:
-    """The ownership prefix: the strategy id's first 8 chars (plan §3/§4)."""
-    return strategy_id[:8]
-
-
 live_group.add_command(live_run)
 
 
@@ -355,6 +356,23 @@ def load_live_config(path: str) -> LiveConfig:
         portfolio_path=portfolio_path if isinstance(portfolio_path, str) else "",
         mode=cast("Literal['paper', 'live']", raw_mode),
         broker=cast("Literal['sim', 'ibkr']", raw_broker),
+        scope=_scope(raw, params, strategy),
+    )
+
+
+def _scope(
+    raw: Mapping[str, object],
+    params: Mapping[str, object],
+    strategy: StrategyConfig,
+) -> str:
+    """The ownership scope: the config's ``scope`` key, else the strategy name.
+
+    A stable strategy identity that survives a config edit (plan §4) — the
+    per-scope book key and the cOID attribution prefix on a shared account.
+    """
+    value = _pick((raw, params), ("scope",), None)
+    return (
+        value if isinstance(value, str) and value else (strategy.scope or strategy.name)
     )
 
 

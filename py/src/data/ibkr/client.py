@@ -284,6 +284,15 @@ class IbkrClient:
         body = await self._get("iserver/account/trades")
         return cast("list[dict[str, Any]]", _as_list(body, "trades"))
 
+    async def open_orders(self) -> list[dict[str, Any]]:
+        """``/iserver/account/orders`` — the account's currently working orders.
+
+        Read before re-sending after an ambiguous submit so a working order is
+        seen rather than duplicated (plan §6 phase 3.5 placement hygiene).
+        """
+        body = await self._get("iserver/account/orders")
+        return cast("list[dict[str, Any]]", _as_list(body, "orders"))
+
     # -- helpers -----------------------------------------------------------
 
     def _require_account(self, account: str | None) -> str:

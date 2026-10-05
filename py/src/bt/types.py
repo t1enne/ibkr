@@ -98,12 +98,18 @@ class StrategyConfig:
     # config's ``broker`` key through ``resolve_broker`` (phase 2); it reads the
     # key once, not this field.
     broker: BrokerName = "sim"
+    #: Stable strategy identity that survives a config edit (plan rev 4.1 §4):
+    #: the per-scope book key AND the cOID prefix a strategy uses to recognise
+    #: its own fills on a shared account. Defaults to ``name`` when unset.
+    scope: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.broker not in ("sim", "ibkr"):
             raise ValueError(
                 f"Unknown broker {self.broker!r}; expected one of ['ibkr', 'sim']"
             )
+        if not self.scope:
+            self.scope = self.name
 
 
 def commission_model_from_config(cfg: StrategyConfig) -> CommissionModel:

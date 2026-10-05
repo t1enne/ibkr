@@ -25,13 +25,24 @@ from src.live.types import FeedError, OrderIntent
 
 BASE = "https://localhost:5000/v1/api/"
 ACCOUNT = "DU452563"
-STRATEGY = "abcdef1234567890"
+SCOPE = "momentum"
 CYCLE_TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T14:30:00Z"))
 ORDER_ID = "979320001"
 
 SUBMIT = f"{BASE}iserver/account/{ACCOUNT}/orders"
 STATUS = f"{BASE}iserver/account/order/status/{ORDER_ID}"
 REPLY = f"{BASE}iserver/reply/"
+POSITIONS = f"{BASE}portfolio/{ACCOUNT}/positions/0"
+
+
+def _mock_long_position() -> None:
+    """A non-flat account position so the close safety guard lets a close through."""
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"conid": 265598, "contractDesc": "AAPL", "position": 1}],
+        )
+    )
 
 
 async def _conid(_ticker: str) -> int:
@@ -50,7 +61,7 @@ def _broker(
 ) -> IbkrBroker:
     return IbkrBroker(
         IbkrClient(base_url=BASE, account=ACCOUNT),
-        strategy_id=STRATEGY,
+        scope=SCOPE,
         account=ACCOUNT,
         dry_run=dry_run,
         conid_lookup=_conid,
@@ -149,7 +160,7 @@ async def test_place_submits_then_waits_for_the_fill() -> None:
     assert len(posted["orders"]) == 1
     ticket = posted["orders"][0]
     assert ticket["orderType"] == "MKT" and ticket["tif"] == "DAY"
-    assert ticket["cOID"].startswith(STRATEGY[:8])
+    assert ticket["cOID"].startswith(SCOPE)
 
 
 # --- submit -> reply -> confirm -> order_id ---------------------------------
@@ -262,8 +273,39 @@ async def test_reply_loop_overflow_aborts() -> None:
 @pytest.mark.asyncio
 async def test_submit_transport_failure_is_typed() -> None:
     respx.post(SUBMIT).mock(side_effect=httpx.ConnectTimeout("down"))
+    # The ambiguous-submit guard reads the working orders; none carries our cOID.
+    respx.get(f"{BASE}iserver/account/orders").mock(
+        return_value=httpx.Response(200, json={"orders": []})
+    )
     error = _failure(await _broker().place(_open_intent()))
     assert error.kind == "transport"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_ambiguous_submit_adopts_a_working_order() -> None:
+    """A working order with our cOID is SEEN, not re-sent (plan §6 phase 3.5)."""
+    from src.exec.types import OrderSide
+    from src.live.adapters.ibkr.orders import build_ticket, sequence
+
+    respx.post(SUBMIT).mock(side_effect=httpx.ConnectTimeout("down"))
+    seq = sequence((_open_intent(),))[0][0]
+    ticket = build_ticket(
+        _open_intent(),
+        conid=265598,
+        side=OrderSide.BUY,
+        scope=SCOPE,
+        cycle_ts=CYCLE_TS,
+        seq=seq,
+    )
+    respx.get(f"{BASE}iserver/account/orders").mock(
+        return_value=httpx.Response(
+            200, json={"orders": [{"orderId": ORDER_ID, "cOID": ticket.order_ref}]}
+        )
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    placed = _ok(await _broker().place(_open_intent()))
+    assert placed.ok and placed.position_id == ORDER_ID
 
 
 # --- wait_filled outcomes ---------------------------------------------------
@@ -415,6 +457,7 @@ async def test_close_resolves_the_lot_side_from_the_seeded_book() -> None:
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_long_position()
     broker = _broker()
     broker.seed(_long_lot("555000111"))
     intent = OrderIntent(
@@ -428,7 +471,12 @@ async def test_close_resolves_the_lot_side_from_the_seeded_book() -> None:
     placed = _ok(await broker.place(intent))
     assert placed.ok
     assert placed.position_id == "555000111"  # a close keeps the lot handle
-    assert '"side":"SELL"' in respx.calls[0].request.content.decode()
+    posted = [
+        call.request.content.decode()
+        for call in respx.calls
+        if call.request.method == "POST"
+    ]
+    assert '"side":"SELL"' in posted[0]
 
 
 # --- cohort loop ------------------------------------------------------------
@@ -444,6 +492,7 @@ async def test_place_cohort_is_a_deterministic_loop_that_survives_one_failure() 
         ]
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_long_position()
     broker = _broker()
     broker.seed(_long_lot("555000111"))
     open_intent = _open_intent()
@@ -472,6 +521,7 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_long_position()
     broker = _broker()
     broker.seed(_long_lot("555000111"))
     close_intent = OrderIntent(
@@ -489,9 +539,10 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
         if call.request.method == "POST"
     ]
     assert bodies[0] != bodies[1]
-    # seq 000 is the close's, seq 001 the open's (same cycle minute).
-    assert "-000" in bodies[0] and "-001" in bodies[1]
+    # The close is placed first and carries a SELL; the open a BUY. Their refs are
+    # identity-keyed (plan §4), so only the side/order distinguishes them here.
     assert '"side":"SELL"' in bodies[0] and '"side":"BUY"' in bodies[1]
+    assert "20240603T143000" in bodies[0] and "20240603T143000" in bodies[1]
 
 
 def test_broker_satisfies_the_live_broker_protocol() -> None:
@@ -500,3 +551,27 @@ def test_broker_satisfies_the_live_broker_protocol() -> None:
 
     broker = cast("LiveBroker", _broker())
     assert broker is not None and OrderSide.BUY.value == "BUY"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_close_on_a_flat_account_is_refused_before_submitting() -> None:
+    """Safety guard (plan §6 phase 3.5): never reduce a conid the account is flat on."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(POSITIONS).mock(return_value=httpx.Response(200, json=[]))  # account flat
+    broker = _broker()
+    broker.seed(_long_lot("555000111"))
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=1.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+    result = await broker.place(intent)
+    assert isinstance(result, Err)
+    assert "flat" in cast("FeedError", result.error).message
+    assert submit.call_count == 0  # never sent

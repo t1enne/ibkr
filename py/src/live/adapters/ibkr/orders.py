@@ -33,7 +33,7 @@ from typing import Literal, cast
 import pandas as pd
 
 from src.bt.state import ActionType
-from src.exec.refs import order_ref as mint_ref
+from src.exec.refs import assign_seqs, order_ref as mint_ref
 from src.exec.types import Fill, OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.mapping import canonical_order_id, num, opt_str
 from src.live.types import OrderIntent
@@ -72,6 +72,8 @@ class Ticket:
     order_ref: str
     side: OrderSide
     body: dict[str, object]
+    #: True when the intent's fractional quantity was rounded to whole shares.
+    rounded: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,31 +116,40 @@ def build_ticket(
     *,
     conid: int,
     side: OrderSide,
-    strategy_id: str,
+    scope: str,
     cycle_ts: pd.Timestamp,
     seq: int,
 ) -> Ticket:
     """Pure: intent + resolved conid + resolved side -> the IBKR ticket body.
 
-    ``cOID`` is ``refs.order_ref(strategy_id, cycle_ts, seq)`` — the deterministic
+    ``cOID`` is ``refs.order_ref(scope, cycle_ts, seq)`` — the deterministic
     identity that makes a re-sent cycle dedupe at IBKR. ``tif`` is always ``DAY``;
-    an MKT order has no meaningful resting life in this phase. The side comes from
-    ``order_side`` (the caller resolves a close's lot side from the replayed book
-    before it gets here), so this function never guesses a direction.
+    an MKT order has no meaningful resting life in this phase. Quantities are
+    whole shares (plan §7.14): a fractional ``qty`` is rounded and flagged, never
+    sent as-is. The side comes from ``order_side`` (the caller resolves a close's
+    lot side from the replayed book before it gets here), so this function never
+    guesses a direction.
     """
     if intent.order_type is not OrderType.MKT:
         raise UnsupportedOrderType(
             f"{intent.order_type.value} order for {intent.symbol} is not supported "
             f"live yet: LMT carry-over lands in phase 4 (MKT only in phase 3)"
         )
-    ref = mint_ref(strategy_id, cycle_ts, seq)
+    whole = int(round(intent.qty))
+    if whole <= 0:
+        raise OrderMappingError(
+            f"{intent.symbol}: quantity {intent.qty!r} rounds to {whole} shares; "
+            f"refusing to place a non-positive whole-share order"
+        )
+    ref = mint_ref(scope, cycle_ts, seq)
     return Ticket(
         order_ref=ref,
         side=side,
+        rounded=abs(intent.qty - whole) > 1e-9,
         body={
             "conid": conid,
             "side": side.value,
-            "quantity": intent.qty,
+            "quantity": float(whole),
             "orderType": intent.order_type.value,
             "tif": "DAY",
             "cOID": ref,
@@ -146,21 +157,32 @@ def build_ticket(
     )
 
 
+def intent_identity(intent: OrderIntent) -> str:
+    """The intent's stable identity: symbol + action + targeted lot.
+
+    ``seq`` (and therefore the ``cOID``) is derived from this, NOT the batch
+    position, so a close filling and dropping out of the next cycle's batch
+    cannot hand the following open the close's already-seen ref (plan §4).
+    """
+    return f"{intent.symbol}|{intent.action.value}|{intent.position_id or ''}"
+
+
 def sequence(
     intents: Sequence[OrderIntent],
 ) -> tuple[tuple[int, OrderIntent], ...]:
-    """``(seq, intent)`` pairs: closes first, then the rest, order preserved.
+    """``(seq, intent)`` pairs: seq keyed on intent identity, closes ordered first.
 
-    ``reconcile`` already emits closes-before-opens in ``config.symbols`` order,
-    so this is a *stable* regroup — it pins each intent to the same ``seq`` (and
-    therefore the same ``cOID``) on every re-run, which is what lets IBKR dedupe a
-    re-sent cycle instead of doubling the order.
+    Each intent's ``seq`` comes from its stable identity (``intent_identity``),
+    so re-running a cycle whose membership changed still mints the intended refs.
+    Returned in closes-first order (a deterministic placement order), which no
+    longer affects any ref.
     """
     ranked = sorted(
         enumerate(intents),
         key=lambda pair: (0 if pair[1].action is ActionType.close else 1, pair[0]),
     )
-    return tuple((seq, intent) for seq, (_index, intent) in enumerate(ranked))
+    seqs = assign_seqs([intent_identity(intent) for _, intent in ranked])
+    return tuple((seq, intent) for seq, (_, intent) in zip(seqs, ranked, strict=True))
 
 
 # -- reply-confirmation vocabulary -------------------------------------------
@@ -284,6 +306,7 @@ __all__ = [
     "UnsupportedOrderType",
     "build_ticket",
     "classify_reply",
+    "intent_identity",
     "is_fully_filled",
     "is_terminal",
     "order_side",

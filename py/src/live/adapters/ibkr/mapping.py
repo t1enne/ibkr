@@ -196,9 +196,11 @@ def parse_executions(
 ) -> tuple[tuple[Execution, ...], tuple[str, ...]]:
     """Parse ``/iserver/account/trades`` rows into :class:`Execution`s.
 
-    A row missing an order id, an interpretable side, a non-zero size or a usable
-    ``trade_time_r`` is skipped with a warning — ordering by time is what makes
-    the replay deterministic, so a timeless execution cannot be trusted.
+    A row missing an order id, conid, an interpretable side, a non-zero size or a
+    usable ``trade_time_r`` is skipped with a warning — ``conid`` is the book key
+    and time orders the apply, so neither can be missing. The per-execution
+    ``position`` (IBKR's account net after the fill) is carried for diagnostics;
+    the book is never advanced from it.
     """
     records: list[Execution] = []
     warnings: list[str] = []
@@ -208,6 +210,10 @@ def parse_executions(
         order_id = canonical_order_id(body.get("order_id"))
         if not order_id:
             warnings.append(f"trade[{index}] {execution_id}: no order_id; skipped")
+            continue
+        conid = int(num(body.get("conid")))
+        if conid == 0:
+            warnings.append(f"trade[{index}] {execution_id}: no conid; skipped")
             continue
         side = _side(body.get("side"))
         if side is None:
@@ -227,12 +233,14 @@ def parse_executions(
                 execution_id=execution_id,
                 order_id=order_id,
                 order_ref=opt_str(body.get("order_ref")),
+                conid=conid,
                 symbol=symbol,
                 side=side,
                 qty=qty,
                 price=num(body.get("price")),
                 commission=num(body.get("commission")),
                 ts=ts,
+                account_position=num(body.get("position")),
             )
         )
     return tuple(records), tuple(warnings)

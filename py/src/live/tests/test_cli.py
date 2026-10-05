@@ -28,7 +28,6 @@ from src.live.cli import (
     render_report,
 )
 from src.live.engine import CycleReport, run_cycle
-from src.live.ledger import PositionRecord
 from src.live.result import Ok, Result
 from src.live.types import (
     FeedError,
@@ -142,6 +141,7 @@ def test_live_run_empty_portfolio_path_usage_error(
 ) -> None:
     class FakeLedger:
         def ensure_strategy(self, *args: object, **kwargs: object) -> None: ...
+        def ensure_cash(self, *args: object, **kwargs: object) -> None: ...
 
     monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
     path = write_config(tmp_path, portfolio_path="", mode="paper")
@@ -246,6 +246,7 @@ def test_live_run_passes_commission_to_execution_params(
 
     class FakeLedger:
         def ensure_strategy(self, *a: object, **k: object) -> None: ...
+        def ensure_cash(self, *a: object, **k: object) -> None: ...
         def prune_closed(self, *a: object, **k: object) -> int:
             return 0
 
@@ -294,21 +295,12 @@ def test_render_report_text_is_deterministic_and_listed() -> None:
 class _RecordingLedger:
     def __init__(self) -> None:
         self.touched = 0
-        self.opens: list[PositionRecord] = []
+        self.opens: list[object] = []
         self.closed: list[str] = []
 
-    def ensure_strategy(self, strategy_id: str, name: str, mode: str) -> None: ...
+    def ensure_strategy(self, *a: object, **k: object) -> None: ...
 
-    def record_open(self, rec: PositionRecord) -> None:
-        self.opens.append(rec)
-
-    def mark_closed(
-        self, strategy_id: str, position_id: str, closed_at: pd.Timestamp
-    ) -> None:
-        self.closed.append(position_id)
-
-    def open_positions(self, strategy_id: str) -> tuple[PositionRecord, ...]:
-        return ()
+    def ensure_cash(self, *a: object, **k: object) -> None: ...
 
     def prune_closed(self, before: pd.Timestamp) -> int:
         return 0
@@ -523,6 +515,7 @@ def test_sim_path_never_builds_a_gateway(
 
 class FakeLedger:
     def ensure_strategy(self, *a: object, **k: object) -> None: ...
+    def ensure_cash(self, *a: object, **k: object) -> None: ...
     def prune_closed(self, *a: object, **k: object) -> int:
         return 0
 

@@ -15,6 +15,7 @@ from src.live.adapters.ibkr.orders import (
     UnsupportedOrderType,
     build_ticket,
     classify_reply,
+    intent_identity,
     is_fully_filled,
     is_terminal,
     order_side,
@@ -25,7 +26,7 @@ from src.live.adapters.ibkr.orders import (
 from src.live.types import OrderIntent
 
 CYCLE_TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T14:30:00Z"))
-STRATEGY = "abcdef1234567890"
+SCOPE = "momentum"
 
 
 def _intent(
@@ -81,7 +82,7 @@ def test_build_ticket_mkt_body_and_deterministic_coid() -> None:
         _intent(),
         conid=265598,
         side=OrderSide.BUY,
-        strategy_id=STRATEGY,
+        scope=SCOPE,
         cycle_ts=CYCLE_TS,
         seq=0,
     )
@@ -91,7 +92,7 @@ def test_build_ticket_mkt_body_and_deterministic_coid() -> None:
         "quantity": 10.0,
         "orderType": "MKT",
         "tif": "DAY",
-        "cOID": order_ref(STRATEGY, CYCLE_TS, 0),
+        "cOID": order_ref(SCOPE, CYCLE_TS, 0),
     }
     assert ticket.side is OrderSide.BUY
     # Deterministic: the same inputs mint the same cOID, so IBKR dedupes a re-send.
@@ -99,7 +100,7 @@ def test_build_ticket_mkt_body_and_deterministic_coid() -> None:
         _intent(),
         conid=265598,
         side=OrderSide.BUY,
-        strategy_id=STRATEGY,
+        scope=SCOPE,
         cycle_ts=CYCLE_TS,
         seq=0,
     )
@@ -109,7 +110,7 @@ def test_build_ticket_mkt_body_and_deterministic_coid() -> None:
         _intent(),
         conid=265598,
         side=OrderSide.BUY,
-        strategy_id=STRATEGY,
+        scope=SCOPE,
         cycle_ts=CYCLE_TS,
         seq=1,
     )
@@ -123,7 +124,7 @@ def test_build_ticket_close_uses_the_lot_side() -> None:
         intent,
         conid=1,
         side=side,
-        strategy_id=STRATEGY,
+        scope=SCOPE,
         cycle_ts=CYCLE_TS,
         seq=0,
     )
@@ -136,7 +137,7 @@ def test_build_ticket_rejects_lmt() -> None:
             _intent(order_type=OrderType.LMT),
             conid=1,
             side=OrderSide.BUY,
-            strategy_id=STRATEGY,
+            scope=SCOPE,
             cycle_ts=CYCLE_TS,
             seq=0,
         )
@@ -145,22 +146,35 @@ def test_build_ticket_rejects_lmt() -> None:
 # --- deterministic sequencing ----------------------------------------------
 
 
-def test_sequence_puts_closes_first_and_is_stable() -> None:
+def test_sequence_puts_closes_first_and_keys_seq_on_identity() -> None:
     opens = (_intent("AAPL"), _intent("MSFT"))
     closes = (
         _intent("MSFT", ActionType.close, position_id="2"),
         _intent("AAPL", ActionType.close, position_id="1"),
     )
-    # reconcile emits closes-then-opens; sequence must not disturb either group.
+    # reconcile emits closes-then-opens; sequence keeps that placement order.
     pairs = sequence(closes + opens)
     assert [intent.symbol for _seq, intent in pairs] == ["MSFT", "AAPL", "AAPL", "MSFT"]
-    assert [seq for seq, _intent_ in pairs] == [0, 1, 2, 3]
     assert [intent.action for _seq, intent in pairs][:2] == [
         ActionType.close,
         ActionType.close,
     ]
+    # seqs are all distinct and keyed on intent identity, not batch position.
+    assert len({seq for seq, _ in pairs}) == 4
     # Re-running the same cycle yields the identical mapping (same cOIDs).
     assert sequence(closes + opens) == pairs
+
+
+def test_sequence_shifted_batch_keeps_the_open_coid() -> None:
+    # The shifted-batch trap (plan §4): a close filling drops it from the next
+    # batch, so a positional seq would hand the open the close's already-seen
+    # ref and dedupe it away. Identity-keyed seq keeps the open's ref.
+    close = _intent("AAPL", ActionType.close, position_id="1")
+    open_ = _intent("AAPL")
+    with_close = dict((intent_identity(i), seq) for seq, i in sequence((close, open_)))
+    without_close = dict((intent_identity(i), seq) for seq, i in sequence((open_,)))
+    assert with_close[intent_identity(open_)] == without_close[intent_identity(open_)]
+    assert with_close[intent_identity(close)] != with_close[intent_identity(open_)]
 
 
 # --- reply classification ---------------------------------------------------

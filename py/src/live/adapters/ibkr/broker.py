@@ -32,20 +32,27 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import cast
 
 import pandas as pd
 
-from src.bt.state import FillEvent, PortfolioState
+from src.bt.state import ActionType, FillEvent, PortfolioState
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import lookup
+from src.exec.refs import assign_seqs
 from src.exec.types import Fill
+from src.live.adapters.ibkr.mapping import (
+    canonical_order_id,
+    opt_str,
+    parse_positions,
+)
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     Ticket,
     build_ticket,
     classify_reply,
+    intent_identity,
     is_fully_filled,
     is_terminal,
     order_side,
@@ -66,6 +73,9 @@ MAX_REPLIES = 5
 #: polling is generous and keeps a cron cycle from hanging on a dead session.
 DEFAULT_POLL_INTERVAL_S = 1.0
 DEFAULT_TIMEOUT_S = 30.0
+
+#: Absolute account net below which the book is flat (the close safety guard).
+_FLAT_EPS = 1e-9
 
 ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
@@ -90,7 +100,7 @@ class IbkrBroker:
         self,
         client: IbkrClient,
         *,
-        strategy_id: str,
+        scope: str,
         account: str | None = None,
         dry_run: bool = False,
         conid_lookup: ConidLookup | None = None,
@@ -102,7 +112,7 @@ class IbkrBroker:
         log: Callable[[str], None] | None = None,
     ) -> None:
         self._client = client
-        self._strategy_id = strategy_id
+        self._scope = scope
         self._account = account
         self._dry_run = dry_run
         self._conid_lookup = (
@@ -128,7 +138,7 @@ class IbkrBroker:
         self._book = portfolio
 
     async def place(
-        self, intent: OrderIntent, *, seq: int = 0
+        self, intent: OrderIntent, *, seq: int | None = None
     ) -> Result[OrderResult, FeedError]:
         """Submit ONE MKT order and wait for its fill.
 
@@ -160,18 +170,44 @@ class IbkrBroker:
             # Resolve the side FIRST: a close whose lot is not in the seeded book
             # is an error, and it must fail before any network round trip.
             side = order_side(intent, position_side_of(self._book, intent))
+            conid = await self._conid(intent.symbol)
+            resolved_seq = (
+                seq if seq is not None else assign_seqs([intent_identity(intent)])[0]
+            )
             ticket = build_ticket(
                 intent,
-                conid=await self._conid(intent.symbol),
+                conid=conid,
                 side=side,
-                strategy_id=self._strategy_id,
+                scope=self._scope,
                 cycle_ts=self._now(),
-                seq=seq,
+                seq=resolved_seq,
             )
         except (OrderMappingError, ValueError, IbkrError) as exc:
             kind = exc.kind if isinstance(exc, IbkrError) else "rejected"
             return Err(
                 feed_error(kind, f"{intent.symbol}: {exc}", symbol=intent.symbol)
+            )
+
+        # Safety guard (plan §6 phase 3.5): never send a REDUCING order for a
+        # conid the account is actually flat on. On a shared account the net is
+        # the sum of all scopes plus a human's, so a zero net is a hard "nothing
+        # to reduce" — this is the one place the account state is read.
+        if intent.action is ActionType.close:
+            net = await self._account_net(conid)
+            if net is not None and abs(net) <= _FLAT_EPS:
+                return Err(
+                    feed_error(
+                        "rejected",
+                        f"refused close {intent.symbol} (conid {conid}): account is "
+                        f"flat, nothing to reduce",
+                        symbol=intent.symbol,
+                    )
+                )
+
+        if ticket.rounded:
+            self._log(
+                f"rounded {intent.symbol} qty {intent.qty:g} -> "
+                f"{ticket.body['quantity']:g} (whole shares)"
             )
 
         submitted = await self._submit(account, ticket)
@@ -245,6 +281,39 @@ class IbkrBroker:
         """The IBKR conid for *symbol* (an edge failure is a typed ``Err``)."""
         return await self._conid_lookup(symbol)
 
+    async def _account_net(self, conid: int) -> float | None:
+        """The account's net quantity for *conid*, or ``None`` if it cannot be read.
+
+        The ONE read of account state in the live edge: it backs the close safety
+        guard. ``None`` (a failed read) means "unknown", which must not be treated
+        as flat — the order proceeds and IBKR itself refuses a bogus reduction.
+        """
+        account = self._account or self._client.account
+        try:
+            raw = await self._client.positions_all(account)
+        except IbkrError:
+            return None
+        positions, _ = parse_positions(raw)
+        return sum(p.qty for p in positions if p.conid == conid)
+
+    async def _working_order_id(self, order_ref: str) -> str | None:
+        """A working order's id for *order_ref* from ``/iserver/account/orders``.
+
+        Read after an ambiguous submit so a working order is SEEN rather than
+        re-sent (plan §6 phase 3.5 placement hygiene).
+        """
+        try:
+            orders = await self._client.open_orders()
+        except IbkrError:
+            return None
+        for entry in orders:
+            if not isinstance(entry, Mapping):
+                continue
+            body = cast("Mapping[str, object]", entry)
+            if opt_str(body.get("cOID")) == order_ref:
+                return canonical_order_id(body.get("orderId")) or None
+        return None
+
     async def _submit(self, account: str, ticket: Ticket) -> Result[str, FeedError]:
         """POST the ticket and run the (bounded) reply-confirmation loop."""
         endpoint = f"iserver/account/{account}/orders"
@@ -255,6 +324,16 @@ class IbkrBroker:
                 endpoint, json={"orders": [ticket.body]}
             )
         except IbkrError as exc:
+            # Ambiguous submit: before reporting failure, ask the account which
+            # orders are working. An order carrying our cOID already exists, so
+            # we adopt it rather than risk a duplicate.
+            working = await self._working_order_id(ticket.order_ref)
+            if working is not None:
+                self._log(
+                    f"submit {ticket.order_ref} errored ({exc}); found working "
+                    f"order {working} via /iserver/account/orders"
+                )
+                return Ok(working)
             return Err(feed_error(exc.kind, f"submit {ticket.order_ref}: {exc}"))
         confirmations = 0
         while True:
