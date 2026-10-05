@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS live_cash (
 );
 CREATE INDEX IF NOT EXISTS ix_live_pos_open
   ON live_position(scope, closed_at);
+CREATE TABLE IF NOT EXISTS live_sim_lot (
+  strategy_id TEXT NOT NULL,
+  position_id TEXT NOT NULL,
+  closed_at   INTEGER,
+  PRIMARY KEY (strategy_id, position_id)
+);
 """
 
 # Timestamps round-trip through INTEGER epoch milliseconds — the same clock the
@@ -196,6 +202,48 @@ class SqliteLedger:
                 "UPDATE live_strategy SET last_cycle_at=? WHERE strategy_id=?",
                 (_ms(at), strategy_id),
             )
+
+    # -- sim/mock lot ownership (position_id keyed) ------------------------
+    #
+    # The per-scope book above is conid-keyed because IBKR names lots by conid.
+    # The sim/mock path has no conid: its broker mints a synthetic ``position_id``
+    # (``SYM_{ts}_{seq}``) and the mock fixture may hold lots the strategy never
+    # opened. Ownership is recorded here so a sim close can only target a lot the
+    # strategy OPENED (``owned`` in ``reconcile``); a fixture lot never opened is
+    # left alone. Keyed by ``strategy_id`` to mirror the pre-4.1 sim behaviour.
+
+    def record_sim_open(self, strategy_id: str, position_id: str) -> None:
+        """Record a sim lot the strategy just opened (resurrects a closed one)."""
+        with self._write() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO live_sim_lot "
+                "(strategy_id, position_id, closed_at) VALUES (?,?,NULL)",
+                (strategy_id, position_id),
+            )
+
+    def mark_sim_closed(
+        self, strategy_id: str, position_id: str, closed_at: pd.Timestamp
+    ) -> None:
+        """Stamp a sim lot closed; an unknown id is a no-op."""
+        with self._write() as con:
+            con.execute(
+                "UPDATE live_sim_lot SET closed_at=? "
+                "WHERE strategy_id=? AND position_id=?",
+                (_ms(closed_at), strategy_id, position_id),
+            )
+
+    def sim_open_ids(self, strategy_id: str) -> frozenset[str]:
+        """The sim lot ids this strategy currently owns (empty if unwritten)."""
+        try:
+            with self._connect() as con:
+                rows = con.execute(
+                    "SELECT position_id FROM live_sim_lot "
+                    "WHERE strategy_id=? AND closed_at IS NULL",
+                    (strategy_id,),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return frozenset()
+        return frozenset(cast("str", r[0]) for r in rows)
 
     # -- book --------------------------------------------------------------
 

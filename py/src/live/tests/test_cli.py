@@ -308,6 +308,17 @@ class _RecordingLedger:
     def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None:
         self.touched += 1
 
+    def sim_open_ids(self, strategy_id: str) -> frozenset[str]:
+        return frozenset(cast("str", p) for p in self.opens)
+
+    def record_sim_open(self, strategy_id: str, position_id: str) -> None:
+        self.opens.append(position_id)
+
+    def mark_sim_closed(
+        self, strategy_id: str, position_id: str, closed_at: pd.Timestamp
+    ) -> None:
+        self.closed.append(position_id)
+
 
 class _FakeBroker:
     def __init__(self) -> None:

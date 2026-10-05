@@ -282,6 +282,151 @@ async def test_run_cycle_close_yields_a_close_intent(tmp_path: Path) -> None:
     assert report.intents[0].position_id == "L1"
 
 
+class SimSource(FakeSource):
+    """A mock-fixture source: its book may hold lots we never opened."""
+
+    owns_book = True
+
+
+@pytest.mark.asyncio
+async def test_sim_source_does_not_close_a_foreign_fixture_lot(tmp_path: Path) -> None:
+    # Ownership scoping (sim path): a lot the strategy never opened is not ours.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")  # no lots recorded
+
+    report = await run_cycle(
+        CFG,
+        source=SimSource(book(lot("L1"))),
+        broker=FakeBroker(),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert report.intents == ()
+
+
+@pytest.mark.asyncio
+async def test_sim_source_closes_only_its_ledger_owned_lot(tmp_path: Path) -> None:
+    # The strategy opened L1 (recorded); OTHER is a foreign fixture lot. A bare
+    # close targets only the lot we own.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.record_sim_open("S1", "L1")
+
+    report = await run_cycle(
+        CFG,
+        source=SimSource(book(lot("L1"), lot("OTHER"))),
+        broker=FakeBroker(),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert [i.position_id for i in report.intents] == ["L1"]
+
+
+@pytest.mark.asyncio
+async def test_sim_cycle_records_an_opened_lot_as_owned(tmp_path: Path) -> None:
+    # A confirmed sim open is recorded as owned so a later cycle may close it.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    await run_cycle(
+        CFG,
+        source=SimSource(book()),
+        broker=FakeBroker(open_pid="AAPL_1"),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert ledger.sim_open_ids("S1") == frozenset({"AAPL_1"})
+
+
+@pytest.mark.asyncio
+async def test_sim_unnamed_open_records_nothing(tmp_path: Path) -> None:
+    # A lot the broker did not name can never be targeted by a close: not owned.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    report = await run_cycle(
+        CFG,
+        source=SimSource(book()),
+        broker=FakeBroker(open_pid=None),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert report.results[0].ok
+    assert ledger.sim_open_ids("S1") == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
+    # A rejected close records NOTHING: the lot stays owned for a later cycle.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.record_sim_open("S1", "L1")
+
+    await run_cycle(
+        CFG,
+        source=SimSource(book(lot("L1"))),
+        broker=FakeBroker(reject=True),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert ledger.sim_open_ids("S1") == frozenset({"L1"})
+
+
+@pytest.mark.asyncio
+async def test_self_owned_source_closes_replayed_lot_with_empty_ledger(
+    tmp_path: Path,
+) -> None:
+    """An ibkr-style book is already ours: closes need no ledger (plan rev 4.1 §3)."""
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")  # a dry run writes nothing
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book(lot("97932"))),  # owns_book = False
+        broker=FakeBroker(),
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert [i.action for i in report.intents] == [ActionType.close]
+    assert report.intents[0].position_id == "97932"
+
+
 @pytest.mark.asyncio
 async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     db = tmp_path / "c.sqlite"
