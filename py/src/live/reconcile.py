@@ -15,6 +15,11 @@ close intents are priced with the SAME ``execute_signal`` the broker fills with
 and folded through the shared ``apply_fills`` (non-opens-first), so the freed
 cash and dropped lots are the broker's actual accounting — not a
 ``Σ qty*ref_price`` approximation of it.
+
+NOTE: this module prices through the module-level ``execute_signal``
+(``src.bt.exchange``), NOT through an injected exchange. Swapping the live
+broker's exchange adapter therefore does NOT reroute reconcile's sizing book —
+the two must be kept in step deliberately.
 """
 
 from __future__ import annotations

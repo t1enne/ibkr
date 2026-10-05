@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
@@ -50,5 +51,8 @@ def test_load_strategy_parses_a_named_broker(tmp_path) -> None:
 
 
 def test_unknown_broker_fails_loudly() -> None:
+    # Simulate untyped JSON input: the cast bypasses the Literal at the type
+    # level, so the runtime check is what must reject it.
+    unknown = cast("Any", "robinhood")
     with pytest.raises(ValueError):
-        replace(_base(), broker="robinhood")
+        replace(_base(), broker=unknown)

@@ -53,9 +53,13 @@ def match_price(
 def match_bar(order: OrderRequest, bars: pd.DataFrame) -> Optional[Fill]:
     """Fill ``order`` against the first bar of ``bars``, or ``None`` if unfilled.
 
-    ``bars`` is a one-row OHLC frame (extra rows are ignored: a single bar is
-    the matching window in this model). The ``Fill`` carries the order's own
-    ref/symbol/side/qty and the matched price; friction is applied downstream.
+    Caller contract: ``bars`` is the FILL bar — the bar the order trades against
+    (a one-row OHLC frame; extra rows are ignored). For a MKT order that means
+    this bar's open, i.e. the same bar a next-open fill uses
+    (``fill_at_next_open``). The returned ``Fill.price`` is the FRICTIONLESS
+    base price; applying spread/slippage/commission is the adapter's job (see
+    ``SimExchange.match_bar``). The ``Fill`` carries the order's own
+    ref/symbol/side/qty and the matched price; costs are left zero here.
     """
     if bars is None or bars.empty:
         return None

@@ -18,10 +18,6 @@ from src.bt.exchange.sim import (
     calculate_adverse_selection,
 )
 
-# Deprecated no-op: ``ExecutionHandler`` was replaced by ``SimExchange``
-# (``src/bt/exchange``). Kept as a name for import compatibility only.
-ExecutionHandler = None  # Removed - compose SimExchange instead
-
 __all__ = [
     # State types
     "ExecutionParams",
@@ -31,6 +27,4 @@ __all__ = [
     "execute_signal",
     "execute_risk_event",
     "calculate_adverse_selection",
-    # Deprecated (for migration only)
-    "ExecutionHandler",
 ]

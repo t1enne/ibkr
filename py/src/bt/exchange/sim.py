@@ -1,7 +1,7 @@
 """The backtest broker adapter: matcher + friction + cohort cash scaling.
 
-``SimExchange`` is the backtest's implementation of the shared ``Broker`` port.
-It owns three things:
+``SimExchange`` is the backtest's implementation of the shared ``Broker`` port
+(and of the bt-local ``FillSurface``). It owns three things:
 
 - the legacy fill surface the engine drives (``execute_signal`` /
   ``execute_risk_event`` / ``apply_fill``), preserved byte-for-byte from the
@@ -15,10 +15,16 @@ It owns three things:
 Only the plain MKT "next bar open" fill is shared with the matcher; the
 same-bar and guard-price base-price paths stay here because they are
 backtest-only behaviours with no broker analogue.
+
+``Fill.price`` has ONE meaning across both surfaces: an EXECUTED price (base
+plus friction), with ``commission``/``spread``/``slippage`` costs populated. The
+pure matcher returns the frictionless base; ``match_bar`` is what applies the
+adapter's friction, reusing the same adverse rule as the signal path.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 import pandas as pd
@@ -35,19 +41,24 @@ from src.bt.state.types import (
     CommissionModel,
     ExecutionParams,
     FillEvent,
-    FixedCommission,
     PortfolioState,
     TradeSignal,
 )
+from src.bt.types import RiskEvent
 from src.exec.friction import apply_friction, commission_for_fill
 from src.exec.matching import match_bar as _match_bar
 from src.exec.types import (
     Fill,
     OrderAck,
     OrderRequest,
+    OrderSide,
     OrderState,
+    OrderType,
     RejectReason,
 )
+
+#: Adverse slippage multiplier shared by the signal and risk paths.
+_ADVERSE_MULTIPLIER = 1.5
 
 
 def is_buy_fill(action: ActionType, position_side: ActionType | None) -> bool:
@@ -63,66 +74,60 @@ def is_buy_fill(action: ActionType, position_side: ActionType | None) -> bool:
     return position_side == ActionType.short
 
 
-def calculate_adverse_selection(signal: TradeSignal, tick: Candle) -> bool:
-    """Determine if slippage should be adverse."""
-    price_move = tick.close - tick.open
-    percent_move = price_move / tick.open if tick.open != 0 else 0
-
-    if signal.action == ActionType.long:
+def _adverse_move(action: ActionType, open_: float, close: float) -> bool:
+    """Whether a bar moved adversely for ``action`` by more than 0.1%."""
+    price_move = close - open_
+    percent_move = price_move / open_ if open_ != 0 else 0
+    if action == ActionType.long:
         return percent_move < -0.001
-    elif signal.action == ActionType.short:
+    if action == ActionType.short:
         return percent_move > 0.001
     return False
 
 
-def execute_signal(
-    signal: TradeSignal, tick: Candle, params: ExecutionParams
-) -> FillEvent:
-    """Convert signal to fill with slippage/spread.
+def calculate_adverse_selection(signal: TradeSignal, tick: Candle) -> bool:
+    """Determine if slippage should be adverse."""
+    return _adverse_move(signal.action, tick.open, tick.close)
 
-    Pure function - no side effects.
 
-    When signal.fill_at_next_open is True, uses tick.open as the base price
-    (realistic: signals generated at close fill at next bar's open).
-    Otherwise uses signal.price (same-bar fill at signal generation price).
+def _side_action(side: OrderSide) -> ActionType:
+    """Map a shared order side onto the signal action that shares its friction."""
+    return ActionType.long if side is OrderSide.BUY else ActionType.short
 
-    A next-open **close** that models an intra-bar stop trigger
-    (``fill_guard_price`` set) fills at the adverse worse-of the guard and the
-    next open, mirroring :func:`execute_risk_event` gap-through math: a long
-    close (sell) fills at ``min(guard, open)`` (the stop level, or lower if the
-    bar gapped down through it), a short close (buy) at ``max(guard, open)``.
-    """
-    base_price = tick.open if signal.fill_at_next_open else signal.price
-    if (
-        signal.action == ActionType.close
-        and signal.fill_at_next_open
-        and signal.fill_guard_price is not None
-        and signal.fill_guard_is_long is not None
-    ):
-        if signal.fill_guard_is_long:
-            base_price = min(signal.fill_guard_price, tick.open)
-        else:
-            base_price = max(signal.fill_guard_price, tick.open)
 
-    qty = signal.qty
+def _signal_is_buy(signal: TradeSignal) -> bool:
+    """The buy/sell direction the signal's friction leans on."""
     side = signal.position_side
     if side is None and signal.fill_guard_is_long is not None:
         side = ActionType.long if signal.fill_guard_is_long else ActionType.short
     if signal.action == ActionType.rebalance:
-        is_buy = signal.qty > 0  # a rebalance adds when its delta is positive
-    else:
-        is_buy = is_buy_fill(signal.action, side)
+        return signal.qty > 0  # a rebalance adds when its delta is positive
+    return is_buy_fill(signal.action, side)
 
-    adverse = calculate_adverse_selection(signal, tick)
+
+def _fill_event(
+    signal: TradeSignal,
+    *,
+    tick: Candle,
+    base_price: float,
+    qty: float,
+    is_buy: bool,
+    params: ExecutionParams,
+    adverse_multiplier: float,
+) -> FillEvent:
+    """Apply friction + commission to a base price and build the ``FillEvent``.
+
+    The ONE place a bt fill is priced, so the signal, risk and matcher paths
+    cannot charge costs differently.
+    """
     friction = apply_friction(
         base_price,
         is_buy=is_buy,
         spread_bps=params.spread_bps,
         slippage_bps=params.slippage_bps,
         qty=qty,
-        adverse_multiplier=1.5 if adverse else 1.0,
+        adverse_multiplier=adverse_multiplier,
     )
-
     return FillEvent(
         signal=signal,
         filled_qty=qty,
@@ -136,14 +141,69 @@ def execute_signal(
     )
 
 
+def _signal_base_price(signal: TradeSignal, tick: Candle) -> float:
+    """The pre-friction base price for a signal fill.
+
+    Next-open fills use ``tick.open``; same-bar fills use ``signal.price``. A
+    next-open **close** that models an intra-bar stop trigger
+    (``fill_guard_price`` set) fills at the adverse worse-of the guard and the
+    next open, mirroring :func:`execute_risk_event` gap-through math: a long
+    close (sell) fills at ``min(guard, open)`` (the stop level, or lower if the
+    bar gapped down through it), a short close (buy) at ``max(guard, open)``.
+    """
+    if (
+        signal.action == ActionType.close
+        and signal.fill_at_next_open
+        and signal.fill_guard_price is not None
+        and signal.fill_guard_is_long is not None
+    ):
+        if signal.fill_guard_is_long:
+            return min(signal.fill_guard_price, tick.open)
+        return max(signal.fill_guard_price, tick.open)
+    return tick.open if signal.fill_at_next_open else signal.price
+
+
+def execute_signal(
+    signal: TradeSignal, tick: Candle, params: ExecutionParams
+) -> FillEvent:
+    """Convert signal to fill with slippage/spread.
+
+    Pure function - no side effects. When ``signal.fill_at_next_open`` is True,
+    the base price is this (fill) bar's open; otherwise ``signal.price``.
+    """
+    adverse = calculate_adverse_selection(signal, tick)
+    return _fill_event(
+        signal,
+        tick=tick,
+        base_price=_signal_base_price(signal, tick),
+        qty=signal.qty,
+        is_buy=_signal_is_buy(signal),
+        params=params,
+        adverse_multiplier=_ADVERSE_MULTIPLIER if adverse else 1.0,
+    )
+
+
+def _risk_base_price(event: RiskEvent, tick: Candle) -> float:
+    """Trigger price adjusted for a gap through the level (worse-of open).
+
+    A stop that is gapped through is filled at the open, not the trigger;
+    a take-profit gap fills favorably through the level.
+    """
+    trigger = event.trigger_price
+    is_long = event.position_type == ActionType.long
+    if event.reason == "sl":
+        return min(trigger, tick.open) if is_long else max(trigger, tick.open)
+    return max(trigger, tick.open) if is_long else min(trigger, tick.open)
+
+
 def execute_risk_event(
-    event: object, tick: Candle, params: ExecutionParams
+    event: RiskEvent, tick: Candle, params: ExecutionParams
 ) -> FillEvent:
     """Convert risk event (SL/TP) into fill event, modeling intra-bar gaps.
 
-    A stop-loss/take-profit event fires because the bar's high/low crossed
-    the trigger level. When the bar *gaps through* the level, the real fill
-    is not the trigger price but the worse-of-trigger-and-open price:
+    A stop-loss/take-profit event fires because the bar's high/low crossed the
+    trigger level. When the bar *gaps through* the level, the real fill is not
+    the trigger price but the worse-of-trigger-and-open price:
 
     - Long stop  (trigger when price falls to ``trigger``): a bar that opens
       below the stop has already gapped past it downward — fill at the open.
@@ -157,78 +217,39 @@ def execute_risk_event(
     Without this, a stop that is gapped through is happily filled at the
     trigger every time, which systematically overstates P&L on gap days.
     """
-    pid = getattr(event, "position_id", "")
-    qty = getattr(event, "position_qty", 0.0)
-    position_type = getattr(event, "position_type", None)
-
-    trigger = getattr(event, "trigger_price")
-    is_stop = getattr(event, "reason", "") == "sl"
-    is_long = position_type == ActionType.long
-
-    # Determine the fill base price, accounting for a gap through the level.
-    if is_stop:
-        # Adverse direction: the loss-worse side of the trigger.
-        if is_long:
-            # Long stop: an open below the stop means we filled at the gap-open
-            # (worse than trigger). Guard against tick.open falling below trigger.
-            fill_base = min(trigger, tick.open)
-        else:
-            # Short stop: an open above the stop means we filled at the gap-open
-            # (worse than trigger, i.e. higher buy-back price = bigger loss).
-            fill_base = max(trigger, tick.open)
-    else:
-        # Take-profit: favorable direction. Take at least the trigger; if the
-        # open already gapped past it favorably, capture the better open.
-        if is_long:
-            # Long TP: open above target is a favorable gap.
-            fill_base = max(trigger, tick.open)
-        else:
-            # Short TP: open below target is a favorable gap.
-            fill_base = min(trigger, tick.open)
-
-    # A stop/take-profit always closes against the position, so the fill is a
-    # sell for a long and a buy-to-cover for a short; slippage is always adverse.
-    friction = apply_friction(
-        fill_base,
-        is_buy=not is_long,
-        spread_bps=params.spread_bps,
-        slippage_bps=params.slippage_bps,
-        qty=qty,
-        adverse_multiplier=1.5,
-    )
-
+    is_long = event.position_type == ActionType.long
+    # A stop/take-profit always closes against the position: a sell for a long,
+    # a buy-to-cover for a short; slippage is always adverse.
     signal = TradeSignal(
         action=ActionType.close,
-        symbol=getattr(event, "symbol"),
-        timestamp=getattr(event, "timestamp"),
-        price=trigger,
-        reason=getattr(event, "reason", None),
-        position_id=pid,
-        position_side=position_type,
-        qty=qty,
+        symbol=event.symbol,
+        timestamp=event.timestamp,
+        price=event.trigger_price,
+        reason=event.reason,
+        position_id=event.position_id,
+        position_side=event.position_type,
+        qty=event.position_qty,
     )
-
-    return FillEvent(
-        signal=signal,
-        filled_qty=qty,
-        executed_price=friction.executed_price,
-        commission=commission_for_fill(
-            params.commission_model, qty, friction.executed_price
-        ),
-        slippage=friction.slippage_cost,
-        spread=friction.spread_cost,
-        timestamp=tick.timestamp,
+    return _fill_event(
+        signal,
+        tick=tick,
+        base_price=_risk_base_price(event, tick),
+        qty=event.position_qty,
+        is_buy=not is_long,
+        params=params,
+        adverse_multiplier=_ADVERSE_MULTIPLIER,
     )
 
 
 class SimExchange:
     """Backtest ``Broker``: prices fills, settles cohorts, matches new orders.
 
-    The engine drives it through ``execute_signal``/``execute_risk_event``
-    (parity path) and ``settle_cohort`` (cash scaling). The order-port methods
-    (``submit``/``cancel``/``fills``) and ``match_bar`` are the new MKT/LMT
-    surface: ``submit`` stages an order, ``match_bar`` resolves it against a bar
-    through the shared matcher and records the fill.
+    The engine drives it through ``execute_signal``/``execute_risk_event``/
+    ``apply_fill``/``settle_cohort`` (the ``FillSurface`` port). The order-port
+    methods (``submit``/``cancel``/``fills``) and ``match_bar`` are the new
+    MKT/LMT surface: ``submit`` stages a validated order, ``match_bar`` resolves
+    a *pending* order against a bar through the shared matcher, applies friction,
+    and records the fill.
     """
 
     def __init__(self) -> None:
@@ -237,7 +258,16 @@ class SimExchange:
 
     # ── Broker port ──────────────────────────────────────────────────────
     def submit(self, order: OrderRequest) -> OrderAck:
-        """Stage an order for matching; ack it as pending."""
+        """Stage an order for matching; reject invalid or duplicate refs.
+
+        An ``LMT`` with no ``limit_price`` can never fill, and a duplicate
+        ``order_ref`` would silently replace a live order — both are rejected as
+        a value (``INVALID``), never by raising.
+        """
+        if order.order_type is OrderType.LMT and order.limit_price is None:
+            return self._reject(order.order_ref)
+        if order.order_ref in self._pending:
+            return self._reject(order.order_ref)
         self._pending[order.order_ref] = order
         return OrderAck(
             order_ref=order.order_ref, accepted=True, state=OrderState.PENDING
@@ -262,16 +292,63 @@ class SimExchange:
         """End the session: drop pending orders (positions are not flattened)."""
         self._pending.clear()
 
-    # ── Exchange port ────────────────────────────────────────────────────
-    def match_bar(self, order: OrderRequest, bars: pd.DataFrame) -> Optional[Fill]:
-        """Resolve one order against a bar via the shared matcher; record fills."""
-        fill = _match_bar(order, bars)
-        if fill is not None:
-            self._pending.pop(order.order_ref, None)
-            self._fills.append(fill)
+    @staticmethod
+    def _reject(order_ref: str) -> OrderAck:
+        return OrderAck(
+            order_ref=order_ref,
+            accepted=False,
+            state=OrderState.REJECTED,
+            reason=RejectReason.INVALID,
+        )
+
+    # ── Exchange-shaped surface (friction-bearing, so not the pure Exchange) ──
+    def match_bar(
+        self,
+        order: OrderRequest,
+        bars: pd.DataFrame,
+        *,
+        spread_bps: float,
+        slippage_bps: float,
+        commission_model: CommissionModel,
+    ) -> Optional[Fill]:
+        """Resolve a *pending* order against a bar; record the executed fill.
+
+        Only orders that were submitted and are still pending resolve — a
+        cancelled or unknown ``order_ref`` returns ``None``. The returned
+        ``Fill.price`` is ALWAYS an executed price (base plus half-spread and
+        slippage, adverse-selected with the SAME rule as the signal path) with
+        ``commission``/``spread``/``slippage`` costs populated, so ``Fill.price``
+        means one thing wherever it appears.
+        """
+        if order.order_ref not in self._pending:
+            return None
+        matched = _match_bar(order, bars)
+        if matched is None:
+            return None
+        row = bars.iloc[0]
+        adverse = _adverse_move(_side_action(order.side), row["open"], row["close"])
+        friction = apply_friction(
+            matched.price,
+            is_buy=order.side is OrderSide.BUY,
+            spread_bps=spread_bps,
+            slippage_bps=slippage_bps,
+            qty=order.qty,
+            adverse_multiplier=_ADVERSE_MULTIPLIER if adverse else 1.0,
+        )
+        fill = replace(
+            matched,
+            price=friction.executed_price,
+            commission=commission_for_fill(
+                commission_model, order.qty, friction.executed_price
+            ),
+            spread=friction.spread_cost,
+            slippage=friction.slippage_cost,
+        )
+        self._pending.pop(order.order_ref, None)
+        self._fills.append(fill)
         return fill
 
-    # ── Legacy fill surface (parity path) ────────────────────────────────
+    # ── Fill surface (parity path) ───────────────────────────────────────
     def execute_signal(
         self, signal: TradeSignal, tick: Candle, params: ExecutionParams
     ) -> FillEvent:
@@ -279,7 +356,7 @@ class SimExchange:
         return execute_signal(signal, tick, params)
 
     def execute_risk_event(
-        self, event: object, tick: Candle, params: ExecutionParams
+        self, event: RiskEvent, tick: Candle, params: ExecutionParams
     ) -> FillEvent:
         """Price one SL/TP event; delegates to the shared gap-through function."""
         return execute_risk_event(event, tick, params)
@@ -294,9 +371,13 @@ class SimExchange:
         fills: tuple[FillEvent, ...],
         *,
         scale_cohorts: bool = True,
-        commission_model: CommissionModel = FixedCommission(0.5),
+        commission_model: CommissionModel,
     ) -> tuple[PortfolioState, tuple[FillRejection, ...], tuple[ScaleRecord, ...]]:
-        """Settle a whole bar's fills atomically via the shared cohort scaler."""
+        """Settle a whole bar's fills atomically via the shared cohort scaler.
+
+        ``commission_model`` is required: the cohort scaler commissions each fill
+        and a silent default would quietly charge the wrong costs.
+        """
         return apply_fills(
             portfolio,
             fills,

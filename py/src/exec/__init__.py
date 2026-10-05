@@ -12,6 +12,7 @@ from src.exec.friction import (
     commission_for_fill,
 )
 from src.exec.matching import match_bar, match_price
+from src.exec.ports import Broker, Exchange
 from src.exec.refs import order_ref
 from src.exec.types import (
     CommissionModel,
@@ -29,7 +30,9 @@ from src.exec.types import (
 )
 
 __all__ = [
+    "Broker",
     "CommissionModel",
+    "Exchange",
     "Fill",
     "FixedCommission",
     "FrictionResult",

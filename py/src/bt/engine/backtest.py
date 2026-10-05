@@ -79,7 +79,7 @@ from src.bt.portfolio.pure import (
     FillRejection,
     ScaleRecord,
 )
-from src.bt.exchange.sim import SimExchange
+from src.bt.exchange.ports import FillSurface
 from src.bt.types import (
     StrategyConfig,
     EngineWindow,
@@ -130,7 +130,7 @@ class Backtest:
 def run_backtest(
     bt: Backtest,
     candle_gen: Generator[Candle, None, None],
-    exchange: SimExchange,
+    exchange: FillSurface,
     risk_handler: RiskHandler,
     initial_state: Optional[BacktestState] = None,
     strategy_mod: Any = None,
@@ -148,7 +148,7 @@ def run_backtest(
     Args:
         bt: Backtest config
         candle_gen: Generator yielding Candles (OHLCV bars)
-        exchange: Simulated broker (SimExchange) — prices fills via
+        exchange: Fill surface (FillSurface/SimExchange) — prices fills via
             execute_signal/execute_risk_event, applies single fills, and
             settles cohorts
         risk_handler: Risk handler with check_risk
@@ -428,7 +428,7 @@ def _close_fill_qty(signal: TradeSignal, portfolio: PortfolioState) -> float:
 def _execute_cohort(
     state: BacktestState,
     cohort: list[tuple[TradeSignal, Candle]],
-    exchange: SimExchange,
+    exchange: FillSurface,
     exec_params: ExecutionParams,
     sizing: SizingParams,
     skip_next_open: bool,
@@ -503,7 +503,7 @@ def _mark_bar(state: BacktestState, bar: list[Candle]) -> BacktestState:
 def _flush_bar(
     bar: list[Candle],
     state: BacktestState,
-    exchange: SimExchange,
+    exchange: FillSurface,
     risk_handler: RiskHandler,
     config: StrategyConfig,
     bt: Backtest,
@@ -676,7 +676,7 @@ def _generate_signals(
 def _check_risk(
     state: BacktestState,
     candle: Candle,
-    exchange: SimExchange,
+    exchange: FillSurface,
     risk_handler: RiskHandler,
     exec_params: ExecutionParams,
     risk_config: RiskConfig,
@@ -759,7 +759,7 @@ def _append_candle(
 
 def _finalize(
     state: BacktestState,
-    exchange: SimExchange,
+    exchange: FillSurface,
     exec_params: ExecutionParams,
     equity_points: list | tuple | None = None,
 ) -> BacktestState:

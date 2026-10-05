@@ -17,7 +17,7 @@ TS = ts("2025-03-04 09:30")
 
 
 def test_order_ref_format() -> None:
-    assert order_ref("momentum_x", TS, 7) == "momentum-20250304T0930-007"
+    assert order_ref("momentum_x", TS, 7) == "momentum-3079e5cd-20250304T0930-007"
 
 
 def test_order_ref_is_deterministic() -> None:
@@ -36,3 +36,12 @@ def test_order_ref_sequence_is_disjoint() -> None:
 
 def test_order_ref_ignores_seconds_and_below() -> None:
     assert order_ref("strat", TS, 1) == order_ref("strat", ts("2025-03-04 09:30:59"), 1)
+
+
+def test_shared_prefix_strategies_get_distinct_refs() -> None:
+    # Two ids sharing the first 8 chars must not collide: a real broker would
+    # silently dedupe one strategy's legitimate order as a re-send of the other's.
+    a = order_ref("momentum_alpha", TS, 0)
+    b = order_ref("momentum_beta", TS, 0)
+    assert a.split("-")[0] == b.split("-")[0] == "momentum"
+    assert a != b

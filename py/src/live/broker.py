@@ -5,7 +5,7 @@ whole cycle's fills through the SAME atomic ``apply_fills`` primitive the
 backtest uses, so paper and backtest book accounting are identical by
 construction — an over-subscribed multi-open cycle SCALES by one shared cash
 factor, exactly as a backtest cohort does. Real IBKR routing is a later
-``IBKRBroker`` implementing the same ``Broker`` Protocol. Failure is a value
+``IBKRBroker`` implementing the same ``LiveBroker`` Protocol. Failure is a value
 (``Result``/``OrderResult.ok``), never an exception that kills the cycle.
 """
 
@@ -43,12 +43,15 @@ class OrderResult:
     position_id: str | None = None  # broker lot id on an OPEN; None on a close
 
 
-class Broker(Protocol):
-    """Async order edge. Fails as a value; seed aligns a simulated book.
+class LiveBroker(Protocol):
+    """Async order edge for the live cycle. Fails as a value; seed aligns a book.
 
-    ``place`` routes ONE order (real IBKR routing is per-order); ``place_cohort``
-    routes a whole cycle and lets a simulated book settle it atomically. A real
-    broker may implement ``place_cohort`` as a loop of ``place``.
+    Distinct from the shared ``src.exec.ports.Broker`` (the synchronous
+    submit/cancel/fills order edge): this is the live cycle's async routing seam
+    (``seed``/``place``/``place_cohort``/``close``). ``place`` routes ONE order
+    (real IBKR routing is per-order); ``place_cohort`` routes a whole cycle and
+    lets a simulated book settle it atomically. A real broker may implement
+    ``place_cohort`` as a loop of ``place``.
     """
 
     def seed(self, portfolio: PortfolioState) -> None: ...

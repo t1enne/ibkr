@@ -398,7 +398,7 @@ src/bt/
 ├── strategies/              # Strategy implementations
 ├── models/             # Z-score, regime, market data models
 ├── portfolio/pure.py   # Pure functions for position/PnL
-├── execution/pure.py   # Signal → fill execution
+├── exchange/sim.py     # SimExchange — signal → fill execution (Broker adapter)
 ├── risk/pure.py        # Stop-loss / take-profit checks
 ├── indicators.py       # Technical indicators (pure functions)
 └── metrics.py          # Performance metrics (pure functions)

@@ -1,5 +1,6 @@
 """Backtest broker adapter — the sim exchange over the shared exec core."""
 
+from src.bt.exchange.ports import FillSurface
 from src.bt.exchange.sim import (
     SimExchange,
     calculate_adverse_selection,
@@ -10,6 +11,7 @@ from src.bt.exchange.sim import (
 )
 
 __all__ = [
+    "FillSurface",
     "SimExchange",
     "calculate_adverse_selection",
     "default_exchange",

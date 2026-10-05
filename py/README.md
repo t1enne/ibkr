@@ -77,8 +77,9 @@ is registered. The DSL owns cursor-safe indicator prefetch, per-symbol signal
 bucketing, and (for `stateful` strategies) a per-run `ctx.shared` holder. The
 engine core still takes a callable `on_candle(state, candle, params)` — the DSL
 adapter satisfies that shape, and test doubles / programmatic `run()` callers
-may too — but authoring surface is DSL-only. Handlers (`ExecutionHandler`,
-`RiskHandler`) are dataclasses wrapping injectable functions.
+may too — but authoring surface is DSL-only. The engine composes a `SimExchange`
+broker adapter (`src/bt/exchange/sim.py`) for execution; `RiskHandler` is a
+dataclass wrapping the injectable `check_risk` function.
 
 ### Multi-Symbol & Multi-Interval Data Flow
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Protocol, Tuple, Union
+from typing import Dict, List, Literal, Optional, Protocol, Tuple, Union
 import pandas as pd
 
 from src.bt.state import (  # noqa: F401
@@ -20,7 +20,6 @@ from src.bt.state import (  # noqa: F401
     CommissionModel,
     build_commission_model,
 )
-from src.bt.state import RiskEvent as StateRiskEvent
 
 
 class ZScoreState:
@@ -49,8 +48,9 @@ class EngineWindow:
     test_end: pd.Timestamp
 
 
-#: Broker names ``StrategyConfig.broker`` accepts (see the field's docstring).
-_KNOWN_BROKERS = frozenset({"sim", "ibkr"})
+#: Broker names ``StrategyConfig.broker`` accepts; a ``Literal`` so a typo is a
+#: type error, with a runtime re-check for untyped JSON input.
+BrokerName = Literal["sim", "ibkr"]
 
 
 @dataclass
@@ -94,13 +94,14 @@ class StrategyConfig:
     # ``SimExchange`` backtest adapter) or ``"ibkr"`` (the live edge). Default
     # preserves every existing JSON's behaviour. An unrecognised value fails
     # loudly at construction rather than silently falling back to the sim.
-    broker: str = "sim"
+    # NOTE: no consumer reads this yet — it is reserved for the phase-2 adapter
+    # selection; deleting it would drop a field already present in the schema.
+    broker: BrokerName = "sim"
 
     def __post_init__(self) -> None:
-        if self.broker not in _KNOWN_BROKERS:
+        if self.broker not in ("sim", "ibkr"):
             raise ValueError(
-                f"Unknown broker {self.broker!r}; expected one of "
-                f"{sorted(_KNOWN_BROKERS)}"
+                f"Unknown broker {self.broker!r}; expected one of ['ibkr', 'sim']"
             )
 
 
@@ -151,7 +152,7 @@ class RiskCheckFn(Protocol):
         portfolio: PortfolioState,
         tick: Candle,
         config: RiskConfig,
-    ) -> Tuple[Tuple[StateRiskEvent, ...], PortfolioState]: ...
+    ) -> Tuple[Tuple[RiskEvent, ...], PortfolioState]: ...
 
 
 class DataLoaderFn(Protocol):

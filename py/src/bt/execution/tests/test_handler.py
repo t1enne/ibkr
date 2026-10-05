@@ -119,3 +119,14 @@ def test_guarded_same_bar_close_ignores_guard():
     )
     fill = execute_signal(sig, _candle(999.0), params)
     assert fill.executed_price == 187.0
+
+
+def test_commission_models_re_exported_from_state_are_the_shared_ones():
+    # ``src.bt.state`` re-exports the commission models defined in ``src.exec``
+    # (identity preserved) so the bt state layer can speak the shared shapes
+    # without ``src.exec`` importing the bt package.
+    from src.bt.state.types import FixedCommission, PerShareCommission
+    from src.exec import types as exec_types
+
+    assert FixedCommission is exec_types.FixedCommission
+    assert PerShareCommission is exec_types.PerShareCommission

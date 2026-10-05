@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.bt.risk.pure import check_risk
 from src.bt.types import RiskCheckFn
 
 
@@ -25,6 +26,4 @@ class RiskHandler:
 
 def default_risk_handler() -> RiskHandler:
     """Create default risk handler with production functions."""
-    from src.bt.risk.pure import check_risk
-
     return RiskHandler(check_risk=check_risk)

@@ -1,7 +1,7 @@
 """Live cycle orchestration — one batch pass: fetch pf → screen → reconcile → place → record.
 
 Not a loop. The caller (CLI / cron) drives cadence. All I/O sits at the edges
-(``PortfolioSource``, ``Broker``, the screen bridge); ``reconcile`` and
+(``PortfolioSource``, ``LiveBroker``, the screen bridge); ``reconcile`` and
 ``build_report`` are pure. A cycle fails loudly on a stale feed or an
 unfetchable portfolio rather than trading yesterday's intent.
 """
@@ -16,7 +16,7 @@ import pandas as pd
 
 from src.bt.state import ActionType, PortfolioState
 from src.data.db import get_connection
-from src.live.broker import Broker, OrderResult
+from src.live.broker import LiveBroker, OrderResult
 from src.live.ledger import Ledger, PositionRecord
 from src.live.portfolio_source import PortfolioSource
 from src.live.reconcile import reconcile
@@ -138,7 +138,7 @@ async def run_cycle(
     config: LiveConfig,
     *,
     source: PortfolioSource,
-    broker: Broker,
+    broker: LiveBroker,
     ledger: Ledger,
     strategy_id: str,
     config_path: str | None = None,
@@ -166,7 +166,7 @@ async def run_cycle(
     )
     signals = signal_source(config_path, max_age_days)
     # Align the simulated book with the fetched read so the SAME book is both
-    # reconciled and settled (doc's Broker Protocol has no seed — adaptation).
+    # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
     broker.seed(snapshot.portfolio)
     owned = _owned_ids(ledger, strategy_id)
     intents = reconcile(signals, snapshot.portfolio, config, owned)
@@ -184,7 +184,7 @@ def _owned_ids(ledger: Ledger, strategy_id: str) -> frozenset[str]:
 
 
 async def _place_all(
-    broker: Broker,
+    broker: LiveBroker,
     ledger: Ledger,
     intents: tuple[OrderIntent, ...],
     strategy_id: str,

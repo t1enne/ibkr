@@ -93,7 +93,16 @@ def match_bar(order: OrderRequest, bars: pd.DataFrame) -> Fill | None
   open is not improved on). LMT sell: `high >= limit`; price = `max(limit, open)`.
 - No fill: `None`, and the backtest reports it as an unfilled order rather than
   pretending an instant fill. `tif=DAY` drops it at that bar; carry-over is phase 4.
-- Friction (`spread_bps`, `slippage_bps`, adverse multiplier) applies on top, unchanged.
+- Friction (`spread_bps`, `slippage_bps`, adverse multiplier) is NOT the matcher's
+  job: `match_bar` returns the frictionless base price, and the ADAPTER applies
+  friction + commission. `SimExchange.match_bar(order, bars, *, spread_bps,
+  slippage_bps, commission_model)` therefore requires those args (no silent
+  default) and returns a `Fill` whose `price` is ALWAYS the executed price with
+  `commission`/`spread`/`slippage` costs populated — one meaning for `Fill.price`
+  across the matcher and the `execute_signal` path. It reuses the same adverse
+  rule (`calculate_adverse_selection`, `adverse_multiplier=1.5`) so the two paths
+  cannot disagree. Because it adds required friction args, `SimExchange.match_bar`
+  is deliberately NOT structurally the pure `Exchange` port.
 
 This is the only place where a candle-based decision can honestly differ from a real
 matching engine, so it is pure, table-tested, and shared with the live dry-run path.
@@ -132,8 +141,14 @@ This deletes from rev 2: `join_book` and its six drift rules, close grouping,
 
 ```python
 def order_ref(strategy_id: str, cycle_ts: pd.Timestamp, seq: int) -> str
-# f"{strategy_id[:8]}-{cycle_ts:%Y%m%dT%H%M}-{seq:03d}"
+# f"{strategy_id[:8]}-{blake2b(strategy_id, 4).hex()}-{cycle_ts:%Y%m%dT%H%M}-{seq:03d}"
 ```
+
+The human-readable 8-char prefix stays first (so `startswith(strategy_id[:8])`
+ownership scoping in §3 still holds), but it is followed by a 4-byte digest of the
+FULL `strategy_id`: two strategies whose ids share the first 8 chars would
+therefore no longer mint identical refs (which a real broker would silently
+dedupe as a re-send).
 
 `seq` is the intent index within the cycle, and reconcile order is deterministic
 (config symbol order, closes first). Re-running the same cycle re-sends the same refs and
