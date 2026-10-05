@@ -107,3 +107,7 @@ class LiveConfig:
     max_symbol_allocation: float = 1.0
     portfolio_path: str = ""  # MockPortfolioSource fixture path
     mode: Literal["paper", "live"] = "paper"
+    # Which broker this config trades through. Mirrors ``StrategyConfig.broker``
+    # (phase 1.5) and is the field ``ibkr live run`` resolves its adapter from
+    # when no ``--adapter`` flag is given.
+    broker: Literal["sim", "ibkr"] = "sim"

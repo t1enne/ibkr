@@ -3,7 +3,7 @@ from ib_rest_api_client.models import (
     SecdefSearchResponseItem,
 )
 from ib_rest_api_client.api.trading_contracts import get_iserver_secdef_search
-from src.data.ibkr.shared import auth_client
+from src.data.ibkr.client import default_client
 
 
 US_EXCHANGES: frozenset[str] = frozenset(
@@ -39,7 +39,7 @@ async def lookup(ticker: str) -> SecdefSearchResponseItem:
     try:
         # r = await client.get("iserver/secdef/search", params={"symbol": ticker})
         r = await get_iserver_secdef_search.asyncio(
-            client=auth_client,
+            client=default_client().rest,
             symbol=ticker,
         )
         if isinstance(r, ErrorOnlyResponse):

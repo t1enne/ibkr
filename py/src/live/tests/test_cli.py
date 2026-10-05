@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pandas as pd
 import pytest
+import click
 from click.testing import CliRunner
 
 from src.bt import load_strategy
@@ -392,3 +393,124 @@ async def test_run_cycle_dry_run_places_nothing() -> None:
     assert broker.placed == []
     assert ledger.opens == [] and ledger.closed == []
     assert ledger.touched == 0  # write-free: not even the cycle stamp
+
+
+# --- adapter resolution (phase 2) -------------------------------------------
+
+
+def _cfg(
+    *, broker: str = "sim", mode: str = "paper", strategy_params: dict | None = None
+) -> LiveConfig:
+    return LiveConfig(
+        strategy_type="vwatr_div_dsl",
+        symbols=("AAPL",),
+        initial_capital=50000.0,
+        strategy_params=strategy_params or {},
+        bars=("1d",),
+        warmup="300d",
+        broker=cast("Any", broker),
+        mode=cast("Any", mode),
+    )
+
+
+def test_resolve_adapter_cli_flag_wins_over_config() -> None:
+    from src.live.cli import resolve_adapter
+
+    assert resolve_adapter("sim", {"broker": "ibkr"}, _cfg(broker="ibkr")) == "sim"
+    assert resolve_adapter("ibkr", {}, _cfg()) == "ibkr"
+
+
+def test_resolve_adapter_falls_back_to_config_broker() -> None:
+    from src.live.cli import resolve_adapter
+
+    assert resolve_adapter(None, {"broker": "ibkr"}, _cfg(broker="ibkr")) == "ibkr"
+    assert resolve_adapter(None, {}, _cfg()) == "sim"
+
+
+def test_resolve_adapter_reads_broker_from_strategy_params() -> None:
+    from src.live.cli import resolve_adapter
+
+    cfg = _cfg(broker="ibkr", strategy_params={"broker": "ibkr"})
+    assert resolve_adapter(None, {}, cfg) == "ibkr"
+
+
+def test_resolve_adapter_live_mode_must_name_its_adapter() -> None:
+    from src.live.cli import resolve_adapter
+
+    with pytest.raises(click.UsageError, match="must name its adapter"):
+        resolve_adapter(None, {}, _cfg(mode="live"))
+
+
+def test_ibkr_without_dry_run_is_refused(tmp_path: Path) -> None:
+    path = write_config(tmp_path, broker="ibkr", portfolio_path="pf.json")
+    out = CliRunner().invoke(live_group, ["run", path])
+    assert out.exit_code != 0
+    assert "phase 3" in out.output
+
+
+def test_sim_path_never_builds_a_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: object, **k: object) -> object:
+        raise AssertionError("IbkrGateway must not be built for the sim adapter")
+
+    monkeypatch.setattr("src.live.cli.IbkrGateway", boom)
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.cli.MockPortfolioSource", lambda p: object())
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, portfolio_path="pf.json")
+    out = CliRunner().invoke(live_group, ["run", path, "--dry-run"])
+    assert out.exit_code == 0, out.output
+
+
+class FakeLedger:
+    def ensure_strategy(self, *a: object, **k: object) -> None: ...
+    def prune_closed(self, *a: object, **k: object) -> int:
+        return 0
+
+
+class _FakeGateway:
+    def __init__(self, *a: object, **k: object) -> None:
+        self.ready_calls = 0
+
+        class _Client:
+            async def resolve_account(self) -> str:
+                return "DU1234567"
+
+        self.client = _Client()
+
+    async def ensure_ready(self, *a: object, **k: object) -> Result[None, FeedError]:
+        self.ready_calls += 1
+        return Ok(None)
+
+
+def test_ibkr_ensures_ready_before_the_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made: list[_FakeGateway] = []
+
+    def make_gateway(*a: object, **k: object) -> _FakeGateway:
+        gateway = _FakeGateway()
+        made.append(gateway)
+        return gateway
+
+    monkeypatch.setattr("src.live.cli.IbkrGateway", make_gateway)
+    monkeypatch.setattr("src.live.cli.IbkrClient", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.IbkrPortfolioSource", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        assert made and made[0].ready_calls == 1  # ready BEFORE the cycle ran
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, broker="ibkr", mode="paper")
+    out = CliRunner().invoke(
+        live_group, ["run", path, "--dry-run", "--adapter", "ibkr"]
+    )
+    assert out.exit_code == 0, out.output
+    assert made[0].ready_calls == 1

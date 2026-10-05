@@ -1,23 +1,26 @@
-from ib_rest_api_client import Client
-import httpx
-from typing import Dict, Any
-from src.data.types import SymbolSchema, ISymbol
+"""Contract lookup helpers — routed through the one gateway client.
 
-client = httpx.AsyncClient(
-    base_url="https://localhost:5000/v1/api/", timeout=10.0, verify=False
-)
+Historically this module held its OWN module-level ``httpx.AsyncClient`` (plus an
+``ib_rest_api_client.Client``) with a hardcoded base url — a second client with
+its own policy next to the one in ``candles.py``. Both now come from
+``src.data.ibkr.client.default_client()``: one base url, one verify policy, one
+error mapping.
+"""
 
-auth_client = Client(base_url="https://localhost:5000/v1/api/", verify_ssl=False)
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from src.data.ibkr.client import IbkrError, default_client
+from src.data.types import ISymbol, SymbolSchema
 
 
 async def fetch_contract_info(conid: int) -> Dict[str, Any]:
     ep = f"iserver/contract/{conid}/info"
     try:
-        r = await client.get(ep)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        raise ValueError(f"Failed call to {ep}: {e}")
+        return await default_client().get(ep)
+    except IbkrError as e:
+        raise ValueError(f"Failed call to {ep}: {e}") from e
 
 
 async def get_contract_info(conid: int) -> ISymbol:

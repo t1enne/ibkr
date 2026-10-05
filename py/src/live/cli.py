@@ -28,6 +28,10 @@ from src.bt.state.factories import (
     build_commission_model,
 )
 from src.bt.types import StrategyConfig
+from src.data.ibkr.client import IbkrClient, IbkrError
+from src.data.ibkr.gateway import IbkrGateway
+from src.live.adapters.ibkr.authz import authorize
+from src.live.adapters.ibkr.portfolio_source import IbkrPortfolioSource
 from src.live.broker import OrderResult, SimulatedBroker
 from src.live.engine import (
     CycleReport,
@@ -36,14 +40,25 @@ from src.live.engine import (
     run_cycle,
 )
 from src.live.ledger import SqliteLedger, config_hash
-from src.live.portfolio_source import MockPortfolioSource
-from src.live.types import LiveConfig
+from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
+from src.live.result import Err
+from src.live.types import FeedError, LiveConfig
 
 #: Sizing modes the shared ``SizingParams`` layer accepts.
 SizeMode = Literal["equity", "cash", "fixed"]
 _SIZE_MODES = frozenset({"equity", "cash", "fixed"})
 #: The keys ``StrategyConfig`` itself defines — everything else is a live-only key.
 _STRATEGY_FIELDS = frozenset(f.name for f in fields(StrategyConfig))
+#: Adapters ``--adapter`` accepts. Phase 2 ships ``ibkr`` read-only.
+_ADAPTERS = ("sim", "ibkr")
+
+
+class GatewayNotReady(RuntimeError):
+    """The broker gateway is not ready; the cycle never ran."""
+
+    def __init__(self, error: FeedError) -> None:
+        super().__init__(error.message)
+        self.error = error
 
 
 @click.group(name="live")
@@ -58,10 +73,35 @@ def live_group() -> None:
 @click.option(
     "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
 )
-def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
+@click.option(
+    "--adapter",
+    type=click.Choice(_ADAPTERS),
+    default=None,
+    help="Broker adapter; defaults to the config's `broker` key.",
+)
+@click.option(
+    "--allow-live",
+    is_flag=True,
+    help="Required to read a LIVE account (mode: live).",
+)
+def live_run(
+    config_path: str,
+    dry_run: bool,
+    max_age: int,
+    fmt: str,
+    adapter: str | None,
+    allow_live: bool,
+) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
+    resolved = resolve_adapter(adapter, raw, cfg)
+    # Phase 2 is READ-ONLY: an ibkr cycle that may place is refused outright.
+    if resolved == "ibkr" and not dry_run:
+        raise click.UsageError(
+            "--adapter ibkr is read-only until phase 3 (order placement): "
+            "re-run with --dry-run. This phase can never place anything."
+        )
     # Scope key derives from the ORIGINAL raw config, never the temp projection
     # (the strategy-only file lives at a random path and must not change scope).
     strategy_id = config_hash(raw)
@@ -69,11 +109,18 @@ def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
     ledger = SqliteLedger()
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
         ledger.ensure_strategy(strategy_id, strategy.name, cfg.mode)
-    if not cfg.portfolio_path:
-        raise click.UsageError(
-            "config requires portfolio_path (mock portfolio fixture)"
+    gateway: IbkrGateway | None = None
+    if resolved == "ibkr":
+        gateway = IbkrGateway(IbkrClient())
+        source: PortfolioSource = IbkrPortfolioSource(
+            gateway.client, _ref_prefix(strategy_id)
         )
-    source = MockPortfolioSource(cfg.portfolio_path)
+    else:
+        if not cfg.portfolio_path:
+            raise click.UsageError(
+                "config requires portfolio_path (mock portfolio fixture)"
+            )
+        source = MockPortfolioSource(cfg.portfolio_path)
     broker = SimulatedBroker(
         create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
         create_execution_params(
@@ -97,7 +144,7 @@ def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
         with tempfile.TemporaryDirectory(prefix="ibkr-live-") as tmp:
             normalized_path = _write_strategy_config(strategy, tmp)
             report = asyncio.run(
-                run_cycle(
+                _run_cycle(
                     cfg,
                     source=source,
                     broker=broker,
@@ -106,14 +153,94 @@ def live_run(config_path: str, dry_run: bool, max_age: int, fmt: str) -> None:
                     config_path=normalized_path,
                     max_age_days=max_age,
                     dry_run=dry_run,
+                    gateway=gateway,
+                    allow_live=allow_live,
                 )
             )
-    except (StaleDataError, PortfolioFetchError, ValueError) as exc:
+    except (StaleDataError, PortfolioFetchError, GatewayNotReady, ValueError) as exc:
         # ValueError: an unsized open raises by default policy — a traceback is
         # not a CLI contract.
         raise click.ClickException(str(exc)) from exc
     click.echo(render_report(report, fmt))
     _housekeeping(ledger, dry_run)
+
+
+async def _run_cycle(
+    cfg: LiveConfig,
+    *,
+    source: PortfolioSource,
+    broker: SimulatedBroker,
+    ledger: SqliteLedger,
+    strategy_id: str,
+    config_path: str,
+    max_age_days: int,
+    dry_run: bool,
+    gateway: IbkrGateway | None,
+    allow_live: bool,
+) -> CycleReport:
+    """Read-only gate, then the cycle: gateway ready + authz before any read.
+
+    The gateway adapter is the ONLY thing this adds over the sim path, and it
+    runs BEFORE ``run_cycle``: a cycle that cannot reach an authenticated broker
+    session must fail without ever touching the screen or the book.
+    """
+    if gateway is not None:
+        try:
+            account = await gateway.client.resolve_account()
+        except IbkrError as exc:
+            raise GatewayNotReady(FeedError(kind="auth", message=str(exc))) from exc
+        decision = authorize(
+            mode=cfg.mode,
+            account=account,
+            allow_live=allow_live,
+            dry_run=dry_run,
+        )
+        if isinstance(decision, Err):
+            raise GatewayNotReady(cast("FeedError", decision.error))
+        ready = await gateway.ensure_ready()
+        if isinstance(ready, Err):
+            raise GatewayNotReady(cast("FeedError", ready.error))
+    return await run_cycle(
+        cfg,
+        source=source,
+        broker=broker,
+        ledger=ledger,
+        strategy_id=strategy_id,
+        config_path=config_path,
+        max_age_days=max_age_days,
+        dry_run=dry_run,
+    )
+
+
+def resolve_adapter(
+    cli_adapter: str | None,
+    raw: Mapping[str, object],
+    cfg: LiveConfig,
+) -> str:
+    """Which adapter this run uses (plan §7.7).
+
+    The ``--adapter`` flag wins; otherwise the config's ``broker`` key (the phase
+    1.5 ``StrategyConfig.broker`` field — its first real consumer). ``mode: live``
+    must NAME its adapter in one of those two places: falling through to the
+    ``sim`` default would let a live run quietly never touch the broker, so it is
+    a hard error instead.
+    """
+    if cli_adapter in _ADAPTERS:
+        return cli_adapter
+    named = "broker" in raw or "broker" in cfg.strategy_params
+    if named:
+        return cfg.broker
+    if cfg.mode == "live":
+        raise click.UsageError(
+            "mode 'live' must name its adapter: pass --adapter or set "
+            "'broker' in the config (no default is assumed for a live run)"
+        )
+    return cfg.broker
+
+
+def _ref_prefix(strategy_id: str) -> str:
+    """The ownership prefix: the strategy id's first 8 chars (plan §3/§4)."""
+    return strategy_id[:8]
 
 
 live_group.add_command(live_run)
@@ -163,6 +290,11 @@ def load_live_config(path: str) -> LiveConfig:
     raw_mode = _pick((raw, params), ("mode",), "paper")
     if raw_mode not in ("paper", "live"):
         raise ValueError(f"mode must be 'paper' or 'live', got {raw_mode!r}")
+    raw_broker = _pick((raw, params), ("broker",), "sim")
+    if raw_broker not in _ADAPTERS:
+        raise ValueError(
+            f"broker must be one of {sorted(_ADAPTERS)}, got {raw_broker!r}"
+        )
     portfolio_path = _pick((raw, params), ("portfolio_path",), "")
     commission = _float_or((raw, params), "commission", strategy.commission)
     spread_bps = _float_or((raw, params), "spread_bps", strategy.spread_bps)
@@ -192,6 +324,7 @@ def load_live_config(path: str) -> LiveConfig:
         max_symbol_allocation=alloc,
         portfolio_path=portfolio_path if isinstance(portfolio_path, str) else "",
         mode=cast("Literal['paper', 'live']", raw_mode),
+        broker=cast("Literal['sim', 'ibkr']", raw_broker),
     )
 
 

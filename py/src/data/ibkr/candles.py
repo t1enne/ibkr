@@ -9,7 +9,8 @@ from ib_rest_api_client.api.trading_market_data import get_iserver_marketdata_hi
 from ib_rest_api_client.models import IserverHistoryBidAskResponse
 from ib_rest_api_client.models import GetIserverMarketdataHistoryDirection
 
-from .shared import get_contract_info, auth_client
+from .client import default_client
+from .shared import get_contract_info
 from .rate_limiter import with_retry
 from src.data.types import CandleDict
 from src.data.xcal import is_non_trading_day
@@ -353,7 +354,7 @@ async def _fetch_candles_iterative(
         )
 
         resp = await get_iserver_marketdata_history.asyncio_detailed(
-            client=auth_client,
+            client=default_client().rest,
             conid=conid,
             bar=bar,
             period=f"{days_to_fetch}d",
