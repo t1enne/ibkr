@@ -17,6 +17,16 @@ import pandas as pd
 
 from src.bt.engine.candle_store import CandleStore
 
+# Commission models and the friction result are part of the shared order core:
+# they are defined there so ``src/exec`` never imports the bt package. Re-exported
+# here (identity preserved) because the state/portfolio layer speaks these shapes.
+from src.exec.types import (  # noqa: F401
+    CommissionModel,
+    FixedCommission,
+    FrictionResult,
+    PerShareCommission,
+)
+
 
 class ActionType(Enum):
     long = "long"
@@ -172,38 +182,6 @@ class TradeSignal:
     # close (a long closes by selling, a short by buying to cover). Without it
     # a close fill cannot know which way ``apply_friction`` should lean.
     position_side: Optional[ActionType] = None
-
-
-@dataclass(frozen=True)
-class FixedCommission:
-    """Flat $ charge per fill; independent of qty and price."""
-
-    amount: float
-
-
-@dataclass(frozen=True)
-class PerShareCommission:
-    """IBKR-style per-share charge with a per-fill floor and optional cap.
-
-    ``max_pct_of_value`` is a percent (not fraction) of the fill's traded
-    value; ``None`` disables the cap.
-    """
-
-    per_share: float
-    min_per_fill: float = 0.0
-    max_pct_of_value: float | None = None
-
-
-CommissionModel = FixedCommission | PerShareCommission
-
-
-@dataclass(frozen=True)
-class FrictionResult:
-    """Executed price plus the qty-scaled dollar cost of each friction."""
-
-    executed_price: float
-    spread_cost: float  # qty-scaled $ (never a per-share fraction)
-    slippage_cost: float  # qty-scaled $
 
 
 @dataclass(frozen=True)

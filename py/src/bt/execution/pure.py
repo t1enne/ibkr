@@ -1,4 +1,10 @@
-"""Pure execution functions."""
+"""Pure execution functions.
+
+``apply_friction`` and ``commission_for_fill`` now live in the shared order
+core (``src/exec/friction.py``) and are re-exported here so existing importers
+keep working; the matcher and the live path charge costs through that one
+implementation.
+"""
 
 from src.bt.state.types import (
     TradeSignal,
@@ -6,28 +12,8 @@ from src.bt.state.types import (
     FillEvent,
     ExecutionParams,
     ActionType,
-    CommissionModel,
-    FixedCommission,
-    FrictionResult,
 )
-
-
-def commission_for_fill(model: CommissionModel, qty: float, price: float) -> float:
-    """Charge $ for one fill under ``model``.
-
-    Flat models ignore qty/price. Per-share models charge ``per_share * |qty|``,
-    raise to the per-fill floor, then cap at ``max_pct_of_value`` percent of the
-    traded value (when set).
-    """
-    if isinstance(model, FixedCommission):
-        return model.amount
-    charge = abs(qty) * model.per_share
-    if charge < model.min_per_fill:
-        charge = model.min_per_fill
-    if model.max_pct_of_value is not None:
-        cap = abs(qty) * price * model.max_pct_of_value / 100.0
-        charge = min(charge, cap)
-    return charge
+from src.exec.friction import apply_friction, commission_for_fill  # noqa: F401
 
 
 def is_buy_fill(action: ActionType, position_side: ActionType | None) -> bool:
@@ -41,35 +27,6 @@ def is_buy_fill(action: ActionType, position_side: ActionType | None) -> bool:
     if action == ActionType.short:
         return False
     return position_side == ActionType.short
-
-
-def apply_friction(
-    base_price: float,
-    *,
-    is_buy: bool,
-    spread_bps: float,
-    slippage_bps: float,
-    qty: float,
-    adverse_multiplier: float = 1.0,
-) -> FrictionResult:
-    """Shift ``base_price`` by half-spread plus slippage; report qty-scaled $.
-
-    A buyer pays above the mid, a seller receives below it, so the half-spread
-    and slippage always lean against the fill. ``adverse_multiplier`` scales the
-    slippage (both exec paths share this one knob). All recorded costs are
-    dollar amounts scaled by ``qty``, never per-share fractions.
-    """
-    half_spread = base_price * (spread_bps / 2.0) / 10000.0
-    slip = base_price * (slippage_bps * adverse_multiplier) / 10000.0
-    if is_buy:
-        executed_price = base_price + half_spread + slip
-    else:
-        executed_price = base_price - half_spread - slip
-    return FrictionResult(
-        executed_price=executed_price,
-        spread_cost=abs(half_spread) * qty,
-        slippage_cost=abs(slip) * qty,
-    )
 
 
 def execute_signal(
