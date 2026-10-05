@@ -1,15 +1,29 @@
-# Plan — Unified execution core, IBKR as first real broker (rev 4)
+# Plan — Unified execution core, IBKR as first real broker (rev 4.1)
 
-Rev 4 changes exactly two things from rev 3, both forced by live paper evidence from
-phase 3 (see §3 and §4 for the observations, and §6 `Phase 3.5` for the follow-up work):
+Rev 4.1 supersedes rev 4's §3 reconciliation model. Rev 4 tried to derive each
+strategy's book from the ACCOUNT net minus foreign executions; that is wrong for the
+case this system actually runs — **two or more strategies on one account**. An account
+net cannot be split between strategies, and with no in-window execution of ours it reads
+a manual position as ours (closable). Rev 4.1 attributes by OUR OWN cOIDs and keeps the
+book in sqlite.
+
+- **Attribution is per scope, from our executions.** One `scope` = one strategy; a
+  strategy's book is exactly the executions whose `order_ref` resolves to its scope.
+- **sqlite is the store; the trades endpoint is a confirmation channel.** `/iserver/account/trades`
+  is a 7-day window, so a lot opened last month exists because the local book says so.
+- **Positions the account holds that no scope owns are ignored by design** — a human may
+  hold anything; we neither reconcile nor trade it.
+
+Rev 4's two surviving changes (from rev 3) still hold, and both were forced by live
+paper evidence in phase 3 (see §3/§4 and §6 `Phase 3.5`):
 
 - **Lot identity is `(scope, conid)`, not `order_id`.** A close is a new order with a new
   `order_id`, so rev 3's "one lot per `order_id`" could never see a lot close.
 - **Ownership scope is a stable `scope`, not `strategy_id[:8]`.** A config *edit* changes
   the config hash, so rev 3 silently orphaned every open lot on a tuning change.
 
-Everything else in rev 3 stands, including the phase-split and the six surviving
-open decisions.
+Everything else in rev 3 stands, including the phase-split and the surviving open
+decisions.
 
 Rev 3 reflects review direction: (a) the backtest adopts the live architecture —
 one `Broker` port, MKT/LMT orders — instead of live mimicking the backtest;
@@ -137,58 +151,65 @@ class Execution:
     commission: float; ts: pd.Timestamp
 
 def reconcile(
-    executions: tuple[Execution, ...],
-    positions: tuple[BrokerPosition, ...],
-    *,
     scope: str,
-) -> BrokerSnapshot
+    executions: tuple[Execution, ...],   # the trades window, already filtered to us
+    book: StrategyBook,                   # the durable rows for this scope
+) -> tuple[StrategyBook, tuple[str, ...]]   # advanced book + warnings
 ```
 
-**One lot per `(scope, conid)` — not per `order_id`.** Rev 3's rule could not express
-closure, and the live paper run proved it: the open filled as `order_id 1469916425` and
-the close as `1469916426`, so the replay produced *two open lots* on a flat account and
-the ledger row for the original stayed `open`. In `(scope, conid)` terms the same
-account reads as one lot that opened and then closed, whatever orders were involved.
+- **Attribution is the cOID scope, nothing else.** `order_ref` resolves to a scope
+  (§4); a strategy's book is exactly the executions whose ref is its own. Two strategies
+  on one account never see each other's fills, and neither reads the account net.
+- **The account summary and positions are informational only.** N strategies share one
+  account's cash and one positions endpoint, so neither can be a per-strategy truth. Cash
+  and equity for a scope are derived from that scope's own executions (its config
+  `initial_capital` advanced by its fills and commissions). `/portfolio/{acct}/summary`
+  is displayed for context, never used as a book input.
+- **sqlite is the store** (`data/db.sqlite`, alongside the existing ledger tables): a row
+  per `(scope, conid)` carrying qty, side, `entry_price`, `opened_at`, `closed_at`, the
+  metadata columns (`stop_loss`, `take_profit`, `tag`, `order_ref`) and a watermark; plus a
+  row per applied `execution_id` so applying the window twice is a no-op. The 7-day window
+  is a confirmation channel that advances the book; it is never the reason a lot exists or
+  stops existing.
+- **Applying an unseen execution advances the book**: open / add / reduce / close per side
+  and sign, `entry_price` = VWAP of the opening executions of the current open interval.
+  qty reaching 0 stamps `closed_at`, so a round trip leaves ONE row closed — never two
+  open lots. A same-sign re-entry after flat reopens the row with a new `opened_at` (and
+  reports it), and a flip is reported rather than merged.
+- **An execution we cannot apply** (a reduction with nothing to reduce, a conid whose
+  symbol does not match the stored row) is a warning carrying the raw execution — never a
+  silent drop, and never a reason to place an order.
+- **A position no scope owns is ignored by design.** The account may hold anything a human
+  did: it is not our book, not a mismatch, not an error, and never traded. Nothing is
+  absorbed into a scope by accident, and nothing needs a "foreign" entity.
+- **A manual trade on a symbol we hold is not absorbed** (its ref is not ours). If it
+  closes our lot, the local book and the account simply disagree; that is reported for
+  context and changes no intent, because we act on our own book only.
 
-- `account_net(conid)` comes from the positions read. Fallback, when a position is not
-  listed: the last in-window execution's `position`, which the API reports as the
-  account's net **after** that execution (observed live: `1 → 2 → 1 → 0` across four
-  AAPL fills).
-- `foreign_net(conid)` = sum of signed `size` over executions whose `order_ref` is not
-  ours; `our_qty(conid) = account_net − foreign_net`. Cross-check it against the sum of
-  our own signed `size` and report any mismatch as a warning carrying both numbers and
-  the executions — never as a silent abort.
-- `our_qty != 0` → one lot: `qty = |our_qty|`, side from the sign, `entry_price` = VWAP of
-  our opening executions on that conid, `status` open iff `our_qty != 0`. A sign flip
-  inside the window is reported, not silently merged into one lot.
-- `our_qty == 0` while `account_net != 0` → the position is **EXTERNAL**: reported loudly
-  (symbol, conid, account net, our executions) and never traded. That is the honest
-  treatment of a manual holding; rev 3 made the whole position invisible instead.
-- Cash from `/portfolio/{acct}/summary`, with the account currency carried rather than
-  assumed.
-
-**Stated limits, not hidden ones.** `/iserver/account/trades` covers 7 days, so a lot
-held longer has no in-window opening executions: its entry price falls back to the
-broker's `avgCost` (the only number available) while attribution above still holds.
-Windowing beyond 7 days is phase 4. A cross-currency book (an EUR account holding USD
-stock) is carried exactly as the broker reports it, with no FX conversion, until a phase
-takes that on.
+**Stated limits, not hidden ones.** `/iserver/account/trades` covers 7 days: the window
+confirms what we can see, and the local book carries what we cannot. A cross-currency book
+(an EUR account holding USD stock) is carried exactly as the broker reports it, with no FX
+conversion, until a phase takes that on. Cash and equity are per scope and no longer read
+from the account summary.
 
 This deletes from rev 2: `join_book` and its six drift rules, close grouping,
 `OrderResult.closed_position_ids`, the cost-tolerance knob, and the tiered repair policy.
-It also deletes rev 3's `order_id`-keyed lot, its `strategy_id[:8]` prefix scope, and the
-phase-3 constraint paragraph those two implied.
+It also deletes rev 3's `order_id`-keyed lot and `strategy_id[:8]` prefix scope, rev 4's
+`account_net − foreign_net` attribution (an account net cannot be split across
+strategies), and rev 4's EXTERNAL-entity requirement.
 
 ## 4. Order identity and re-run safety
 
 ```python
 def order_ref(scope: str, cycle_ts: pd.Timestamp, seq: int) -> str
-# f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M}-{seq:03d}"
+# f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M%S}-{seq:03d}"
 ```
 
 `scope` is a **stable strategy identity that survives a config edit**: the live
-config's `scope` key, defaulting to `StrategyConfig.name`. Ownership is decided on the
-whole scope, never on a slice of a hash. Two consequences of rev 3's
+config's `scope` key, defaulting to `StrategyConfig.name`. It is also the attribution key
+(§3): the ref's `slug(scope)` prefix is how a strategy recognises its own executions, so
+it must be present on every ref and unique per strategy on an account. Ownership is
+decided on the whole slug, never on a slice of a hash. Two consequences of rev 3's
 `strategy_id[:8]` scope, both observed in the phase-3 paper run:
 
 - Two strategies whose config hashes share 8 characters share each other's lots —
@@ -202,11 +223,17 @@ whole scope, never on a slice of a hash. Two consequences of rev 3's
 The config hash survives ONLY as an audit column (`strategy_id` on ledger rows: which
 revision placed what). It is never an ownership filter.
 
-`slug(scope)` keeps the ref short and safe as a broker client id. `seq` is the intent
-index within the cycle, and reconcile order is deterministic (config symbol order, closes
-first). Re-running the same cycle re-sends the same refs and IBKR dedupes; the next bar
-gets fresh refs, so a legitimate re-entry is never blocked. No hashing of price or qty, so
-a size change does not silently defeat the dedupe.
+`slug(scope)` keeps the ref short and safe as a broker client id, and the prefix is what
+makes attribution possible on a shared account. `cycle_ts` is second-granular so two
+different cycles can never share a timestamp, and `seq` is the intent index within the
+cycle with deterministic reconcile order (config symbol order, closes first). Re-running
+the same cycle re-sends the same refs and IBKR dedupes; a different cycle gets different
+refs, so a legitimate re-entry is never blocked. No hashing of price or qty, so a size
+change does not silently defeat the dedupe. **Open, must be decided in phase 3.5:** a
+re-run whose intent SET differs from the original (the close filled, so the open moved
+to seq 0) can mint a ref the broker already saw and dedupe a genuinely new order away;
+the fix is to key `seq` on the intent's stable identity (symbol + action + lot), not on
+its position in the batch.
 
 ## 5. Gateway lifecycle
 
@@ -269,23 +296,45 @@ Each phase ships alone. Later phases are not prerequisites for earlier ones.
   immediately. See Phase 3.5 and §3.
 - Non-goals: no resting stops, no cancel/modify, no bracket/OCA.
 
-### Phase 3.5 — reconciliation model (rev 4 §3/§4)
+### Phase 3.5 — per-strategy book in sqlite (rev 4.1 §3/§4)
 
-The correctness follow-up phase 3 proved is needed. No new broker surface, no new orders
-until the book model is right.
+The correctness follow-up phase 3 proved is needed. No new broker surface, and no order
+may be placed from a reconciliation mismatch.
 
-- `adapters/ibkr/trades.py`: replace the `order_id`-keyed replay with
-  `reconcile(executions, positions, *, scope) -> BrokerSnapshot` — one lot per
-  `(scope, conid)`, the attribution rule (`our_qty = account_net − foreign_net`), the
-  `avgCost` fallback, and EXTERNAL reporting for a position we do not own.
-- `refs.order_ref(scope, cycle_ts, seq)`; thread `scope` from the live config through
-  `cli.py`, `engine.py` and `ledger.py`; key the ledger by `(scope, conid)` and keep
-  `strategy_id` as an audit column only.
-- `status_to_fill` must read `cum_fill`/`average_price`: a filled order reports
-  `size 0.0` because that field is the remaining size (observed live on four orders).
-- Proof, on the paper account: an open→close cycle reads as ONE lot going open→closed
-  from the broker's net; a manual/foreign holding appears as EXTERNAL and is never
-  traded; a parameter edit no longer orphans the lot; `make check` green.
+- **sqlite book, per scope.** `data/db.sqlite` carries a row per `(scope, conid)` (qty,
+  side, `entry_price`, `opened_at`, `closed_at`, `stop_loss`, `take_profit`, `tag`,
+  `order_ref`, watermark) plus a row per applied `execution_id`. The existing
+  `live_position` table changes primary key and gains `conid`; `live_strategy` keeps
+  `strategy_id` (the config hash) as an AUDIT column only.
+- **`reconcile(scope, executions, book)`** replaces the `order_id`-keyed replay in
+  `adapters/ibkr/trades.py`: apply unseen executions to the durable rows (open/add/
+  reduce/close/reopen-as-reported), VWAP the open interval, stamp `closed_at` at zero,
+  warn on anything unapplicable. A round trip must leave ONE closed row, not two open
+  lots.
+- **Stop deriving the book from the account.** `portfolio_source.py` keeps the summary
+  for display only; `cross_check` and `signed_net` book-building go away, so a position
+  no scope owns is neither an error nor an input. `mapping.parse_executions` must parse
+  `conid` (and the per-execution `position` for diagnostics).
+- **Thread `scope`** from the live config (`LiveConfig.scope`, `StrategyConfig.scope`
+  defaulting to `name`) through `cli.py`, `engine.py`, `ledger.py`; delete
+  `cli._ref_prefix` and the `engine`'s `owns_book`/`owned=None` hack, which the new book
+  makes wrong.
+- **Per-scope cash/equity** derived from the scope's own executions (config
+  `initial_capital` advanced by its fills/commissions). The account summary is no longer
+  a book input; state that in the report so N-strategies-one-account is honest.
+- **Fix the ref scheme** per §4: `slug(scope)` + second-granular `cycle_ts` + a `seq`
+  keyed on intent identity, with a test for the shifted-batch case.
+- **Placement hygiene:** whole-share quantities (round and reject/flag fractional before
+  submit — `compute_qty` currently returns 4 dp), and read `/iserver/account/orders`
+  before re-sending after an ambiguous submit timeout, so a working order is seen instead
+  of duplicated. An LMT/working order is out of scope (phase 4) but the re-send guard is
+  not.
+- **Decide `Broker` vs `LiveBroker`** convergence before phase 4 LMT: the shared
+  `OrderRequest` vocabulary needs `limit_price`/`tif` on the live edge.
+- Proof, on the paper account: two scopes on one account each reconcile only their own
+  book; an open→close round trip shows one closed row; a manual/foreign position is
+  ignored without a warning storm; a parameter edit keeps the same scope's book; a
+  `--dry-run` writes no DDL; `make check` green.
 
 ### Phase 4 — deferred (deliberately not phase 1)
 
@@ -311,11 +360,18 @@ multi-account allocation, IBKR market data.
 9. **Golden-report parity artifact.** Where does the phase-1 baseline get stored so the
    diff is reproducible (a `tests/fixtures/bt_reports/` snapshot vs a scratch dir)?
    Default: scratch dir in phase 1, committed snapshot only if it stays stable.
-10. **Ownership scope key.** Resolved in rev 4 §4: the live config's `scope` (default
-    `StrategyConfig.name`), not the config hash and never a hash prefix. A hash-keyed
-    scope orphans live lots on every parameter edit.
-11. **Lot identity.** Resolved in rev 4 §3: one lot per `(scope, conid)`, closed when the
-    broker's net returns to zero. Per-`order_id` lots cannot represent closure at all.
-12. **Positions we do not own.** Resolved in rev 4 §3: `our_qty = account_net −
-    foreign_net`; a nonzero net with `our_qty == 0` is EXTERNAL — reported loudly and
-    never traded, which is what makes a manual holding visible instead of invisible.
+10. **Ownership scope key.** Resolved in rev 4.1 §4: the live config's `scope` (default
+    `StrategyConfig.name`), not the config hash and never a hash prefix. It is both the
+    durable book key and the cOID prefix a strategy uses to recognise its own fills on a
+    shared account. A hash-keyed scope orphans live lots on every parameter edit.
+11. **Lot identity.** Resolved in rev 4.1 §3: one row per `(scope, conid)`, closed when
+    the scope's own qty returns to zero. Per-`order_id` lots cannot represent closure at
+    all.
+12. **Positions we do not own.** Resolved in rev 4.1 §3: IGNORED BY DESIGN. The account
+    may hold anything a human did; a position no scope owns is not our book, not a
+    mismatch, never traded. No "foreign" entity, no EXTERNAL reporting.
+13. **Per-strategy cash/equity on a shared account.** Resolved in rev 4.1 §3: derived
+    from each scope's own executions and its config `initial_capital`. The account summary
+    is display-only, because N strategies share one account's cash.
+14. **Share granularity.** Resolved in rev 4.1 §6 phase 3.5: orders are whole shares;
+    a fractional quantity is rounded and flagged before submit, not sent to the broker.
