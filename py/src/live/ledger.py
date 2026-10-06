@@ -229,16 +229,34 @@ def _table_columns(db: SqliteDatabase, name: str) -> set[str]:
     return {str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})")}
 
 
+def _free_legacy_name(db: SqliteDatabase) -> str:
+    """A table name to keep a legacy ``live_position`` under, never overwriting one.
+
+    The canonical copy is ``live_position_legacy``; if that already exists (a
+    legacy-shaped ``live_position`` re-created after a prior migration), a fresh
+    ``live_position_legacy_<n>`` is chosen so EVERY copy is kept — a rename,
+    never a drop, so no row is ever lost.
+    """
+    if not _table_exists(db, _LEGACY_POSITION_TABLE):
+        return _LEGACY_POSITION_TABLE
+    n = 1
+    while _table_exists(db, f"{_LEGACY_POSITION_TABLE}_{n}"):
+        n += 1
+    return f"{_LEGACY_POSITION_TABLE}_{n}"
+
+
 def _preserve_legacy_positions(db: SqliteDatabase) -> None:
-    """Preserve a pre-conid ``live_position`` and warn about the open rows it held.
+    """Preserve a pre-conid ``live_position`` under a kept copy and warn.
 
     A pre-4.1 ``live_position`` cannot be read into the conid-keyed book, but
     dropping it would erase durable position state the rolling trades window
-    cannot rebuild. Rename it to a kept copy instead, naming any still-open rows
-    loudly: until an operator reconciles them, the strategy reads the symbol as
-    flat and could open again on top of a live position.
+    cannot rebuild. RENAME it to a kept copy (a fresh name when one is already
+    kept, so a re-created table is preserved too) instead of dropping, naming any
+    still-open rows loudly: until an operator reconciles them, the strategy reads
+    the symbol as flat and could open again on top of a live position.
     """
     columns = _table_columns(db, "live_position")
+    target = _free_legacy_name(db)
     sql = "SELECT symbol, side, qty FROM live_position"
     for symbol, side, qty in db.execute_sql(
         sql + (" WHERE status = 'open'" if "status" in columns else "")
@@ -250,13 +268,9 @@ def _preserve_legacy_positions(db: SqliteDatabase) -> None:
             symbol,
             side,
             qty,
-            _LEGACY_POSITION_TABLE,
+            target,
         )
-    if _table_exists(db, _LEGACY_POSITION_TABLE):
-        # A previous run already kept a copy; nothing more to preserve here.
-        db.execute_sql("DROP TABLE live_position")
-        return
-    db.execute_sql(f"ALTER TABLE live_position RENAME TO {_LEGACY_POSITION_TABLE}")
+    db.execute_sql(f"ALTER TABLE live_position RENAME TO {target}")
 
 
 def _rekey_sim_lots(db: SqliteDatabase) -> None:
@@ -321,11 +335,25 @@ class SqliteLedger:
     # -- lazy DDL / migration ---------------------------------------------
 
     def _ready_schema(self) -> None:
-        """Create the live tables exactly once, on the first WRITE only."""
+        """Create the live tables exactly once, on the first WRITE only.
+
+        The migration + DDL run in ONE ``BEGIN IMMEDIATE`` transaction. That takes
+        the SQLite write lock up front, so two processes racing the first
+        migration (the overlap the cycle lease guards against) are SERIALIZED: the
+        second blocks until the first commits, re-reads the migrated schema and is
+        a no-op. There is no check-then-act window, so neither a ``no such table``
+        nor a double-drop race is reachable. It is deliberately NOT wrapped in the
+        cycle lease — ``ensure_strategy``/``ensure_cash`` write before ``run_cycle``
+        takes the lease, and re-taking it here would deadlock a cycle already
+        holding it. What this does NOT do: it does not serialize those later
+        idempotent writes against a live cycle; each is its own atomic write, and
+        the lease remains the cross-process guard for placement.
+        """
         if self._schema_ready:
             return
-        self._migrate()
-        self._database.create_tables(_MODELS)
+        with self._database.atomic(lock_type="IMMEDIATE"):
+            self._migrate()
+            self._database.create_tables(_MODELS)
         self._schema_ready = True
 
     def _migrate(self) -> None:

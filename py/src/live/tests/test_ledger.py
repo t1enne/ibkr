@@ -12,7 +12,7 @@ import pytest
 
 
 from src.data.db import get_connection
-from src.exec.refs import slug
+from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
 from src.bt.state import ActionType
@@ -52,7 +52,7 @@ def _exec(
     return Execution(
         execution_id=execution_id,
         order_id="o" + execution_id,
-        order_ref=f"{slug(scope)}-20240603T150000-000",
+        order_ref=f"{scope_tag(scope)}-20240603T150000-000",
         conid=conid,
         symbol="AAPL",
         side=side,
@@ -280,6 +280,84 @@ def test_migration_preserves_incompatible_legacy_position_table(
     # The migration is one-time: a second write neither re-warns nor loses rows.
     ledger.touch_cycle("h1", TS)
     assert "live_position_legacy" in _tables(db)
+
+
+def test_migration_keeps_every_legacy_copy_never_dropping_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # D7(b): a legacy-shaped live_position re-created WITH rows beside an already
+    # kept copy must be preserved, not dropped. The old branch warned about the
+    # open rows and then DROPped the table, losing them.
+    db = tmp_path / "legacy.sqlite"
+    legacy_schema = (
+        "CREATE TABLE %s (strategy_id TEXT, position_id TEXT, symbol TEXT, "
+        "side TEXT, qty REAL, status TEXT, PRIMARY KEY (strategy_id, position_id))"
+    )
+    with get_connection(db) as con:
+        con.execute(legacy_schema % "live_position")
+        con.execute(
+            "INSERT INTO live_position VALUES ('h1','lot-1','AAPL','long',10.0,'open')"
+        )
+        con.execute(legacy_schema % "live_position_legacy")
+        con.execute(
+            "INSERT INTO live_position_legacy VALUES "
+            "('h0','lot-0','MSFT','long',5.0,'open')"
+        )
+    ledger = SqliteLedger(db)
+    with caplog.at_level("WARNING", logger="src.live.ledger"):
+        ledger.ensure_strategy("h1", "momentum", "phase", "paper")
+
+    tables = _tables(db)
+    assert "live_position" in tables  # fresh conid-keyed book created
+    assert "live_position_legacy" in tables  # the pre-existing copy kept
+    assert "live_position_legacy_1" in tables  # the re-created one kept, not dropped
+    with get_connection(db) as con:
+        kept = con.execute("SELECT symbol FROM live_position_legacy").fetchall()
+        recreated = con.execute("SELECT symbol FROM live_position_legacy_1").fetchall()
+        fresh = con.execute("SELECT * FROM live_position").fetchall()
+    assert kept == [("MSFT",)]
+    assert recreated == [("AAPL",)]  # no row lost
+    assert fresh == []  # the new book starts empty, not erased
+
+
+def test_migration_check_and_action_are_one_atomic_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D7(a): the "is-this-legacy" check and the rename run in ONE transaction, so a
+    # concurrent process cannot see a half-migrated schema and no check-then-act
+    # window exists. We prove ATOMICITY: when the DDL step fails the rename is
+    # fully ROLLED BACK — before the fix the rename committed on its own and the
+    # legacy table survived a failed first write. That, plus ``BEGIN IMMEDIATE``
+    # taking SQLite's write lock up front, is what makes two racing migration
+    # PROCESSES serialize instead of dropping each other's table.
+    db = tmp_path / "atomic.sqlite"
+    setup = get_connection(db)
+    setup.execute(
+        "CREATE TABLE live_position (strategy_id TEXT, position_id TEXT, "
+        "symbol TEXT, side TEXT, qty REAL, status TEXT, "
+        "PRIMARY KEY (strategy_id, position_id))"
+    )
+    setup.execute(
+        "INSERT INTO live_position VALUES ('h1','lot-1','AAPL','long',10.0,'open')"
+    )
+    setup.commit()
+    setup.close()
+    ledger = SqliteLedger(db)
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("schema build failed mid-transaction")
+
+    monkeypatch.setattr(ledger._database, "create_tables", explode)
+    with pytest.raises(RuntimeError, match="mid-transaction"):
+        ledger.ensure_strategy("h1", "momentum", "phase", "paper")
+    monkeypatch.undo()
+
+    tables = _tables(db)
+    assert "live_position" in tables  # the rename was rolled back
+    assert "live_position_legacy" not in tables
+    with get_connection(db) as con:
+        kept = con.execute("SELECT symbol FROM live_position").fetchall()
+    assert kept == [("AAPL",)]  # no row lost to a failed migration
 
 
 def test_migration_rekeys_legacy_sim_lots_to_scope(tmp_path: Path) -> None:

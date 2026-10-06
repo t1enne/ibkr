@@ -5,7 +5,7 @@ Read-only. Nothing here places, cancels or modifies an order.
 The book is assembled the way plan rev 4.1 §3 says. The account summary and
 positions are **display-only**: N strategies share one account's cash and one
 positions endpoint, so neither can be a per-strategy truth. A scope's book is
-exactly the executions whose ``cOID`` carries its ``slug(scope)`` prefix, applied
+exactly the executions whose ``cOID`` carries its ``scope_tag`` prefix, applied
 to the durable rows in sqlite (``trades.reconcile``); a position no scope owns is
 IGNORED BY DESIGN — not our book, not a mismatch, never traded.
 

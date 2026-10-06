@@ -10,11 +10,12 @@ rows plus the confirmation window and returns the advanced book, so the caller
 
 Rules (plan §3):
 
-- **Ours** = the execution's ``order_ref`` scope segment equals ``slug(scope)``
-  exactly (the ref minus its ``-{ts}-{seq}`` tail). A ref that is not ours is
-  ignored by design (a human's trade is not our book), never a mismatch and
-  never a reason to place an order. Exact-segment matching keeps scope
-  ``momentum`` from absorbing ``momentum-v2``'s fills.
+- **Ours** = the execution's ``order_ref`` scope segment equals ``scope_tag(scope)``
+  exactly (the ref minus its last two ``-``-separated parts). A ref that is not
+  ours is ignored by design (a human's trade is not our book), never a mismatch
+  and never a reason to place an order. Exact-segment matching keeps scope
+  ``momentum`` from absorbing ``momentum-v2``'s fills, and the non-collapsing
+  ``scope_tag`` keeps two scopes with one ``slug`` from sharing an owner.
 - **One row per conid.** Open / add / reduce / close per side and sign; a
   round trip leaves ONE closed row, not two open lots. ``entry_price`` is the
   VWAP of the opening executions of the *current* open interval.
@@ -32,7 +33,7 @@ from dataclasses import dataclass, replace
 
 import pandas as pd
 
-from src.exec.refs import slug
+from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 
 #: Absolute quantity below which a net position is considered flat (float noise).
@@ -98,14 +99,15 @@ class StrategyBook:
 
 
 def is_ours(scope: str, execution: Execution) -> bool:
-    """Ownership: the ref's scope segment equals ``slug(scope)`` exactly.
+    """Ownership: the ref's scope segment equals ``scope_tag(scope)`` exactly.
 
-    A ref is ``{slug}-{ts}-{seq}`` and neither ``ts`` nor ``seq`` contains a
-    ``-``, so the scope segment is the ref minus its last two segments. An exact
-    match (not a prefix) keeps scope ``momentum`` from claiming refs minted by
-    ``momentum-v2`` / ``momentum-2``.
+    A ref is ``{scope_tag}-{token}-{attempt}`` and neither the token nor the
+    attempt contains a ``-``, so the scope segment is the ref minus its last two
+    segments. An exact match (not a prefix) keeps scope ``momentum`` from
+    claiming refs minted by ``momentum-v2`` / ``momentum-2``, and the
+    non-collapsing tag keeps ``momentum_v2`` from claiming ``momentum-v2``'s.
     """
-    return execution.order_ref.rsplit("-", 2)[0] == slug(scope)
+    return execution.order_ref.rsplit("-", 2)[0] == scope_tag(scope)
 
 
 def _signed(execution: Execution) -> float:

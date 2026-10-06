@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -633,6 +634,42 @@ class _FakeGateway:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+def test_sim_json_run_keeps_broker_logs_off_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D9: a sim ``-F json`` run must emit pure JSON on stdout.
+
+    The sim broker logs each fill; when that logger wrote via ``click.echo`` it
+    prefixed the JSON report with log lines, so ``-F json`` did not parse. The log
+    is routed to stderr, and the report stays the only thing on stdout.
+    """
+    captured: dict[str, Callable[[str], None]] = {}
+
+    class _LoggingBroker:
+        def __init__(
+            self, portfolio: object, params: object, log: Callable[[str], None]
+        ) -> None:
+            captured["log"] = log
+
+        async def close(self) -> Result[None, FeedError]:
+            return Ok(None)
+
+    monkeypatch.setattr("src.live.cli.MockPortfolioSource", lambda p: object())
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.cli.SimulatedBroker", _LoggingBroker)
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        captured["log"]("AAPL long qty=1 @ 100.0")
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, portfolio_path="pf.json")
+    out = CliRunner().invoke(live_group, ["run", path, "-F", "json"])
+    assert out.exit_code == 0, out.output
+    json.loads(out.stdout)  # stdout is a clean JSON document, not log + JSON
+    assert "AAPL long qty=1" in out.stderr  # the notice went to stderr instead
 
 
 def test_ibkr_ensures_ready_before_the_cycle(

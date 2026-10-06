@@ -202,13 +202,13 @@ def _book(positions: dict[str, tuple[Position, ...]]) -> PortfolioState:
     )
 
 
-def _long_lot(position_id: str = "555000111") -> PortfolioState:
+def _long_lot(position_id: str = "555000111", qty: float = 1.0) -> PortfolioState:
     return _book(
         {
             "AAPL": (
                 Position(
                     symbol="AAPL",
-                    qty=1.0,
+                    qty=qty,
                     entry_price=100.0,
                     entry_time=CYCLE_TS,
                     stop_loss=None,
@@ -1108,6 +1108,102 @@ async def test_close_on_a_flat_account_is_refused_before_submitting() -> None:
     assert isinstance(result, Err)
     assert "flat" in cast("FeedError", result.error).message
     assert submit.call_count == 0  # never sent
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_close_larger_than_a_shared_net_is_refused_before_submitting() -> None:
+    """D3: a close on a SHARED account must not exceed the account net.
+
+    Our book holds long 60, but another scope/human holds 40 short on the same
+    conid, so the account nets to 20. The old guard only checked ``abs(net) > eps``,
+    so A's SELL 60 passed and flipped the account to -40 — an unintended naked
+    short. Worse, without a check the close never opens a new position.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    # Our long 60 and a FOREIGN short 40 on the same conid net the account to 20.
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"conid": 265598, "contractDesc": "AAPL", "position": 60},
+                {"conid": 265598, "contractDesc": "AAPL", "position": -40},
+            ],
+        )
+    )
+    _mock_no_working_orders()
+    broker = _broker()
+    broker.seed(_long_lot("555000111", qty=60.0))
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=60.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+    result = await broker.place(intent)
+    assert isinstance(result, Err)
+    assert "exceeds the account net" in cast("FeedError", result.error).message
+    assert submit.call_count == 0  # the flip is refused, nothing sent
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_close_against_the_opposite_net_side_is_refused() -> None:
+    """D3: a SELL cannot reduce a short net — it must be refused, not flipped."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200, json=[{"conid": 265598, "contractDesc": "AAPL", "position": -5}]
+        )
+    )
+    _mock_no_working_orders()
+    broker = _broker()
+    broker.seed(_long_lot("555000111", qty=1.0))
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=1.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+    result = await broker.place(intent)
+    assert isinstance(result, Err)
+    assert "opposite side" in cast("FeedError", result.error).message
+    assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_close_within_the_net_is_allowed() -> None:
+    """D3 positive control: a close no larger than the net on the reduce side passes."""
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200, json=[{"conid": 265598, "contractDesc": "AAPL", "position": 60}]
+        )
+    )
+    _mock_no_working_orders()
+    broker = _broker()
+    broker.seed(_long_lot("555000111", qty=60.0))
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=60.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+    assert _ok(await broker.place(intent)).ok
 
 
 # --- conid resolution: verification + caching (finding L10) -----------------

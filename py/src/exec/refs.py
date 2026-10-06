@@ -33,6 +33,19 @@ def slug(scope: str) -> str:
     return cleaned or "scope"
 
 
+def scope_tag(scope: str) -> str:
+    """Broker-safe, NON-COLLAPSING ownership tag for *scope*: ``<slug>-<crc32>``.
+
+    ``slug`` alone maps two distinct scopes such as ``momentum_v2`` and
+    ``momentum-v2`` to one token, so both would share a single owner on a shared
+    account (each booking the other's fills). Appending the raw scope's crc32 as
+    a dashless hex tail makes the tag distinct for any two differing scope
+    strings short of a crc32 collision, while staying broker-safe as a cOID
+    prefix and keeping the readable ``slug`` ahead of it.
+    """
+    return f"{slug(scope)}-{zlib.crc32(scope.encode('utf-8')):08x}"
+
+
 def _seq_of(identity: str) -> int:
     """Deterministic seq in ``[0, 99999]`` from an intent's stable identity.
 

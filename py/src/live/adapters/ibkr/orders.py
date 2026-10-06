@@ -263,7 +263,7 @@ def parse_working_order(entry: object) -> WorkingOrder | None:
 def match_working(orders: Sequence[WorkingOrder], prefix: str) -> WorkingOrder | None:
     """The first working order whose ref starts with *prefix* (ours only).
 
-    *prefix* is ``slug(scope)-token-``: an exact scope+key prefix, never a
+    *prefix* is ``scope_tag-token-``: an exact scope+key prefix, never a
     symbol/side match, so a shared account's foreign orders are never adopted.
     """
     return next((o for o in orders if o.order_ref.startswith(prefix)), None)

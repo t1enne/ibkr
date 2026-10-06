@@ -155,7 +155,7 @@ def live_run(
         broker = SimulatedBroker(
             create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
             exec_params_of(cfg),
-            click.echo,
+            _stderr_log,
         )
     # Plan §7.3: label which source produced this run's costs. A resolved IBKR run
     # books the broker's exact per-execution commission but still SIZES on the sim
@@ -239,7 +239,7 @@ async def _run_cycle(
         if isinstance(decision, Err):
             raise GatewayNotReady(cast("FeedError", decision.error))
         if no_gateway:
-            click.echo(
+            _stderr_log(
                 "gateway readiness check skipped (--no-gateway; "
                 "trusting an externally kept-alive gateway)"
             )

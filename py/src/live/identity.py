@@ -4,7 +4,7 @@ The live path's identity scheme, replacing the decision-bar-anchored ``cOID``
 the previous iterations used. A ref embeds a *bar-free* key token so adoption
 survives bars, days and reruns:
 
-    cOID = f"{slug(scope)}-{key.token()}-{attempt:02x}"
+    cOID = f"{scope_tag(scope)}-{key.token()}-{attempt:02x}"
 
 ``key`` is ``(scope, symbol, action, position_id)`` — ``position_id`` is ``None``
 for an open and the lot's conid for a close. The token is the full 32-bit crc32
@@ -34,7 +34,7 @@ from typing import Literal, Protocol
 import pandas as pd
 
 from src.bt.state import ActionType
-from src.exec.refs import slug
+from src.exec.refs import scope_tag
 from src.live.types import OrderIntent
 
 
@@ -74,28 +74,30 @@ def intent_key(scope: str, intent: OrderIntent) -> IntentKey:
 
 
 def ref_prefix(key: IntentKey) -> str:
-    """The exact prefix every cOID for *key* carries: ``slug(scope)-token-``.
+    """The exact prefix every cOID for *key* carries: ``scope_tag-token-``.
 
-    The scope is slugged (broker-safe, ``-`` preserved) and the token is
+    The scope is tagged with :func:`scope_tag` (broker-safe AND non-collapsing, so
+    two scopes that share a ``slug`` do not share an owner) and the token is
     dashless, so ``trades.is_ours``'s ``rsplit("-", 2)[0]`` still yields the whole
-    slug for attribution.
+    tag for attribution.
     """
-    return f"{slug(key.scope)}-{key.token()}-"
+    return f"{scope_tag(key.scope)}-{key.token()}-"
 
 
 def order_ref(key: IntentKey, attempt: int) -> str:
-    """The cOID for *key*'s *attempt*: ``slug(scope)-token-attempt`` (bar-free)."""
-    return f"{slug(key.scope)}-{key.token()}-{attempt:02x}"
+    """The cOID for *key*'s *attempt*: ``scope_tag-token-attempt`` (bar-free)."""
+    return f"{scope_tag(key.scope)}-{key.token()}-{attempt:02x}"
 
 
 def ref_is_ours(scope: str, coid: str) -> bool:
-    """Whether *coid* was minted by *scope* (its scope segment equals the slug).
+    """Whether *coid* was minted by *scope* (its scope segment equals the tag).
 
     Mirrors ``trades.is_ours``: the token and attempt are dashless, so the scope
     segment is the ref minus its last two ``-``-separated parts. An exact match
-    keeps scope ``momentum`` from claiming ``momentum-v2``'s refs.
+    keeps scope ``momentum`` from claiming ``momentum-v2``'s refs, and the
+    non-collapsing ``scope_tag`` keeps two scopes with one ``slug`` distinct.
     """
-    return coid.rsplit("-", 2)[0] == slug(scope)
+    return coid.rsplit("-", 2)[0] == scope_tag(scope)
 
 
 class IntentState(Enum):

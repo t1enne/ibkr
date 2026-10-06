@@ -14,6 +14,7 @@ import respx
 
 from src.bt.state import ActionType
 from src.data.ibkr.client import IbkrClient
+from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.mapping import IbkrPosition
 from src.live.adapters.ibkr.portfolio_source import IbkrPortfolioSource, build_snapshot
@@ -31,7 +32,7 @@ def _row() -> BookRow:
     ex = Execution(
         execution_id="e1",
         order_id="o1",
-        order_ref=f"{SCOPE}-20240102T093000-000",
+        order_ref=f"{scope_tag(SCOPE)}-20240102T093000-000",
         conid=1,
         symbol="AAPL",
         side=OrderSide.BUY,
@@ -94,7 +95,7 @@ async def test_fetch_advances_the_scope_book(tmp_path: Path) -> None:
             {
                 "execution_id": "e1",
                 "order_id": "o1",
-                "order_ref": f"{SCOPE}-20240102T093000-000",
+                "order_ref": f"{scope_tag(SCOPE)}-20240102T093000-000",
                 "conid": 1,
                 "symbol": "AAPL",
                 "side": "B",
@@ -137,7 +138,7 @@ async def test_fetch_dry_run_writes_nothing(tmp_path: Path) -> None:
             {
                 "execution_id": "e1",
                 "order_id": "o1",
-                "order_ref": f"{SCOPE}-20240102T093000-000",
+                "order_ref": f"{scope_tag(SCOPE)}-20240102T093000-000",
                 "conid": 1,
                 "symbol": "AAPL",
                 "side": "B",

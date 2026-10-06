@@ -120,10 +120,12 @@ class OrderIntent:
     order_type: OrderType = OrderType.MKT
     #: On an OPEN, the scope's funded cash the sizer clamped the quantity against
     #: at decision time (the SAME ``PortfolioView.cash`` reconcile passed to
-    #: ``sized_signal``). The IBKR edge re-checks the order notional against it so
-    #: a gap between here and the fill cannot silently over-deploy the scope onto
-    #: margin. ``None`` on a close, and on an open from a caller that cannot state
-    #: it — the edge then refuses (fail-closed) rather than trading unbounded.
+    #: ``sized_signal``). The IBKR edge re-checks the order notional against it,
+    #: so it bounds the DECISION notional: a notional within the tolerance, the
+    #: whole-share round-up, a funding close that never fills, and a mis-modelled
+    #: commission are all outside what this bound can guarantee. ``None`` on a
+    #: close, and on an open from a caller that cannot state it — the edge then
+    #: refuses (fail-closed) rather than trading unbounded.
     cash_bound: float | None = None
 
 

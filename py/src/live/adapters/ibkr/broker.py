@@ -3,7 +3,7 @@
 Implements ``LiveBroker`` over the Client Portal Gateway. Four things make this
 adapter real rather than a wrapper:
 
-1. **Identity + the pending-intent table.** A ``cOID`` is ``slug(scope)-token-
+1. **Identity + the pending-intent table.** A ``cOID`` is ``scope_tag-token-
    attempt`` built by ``src.live.identity`` — a bar-free key token plus an
    attempt counter — never the decision bar. The durable ``PendingIntents``
    table (the ONLY owner of OPEN state) records every unresolved intent, so a
@@ -281,7 +281,7 @@ class IbkrBroker:
             return Err(cast("FeedError", prepared.error))
         side, conid = prepared.value
         key = intent_key(self._scope, intent)
-        refused = await self._pre_guard(intent, conid)
+        refused = await self._pre_guard(intent, side, conid)
         if refused is not None:
             return Err(refused)
         # INV-1: a SUCCESSFUL working-orders read is a precondition for ANY POST.
@@ -445,36 +445,74 @@ class IbkrBroker:
                 index.setdefault(parsed.order_ref, parsed)
         return Ok(index)
 
-    async def _pre_guard(self, intent: OrderIntent, conid: int) -> FeedError | None:
+    async def _pre_guard(
+        self, intent: OrderIntent, side: OrderSide, conid: int
+    ) -> FeedError | None:
         """The pre-submit safety guards, run before any working-orders read.
 
-        A REDUCING order is refused against a flat or unreadable account net; an
-        OPEN is bounded by the decision-time ``cash_bound`` applied to the
-        WHOLE-share quantity the ticket will actually carry (never the pre-round
-        request, which could round up past the bound).
+        A REDUCING order is refused unless the WHOLE-share quantity it will send
+        is no larger than the account net AND the net is on the side the order
+        reduces (a SELL reduces a long net, a BUY a short one) — so a close on a
+        shared account can never flip a smaller foreign net into an open. An
+        unreadable net still fails closed. An OPEN is bounded by the decision-time
+        ``cash_bound`` applied to the whole-share quantity the ticket will carry
+        (never the pre-round request, which could round up past the bound).
         """
         if intent.action is ActionType.close:
-            net = await self._account_net(conid)
-            if net is None:
-                return feed_error(
-                    "rejected",
-                    f"refused close {intent.symbol} (conid {conid}): account net "
-                    f"unreadable, cannot prove there is anything to reduce",
-                    intent.symbol,
-                )
-            if abs(net) <= _FLAT_EPS:
-                return feed_error(
-                    "rejected",
-                    f"refused close {intent.symbol} (conid {conid}): account is "
-                    f"flat, nothing to reduce",
-                    intent.symbol,
-                )
-            return None
+            return await self._close_guard(intent, side, conid)
         try:
             whole = whole_quantity(intent)
         except OrderMappingError as exc:
             return feed_error("rejected", f"{intent.symbol}: {exc}", intent.symbol)
         return self._open_cash_guard(intent, whole)
+
+    async def _close_guard(
+        self, intent: OrderIntent, side: OrderSide, conid: int
+    ) -> FeedError | None:
+        """Refuse a reducing order the account net cannot safely absorb.
+
+        The account net is the SHARED account's net for the conid, so it can be
+        smaller than our book, or held by another scope/human on the opposite
+        side. Refusing (never clamping — a clamped close would silently leave the
+        lot half-open) when the sent quantity exceeds ``|net|`` or the net is not
+        on the reduce side stops a close from opening a position. An unreadable
+        net fails closed; the flat check keeps the old fail-closed behaviour for
+        a genuinely empty book. ``_FLAT_EPS`` absorbs float noise and a fractional
+        net that shrank slightly between cycles.
+        """
+        net = await self._account_net(conid)
+        if net is None:
+            return feed_error(
+                "rejected",
+                f"refused close {intent.symbol} (conid {conid}): account net "
+                f"unreadable, cannot prove there is anything to reduce",
+                intent.symbol,
+            )
+        if abs(net) <= _FLAT_EPS:
+            return feed_error(
+                "rejected",
+                f"refused close {intent.symbol} (conid {conid}): account is "
+                f"flat, nothing to reduce",
+                intent.symbol,
+            )
+        reducing = net > 0 if side is OrderSide.SELL else net < 0
+        if not reducing:
+            return feed_error(
+                "rejected",
+                f"refused close {intent.symbol} (conid {conid}): account net "
+                f"{net:g} is on the opposite side to the {side.value} close, which "
+                f"would open a position",
+                intent.symbol,
+            )
+        whole = whole_quantity(intent)
+        if whole > abs(net) + _FLAT_EPS:
+            return feed_error(
+                "rejected",
+                f"refused close {intent.symbol} (conid {conid}): close qty {whole:g} "
+                f"exceeds the account net {abs(net):g}, which would open a position",
+                intent.symbol,
+            )
+        return None
 
     def _open_cash_guard(self, intent: OrderIntent, whole: int) -> FeedError | None:
         """Refuse an open whose TICKET notional exceeds its funded cash bound.
@@ -834,8 +872,9 @@ class IbkrBroker:
     async def _account_net(self, conid: int) -> float | None:
         """The account's net quantity for *conid*, or ``None`` if it cannot be read.
 
-        ``None`` (a failed read) means "unknown", which must not be treated as
-        flat — the caller fails closed rather than reducing a book it cannot see.
+        ``None`` (a failed read) means "unknown": the caller fails closed — a
+        reducing order is REFUSED rather than sent against a book it cannot see,
+        because the account net (not our book) is what a close must not exceed.
         """
         account = self._account or self._client.account
         try:

@@ -6,10 +6,16 @@ from typing import cast
 
 import pandas as pd
 
+from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, is_ours, reconcile
 
 SCOPE = "momentum"
+
+
+def _ref(scope: str, ts: str = "20240102T093000", seq: int = 0) -> str:
+    """A ref minted by *scope* (its non-collapsing ``scope_tag`` prefix)."""
+    return f"{scope_tag(scope)}-{ts}-{seq:03d}"
 
 
 def _exec(
@@ -18,7 +24,7 @@ def _exec(
     side: OrderSide,
     qty: float,
     price: float,
-    ref: str = f"{SCOPE}-20240102T093000-000",
+    ref: str = _ref(SCOPE),
     ts: str = "2024-01-02T09:30:00Z",
     commission: float = 1.0,
     symbol: str = "AAPL",
@@ -39,43 +45,76 @@ def _exec(
     )
 
 
-def test_is_ours_uses_the_scope_slug_prefix() -> None:
+def test_is_ours_uses_the_scope_tag_prefix() -> None:
     assert is_ours(SCOPE, _exec("o", side=OrderSide.BUY, qty=1, price=1))
-    foreign = _exec(
-        "o", side=OrderSide.BUY, qty=1, price=1, ref="other-20240102T093000-000"
-    )
+    foreign = _exec("o", side=OrderSide.BUY, qty=1, price=1, ref=_ref("other"))
     assert not is_ours(SCOPE, foreign)
 
 
 def test_is_ours_does_not_claim_a_longer_slug_scope() -> None:
     # Scope "momentum" must NOT absorb refs minted by "momentum-v2"/"momentum-2"
-    # (slug keeps the dash): a prefix match let one scope's book absorb another's
+    # (the tag keeps the dash): a prefix match let one scope's book absorb another's
     # lots (finding 3). The scope segment must match exactly.
     longer = _exec(
         "o",
         side=OrderSide.BUY,
         qty=1,
         price=1,
-        ref="momentum-v2-20240102T093000-000",
+        ref=_ref("momentum-v2"),
     )
     assert not is_ours("momentum", longer)
-    assert is_ours("momentum_v2", longer)  # slug("momentum_v2") == "momentum-v2"
+    assert is_ours("momentum-v2", longer)
     assert is_ours("momentum", _exec("o", side=OrderSide.BUY, qty=1, price=1))
 
 
 def test_is_ours_attributes_the_new_bar_free_ref() -> None:
-    # cOID = slug(scope)-token-attempt. The token and attempt are dashless, so
-    # rsplit("-", 2)[0] yields the whole slug (dashes included) and attribution
+    # cOID = scope_tag-token-attempt. The token and attempt are dashless, so
+    # rsplit("-", 2)[0] yields the whole tag (dashes included) and attribution
     # is unaffected by the identity change.
     assert is_ours(
         SCOPE,
-        _exec("o", side=OrderSide.BUY, qty=1, price=1, ref="momentum-ffb76999-00"),
+        _exec(
+            "o",
+            side=OrderSide.BUY,
+            qty=1,
+            price=1,
+            ref=f"{scope_tag(SCOPE)}-ffb76999-00",
+        ),
     )
     dashed = _exec(
-        "o", side=OrderSide.BUY, qty=1, price=1, ref="momentum-v2-1a2b3c4d-01"
+        "o",
+        side=OrderSide.BUY,
+        qty=1,
+        price=1,
+        ref=f"{scope_tag('momentum-v2')}-1a2b3c4d-01",
     )
-    assert is_ours("momentum_v2", dashed)
+    assert is_ours("momentum-v2", dashed)
     assert not is_ours("momentum", dashed)
+
+
+def test_two_scopes_with_one_slug_do_not_share_an_owner() -> None:
+    # D8: slug("momentum_v2") == slug("momentum-v2"), so a slug-only owner made
+    # both scopes claim each other's fills. The non-collapsing scope_tag keeps
+    # them distinct, so at most one can claim any single execution.
+    assert scope_tag("momentum_v2") != scope_tag("momentum-v2")
+    mine = _exec(
+        "o",
+        side=OrderSide.BUY,
+        qty=1,
+        price=1,
+        ref=f"{scope_tag('momentum_v2')}-1a2b3c4d-00",
+    )
+    assert is_ours("momentum_v2", mine)
+    assert not is_ours("momentum-v2", mine)
+    theirs = _exec(
+        "o",
+        side=OrderSide.BUY,
+        qty=1,
+        price=1,
+        ref=f"{scope_tag('momentum-v2')}-1a2b3c4d-00",
+    )
+    assert not is_ours("momentum_v2", theirs)
+    assert is_ours("momentum-v2", theirs)
 
 
 def test_single_buy_opens_one_row() -> None:
@@ -155,7 +194,7 @@ def test_foreign_executions_are_ignored_without_warning() -> None:
         side=OrderSide.BUY,
         qty=99,
         price=1,
-        ref="someone-else-20240102T093000-000",
+        ref=_ref("someone-else"),
     )
     book, warnings = reconcile(SCOPE, (foreign,), StrategyBook())
     assert book.rows == () and warnings == ()
@@ -177,10 +216,8 @@ def test_empty_scope_is_rejected() -> None:
 
 
 def test_separate_scopes_keep_separate_books() -> None:
-    a = _exec(
-        "o1", side=OrderSide.BUY, qty=10, price=100, ref="alpha-20240102T093000-000"
-    )
-    b = _exec("o2", side=OrderSide.BUY, qty=5, price=50, ref="beta-20240102T093000-000")
+    a = _exec("o1", side=OrderSide.BUY, qty=10, price=100, ref=_ref("alpha"))
+    b = _exec("o2", side=OrderSide.BUY, qty=5, price=50, ref=_ref("beta"))
     abook, _ = reconcile("alpha", (a, b), StrategyBook())
     bbook, _ = reconcile("beta", (a, b), StrategyBook())
     assert [r.qty for r in abook.rows] == [10]
