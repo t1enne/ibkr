@@ -4,18 +4,18 @@ Three pure mappings live here, all table-tested and free of I/O:
 
 - ``build_ticket`` — an ``OrderIntent`` plus the conid we resolved for it becomes
   the ``singleOrderSubmissionRequest`` body IBKR wants (``conid``, ``side``,
-  ``quantity``, ``orderType``, ``tif``, ``cOID``). The ``cOID`` is
-  ``refs.order_ref`` — the SAME deterministic scheme the sim side uses — anchored
-  on the intent's DECISION BAR, so a re-run on the same bar re-mints the identical
-  ref: IBKR dedupes it and the working-order pre-flight adopts it. A later bar
-  mints a fresh ref.
-- ``sequence`` — the deterministic ``(seq, intent)`` ordering (closes first, then
-  opens in the order reconcile emitted, i.e. ``config.symbols`` order). Re-running
-  the same cycle therefore mints identical refs; the next bar gets fresh ones.
+  ``quantity``, ``orderType``, ``tif``, ``cOID``). The ``cOID`` is now supplied
+  by the CALLER (``src.live.identity.order_ref``) — the intent's bar-free token
+  plus an attempt counter — so this function mints no identity of its own and
+  the same key always maps to the same prefix regardless of the decision bar.
+- ``placement_order`` — the deterministic placement order (closes first, then
+  opens in the order reconcile emitted). It no longer affects any ref: identity
+  is keyed on the intent, never the batch position.
 - ``scale_open_cohort`` — the backtest's ONE shared cash scale applied to a live
-  over-cash OPEN cohort (whole-share floor), so an over-deployed multi-open cycle
-  is scaled the way the sim/backtest scales it rather than sending every open at
-  its individually-guarded full size.
+  over-cash OPEN cohort (whole-share floor). It reserves the cohort's estimated
+  commission and requests at the friction-adjusted (executed) price, mirroring
+  ``src.bt.portfolio.pure._scale_opens`` exactly so the live scale never exceeds
+  the backtest's.
 - ``classify_reply`` — the reply-confirmation vocabulary: an order ticket's
   response is either a success carrying an ``order_id``, a reply message that must
   be *confirmed* through ``POST /iserver/reply/{replyId}``, or a refusal to abort
@@ -44,12 +44,19 @@ from typing import Literal, cast
 
 import pandas as pd
 
-from src.bt.portfolio.pure import ScaleRecord
-from src.bt.state import ActionType
-from src.exec.refs import assign_seqs, order_ref as mint_ref
+from src.bt.exchange import execute_signal
+from src.bt.portfolio.pure import ScaleRecord, estimate_open_commission
+from src.bt.state import ActionType, ExecutionParams, FillEvent
 from src.exec.types import Fill, OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.mapping import canonical_order_id, num, opt_str
+from src.live.broker import intent_to_signal, ref_candle
+from src.live.identity import WorkingOrder
 from src.live.types import OrderIntent
+
+#: Deterministic timestamp for the synthetic cohort-sizing probes. Only the
+#: friction/commission figures depend on it (price, not time), so a constant
+#: keeps ``scale_open_cohort`` pure and its scale reproducible.
+_PROBE_TS = cast("pd.Timestamp", pd.Timestamp(0))
 
 #: IBKR's ``orderStatus.order_status`` values. ``Filled``/``Cancelled``/
 #: ``Inactive`` end an order's life; everything else (including an unknown string
@@ -131,27 +138,35 @@ def order_side(
     )
 
 
-def build_ticket(
-    intent: OrderIntent,
-    *,
-    conid: int,
-    side: OrderSide,
-    scope: str,
-    cycle_ts: pd.Timestamp,
-    seq: int,
-) -> Ticket:
-    """Pure: intent + resolved conid + resolved side -> the IBKR ticket body.
+def whole_quantity(intent: OrderIntent) -> int:
+    """The whole-share quantity the ticket will actually carry.
 
-    ``cOID`` is ``refs.order_ref(scope, cycle_ts, seq)`` — the deterministic
-    identity that makes a re-sent order on the same decision bar dedupe at IBKR.
-    ``tif`` is always ``DAY``;
-    an MKT order has no meaningful resting life in this phase. Quantities are
-    whole shares (plan §7.14): a fractional ``qty`` is rounded and flagged, never
-    sent as-is. A REDUCING order (``close``) FLOORS its quantity so it can never
-    overshoot the position it reduces; an opening order rounds to nearest. The
-    side comes from ``order_side`` (the caller resolves a close's lot side from
-    the replayed book before it gets here), so this function never guesses a
-    direction.
+    A REDUCING order (``close``) FLOORS so it can never overshoot the position
+    it reduces; an opening order rounds to nearest. The ONE definition of the
+    rounding rule: ``build_ticket`` and the edge's cash guard both call it, so
+    the guard bounds the quantity that is really sent (never the pre-round one).
+    """
+    whole = (
+        math.floor(intent.qty)
+        if intent.action is ActionType.close
+        else int(round(intent.qty))
+    )
+    if whole <= 0:
+        raise OrderMappingError(
+            f"{intent.symbol}: quantity {intent.qty!r} rounds to {whole} shares; "
+            f"refusing to place a non-positive whole-share order"
+        )
+    return whole
+
+
+def validate_order(intent: OrderIntent) -> None:
+    """Raise when *intent* cannot become a ticket (type, stops, whole quantity).
+
+    Split from ``build_ticket`` so a caller can refuse an unsupported intent
+    BEFORE any network round trip (the pre-flight working-orders read), and so
+    the edge's cash guard bounds a quantity that has already been proven
+    positive-whole. Raising ``OrderMappingError`` keeps the refusal a value at
+    the edge.
     """
     if intent.order_type is not OrderType.MKT:
         raise UnsupportedOrderType(
@@ -165,19 +180,30 @@ def build_ticket(
             f"resting stop (phase 4); refusing to place a naked order that would "
             f"drop the risk levels"
         )
-    whole = (
-        math.floor(intent.qty)
-        if intent.action is ActionType.close
-        else int(round(intent.qty))
-    )
-    if whole <= 0:
-        raise OrderMappingError(
-            f"{intent.symbol}: quantity {intent.qty!r} rounds to {whole} shares; "
-            f"refusing to place a non-positive whole-share order"
-        )
-    ref = mint_ref(scope, cycle_ts, seq)
+    whole_quantity(intent)
+
+
+def build_ticket(
+    intent: OrderIntent,
+    *,
+    conid: int,
+    side: OrderSide,
+    order_ref: str,
+) -> Ticket:
+    """Pure: intent + resolved conid + resolved side -> the IBKR ticket body.
+
+    ``order_ref`` is the ``cOID`` the CALLER minted (``identity.order_ref``): a
+    bar-free key token plus an attempt, so the ticket never embeds the decision
+    bar. ``tif`` is always ``DAY``; an MKT order has no meaningful resting life
+    in this phase. Quantities are whole shares: a fractional ``qty`` is rounded
+    and flagged, never sent as-is (``whole_quantity``). The side comes from
+    ``order_side`` (the caller resolves a close's lot side from the replayed
+    book before it gets here), so this function never guesses a direction.
+    """
+    validate_order(intent)
+    whole = whole_quantity(intent)
     return Ticket(
-        order_ref=ref,
+        order_ref=order_ref,
         side=side,
         conid=conid,
         rounded=abs(intent.qty - whole) > 1e-9,
@@ -187,37 +213,60 @@ def build_ticket(
             "quantity": float(whole),
             "orderType": intent.order_type.value,
             "tif": "DAY",
-            "cOID": ref,
+            "cOID": order_ref,
         },
     )
 
 
-def intent_identity(intent: OrderIntent) -> str:
-    """The intent's stable identity: symbol + action + targeted lot.
+def placement_order(intents: Sequence[OrderIntent]) -> tuple[OrderIntent, ...]:
+    """Deterministic placement order: closes first, then opens in input order.
 
-    ``seq`` (and therefore the ``cOID``) is derived from this, NOT the batch
-    position, so a close filling and dropping out of the next cycle's batch
-    cannot hand the following open the close's already-seen ref (plan §4).
-    """
-    return f"{intent.symbol}|{intent.action.value}|{intent.position_id or ''}"
-
-
-def sequence(
-    intents: Sequence[OrderIntent],
-) -> tuple[tuple[int, OrderIntent], ...]:
-    """``(seq, intent)`` pairs: seq keyed on intent identity, closes ordered first.
-
-    Each intent's ``seq`` comes from its stable identity (``intent_identity``),
-    so re-running a cycle whose membership changed still mints the intended refs.
-    Returned in closes-first order (a deterministic placement order), which no
-    longer affects any ref.
+    A close frees the lot/cash an open needs, so it is placed first. The order
+    no longer affects any ref (identity is keyed on the intent), only the wire
+    sequence.
     """
     ranked = sorted(
         enumerate(intents),
         key=lambda pair: (0 if pair[1].action is ActionType.close else 1, pair[0]),
     )
-    seqs = assign_seqs([intent_identity(intent) for _, intent in ranked])
-    return tuple((seq, intent) for seq, (_, intent) in zip(seqs, ranked, strict=True))
+    return tuple(intent for _, intent in ranked)
+
+
+def parse_working_order(entry: object) -> WorkingOrder | None:
+    """Parse one open-orders entry into a ``WorkingOrder`` (``None`` if unusable).
+
+    A row with no ``cOID`` cannot be attributed to a scope, so it is skipped
+    rather than guessed at. Every other field is best-effort: only the ref and
+    the order id drive adoption, the rest is diagnostic.
+    """
+    if not isinstance(entry, Mapping):
+        return None
+    body = cast("Mapping[str, object]", entry)
+    order_ref = opt_str(body.get("cOID")).strip()
+    if not order_ref:
+        return None
+    return WorkingOrder(
+        order_ref=order_ref,
+        order_id=canonical_order_id(body.get("orderId")),
+        conid=int(num(body.get("conid"))),
+        symbol=opt_str(body.get("ticker") or body.get("symbol")),
+        side=opt_str(body.get("side")),
+        status=opt_str(body.get("order_status") or body.get("status")),
+        filled_qty=num(
+            body.get("filledQuantity")
+            or body.get("filled_quantity")
+            or body.get("cum_fill")
+        ),
+    )
+
+
+def match_working(orders: Sequence[WorkingOrder], prefix: str) -> WorkingOrder | None:
+    """The first working order whose ref starts with *prefix* (ours only).
+
+    *prefix* is ``slug(scope)-token-``: an exact scope+key prefix, never a
+    symbol/side match, so a shared account's foreign orders are never adopted.
+    """
+    return next((o for o in orders if o.order_ref.startswith(prefix)), None)
 
 
 # -- cohort cash scaling (backtest parity) -----------------------------------
@@ -245,16 +294,23 @@ class CohortPlan:
     dropped: tuple[OpenDrop, ...]
 
 
-def scale_open_cohort(intents: tuple[OrderIntent, ...]) -> CohortPlan:
+def scale_open_cohort(
+    intents: tuple[OrderIntent, ...], params: ExecutionParams
+) -> CohortPlan:
     """Mimic the backtest's ONE shared cash scale on a live OPEN cohort.
 
     A lone open is full-size-or-reject and is NEVER scaled (the edge's per-intent
     ``_open_cash_guard`` refuses it) — the legacy path, bit-identical to before.
     Two or more opens were all sized against the ONE ``view.cash`` reconcile
     carried to the edge as their shared ``cash_bound``; if their combined
-    reference-price notional exceeds that budget they compete for it and every
-    qty is scaled by ``min(1, budget / requested)``, mirroring
-    ``src.bt.portfolio.pure._scale_opens``. Two live-only consequences of orders
+    cost exceeds that budget they compete for it and every qty is scaled by
+    ``min(1, budget / requested)``, mirroring ``src.bt.portfolio.pure._scale_opens``
+    exactly: ``requested`` is the friction-adjusted (executed-price) notional and
+    ``budget`` is the shared cash MINUS the cohort's estimated commission under
+    the config's model. Subtracting the reserve is what keeps the live scale from
+    exceeding the backtest's and stops the cohort deploying cash the commission
+    still needs. A budget at or below the reserve scales to zero, so the opens
+    are dropped (rejected) rather than sent. Two live-only consequences of orders
     being whole shares: a scaled qty is FLOORED to whole shares (round-to-nearest
     could resize it back UP past the budget), and one that floors to 0 shares is
     DROPPED rather than sent as a 0-share order. An unprovable budget (opens
@@ -263,17 +319,18 @@ def scale_open_cohort(intents: tuple[OrderIntent, ...]) -> CohortPlan:
     opens = tuple(i for i in intents if i.action in (ActionType.long, ActionType.short))
     if len(opens) <= 1:
         return CohortPlan(intents=intents, scale=None, dropped=())
-    budget = _shared_cash_bound(opens)
-    if budget is None:
+    cash = _shared_cash_bound(opens)
+    if cash is None:
         return _refuse_opens(
             intents,
             opens,
             "cohort opens disagree on their cash bound; cannot prove a shared budget",
         )
-    requested = sum(i.qty * i.ref_price for i in opens)
-    if requested <= 0.0 or budget <= 0.0:
+    commission, requested = _cohort_cost(opens, params)
+    budget = cash - commission
+    if requested <= 0.0:
         return CohortPlan(intents=intents, scale=None, dropped=())
-    scale = min(1.0, budget / requested)
+    scale = max(0.0, min(1.0, budget / requested))
     if scale >= 1.0:
         return CohortPlan(intents=intents, scale=None, dropped=())
     scaled, dropped, members = _apply_scale(opens, scale)
@@ -288,6 +345,28 @@ def scale_open_cohort(intents: tuple[OrderIntent, ...]) -> CohortPlan:
         ),
         dropped=tuple(dropped),
     )
+
+
+def _cohort_cost(
+    opens: tuple[OrderIntent, ...], params: ExecutionParams
+) -> tuple[float, float]:
+    """The cohort's estimated commission and its friction-adjusted requested notional.
+
+    Priced through the SAME ``execute_signal`` the broker fills with, so the
+    figures match ``_scale_opens``' (executed price, model commission) exactly
+    rather than approximating them from the reference price.
+    """
+    fills: tuple[FillEvent, ...] = tuple(
+        execute_signal(
+            intent_to_signal(intent, _PROBE_TS, None),
+            ref_candle(intent.ref_price, intent.symbol, _PROBE_TS),
+            params,
+        )
+        for intent in opens
+    )
+    commission = estimate_open_commission(fills, params.commission_model)
+    requested = sum(max(f.signal.qty, 0.0) * f.executed_price for f in fills)
+    return commission, requested
 
 
 def _shared_cash_bound(opens: tuple[OrderIntent, ...]) -> float | None:
@@ -464,12 +543,16 @@ __all__ = [
     "UnsupportedOrderType",
     "build_ticket",
     "classify_reply",
-    "intent_identity",
     "is_fully_filled",
     "is_terminal",
+    "match_working",
     "order_side",
     "order_state",
     "order_status_of",
-    "sequence",
+    "parse_working_order",
+    "placement_order",
+    "scale_open_cohort",
     "status_to_fill",
+    "validate_order",
+    "whole_quantity",
 ]

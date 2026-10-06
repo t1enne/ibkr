@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import math
 from typing import cast
 
 import pandas as pd
 import pytest
 
+from src.bt.exchange import execute_signal
 from src.bt.portfolio.pure import _scale_opens
-from src.bt.state import ActionType, FillEvent, PortfolioState, TradeSignal
-from src.exec.refs import order_ref
-from src.exec.types import FixedCommission, OrderSide, OrderState, OrderType
+from src.bt.state import ActionType, ExecutionParams, PortfolioState
+from src.exec.types import (
+    FixedCommission,
+    OrderSide,
+    OrderState,
+    OrderType,
+    PerShareCommission,
+)
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     UnknownCloseLot,
@@ -18,19 +26,35 @@ from src.live.adapters.ibkr.orders import (
     UnsupportedStopOrder,
     build_ticket,
     classify_reply,
-    intent_identity,
     is_fully_filled,
     is_terminal,
+    match_working,
     order_side,
     order_state,
+    parse_working_order,
+    placement_order,
     scale_open_cohort,
-    sequence,
     status_to_fill,
+    whole_quantity,
 )
+from src.live.broker import intent_to_signal, ref_candle
+from src.live.identity import intent_key, order_ref, ref_prefix
 from src.live.types import OrderIntent
 
 CYCLE_TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T14:30:00Z"))
 SCOPE = "momentum"
+
+
+def replace_intent(intent: OrderIntent, **changes: object) -> OrderIntent:
+    """A frozen-intent copy with *changes* applied (test convenience)."""
+    return replace(intent, **changes)
+
+
+#: Zero-friction, zero-commission params: the simple scale cases (requested at
+#: the reference price, no reserve) reduce to the pre-fix arithmetic.
+_FLAT_PARAMS = ExecutionParams(
+    spread_bps=0.0, slippage_bps=0.0, commission_model=FixedCommission(0.0)
+)
 
 
 def _intent(
@@ -82,56 +106,48 @@ def test_close_without_a_lot_side_is_an_error() -> None:
 # --- ticket body ------------------------------------------------------------
 
 
-def test_build_ticket_mkt_body_and_deterministic_coid() -> None:
-    ticket = build_ticket(
-        _intent(),
-        conid=265598,
-        side=OrderSide.BUY,
-        scope=SCOPE,
-        cycle_ts=CYCLE_TS,
-        seq=0,
+def test_ref_is_bar_free_and_keyed_on_the_intent() -> None:
+    # INV-2: the cOID is a pure function of (scope, symbol, action, position_id).
+    # It never embeds the decision bar, so a re-run on a LATER bar re-mints the
+    # SAME ref and the working-order pre-flight adopts it instead of duplicating.
+    early = _intent()
+    late = replace_intent(_intent(), decision_ts=CYCLE_TS)
+    assert intent_key(SCOPE, early) == intent_key(SCOPE, late)
+    assert order_ref(intent_key(SCOPE, early), 0) == order_ref(
+        intent_key(SCOPE, late), 0
     )
+    # A different intent (different symbol) mints a different ref.
+    assert order_ref(intent_key(SCOPE, _intent("MSFT")), 0) != order_ref(
+        intent_key(SCOPE, early), 0
+    )
+    # A different attempt on the SAME key mints a different ref (so IBKR's own
+    # dedupe cannot swallow a legitimate re-send).
+    key = intent_key(SCOPE, early)
+    assert order_ref(key, 0) != order_ref(key, 1)
+    assert ref_prefix(key) == order_ref(key, 0)[:-2]
+
+
+def test_build_ticket_mkt_body_carries_the_supplied_coid() -> None:
+    key = intent_key(SCOPE, _intent())
+    ref = order_ref(key, 0)
+    ticket = build_ticket(_intent(), conid=265598, side=OrderSide.BUY, order_ref=ref)
     assert ticket.body == {
         "conid": 265598,
         "side": "BUY",
         "quantity": 10.0,
         "orderType": "MKT",
         "tif": "DAY",
-        "cOID": order_ref(SCOPE, CYCLE_TS, 0),
+        "cOID": ref,
     }
     assert ticket.side is OrderSide.BUY
-    # Deterministic: the same inputs mint the same cOID, so IBKR dedupes a re-send.
-    again = build_ticket(
-        _intent(),
-        conid=265598,
-        side=OrderSide.BUY,
-        scope=SCOPE,
-        cycle_ts=CYCLE_TS,
-        seq=0,
-    )
-    assert again.order_ref == ticket.order_ref
-    # A different seq (a different intent in the cycle) does not.
-    other = build_ticket(
-        _intent(),
-        conid=265598,
-        side=OrderSide.BUY,
-        scope=SCOPE,
-        cycle_ts=CYCLE_TS,
-        seq=1,
-    )
-    assert other.order_ref != ticket.order_ref
+    assert ticket.order_ref == ref
 
 
 def test_build_ticket_close_uses_the_lot_side() -> None:
     intent = _intent(action=ActionType.close, position_id="55")
     side = order_side(intent, ActionType.long)
     ticket = build_ticket(
-        intent,
-        conid=1,
-        side=side,
-        scope=SCOPE,
-        cycle_ts=CYCLE_TS,
-        seq=0,
+        intent, conid=1, side=side, order_ref=order_ref(intent_key(SCOPE, intent), 0)
     )
     assert ticket.body["side"] == "SELL"
 
@@ -140,13 +156,9 @@ def test_build_ticket_close_floors_the_quantity() -> None:
     # A reducing order must never round UP: a 1.6-share close sends 1 share, not
     # 2 (2 would flip the 1.6 long into a 0.4 short — finding 2).
     intent = _intent(action=ActionType.close, position_id="55", qty=1.6)
+    ref = order_ref(intent_key(SCOPE, intent), 0)
     ticket = build_ticket(
-        intent,
-        conid=1,
-        side=order_side(intent, ActionType.long),
-        scope=SCOPE,
-        cycle_ts=CYCLE_TS,
-        seq=0,
+        intent, conid=1, side=order_side(intent, ActionType.long), order_ref=ref
     )
     assert ticket.body["quantity"] == 1.0
     assert ticket.rounded
@@ -158,11 +170,16 @@ def test_build_ticket_open_still_rounds_to_nearest() -> None:
         _intent(qty=1.6),
         conid=1,
         side=OrderSide.BUY,
-        scope=SCOPE,
-        cycle_ts=CYCLE_TS,
-        seq=0,
+        order_ref=order_ref(intent_key(SCOPE, _intent()), 0),
     )
     assert ticket.body["quantity"] == 2.0
+
+
+def test_whole_quantity_is_the_ticket_quantity() -> None:
+    assert whole_quantity(_intent(qty=1.6)) == 2  # open rounds to nearest
+    assert (
+        whole_quantity(_intent(qty=1.6, action=ActionType.close, position_id="x")) == 1
+    )
 
 
 def test_build_ticket_close_that_floors_to_zero_is_refused() -> None:
@@ -173,9 +190,7 @@ def test_build_ticket_close_that_floors_to_zero_is_refused() -> None:
             intent,
             conid=1,
             side=order_side(intent, ActionType.long),
-            scope=SCOPE,
-            cycle_ts=CYCLE_TS,
-            seq=0,
+            order_ref=order_ref(intent_key(SCOPE, intent), 0),
         )
 
 
@@ -185,9 +200,7 @@ def test_build_ticket_rejects_lmt() -> None:
             _intent(order_type=OrderType.LMT),
             conid=1,
             side=OrderSide.BUY,
-            scope=SCOPE,
-            cycle_ts=CYCLE_TS,
-            seq=0,
+            order_ref=order_ref(intent_key(SCOPE, _intent()), 0),
         )
 
 
@@ -205,44 +218,60 @@ def test_build_ticket_refuses_an_intent_carrying_a_stop(
             _intent(stop_loss=stop_loss, take_profit=take_profit),
             conid=1,
             side=OrderSide.BUY,
-            scope=SCOPE,
-            cycle_ts=CYCLE_TS,
-            seq=0,
+            order_ref=order_ref(intent_key(SCOPE, _intent()), 0),
         )
 
 
-# --- deterministic sequencing ----------------------------------------------
+# --- placement order + working-order matching -------------------------------
 
 
-def test_sequence_puts_closes_first_and_keys_seq_on_identity() -> None:
+def test_placement_order_puts_closes_first_deterministically() -> None:
     opens = (_intent("AAPL"), _intent("MSFT"))
     closes = (
         _intent("MSFT", ActionType.close, position_id="2"),
         _intent("AAPL", ActionType.close, position_id="1"),
     )
-    # reconcile emits closes-then-opens; sequence keeps that placement order.
-    pairs = sequence(closes + opens)
-    assert [intent.symbol for _seq, intent in pairs] == ["MSFT", "AAPL", "AAPL", "MSFT"]
-    assert [intent.action for _seq, intent in pairs][:2] == [
-        ActionType.close,
-        ActionType.close,
+    assert [i.symbol for i in placement_order(closes + opens)] == [
+        "MSFT",
+        "AAPL",
+        "AAPL",
+        "MSFT",
     ]
-    # seqs are all distinct and keyed on intent identity, not batch position.
-    assert len({seq for seq, _ in pairs}) == 4
-    # Re-running the same cycle yields the identical mapping (same cOIDs).
-    assert sequence(closes + opens) == pairs
+    assert placement_order(closes + opens) == placement_order(closes + opens)
 
 
-def test_sequence_shifted_batch_keeps_the_open_coid() -> None:
-    # The shifted-batch trap (plan §4): a close filling drops it from the next
-    # batch, so a positional seq would hand the open the close's already-seen
-    # ref and dedupe it away. Identity-keyed seq keeps the open's ref.
-    close = _intent("AAPL", ActionType.close, position_id="1")
-    open_ = _intent("AAPL")
-    with_close = dict((intent_identity(i), seq) for seq, i in sequence((close, open_)))
-    without_close = dict((intent_identity(i), seq) for seq, i in sequence((open_,)))
-    assert with_close[intent_identity(open_)] == without_close[intent_identity(open_)]
-    assert with_close[intent_identity(close)] != with_close[intent_identity(open_)]
+def test_parse_working_order_reads_the_coid_and_order_id() -> None:
+    parsed = parse_working_order(
+        {
+            "cOID": "momentum-1a2b3c4d-00",
+            "orderId": 979320001.0,
+            "conid": "265598",
+            "ticker": "AAPL",
+            "side": "BUY",
+            "order_status": "Submitted",
+            "filledQuantity": "0",
+        }
+    )
+    assert parsed is not None
+    assert parsed.order_ref == "momentum-1a2b3c4d-00"
+    assert parsed.order_id == "979320001"  # canonicalised str(int(...))
+    assert parsed.symbol == "AAPL"
+    assert parsed.conid == 265598
+
+
+@pytest.mark.parametrize("entry", [None, {}, {"orderId": 1}, {"cOID": ""}])
+def test_parse_working_order_skips_unattributable_rows(entry: object) -> None:
+    assert parse_working_order(entry) is None
+
+
+def test_match_working_matches_on_the_exact_scope_token_prefix() -> None:
+    from src.live.identity import WorkingOrder
+
+    ours = WorkingOrder("momentum-1a2b3c4d-00", "1", 1, "AAPL", "BUY", "Submitted", 0.0)
+    foreign = WorkingOrder("mom-99999999-00", "2", 1, "AAPL", "BUY", "Submitted", 0.0)
+    assert match_working((foreign, ours), "momentum-1a2b3c4d-") is ours
+    # Never a symbol+side match: a foreign order on the same symbol is not ours.
+    assert match_working((foreign,), "momentum-1a2b3c4d-") is None
 
 
 # --- reply classification ---------------------------------------------------
@@ -413,14 +442,15 @@ def _open(symbol: str, qty: float, price: float, bound: float) -> OrderIntent:
 
 
 def test_lone_open_is_never_scaled() -> None:
-    plan = scale_open_cohort((_open("AAPL", 100.0, 100.0, 5000.0),))
+    plan = scale_open_cohort((_open("AAPL", 100.0, 100.0, 5000.0),), _FLAT_PARAMS)
     assert plan.scale is None and not plan.dropped
     assert plan.intents[0].qty == 100.0
 
 
 def test_multi_open_cohort_scales_to_the_shared_bound() -> None:
     plan = scale_open_cohort(
-        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 15000.0))
+        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 15000.0)),
+        _FLAT_PARAMS,
     )
     assert plan.scale is not None
     assert plan.scale.scale == pytest.approx(0.75)
@@ -430,14 +460,16 @@ def test_multi_open_cohort_scales_to_the_shared_bound() -> None:
 
 def test_cohort_that_already_fits_is_not_scaled() -> None:
     plan = scale_open_cohort(
-        (_open("AAPL", 10.0, 100.0, 15000.0), _open("MSFT", 10.0, 100.0, 15000.0))
+        (_open("AAPL", 10.0, 100.0, 15000.0), _open("MSFT", 10.0, 100.0, 15000.0)),
+        _FLAT_PARAMS,
     )
     assert plan.scale is None and not plan.dropped
 
 
 def test_scaled_open_that_floors_to_zero_is_dropped() -> None:
     plan = scale_open_cohort(
-        (_open("AAPL", 100.0, 100.0, 5000.0), _open("MSFT", 1.0, 100.0, 5000.0))
+        (_open("AAPL", 100.0, 100.0, 5000.0), _open("MSFT", 1.0, 100.0, 5000.0)),
+        _FLAT_PARAMS,
     )
     assert [d.intent.symbol for d in plan.dropped] == ["MSFT"]
     assert sorted(i.qty for i in plan.intents) == [49.0]
@@ -445,47 +477,74 @@ def test_scaled_open_that_floors_to_zero_is_dropped() -> None:
 
 def test_opens_disagreeing_on_their_bound_fail_closed() -> None:
     plan = scale_open_cohort(
-        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 9000.0))
+        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 9000.0)),
+        _FLAT_PARAMS,
     )
     assert plan.scale is None
     assert sorted(d.intent.symbol for d in plan.dropped) == ["AAPL", "MSFT"]
     assert plan.intents == ()
 
 
-def test_live_scale_matches_the_backtest_shared_scale() -> None:
-    """The edge applies the SAME shared factor ``_scale_opens`` derives."""
-    cash = 15000.0
-    fills = tuple(
-        FillEvent(
-            signal=TradeSignal(
-                action=ActionType.long,
-                symbol=sym,
-                timestamp=CYCLE_TS,
-                price=100.0,
-                qty=100.0,
-                fill_at_next_open=False,
-            ),
-            filled_qty=100.0,
-            executed_price=100.0,
-            commission=0.0,
-            slippage=0.0,
-            timestamp=CYCLE_TS,
-        )
-        for sym in ("AAPL", "MSFT")
+def test_commission_reserve_that_does_not_fit_drops_the_opens() -> None:
+    # B3: when the commission reserve alone exhausts the budget the cohort used
+    # to fit, the opens are DROPPED (rejected), never sent on cash the fee needs.
+    huge_fee = ExecutionParams(
+        spread_bps=0.0, slippage_bps=0.0, commission_model=FixedCommission(20000.0)
     )
+    plan = scale_open_cohort(
+        (_open("AAPL", 10.0, 100.0, 1000.0), _open("MSFT", 10.0, 100.0, 1000.0)),
+        huge_fee,
+    )
+    assert plan.scale is not None and plan.scale.scale == 0.0
+    assert sorted(d.intent.symbol for d in plan.dropped) == ["AAPL", "MSFT"]
+    assert plan.intents == ()
+
+
+def _probe_fills(
+    symbols: tuple[str, ...], qty: float, cash: float, params: ExecutionParams
+):
+    """The backtest's fills, priced exactly as the live probe derives them."""
+    return tuple(
+        execute_signal(
+            intent_to_signal(_open(sym, qty, 100.0, cash), CYCLE_TS, None),
+            ref_candle(100.0, sym, CYCLE_TS),
+            params,
+        )
+        for sym in symbols
+    )
+
+
+def test_live_scale_matches_the_backtest_with_commission_and_friction() -> None:
+    """The edge applies the SAME shared factor ``_scale_opens`` derives, reserving
+    commission and requesting at the friction-adjusted price (B3).
+
+    The old formula used the raw reference notional and no reserve, so live could
+    only ever deploy MORE than the backtest. With a real per-share commission and
+    non-zero friction the live factor must EQUAL the backtest's (parity) and be
+    strictly BELOW the naive ``cash / ref-notional`` scale the old code produced.
+    """
+    cash = 15000.0
+    params = ExecutionParams(
+        spread_bps=5.0, slippage_bps=2.0, commission_model=PerShareCommission(0.01)
+    )
+    fills = _probe_fills(("AAPL", "MSFT"), 100.0, cash, params)
     portfolio = PortfolioState(
         cash=cash, positions={}, trades=(), equity_curve=(), initial_capital=cash
     )
-    scaled, record = _scale_opens(portfolio, fills, FixedCommission(0.0))
+    scaled, record = _scale_opens(portfolio, fills, params.commission_model)
     assert record is not None
 
-    plan = scale_open_cohort(
-        (_open("AAPL", 100.0, 100.0, cash), _open("MSFT", 100.0, 100.0, cash))
-    )
+    opens = (_open("AAPL", 100.0, 100.0, cash), _open("MSFT", 100.0, 100.0, cash))
+    plan = scale_open_cohort(opens, params)
     assert plan.scale is not None
-    assert plan.scale.scale == pytest.approx(record.scale) == pytest.approx(0.75)
-    assert (
-        sorted(i.qty for i in plan.intents)
-        == sorted(f.signal.qty for f in scaled)
-        == [75.0, 75.0]
-    )
+    # Parity with the backtest's shared scale.
+    assert plan.scale.scale == pytest.approx(record.scale)
+    # Direction: the live scale is strictly below the naive no-reserve factor, so
+    # live never deploys more than the backtest (the bug this fixes).
+    naive = cash / sum(o.qty * o.ref_price for o in opens)
+    assert plan.scale.scale < naive
+    # Same factor, but live orders are whole shares: each is the backtest's scaled
+    # qty FLOORED (never rounded up past the budget).
+    assert [i.qty for i in plan.intents] == [
+        float(math.floor(f.signal.qty)) for f in scaled
+    ]

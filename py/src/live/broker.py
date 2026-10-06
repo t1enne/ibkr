@@ -28,6 +28,7 @@ from src.bt.state import (
     Position,
     TradeSignal,
 )
+from src.live.identity import OrderOutcome
 from src.live.result import Err, Ok, Result
 from src.live.types import FeedError, OrderIntent, PortfolioView
 
@@ -41,6 +42,9 @@ class OrderResult:
     ok: bool
     message: str = ""
     position_id: str | None = None  # book lot handle: the opened lot, or the closed lot
+    #: How this order was dispositioned. ``ADOPTED`` = an already-working order
+    #: was seen and not re-sent; the rest mirror the outcome vocabulary.
+    outcome: OrderOutcome = OrderOutcome.PLACED
 
 
 class LiveBroker(Protocol):
@@ -48,13 +52,18 @@ class LiveBroker(Protocol):
 
     Distinct from the shared ``src.exec.ports.Broker`` (the synchronous
     submit/cancel/fills order edge): this is the live cycle's async routing seam
-    (``seed``/``place``/``place_cohort``/``close``). ``place`` routes ONE order
-    (real IBKR routing is per-order); ``place_cohort`` routes a whole cycle and
-    lets a simulated book settle it atomically. A real broker may implement
-    ``place_cohort`` as a loop of ``place``.
+    (``seed``/``resync``/``place``/``place_cohort``/``close``). ``place`` routes
+    ONE order (real IBKR routing is per-order); ``place_cohort`` routes a whole
+    cycle and lets a simulated book settle it atomically. A real broker may
+    implement ``place_cohort`` as a loop of ``place``.
+
+    ``resync`` reconciles the broker's durable OPEN order state at cycle start
+    (adopting a prior cycle's working order); the simulated broker has nothing
+    to reconcile and returns an empty tuple.
     """
 
     def seed(self, portfolio: PortfolioState) -> None: ...
+    async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]: ...
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]: ...
     async def place_cohort(
         self, intents: tuple[OrderIntent, ...]
@@ -259,6 +268,10 @@ class SimulatedBroker:
         """The current simulated book."""
         return self._portfolio
 
+    async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
+        """Nothing to resync: the simulated book is advanced from its own settles."""
+        return Ok(())
+
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]:
         """Route one order; a cohort of one, so a lone open fills or rejects as before."""
         placed = await self.place_cohort((intent,))
@@ -340,7 +353,11 @@ class SimulatedBroker:
         """Per-order outcome after the cohort settled (scaled qty for applied opens)."""
         if index in rejected:
             return OrderResult(
-                intent=intent, fill=None, ok=False, message=rejected[index]
+                intent=intent,
+                fill=None,
+                ok=False,
+                message=rejected[index],
+                outcome=OrderOutcome.REJECTED,
             )
         routed = fills[index]
         if intent.action is ActionType.close:
@@ -353,6 +370,7 @@ class SimulatedBroker:
                     fill=None,
                     ok=False,
                     message=_rejection_message(failure),
+                    outcome=OrderOutcome.REJECTED,
                 )
             position_id = next_position_id(
                 intent.symbol, ts, open_base + open_rank[index]

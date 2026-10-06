@@ -101,13 +101,21 @@ class FakeBroker:
     def __init__(self, reject: bool = False, open_pid: str | None = "L1") -> None:
         self.seeded: PortfolioState | None = None
         self.placed: list[OrderIntent] = []
+        self.resynced = 0
+        self.events: list[str] = []
         self._reject = reject
         self._open_pid = open_pid
 
     def seed(self, portfolio: PortfolioState) -> None:
         self.seeded = portfolio
 
+    async def resync(self) -> Ok[tuple[OrderResult, ...], FeedError]:
+        self.resynced += 1
+        self.events.append("resync")
+        return Ok(())
+
     async def place(self, intent: OrderIntent) -> PlaceResult:
+        self.events.append("place")
         self.placed.append(intent)
         if self._reject:
             return Ok(OrderResult(intent=intent, fill=None, ok=False, message="no"))
@@ -659,6 +667,58 @@ async def test_run_cycle_cohort_error_is_surfaced_not_silently_empty(
     assert report.placement_error is not None
     assert report.placement_error.kind == "transport"
     assert "cohort refused" in report.placement_error.message
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_resyncs_before_placing(tmp_path: Path) -> None:
+    # Cycle start must reconcile OPEN intents (resync) BEFORE signals/reconcile/
+    # placement, so a prior cycle's working order is adopted, never re-minted.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    broker = FakeBroker()
+
+    await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=broker,
+        ledger=ledger,
+        strategy_id="S1",
+        scope="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert broker.resynced == 1
+    assert broker.events[0] == "resync"  # before any placement
+    assert "place" in broker.events
+
+
+@pytest.mark.asyncio
+async def test_dry_run_never_resyncs(tmp_path: Path) -> None:
+    # resync persists state, which a read-only run must not do.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    broker = FakeBroker()
+
+    await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=broker,
+        ledger=ledger,
+        strategy_id="S1",
+        scope="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        dry_run=True,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert broker.resynced == 0
 
 
 def test_build_report_is_pure() -> None:

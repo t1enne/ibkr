@@ -42,6 +42,7 @@ from peewee import (
     fn,
 )
 
+from src.bt.state import ActionType
 from src.data.db import _DEFAULT_DB_PATH
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import (
@@ -49,6 +50,13 @@ from src.live.adapters.ibkr.trades import (
     Execution,
     StrategyBook,
     is_ours,
+)
+from src.live.identity import (
+    OPEN_STATES,
+    IntentKey,
+    IntentRecord,
+    IntentState,
+    order_ref,
 )
 from src.live.lease import file_lease
 
@@ -158,13 +166,49 @@ class LiveSimLot(_Base):
         primary_key = CompositeKey("scope", "position_id")
 
 
+class LiveOrderIntent(_Base):
+    """The durable owner of OPEN order state, keyed by ``(scope, token)``.
+
+    One row per intent key (``symbol``/``action``/``position_id`` split out for
+    the collision check and for readability). ``state`` is an ``IntentState``
+    value, ``attempt`` the re-send counter, ``order_ref`` the minted cOID and
+    ``order_id`` the broker's id (null while unknown). Added to the model set
+    above so the existing ``IF NOT EXISTS`` create path builds it — no ALTER,
+    no rename, nothing existing is touched.
+    """
+
+    scope = TextField()
+    token = TextField()
+    symbol = TextField()
+    action = TextField()
+    position_id = TextField(null=True)
+    state = TextField()
+    attempt = IntegerField()
+    order_ref = TextField()
+    order_id = TextField(null=True)
+    decision_ts = IntegerField(null=True)
+    updated_at = IntegerField()
+
+    class Meta:
+        table_name = "live_order_intent"
+        primary_key = CompositeKey("scope", "token")
+
+
 _MODELS = (
     LiveStrategy,
     LivePosition,
     LiveExecution,
     LiveCash,
     LiveSimLot,
+    LiveOrderIntent,
 )
+
+#: The terminal (closed) intent states ``prune`` is allowed to delete.
+_CLOSED_INTENTS = [
+    IntentState.FILLED.value,
+    IntentState.UNFILLED.value,
+    IntentState.REJECTED.value,
+]
 
 # Timestamps round-trip through INTEGER epoch milliseconds — the same clock the
 # candle table uses, so a book row and a bar are comparable without a tz step.
@@ -541,6 +585,140 @@ class SqliteLedger:
                 .execute()
             )
 
+    # -- pending order intents (PendingIntents) ----------------------------
+    #
+    # The durable owner of OPEN order state. Reads tolerate a missing table
+    # (empty), like ``load_book``; writes create it lazily. A stored row whose
+    # symbol/action/position_id disagrees with the token's key is a crc32
+    # collision: it is warned about and treated as ABSENT, so a foreign identity
+    # is never adopted. (A true collision-bump would require identity to consult
+    # the store, which the pure ``IntentKey.token`` forbids.)
+
+    def load(self, key: IntentKey) -> IntentRecord | None:
+        """The durable record for *key*, or ``None`` when unwritten/foreign."""
+        try:
+            with self._database.bind_ctx(_MODELS):
+                row = LiveOrderIntent.get_or_none(
+                    (LiveOrderIntent.scope == key.scope)
+                    & (LiveOrderIntent.token == key.token())
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return None
+        if row is None:
+            return None
+        if not _row_matches_key(row, key):
+            logger.warning(
+                "live_order_intent token %s under scope %r collides with key "
+                "%s|%s|%s; refusing to adopt a foreign identity",
+                key.token(),
+                key.scope,
+                key.symbol,
+                key.action.value,
+                key.position_id,
+            )
+            return None
+        return _model_to_intent(row)
+
+    def load_open(self, scope: str) -> tuple[IntentRecord, ...]:
+        """Every OPEN record for *scope* (empty if unwritten)."""
+        states = [s.value for s in OPEN_STATES]
+        try:
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LiveOrderIntent.select()
+                    .where(
+                        (LiveOrderIntent.scope == scope)
+                        & (LiveOrderIntent.state << states)
+                    )
+                    .execute()
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return ()
+        return tuple(_model_to_intent(row) for row in rows)
+
+    def save(self, record: IntentRecord) -> None:
+        """Upsert *record* keyed ``(scope, token)``; warn on a token collision."""
+        with self._write():
+            occupied = LiveOrderIntent.get_or_none(
+                (LiveOrderIntent.scope == record.key.scope)
+                & (LiveOrderIntent.token == record.key.token())
+            )
+            if occupied is not None and not _row_matches_key(occupied, record.key):
+                logger.warning(
+                    "live_order_intent token %s under scope %r already belongs to "
+                    "%s|%s|%s; replacing it with %s|%s|%s (crc32 collision)",
+                    record.key.token(),
+                    record.key.scope,
+                    occupied.symbol,
+                    occupied.action,
+                    occupied.position_id,
+                    record.key.symbol,
+                    record.key.action.value,
+                    record.key.position_id,
+                )
+            LiveOrderIntent.insert(**_intent_fields(record)).on_conflict(
+                "REPLACE"
+            ).execute()
+
+    def open_attempt(
+        self, key: IntentKey, decision_ts: pd.Timestamp | None, now: pd.Timestamp
+    ) -> IntentRecord:
+        """Mint the next attempt for *key* and persist it PENDING.
+
+        The attempt bumps past any prior stored record, so a legitimate re-send
+        (a close re-closed after a partial fill) gets a NEW cOID and IBKR's own
+        dedupe cannot swallow it.
+        """
+        existing = self.load(key)
+        attempt = existing.attempt + 1 if existing is not None else 0
+        record = IntentRecord(
+            key=key,
+            state=IntentState.PENDING,
+            attempt=attempt,
+            order_ref=order_ref(key, attempt),
+            order_id=None,
+            decision_ts=decision_ts,
+        )
+        self.save(record)
+        return record
+
+    def close(
+        self,
+        key: IntentKey,
+        state: IntentState,
+        order_id: str | None,
+        now: pd.Timestamp,
+    ) -> None:
+        """Stamp *state* (and *order_id* when known) on *key*'s record.
+
+        The stored ``order_id`` is only overwritten when a new one is supplied,
+        so an UNRESOLVED transition does not erase a known id.
+        """
+        fields: dict[str, object] = {"state": state.value, "updated_at": _ms(now)}
+        if order_id is not None:
+            fields["order_id"] = order_id
+        with self._write():
+            LiveOrderIntent.update(**fields).where(
+                (LiveOrderIntent.scope == key.scope)
+                & (LiveOrderIntent.token == key.token())
+            ).execute()
+
+    def prune(self, before: pd.Timestamp) -> int:
+        """Delete CLOSED intent rows older than *before*; return the count."""
+        with self._write():
+            return (
+                LiveOrderIntent.delete()
+                .where(
+                    (LiveOrderIntent.state << _CLOSED_INTENTS)
+                    & (LiveOrderIntent.updated_at < _ms(before))
+                )
+                .execute()
+            )
+
 
 def _ms(ts: pd.Timestamp) -> int:
     """Epoch-milliseconds of *ts*.
@@ -557,6 +735,50 @@ def _ts(value: int | None) -> pd.Timestamp | None:
     if value is None:
         return None
     return cast("pd.Timestamp", pd.Timestamp(value, unit="ms", tz="UTC"))
+
+
+def _row_matches_key(row: LiveOrderIntent, key: IntentKey) -> bool:
+    """Whether a stored intent row names the same trade as *key*."""
+    return (
+        row.symbol == key.symbol
+        and row.action == key.action.value
+        and (row.position_id or None) == key.position_id
+    )
+
+
+def _intent_fields(record: IntentRecord) -> dict[str, object]:
+    now = pd.Timestamp.now()
+    return {
+        "scope": record.key.scope,
+        "token": record.key.token(),
+        "symbol": record.key.symbol,
+        "action": record.key.action.value,
+        "position_id": record.key.position_id,
+        "state": record.state.value,
+        "attempt": record.attempt,
+        "order_ref": record.order_ref,
+        "order_id": record.order_id,
+        "decision_ts": (
+            _ms(record.decision_ts) if record.decision_ts is not None else None
+        ),
+        "updated_at": _ms(now),
+    }
+
+
+def _model_to_intent(row: LiveOrderIntent) -> IntentRecord:
+    return IntentRecord(
+        key=IntentKey(
+            scope=cast("str", row.scope),
+            symbol=cast("str", row.symbol),
+            action=ActionType(cast("str", row.action)),
+            position_id=cast("str | None", row.position_id),
+        ),
+        state=IntentState(cast("str", row.state)),
+        attempt=int(cast("int", row.attempt)),
+        order_ref=cast("str", row.order_ref),
+        order_id=cast("str | None", row.order_id),
+        decision_ts=_ts(cast("int | None", row.decision_ts)),
+    )
 
 
 def _book_fields(row: BookRow) -> dict[str, object]:

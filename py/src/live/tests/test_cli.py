@@ -346,6 +346,9 @@ class _RecordingLedger:
     def prune_closed(self, before: pd.Timestamp) -> int:
         return 0
 
+    def prune(self, before: pd.Timestamp) -> int:
+        return 0
+
     def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None:
         self.touched += 1
 
@@ -369,6 +372,9 @@ class _FakeBroker:
         self.placed: list[OrderIntent] = []
 
     def seed(self, portfolio: PortfolioState) -> None: ...
+
+    async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
+        return Ok(())
 
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]:
         self.placed.append(intent)
@@ -605,6 +611,9 @@ class FakeLedger:
     def ensure_strategy(self, *a: object, **k: object) -> None: ...
     def ensure_cash(self, *a: object, **k: object) -> None: ...
     def prune_closed(self, *a: object, **k: object) -> int:
+        return 0
+
+    def prune(self, *a: object, **k: object) -> int:
         return 0
 
 

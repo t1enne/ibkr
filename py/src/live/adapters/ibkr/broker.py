@@ -1,31 +1,33 @@
 """``IbkrBroker`` — the real routing edge for a live cycle (plan phase 3, MKT).
 
-Implements ``LiveBroker`` over the Client Portal Gateway. Three things make this
+Implements ``LiveBroker`` over the Client Portal Gateway. Four things make this
 adapter real rather than a wrapper:
 
-1. **The reply-confirmation loop.** ``POST /iserver/account/{acct}/orders`` does
-   not always return an ``order_id``: for a warning (an MKT order without market
-   data, say) it returns an order *reply message* carrying a ``replyId`` that must
-   be confirmed through ``POST /iserver/reply/{replyId}`` before the order is
-   actually submitted. We auto-confirm exactly one thing — an ordinary
-   confirm-this-order reply — and abort on anything else (a reject prompt, an
-   ``error``, an unrecognised shape) with the broker's own verbatim text. The
-   loop is bounded: an endless stream of confirmations is a broker bug, not a
-   mandate to keep pressing yes.
-2. **The fill wait.** A submission returns an order id, not a fill. ``wait_filled``
-   polls ``/iserver/account/order/status/{orderId}`` to a terminal status with a
-   bounded timeout, and maps the outcome honestly: filled → a fill; rejected →
-   ``rejected``; still working (or partial) when the clock runs out → ``unfilled``
-   carrying the partial qty — never silently reported as success; no terminal
-   status at all → ``timeout``.
-3. **No local book.** ``seed`` records the replayed book for ONE purpose —
-   resolving the side of a lot a close intent targets — but never settles fills
-   through ``apply_fills``. IBKR is the truth: the next cycle's replay picks the
-   fills up from ``/iserver/account/trades``.
+1. **Identity + the pending-intent table.** A ``cOID`` is ``slug(scope)-token-
+   attempt`` built by ``src.live.identity`` — a bar-free key token plus an
+   attempt counter — never the decision bar. The durable ``PendingIntents``
+   table (the ONLY owner of OPEN state) records every unresolved intent, so a
+   reported timeout leaves a durable record and the next cycle re-checks it
+   instead of re-minting a fresh duplicate.
+2. **The reply-confirmation loop.** ``POST /iserver/account/{acct}/orders`` does
+   not always return an ``order_id``: for a warning it returns an order *reply
+   message* carrying a ``replyId`` that must be confirmed through
+   ``POST /iserver/reply/{replyId}``. We auto-confirm exactly one thing — an
+   ordinary confirm-this-order reply — and abort on anything else.
+3. **The fill wait.** A submission returns an order id, not a fill.
+   ``wait_filled`` polls ``/iserver/account/order/status/{orderId}`` honestly:
+   filled → a fill; rejected → ``rejected``; still working/partial at the
+   deadline → ``unfilled``/``timeout`` — never silently success.
+4. **No local book.** ``seed`` records the replayed book only to resolve a
+   close's lot side; IBKR is the truth and the next cycle's execution replay
+   advances the book.
 
-Defense in depth: an ``IbkrBroker`` constructed (or flagged) as a dry run refuses
-to place anything, even if a caller forgets the CLI's guard. Phase 3 places no
-cancel/modify, no resting stop, no bracket and no OCA order.
+**Fail-closed on identity.** Before any POST — submit or reply-confirm — an
+``open_orders`` read must SUCCEED. A failed read is an ``Err`` and no POST
+follows: a duplicate order is unbounded exposure, while a skipped cycle is
+recoverable on the next bar because the intent is still desired. Any POST that
+can submit (a submit OR a confirm) is settled by a SUCCESSFUL working-orders
+read; absence in a FAILED read is ``unresolved``, never "not placed".
 """
 
 from __future__ import annotations
@@ -34,37 +36,50 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import cast
 
 import pandas as pd
 from ib_rest_api_client.models import SecdefSearchResponseItem
 
-from src.bt.state import ActionType, FillEvent, PortfolioState
+from src.bt.state import ActionType, ExecutionParams, FillEvent, PortfolioState
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import search_contracts
-from src.exec.refs import assign_seqs
-from src.exec.types import Fill, OrderState
-from src.live.adapters.ibkr.mapping import (
-    canonical_order_id,
-    opt_str,
-    parse_positions,
-)
+from src.exec.types import Fill, OrderSide, OrderState
+from src.live.adapters.ibkr.mapping import parse_positions
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
+    ReplyOutcome,
     Ticket,
     build_ticket,
     classify_reply,
-    intent_identity,
     is_fully_filled,
     is_terminal,
+    match_working,
     order_side,
     order_state,
     order_status_of,
+    parse_working_order,
+    placement_order,
     scale_open_cohort,
-    sequence,
     status_to_fill,
+    validate_order,
+    whole_quantity,
 )
 from src.live.broker import OrderResult, position_side_of, trade_signal
+from src.live.identity import (
+    OPEN_STATES,
+    IntentKey,
+    IntentRecord,
+    IntentState,
+    OrderOutcome,
+    PendingIntents,
+    Resolution,
+    WorkingOrder,
+    intent_key,
+    order_ref,
+    ref_prefix,
+)
 from src.live.result import Err, Ok, Result
 from src.live.types import FeedError, OrderIntent, PortfolioView, feed_error
 
@@ -83,10 +98,17 @@ _FLAT_EPS = 1e-9
 
 #: Slack allowed on an OPEN's notional over its decision-time ``cash_bound`` before
 #: refusing: absorbs a normal reference-price gap between the decision bar and the
-#: fill, so an order sized to the full funded cash is not refused on a few cents of
-#: drift. A material over-deployment (an explicit-qty strategy sizing past cash, or
-#: a stale intent) still trips it.
+#: fill. A material over-deployment (an explicit-qty strategy, or a stale intent)
+#: still trips it.
 _OPEN_CASH_TOLERANCE = 0.02
+
+#: A settle-with-no-terminal maps back to a durable intent state. ``rejected`` and
+#: ``unfilled`` are terminal; anything else (timeout, a transport blip on the
+#: status read) keeps the intent WORKING so the next cycle re-checks it.
+_STATE_FOR_KIND: Mapping[str, IntentState] = {
+    "rejected": IntentState.REJECTED,
+    "unfilled": IntentState.UNFILLED,
+}
 
 ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
@@ -104,11 +126,7 @@ async def _default_conid_lookup(ticker: str) -> int:
     The search is by ticker, so an unverified first hit can put a real order on
     the wrong instrument. Refuses (``ValueError`` -> a typed ``FeedError``) when
     no candidate names the ticker, when the candidates name more than one conid
-    (ambiguous), or when the chosen contract is ``restricted``. Verified: the
-    contract's ``symbol`` equals the ticker, and ``search_contracts`` has already
-    restricted the set to US-stock listings (a US primary exchange or an ``STK``
-    section) — the search response carries no currency field, so that listing
-    filter is the instrument-type/currency guarantee available here.
+    (ambiguous), or when the chosen contract is ``restricted``.
     """
     candidates = await search_contracts(ticker)
     matches = tuple(c for c in candidates if _names_the_ticker(c, ticker))
@@ -130,17 +148,21 @@ async def _default_conid_lookup(ticker: str) -> int:
     return int(conid)
 
 
-def _cycle_ts(intent: OrderIntent, fallback: pd.Timestamp) -> pd.Timestamp:
-    """The cOID's timestamp anchor: the intent's decision bar, else *fallback*.
+def _attempt_of(order_ref_str: str, existing: IntentRecord | None) -> int:
+    """The attempt encoded in *order_ref_str*'s dashless hex tail (or the prior one)."""
+    try:
+        return int(order_ref_str.rsplit("-", 1)[-1], 16)
+    except ValueError:
+        return existing.attempt if existing is not None else 0
 
-    A DETERMINISTIC anchor (the bar the order was decided on) makes a re-run on
-    the same data re-mint an identical ref, so IBKR dedupes it and the
-    working-order pre-flight can adopt it. A wall-clock anchor minted a fresh
-    ref every cycle, so an open whose ``wait_filled`` timed out became a second
-    live order on the next cycle (double exposure). ``fallback`` (the wall clock)
-    is used only when the intent never carried a bar — a direct/synthetic caller.
+
+def _day_rolled(decision_ts: pd.Timestamp | None, now: pd.Timestamp) -> bool:
+    """Whether *now* is a later calendar day than *decision_ts* (a DAY order expired).
+
+    A DAY order that is no longer working after its bar's day rolled over has
+    expired unfilled; before that, a missing working order is not proof.
     """
-    return intent.decision_ts if intent.decision_ts is not None else fallback
+    return decision_ts is not None and now.date() > decision_ts.date()
 
 
 class IbkrBroker:
@@ -155,6 +177,8 @@ class IbkrBroker:
         client: IbkrClient,
         *,
         scope: str,
+        intents: PendingIntents,
+        params: ExecutionParams,
         account: str | None = None,
         dry_run: bool = False,
         conid_lookup: ConidLookup | None = None,
@@ -167,6 +191,8 @@ class IbkrBroker:
     ) -> None:
         self._client = client
         self._scope = scope
+        self._intents = intents
+        self._params = params
         self._account = account
         self._dry_run = dry_run
         self._conid_lookup = (
@@ -192,14 +218,43 @@ class IbkrBroker:
         """
         self._book = portfolio
 
-    async def place(
-        self, intent: OrderIntent, *, seq: int | None = None
-    ) -> Result[OrderResult, FeedError]:
-        """Submit ONE MKT order and wait for its fill.
+    async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
+        """Reconcile every OPEN intent record at cycle start (INV-4).
 
-        Failure is a value at every step: a refused mapping (LMT, an unknown close
-        lot), a transport failure, a rejected/unfilled/timed-out order. Nothing is
-        retried blindly — a duplicate live order is worse than a failed cycle.
+        A working order carrying an OPEN key's prefix is ADOPTED and persisted
+        WORKING. Otherwise the record's known ``order_id`` is asked directly:
+        terminal Filled -> FILLED, Cancelled/Inactive -> UNFILLED/REJECTED, still
+        working -> WORKING, and a DAY order gone with no fill after its day rolled
+        -> UNFILLED. A record with no ``order_id`` stays OPEN (an empty working
+        read is not proof when the id is unknown) and a failing status read keeps
+        it WORKING (retried next cycle). A failed open-orders read returns ``Err``
+        and leaves every record untouched.
+        """
+        records = self._intents.load_open(self._scope)
+        if not records:
+            return Ok(())
+        index = await self._working_index()
+        if isinstance(index, Err):
+            return Err(cast("FeedError", index.error))
+        working = tuple(index.value.values())
+        now = self._now()
+        adopted: list[OrderResult] = []
+        for record in records:
+            found = match_working(working, ref_prefix(record.key))
+            if found is not None:
+                self._persist_working(record.key, found, record.decision_ts)
+                adopted.append(_adopted_result(record, found))
+                continue
+            await self._resync_status(record, now)
+        return Ok(tuple(adopted))
+
+    async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]:
+        """Submit or ADOPT one MKT order and settle its outcome.
+
+        Fail-closed at the pre-flight: an ``open_orders`` read failure is an
+        ``Err`` and NO POST follows. Any POST that can submit is settled by a
+        SUCCESSFUL working-orders read: absence in a FAILED read is
+        ``unresolved``, never "not placed".
         """
         if self._dry_run:
             return Err(
@@ -221,96 +276,46 @@ class IbkrBroker:
                     symbol=intent.symbol,
                 )
             )
-        try:
-            # Resolve the side FIRST: a close whose lot is not in the seeded book
-            # is an error, and it must fail before any network round trip.
-            side = order_side(intent, position_side_of(self._book, intent))
-            conid = await self._conid(intent.symbol)
-            resolved_seq = (
-                seq if seq is not None else assign_seqs([intent_identity(intent)])[0]
-            )
-            ticket = build_ticket(
-                intent,
-                conid=conid,
-                side=side,
-                scope=self._scope,
-                cycle_ts=_cycle_ts(intent, self._now()),
-                seq=resolved_seq,
-            )
-        except (OrderMappingError, ValueError, IbkrError) as exc:
-            kind = exc.kind if isinstance(exc, IbkrError) else "rejected"
+        prepared = await self._prepare_leg(intent)
+        if isinstance(prepared, Err):
+            return Err(cast("FeedError", prepared.error))
+        side, conid = prepared.value
+        key = intent_key(self._scope, intent)
+        refused = await self._pre_guard(intent, conid)
+        if refused is not None:
+            return Err(refused)
+        # INV-1: a SUCCESSFUL working-orders read is a precondition for ANY POST.
+        index = await self._working_index()
+        if isinstance(index, Err):
+            return Err(cast("FeedError", index.error))
+        decision = self._resolve(intent, key, index.value)
+        if decision.kind == "adopt":
+            return await self._adopt(intent, key, side, conid, index.value)
+        if decision.kind == "skip":
+            self._persist_unresolved(key)
             return Err(
-                feed_error(kind, f"{intent.symbol}: {exc}", symbol=intent.symbol)
-            )
-
-        # Safety guard (plan §6 phase 3.5): never send a REDUCING order for a
-        # conid the account is actually flat on, and never send one when the
-        # account net cannot be READ. On a shared account the net is the sum of
-        # all scopes plus a human's, so a zero net is a hard "nothing to
-        # reduce"; an unreadable net fails CLOSED (a reducing order against an
-        # unknown net is how a close flips into an open).
-        if intent.action is ActionType.close:
-            net = await self._account_net(conid)
-            if net is None:
-                return Err(
-                    feed_error(
-                        "rejected",
-                        f"refused close {intent.symbol} (conid {conid}): account net "
-                        f"unreadable, cannot prove there is anything to reduce",
-                        symbol=intent.symbol,
-                    )
+                feed_error(
+                    "unresolved", f"{intent.symbol}: {decision.reason}", intent.symbol
                 )
-            if abs(net) <= _FLAT_EPS:
-                return Err(
-                    feed_error(
-                        "rejected",
-                        f"refused close {intent.symbol} (conid {conid}): account is "
-                        f"flat, nothing to reduce",
-                        symbol=intent.symbol,
-                    )
-                )
-        else:
-            # An OPEN is funded by the scope's cash: re-check its notional at the
-            # edge against the decision-time bound the sizer used.
-            refused = self._open_cash_guard(intent)
-            if refused is not None:
-                return Err(refused)
-
-        if ticket.rounded:
-            self._log(
-                f"rounded {intent.symbol} qty {intent.qty:g} -> "
-                f"{ticket.body['quantity']:g} (whole shares)"
             )
-
-        submitted = await self._submit(account, ticket)
-        if isinstance(submitted, Err):
-            return Err(cast("FeedError", submitted.error))
-        order_id = submitted.value
-        self._log(
-            f"submitted {intent.action.value} {intent.symbol} qty={intent.qty:g} "
-            f"cOID={ticket.order_ref} order_id={order_id}"
-        )
-        return await self.wait_filled(order_id, intent, ticket)
+        return await self._submit_new(account, intent, key, side, conid)
 
     async def place_cohort(
         self, intents: tuple[OrderIntent, ...]
     ) -> Result[tuple[OrderResult, ...], FeedError]:
-        """A deterministic loop of ``place`` — one order per intent, in order.
+        """A deterministic loop of ``place`` — closes first, then opens.
 
-        Unlike the simulated broker this settles nothing atomically (IBKR does the
-        settling), so a single failed order is reported as a failed ``OrderResult``
-        and the loop continues: one bad symbol must not abandon the rest of the
-        cycle. The cohort therefore never returns a cohort-level ``Err``.
-
-        Before placing, the cohort's opens are scaled by ONE shared cash factor —
-        ``scale_open_cohort``, the backtest's rule at the edge — so an over-cash
-        multi-open cycle is reduced the way the sim/backtest reduces it instead of
-        sending every open at its individually-guarded full size. A scaled or
-        dropped cohort writes ONE stderr line (via ``log``) naming the scale and
-        the affected symbols; a scaled-to-zero open is reported as a failed order,
-        never submitted.
+        The cohort's opens are scaled by ONE shared cash factor (``scale_open_cohort``,
+        the backtest's rule including its commission reserve at the edge). Opens are
+        funded by prospective cash from this cycle's closes, so if ANY close leg
+        fails, every open is DROPPED and reported: the shared ``cash_bound`` the
+        sizer used assumed those closes settled, and without a live available-funds
+        read the only provable-safe rule is to refuse the opens the failed close
+        was funding. One bad symbol never abandons the rest of the cycle.
         """
-        plan = scale_open_cohort(intents)
+        if not intents:
+            return Ok(())
+        plan = scale_open_cohort(intents, self._params)
         if plan.scale is not None:
             report = plan.scale
             self._log(
@@ -318,28 +323,35 @@ class IbkrBroker:
                 f"{report.requested:.2f} > budget {report.budget:.2f}; reduced "
                 f"{', '.join(report.members)}"
             )
-        scaled = {intent_identity(i): i for i in plan.intents}
-        dropped = {intent_identity(d.intent): d for d in plan.dropped}
+        scaled = {intent_key(self._scope, i): i for i in plan.intents}
+        dropped = {intent_key(self._scope, d.intent): d for d in plan.dropped}
         results: list[OrderResult] = []
-        for seq, intent in sequence(intents):
-            ident = intent_identity(intent)
+        close_failed = False
+        for intent in placement_order(intents):
+            ident = intent_key(self._scope, intent)
             drop = dropped.get(ident)
             if drop is not None:
                 self._log(drop.reason)
-                results.append(
-                    OrderResult(intent=intent, fill=None, ok=False, message=drop.reason)
-                )
+                results.append(_failed(intent, drop.reason))
                 continue
-            placed = await self.place(scaled.get(ident, intent), seq=seq)
+            if intent.action is not ActionType.close and close_failed:
+                message = (
+                    f"dropped open {intent.symbol}: its funding close leg did not "
+                    f"fill; refusing to deploy prospective cash"
+                )
+                self._log(message)
+                results.append(_failed(intent, message))
+                continue
+            placed = await self.place(scaled.get(ident, intent))
             if isinstance(placed, Err):
                 error = cast("FeedError", placed.error)
                 message = f"{error.kind}: {error.message}"
                 self._log(f"order failed {intent.symbol}: {message}")
-                results.append(
-                    OrderResult(intent=intent, fill=None, ok=False, message=message)
-                )
+                results.append(_failed(intent, message))
             else:
                 results.append(placed.value)
+            if intent.action is ActionType.close and not results[-1].ok:
+                close_failed = True
         return Ok(tuple(results))
 
     async def close(self) -> Result[None, FeedError]:
@@ -379,15 +391,35 @@ class IbkrBroker:
                 return self._unresolved_result(order_id, intent, ticket, status)
             await self._sleep(self._poll_interval_s)
 
-    # -- internals ---------------------------------------------------------
+    # -- internals: pre-flight --------------------------------------------
+
+    async def _prepare_leg(
+        self, intent: OrderIntent
+    ) -> Result[tuple[OrderSide, int], FeedError]:
+        """Validate the intent and resolve its side + conid, before any POST.
+
+        A close whose lot is not in the seeded book, an unsupported order type or
+        a stop-carrying intent all fail here — an ``Err`` with no network round
+        trip and no ticket.
+        """
+        try:
+            validate_order(intent)
+        except OrderMappingError as exc:
+            return Err(feed_error("rejected", f"{intent.symbol}: {exc}", intent.symbol))
+        try:
+            # Resolve the side FIRST: a close whose lot is not in the seeded book
+            # is an error, and it must fail before any network round trip.
+            side = order_side(intent, position_side_of(self._book, intent))
+            conid = await self._conid(intent.symbol)
+        except (OrderMappingError, ValueError, IbkrError) as exc:
+            kind = exc.kind if isinstance(exc, IbkrError) else "rejected"
+            return Err(
+                feed_error(kind, f"{intent.symbol}: {exc}", symbol=intent.symbol)
+            )
+        return Ok((side, conid))
 
     async def _conid(self, symbol: str) -> int:
-        """The IBKR conid for *symbol*, resolved once and cached for the run.
-
-        A cohort with several orders on one symbol pays the secdef search (and
-        its verification) once. A failed lookup is NOT cached — it raises before
-        the store, so a retry re-resolves rather than serving a stale miss.
-        """
+        """The IBKR conid for *symbol*, resolved once and cached for the run."""
         cached = self._conid_cache.get(symbol)
         if cached is not None:
             return cached
@@ -395,16 +427,62 @@ class IbkrBroker:
         self._conid_cache[symbol] = conid
         return conid
 
-    def _open_cash_guard(self, intent: OrderIntent) -> FeedError | None:
-        """Refuse an open whose decision-time notional exceeds its funded cash bound.
+    async def _working_index(self) -> Result[dict[str, WorkingOrder], FeedError]:
+        """Every working order keyed by ``cOID``, or ``Err`` when the read fails.
 
-        The bound is ``intent.cash_bound`` — the EXACT cash reconcile passed to the
-        sizer (``view.cash``), so the edge re-checks the same quantity the sizer
-        clamped against. An intent that cannot state a bound, or a non-finite /
-        non-positive reference price, is UNDETERMINABLE and fails closed: the edge
-        holds no live quote, so it bounds the DECISION notional (catching an
-        explicit-qty strategy or a stale intent sizing past cash); the tolerance
-        only leaves room for a reference-price gap, not for a material over-deploy.
+        A failed read is ALWAYS an ``Err`` — never ``None`` or an empty index —
+        so the caller fails closed (no POST) rather than mistaking "unreadable"
+        for "nothing working" (the fail-open bug this replaces).
+        """
+        try:
+            raw = await self._client.open_orders()
+        except IbkrError as exc:
+            return Err(feed_error(exc.kind, f"open_orders: {exc}"))
+        index: dict[str, WorkingOrder] = {}
+        for entry in raw:
+            parsed = parse_working_order(entry)
+            if parsed is not None:
+                index.setdefault(parsed.order_ref, parsed)
+        return Ok(index)
+
+    async def _pre_guard(self, intent: OrderIntent, conid: int) -> FeedError | None:
+        """The pre-submit safety guards, run before any working-orders read.
+
+        A REDUCING order is refused against a flat or unreadable account net; an
+        OPEN is bounded by the decision-time ``cash_bound`` applied to the
+        WHOLE-share quantity the ticket will actually carry (never the pre-round
+        request, which could round up past the bound).
+        """
+        if intent.action is ActionType.close:
+            net = await self._account_net(conid)
+            if net is None:
+                return feed_error(
+                    "rejected",
+                    f"refused close {intent.symbol} (conid {conid}): account net "
+                    f"unreadable, cannot prove there is anything to reduce",
+                    intent.symbol,
+                )
+            if abs(net) <= _FLAT_EPS:
+                return feed_error(
+                    "rejected",
+                    f"refused close {intent.symbol} (conid {conid}): account is "
+                    f"flat, nothing to reduce",
+                    intent.symbol,
+                )
+            return None
+        try:
+            whole = whole_quantity(intent)
+        except OrderMappingError as exc:
+            return feed_error("rejected", f"{intent.symbol}: {exc}", intent.symbol)
+        return self._open_cash_guard(intent, whole)
+
+    def _open_cash_guard(self, intent: OrderIntent, whole: int) -> FeedError | None:
+        """Refuse an open whose TICKET notional exceeds its funded cash bound.
+
+        The bound is ``intent.cash_bound`` — the EXACT cash reconcile passed to
+        the sizer — re-checked against ``whole * ref_price``, the notional of the
+        order actually sent. An intent that cannot state a bound, or a non-finite
+        / non-positive reference price, is UNDETERMINABLE and fails closed.
         """
         bound = intent.cash_bound
         if bound is None or not math.isfinite(bound):
@@ -412,7 +490,7 @@ class IbkrBroker:
                 "rejected",
                 f"refused open {intent.symbol}: no decision-time cash bound, cannot "
                 f"prove the scope funds the notional",
-                symbol=intent.symbol,
+                intent.symbol,
             )
         price = intent.ref_price
         if not math.isfinite(price) or price <= 0:
@@ -420,67 +498,130 @@ class IbkrBroker:
                 "rejected",
                 f"refused open {intent.symbol}: no usable reference price "
                 f"({price!r}) to bound the notional against the cash",
-                symbol=intent.symbol,
+                intent.symbol,
             )
-        notional = intent.qty * price
+        notional = whole * price
         if notional > bound * (1.0 + _OPEN_CASH_TOLERANCE):
             return feed_error(
                 "rejected",
                 f"refused open {intent.symbol}: notional {notional:.2f} exceeds "
                 f"funded cash {bound:.2f} by more than {_OPEN_CASH_TOLERANCE:.0%}",
-                symbol=intent.symbol,
+                intent.symbol,
             )
         return None
 
-    async def _account_net(self, conid: int) -> float | None:
-        """The account's net quantity for *conid*, or ``None`` if it cannot be read.
+    def _resolve(
+        self, intent: OrderIntent, key: IntentKey, index: Mapping[str, WorkingOrder]
+    ) -> Resolution:
+        """Decide adopt / submit / skip for *key* given the working-orders index.
 
-        The ONE read of account state in the live edge: it backs the close safety
-        guard. ``None`` (a failed read) means "unknown", which must not be treated
-        as flat — the order proceeds and IBKR itself refuses a bogus reduction.
+        A working order carrying the key's exact prefix is ADOPTED. With none, a
+        record in a terminal state submits a fresh attempt; a record that is OPEN
+        with a known ``order_id`` is SKIPPED (no re-mint — a vanished working
+        order is not proof it is gone); an OPEN record with no id (never
+        confirmed placed) submits, because a clean read showing nothing is proof
+        enough for an order we have no id for.
         """
-        account = self._account or self._client.account
+        found = match_working(tuple(index.values()), ref_prefix(key))
+        if found is not None:
+            return Resolution(
+                "adopt",
+                found.order_id,
+                f"working order {found.order_id} carries {found.order_ref}",
+            )
+        existing = self._intents.load(key)
+        if existing is None or existing.state not in OPEN_STATES:
+            return Resolution("submit", None, "no open intent for this key")
+        if existing.order_id is None:
+            return Resolution(
+                "submit", None, "open intent has no known order id and no working order"
+            )
+        return Resolution(
+            "skip",
+            existing.order_id,
+            f"open intent {existing.state.value} holds order {existing.order_id} "
+            f"but no working order carries its prefix; not re-minting",
+        )
+
+    # -- internals: submit paths ------------------------------------------
+
+    async def _adopt(
+        self,
+        intent: OrderIntent,
+        key: IntentKey,
+        side: OrderSide,
+        conid: int,
+        index: Mapping[str, WorkingOrder],
+    ) -> Result[OrderResult, FeedError]:
+        """Persist WORKING for a found working order and wait on its real status."""
+        found = match_working(tuple(index.values()), ref_prefix(key))
+        if found is None:
+            self._persist_unresolved(key)
+            return Err(
+                feed_error(
+                    "unresolved",
+                    f"{intent.symbol}: pre-flight adopted an order that is no longer "
+                    f"working; whether it is live is unknown",
+                    intent.symbol,
+                )
+            )
+        self._persist_working(key, found, intent.decision_ts)
+        self._log(
+            f"adopting already-working order {found.order_id} for {found.order_ref}"
+        )
+        ticket = build_ticket(intent, conid=conid, side=side, order_ref=found.order_ref)
+        result = await self.wait_filled(found.order_id, intent, ticket)
+        return self._settle_wait(key, result, found.order_id, adopted=True)
+
+    async def _submit_new(
+        self,
+        account: str,
+        intent: OrderIntent,
+        key: IntentKey,
+        side: OrderSide,
+        conid: int,
+    ) -> Result[OrderResult, FeedError]:
+        """Mint a fresh attempt, build the ticket, submit, and settle the wait."""
+        record = self._intents.open_attempt(key, intent.decision_ts, self._now())
         try:
-            raw = await self._client.positions_all(account)
-        except IbkrError:
-            return None
-        positions, _ = parse_positions(raw)
-        return sum(p.qty for p in positions if p.conid == conid)
+            ticket = build_ticket(
+                intent, conid=conid, side=side, order_ref=order_ref(key, record.attempt)
+            )
+        except OrderMappingError as exc:
+            self._intents.close(key, IntentState.REJECTED, None, self._now())
+            return Err(feed_error("rejected", f"{intent.symbol}: {exc}", intent.symbol))
+        if ticket.rounded:
+            self._log(
+                f"rounded {intent.symbol} qty {intent.qty:g} -> "
+                f"{ticket.body['quantity']:g} (whole shares)"
+            )
+        submitted = await self._submit(
+            account, ticket, key, record.attempt, intent.decision_ts
+        )
+        if isinstance(submitted, Err):
+            return Err(cast("FeedError", submitted.error))
+        order_id = submitted.value
+        self._log(
+            f"submitted {intent.action.value} {intent.symbol} qty={intent.qty:g} "
+            f"cOID={ticket.order_ref} order_id={order_id}"
+        )
+        result = await self.wait_filled(order_id, intent, ticket)
+        return self._settle_wait(key, result, order_id, adopted=False)
 
-    async def _working_order_id(self, order_ref: str) -> str | None:
-        """A working order's id for *order_ref* from ``/iserver/account/orders``.
+    async def _submit(
+        self,
+        account: str,
+        ticket: Ticket,
+        key: IntentKey,
+        attempt: int,
+        decision_ts: pd.Timestamp | None,
+    ) -> Result[str, FeedError]:
+        """POST the ticket and run the reply loop; an ambiguous submit is settled.
 
-        Read after an ambiguous submit so a working order is SEEN rather than
-        re-sent (plan §6 phase 3.5 placement hygiene).
-        """
-        try:
-            orders = await self._client.open_orders()
-        except IbkrError:
-            return None
-        for entry in orders:
-            if not isinstance(entry, Mapping):
-                continue
-            body = cast("Mapping[str, object]", entry)
-            if opt_str(body.get("cOID")) == order_ref:
-                return canonical_order_id(body.get("orderId")) or None
-        return None
-
-    async def _submit(self, account: str, ticket: Ticket) -> Result[str, FeedError]:
-        """Adopt an already-working order, else POST and run the reply loop.
-
-        Before every submit we ask the account which orders are working and ADOPT
-        one carrying our cOID. Because the cOID is anchored on the decision bar,
-        a still-live order from a prior cycle (its ``wait_filled`` timed out) is
-        found here and never re-sent — the fix for cross-cycle double exposure.
+        The pre-flight already read the working orders (INV-1), so this POST is
+        only reached with a successful read behind it.
         """
         endpoint = f"iserver/account/{account}/orders"
-        working = await self._working_order_id(ticket.order_ref)
-        if working is not None:
-            self._log(
-                f"adopting already-working order {working} for {ticket.order_ref} "
-                f"via /iserver/account/orders"
-            )
-            return Ok(working)
         try:
             # The gateway rejects a bare order (400 "Missing orders"); it wants
             # the order(s) wrapped under an ``orders`` array.
@@ -488,44 +629,51 @@ class IbkrBroker:
                 endpoint, json={"orders": [ticket.body]}
             )
         except IbkrError as exc:
-            # Ambiguous submit: before reporting failure, ask the account which
-            # orders are working. An order carrying our cOID already exists, so
-            # we adopt it rather than risk a duplicate.
-            working = await self._working_order_id(ticket.order_ref)
-            if working is not None:
-                self._log(
-                    f"submit {ticket.order_ref} errored ({exc}); found working "
-                    f"order {working} via /iserver/account/orders"
-                )
-                return Ok(working)
-            return Err(feed_error(exc.kind, f"submit {ticket.order_ref}: {exc}"))
+            return await self._settle_ambiguous(
+                key, f"submit {ticket.order_ref} errored ({exc.kind}): {exc}"
+            )
+        return await self._reply_loop(response, ticket, key, attempt, decision_ts)
+
+    async def _reply_loop(
+        self,
+        response: object,
+        ticket: Ticket,
+        key: IntentKey,
+        attempt: int,
+        decision_ts: pd.Timestamp | None,
+    ) -> Result[str, FeedError]:
+        """Classify the submission response, confirming ordinary replies only."""
         confirmations = 0
         while True:
             outcome = classify_reply(response)
-            if outcome.kind == "success":
-                return Ok(outcome.order_id)
-            if outcome.kind == "abort":
-                if confirmations == 0:
-                    return Err(
-                        FeedError(
-                            kind="rejected",
-                            message=(
-                                f"order {ticket.order_ref} not placed: "
-                                f"{outcome.message}"
-                            ),
-                        )
-                    )
-                return await self._resolve_after_confirms(
-                    ticket,
-                    f"aborted after {confirmations} confirmations: {outcome.message}",
+            if outcome.kind != "confirm":
+                return await self._settle_reply(
+                    outcome, ticket, key, attempt, decision_ts, confirmations
                 )
             confirmations += 1
             if confirmations > MAX_REPLIES:
-                return await self._resolve_after_confirms(
-                    ticket,
+                return await self._settle_ambiguous(
+                    key,
                     f"still asking for confirmation after {MAX_REPLIES} replies; "
                     f"last message: {outcome.message}",
                 )
+            # INV-1 before the confirm POST: a SUCCESSFUL read must show no
+            # working order for our key (adopt one if it appears; never POST on a
+            # failed read).
+            guard = await self._working_index()
+            if isinstance(guard, Err):
+                self._persist_unresolved(key)
+                return self._ambiguous_error(
+                    f"confirm {ticket.order_ref}: pre-confirm working-orders read failed"
+                )
+            already = match_working(tuple(guard.value.values()), ref_prefix(key))
+            if already is not None:
+                self._persist_working(key, already, decision_ts)
+                self._log(
+                    f"{ticket.order_ref} already working as {already.order_id}; "
+                    f"adopting instead of confirming again"
+                )
+                return Ok(already.order_id)
             self._log(
                 f"confirming {ticket.order_ref} reply {outcome.reply_id}: "
                 f"{outcome.message}"
@@ -535,36 +683,167 @@ class IbkrBroker:
                     f"iserver/reply/{outcome.reply_id}", json={"confirmed": True}
                 )
             except IbkrError as exc:
-                return Err(feed_error(exc.kind, f"confirm {ticket.order_ref}: {exc}"))
+                return await self._settle_ambiguous(
+                    key, f"confirm {ticket.order_ref} errored ({exc.kind}): {exc}"
+                )
 
-    async def _resolve_after_confirms(
-        self, ticket: Ticket, reason: str
+    async def _settle_reply(
+        self,
+        outcome: ReplyOutcome,
+        ticket: Ticket,
+        key: IntentKey,
+        attempt: int,
+        decision_ts: pd.Timestamp | None,
+        confirmations: int,
     ) -> Result[str, FeedError]:
-        """A refusal AFTER we pressed yes: the order may be live, so never claim otherwise.
+        """A terminal submission reply: success persists WORKING; a plain abort rejects.
 
-        Every confirmation we sent was a ``{"confirmed": true}`` POST, which can
-        submit the order. So a refusal past the first confirmation cannot be
-        reported as "not placed". Ask the account by cOID: a working order is
-        ADOPTED (the caller then waits on its real status); when none is found the
-        state is genuinely UNKNOWN, reported as ``unresolved`` — never a rejection
-        a human might answer by placing the order a second time.
+        A refusal BEFORE any confirmation cannot have been submitted, so it is a
+        genuine rejection. A refusal AFTER a confirmation goes through
+        ``_settle_ambiguous`` — the confirm may have submitted the order.
         """
-        working = await self._working_order_id(ticket.order_ref)
-        if working is not None:
-            self._log(
-                f"{reason}; adopting working order {working} for {ticket.order_ref}"
+        if outcome.kind == "success":
+            self._intents.save(
+                IntentRecord(
+                    key=key,
+                    state=IntentState.WORKING,
+                    attempt=attempt,
+                    order_ref=ticket.order_ref,
+                    order_id=outcome.order_id,
+                    decision_ts=decision_ts,
+                )
             )
-            return Ok(working)
+            return Ok(outcome.order_id)
+        if confirmations == 0:
+            self._intents.close(key, IntentState.REJECTED, None, self._now())
+            return Err(
+                FeedError(
+                    kind="rejected",
+                    message=f"order {ticket.order_ref} not placed: {outcome.message}",
+                )
+            )
+        return await self._settle_ambiguous(
+            key, f"aborted after {confirmations} confirmations: {outcome.message}"
+        )
+
+    async def _settle_ambiguous(
+        self, key: IntentKey, reason: str
+    ) -> Result[str, FeedError]:
+        """Settle an order that MAY have been submitted: adopt, or mark UNRESOLVED.
+
+        Shared by the ambiguous-submit, ambiguous-confirm and reply-abort/overflow
+        paths. Every one of them sent a POST that can submit the order, so absence
+        from a SUCCESSFUL read means the state is UNKNOWN — persisted UNRESOLVED
+        and reported as such, never as "not placed". A failed read is likewise
+        UNRESOLVED, never a rejection.
+        """
+        index = await self._working_index()
+        if isinstance(index, Err):
+            self._persist_unresolved(key)
+            return self._ambiguous_error(reason)
+        found = match_working(tuple(index.value.values()), ref_prefix(key))
+        if found is not None:
+            self._persist_working(key, found, None)
+            self._log(f"{reason}; adopting working order {found.order_id}")
+            return Ok(found.order_id)
+        self._persist_unresolved(key)
+        return self._ambiguous_error(reason)
+
+    def _ambiguous_error(self, reason: str) -> Err[str, FeedError]:
+        """The unresolved failure for an order whose submission left state unknown."""
         return Err(
             FeedError(
                 kind="unresolved",
                 message=(
-                    f"order {ticket.order_ref} {reason}; whether it was placed is "
-                    f"unknown (no working order carries the cOID) — do not assume "
-                    f"it was not placed"
+                    f"{reason}; whether it was placed is unknown (no working order "
+                    f"carries the key prefix) — do not assume it was not placed"
                 ),
             )
         )
+
+    def _settle_wait(
+        self,
+        key: IntentKey,
+        result: Result[OrderResult, FeedError],
+        order_id: str | None,
+        *,
+        adopted: bool,
+    ) -> Result[OrderResult, FeedError]:
+        """Persist the durable state a wait settled to, and pass the result through."""
+        now = self._now()
+        if isinstance(result, Err):
+            error = cast("FeedError", result.error)
+            state = _STATE_FOR_KIND.get(error.kind, IntentState.WORKING)
+            self._intents.close(key, state, order_id, now)
+            return Err(error)
+        self._intents.close(key, IntentState.FILLED, order_id, now)
+        order = result.value
+        return Ok(replace(order, outcome=OrderOutcome.ADOPTED) if adopted else order)
+
+    # -- internals: durable intent state ----------------------------------
+
+    def _persist_working(
+        self,
+        key: IntentKey,
+        working: WorkingOrder,
+        decision_ts: pd.Timestamp | None,
+    ) -> None:
+        """Upsert a WORKING record for a found/adopted working order."""
+        existing = self._intents.load(key)
+        self._intents.save(
+            IntentRecord(
+                key=key,
+                state=IntentState.WORKING,
+                attempt=_attempt_of(working.order_ref, existing),
+                order_ref=working.order_ref,
+                order_id=working.order_id,
+                decision_ts=decision_ts
+                if decision_ts is not None
+                else (existing.decision_ts if existing is not None else None),
+            )
+        )
+
+    def _persist_unresolved(self, key: IntentKey) -> None:
+        """Stamp the record UNRESOLVED: an ambiguous POST left state unknown."""
+        if self._intents.load(key) is not None:
+            self._intents.close(key, IntentState.UNRESOLVED, None, self._now())
+
+    async def _resync_status(self, record: IntentRecord, now: pd.Timestamp) -> None:
+        """Resolve an OPEN record that has no working order but a known order id."""
+        if record.order_id is None:
+            return
+        fetched = await self._status(record.order_id)
+        if isinstance(fetched, Err):
+            return  # keep WORKING; retried next cycle
+        status = fetched.value
+        state = order_state(status)
+        if state is OrderState.FILLED:
+            new_state = IntentState.FILLED
+        elif order_status_of(status) == "Cancelled":
+            new_state = IntentState.UNFILLED
+        elif state is OrderState.REJECTED:
+            new_state = IntentState.REJECTED
+        elif _day_rolled(record.decision_ts, now):
+            new_state = IntentState.UNFILLED
+        else:
+            new_state = IntentState.WORKING
+        self._intents.close(record.key, new_state, record.order_id, now)
+
+    # -- internals: account / status reads --------------------------------
+
+    async def _account_net(self, conid: int) -> float | None:
+        """The account's net quantity for *conid*, or ``None`` if it cannot be read.
+
+        ``None`` (a failed read) means "unknown", which must not be treated as
+        flat — the caller fails closed rather than reducing a book it cannot see.
+        """
+        account = self._account or self._client.account
+        try:
+            raw = await self._client.positions_all(account)
+        except IbkrError:
+            return None
+        positions, _ = parse_positions(raw)
+        return sum(p.qty for p in positions if p.conid == conid)
 
     async def _status(self, order_id: str) -> Result[dict[str, object], FeedError]:
         """One ``orderStatus`` read, as a typed value."""
@@ -619,11 +898,6 @@ class IbkrBroker:
                     symbol=intent.symbol,
                 )
             )
-        # The book names a lot by its conid (``portfolio_source`` sets
-        # ``position_id = str(conid)``), so the conid is the ONE handle a caller
-        # can correlate back to the book. An IBKR order id resolves to nothing in
-        # the book, so it is never reported. A close's intent already carries the
-        # targeted lot's conid; an open carries none.
         position_id = intent.position_id or str(ticket.conid)
         message = (
             f"{intent.action.value} {intent.symbol} qty={fill.qty:g} "
@@ -648,13 +922,7 @@ class IbkrBroker:
         raw: str,
         status: dict[str, object],
     ) -> Result[OrderResult, FeedError]:
-        """A terminal body with no readable fill quantity: unknown, not "nothing filled".
-
-        A terminal ``Filled`` with an omitted/garbled ``cum_fill`` is NOT a
-        zero-fill rejection — the order DID fill; only its size is unreadable, so
-        it is reported ``unresolved``. Only a terminal non-filled status
-        (``Cancelled``/``Inactive``) is a genuine nothing-filled rejection.
-        """
+        """A terminal body with no readable fill quantity: unknown, not "nothing filled"."""
         if order_state(status) is OrderState.FILLED:
             return Err(
                 FeedError(
@@ -742,6 +1010,37 @@ class IbkrBroker:
             else signal.timestamp,
             spread=fill.spread,
         )
+
+
+def _failed(intent: OrderIntent, message: str) -> OrderResult:
+    """A dropped/refused order as a failed ``OrderResult`` (outcome REJECTED)."""
+    return OrderResult(
+        intent=intent,
+        fill=None,
+        ok=False,
+        message=message,
+        outcome=OrderOutcome.REJECTED,
+    )
+
+
+def _adopted_result(record: IntentRecord, found: WorkingOrder) -> OrderResult:
+    """The report row for an order adopted at cycle start (a synthetic intent)."""
+    intent = OrderIntent(
+        symbol=record.key.symbol,
+        action=record.key.action,
+        qty=found.filled_qty,
+        ref_price=0.0,
+        reason=f"adopted cycle-start working order {found.order_id}",
+        position_id=record.key.position_id,
+    )
+    return OrderResult(
+        intent=intent,
+        fill=None,
+        ok=True,
+        message=f"adopted {found.order_ref} order_id={found.order_id}",
+        position_id=record.key.position_id,
+        outcome=OrderOutcome.ADOPTED,
+    )
 
 
 __all__ = ["DEFAULT_POLL_INTERVAL_S", "DEFAULT_TIMEOUT_S", "MAX_REPLIES", "IbkrBroker"]

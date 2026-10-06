@@ -141,6 +141,8 @@ def live_run(
         broker = IbkrBroker(
             gateway.client,
             scope=scope,
+            intents=ledger,
+            params=exec_params_of(cfg),
             dry_run=dry_run,
             log=_stderr_log,
         )

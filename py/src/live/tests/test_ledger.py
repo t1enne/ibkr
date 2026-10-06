@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -14,6 +15,13 @@ from src.data.db import get_connection
 from src.exec.refs import slug
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
+from src.bt.state import ActionType
+from src.live.identity import (
+    IntentKey,
+    IntentRecord,
+    IntentState,
+    order_ref,
+)
 from src.live.ledger import (
     LedgerReadError,
     SqliteLedger,
@@ -299,6 +307,120 @@ def test_migration_rekeys_legacy_sim_lots_to_scope(tmp_path: Path) -> None:
     with get_connection(db) as con:
         cols = {r[1] for r in con.execute("PRAGMA table_info(live_sim_lot)")}
     assert "scope" in cols and "strategy_id" not in cols
+
+
+# --- pending order intents (PendingIntents) ---------------------------------
+
+
+def _key(
+    symbol: str = "AAPL",
+    action: ActionType = ActionType.long,
+    pid: str | None = None,
+) -> IntentKey:
+    return IntentKey(scope="S1", symbol=symbol, action=action, position_id=pid)
+
+
+def test_intent_table_is_created_lazily_and_is_named_for_this_feature(
+    ledger: SqliteLedger, tmp_path: Path
+) -> None:
+    path = tmp_path / "ledger.sqlite"
+    assert ledger.load(_key()) is None  # a read writes no DDL
+    assert "live_order_intent" not in _tables(path)
+    ledger.open_attempt(_key(), None, TS)
+    assert "live_order_intent" in _tables(path)
+
+
+def test_open_attempt_bumps_after_the_prior_record(ledger: SqliteLedger) -> None:
+    key = _key()
+    first = ledger.open_attempt(key, TS, TS)
+    assert first.attempt == 0 and first.state is IntentState.PENDING
+    assert first.order_ref == order_ref(key, 0)
+    second = ledger.open_attempt(key, TS, TS)
+    assert second.attempt == 1
+    assert second.order_ref != first.order_ref  # a NEW cOID for the new attempt
+
+
+def test_close_and_load_open_round_trip(ledger: SqliteLedger) -> None:
+    key = _key()
+    ledger.open_attempt(key, TS, TS)
+    ledger.close(key, IntentState.WORKING, "97932", TS)
+    record = ledger.load(key)
+    assert record is not None
+    assert record.state is IntentState.WORKING and record.order_id == "97932"
+    assert ledger.load_open("S1") == (record,)
+
+
+def test_close_unresolved_keeps_a_known_order_id(ledger: SqliteLedger) -> None:
+    key = _key()
+    ledger.open_attempt(key, TS, TS)
+    ledger.close(key, IntentState.WORKING, "97932", TS)
+    ledger.close(key, IntentState.UNRESOLVED, None, TS)
+    record = ledger.load(key)
+    assert record is not None
+    assert record.state is IntentState.UNRESOLVED and record.order_id == "97932"
+
+
+def test_terminal_records_are_excluded_from_load_open(ledger: SqliteLedger) -> None:
+    key = _key()
+    ledger.open_attempt(key, TS, TS)
+    ledger.close(key, IntentState.FILLED, "97932", TS)
+    assert ledger.load_open("S1") == ()
+
+
+def test_prune_deletes_only_closed_old_rows(ledger: SqliteLedger) -> None:
+    filled = _key("AAPL")
+    open_key = _key("MSFT")
+    ledger.open_attempt(filled, OLD, OLD)
+    ledger.close(filled, IntentState.FILLED, "1", OLD)
+    ledger.open_attempt(open_key, OLD, OLD)
+    # A cutoff after the closed row but the OPEN row is never pruned.
+    assert ledger.prune(TS) == 1
+    assert ledger.load(filled) is None
+    assert ledger.load(open_key) is not None
+
+
+def test_save_overwrites_a_same_key_record(ledger: SqliteLedger) -> None:
+    key = _key()
+    ledger.open_attempt(key, TS, TS)
+    ledger.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id="97932",
+            decision_ts=TS,
+        )
+    )
+    record = ledger.load(key)
+    assert record is not None and record.state is IntentState.WORKING
+
+
+def test_load_warns_and_ignores_a_token_owned_by_a_foreign_identity(
+    ledger: SqliteLedger, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Same (scope, token) but a different symbol/action/position_id is a crc32
+    # collision: the foreign row is warned about and read as absent, never adopted.
+    key = _key("AAPL")
+    foreign = replace(key, symbol="MSFT")
+    ledger.save(
+        IntentRecord(
+            key=foreign,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(foreign, 0),
+            order_id="1",
+            decision_ts=None,
+        )
+    )
+    with get_connection(tmp_path / "ledger.sqlite") as con:  # force the collision
+        con.execute(
+            "UPDATE live_order_intent SET token=? WHERE token=?",
+            (key.token(), foreign.token()),
+        )
+    with caplog.at_level(logging.WARNING):
+        assert ledger.load(key) is None
+    assert any("collides" in r.message for r in caplog.records)
 
 
 pytestmark = pytest.mark.db

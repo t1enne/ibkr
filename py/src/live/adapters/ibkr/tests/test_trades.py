@@ -63,6 +63,21 @@ def test_is_ours_does_not_claim_a_longer_slug_scope() -> None:
     assert is_ours("momentum", _exec("o", side=OrderSide.BUY, qty=1, price=1))
 
 
+def test_is_ours_attributes_the_new_bar_free_ref() -> None:
+    # cOID = slug(scope)-token-attempt. The token and attempt are dashless, so
+    # rsplit("-", 2)[0] yields the whole slug (dashes included) and attribution
+    # is unaffected by the identity change.
+    assert is_ours(
+        SCOPE,
+        _exec("o", side=OrderSide.BUY, qty=1, price=1, ref="momentum-ffb76999-00"),
+    )
+    dashed = _exec(
+        "o", side=OrderSide.BUY, qty=1, price=1, ref="momentum-v2-1a2b3c4d-01"
+    )
+    assert is_ours("momentum_v2", dashed)
+    assert not is_ours("momentum", dashed)
+
+
 def test_single_buy_opens_one_row() -> None:
     book, warnings = reconcile(
         SCOPE, (_exec("o1", side=OrderSide.BUY, qty=10, price=100),), StrategyBook()

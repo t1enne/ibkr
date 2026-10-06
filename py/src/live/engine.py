@@ -50,6 +50,11 @@ class CycleReport:
     placement_error: FeedError | None = None
 
 
+#: A closed intent record older than this is housekeeping noise; OPEN records
+#: are never pruned (they still own state).
+_INTENT_RETENTION_DAYS = 90
+
+
 class StaleDataError(RuntimeError):
     """The universe's newest bar is too old — refuse to trade on a stale tail."""
 
@@ -94,6 +99,8 @@ class CycleLedger(Protocol):
     def mark_sim_closed(
         self, scope: str, position_id: str, closed_at: pd.Timestamp
     ) -> None: ...
+
+    def prune(self, before: pd.Timestamp) -> int: ...
 
 
 def build_report(
@@ -220,6 +227,10 @@ async def run_cycle(
         # Align the simulated book with the fetched read so the SAME book is both
         # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
         broker.seed(snapshot.portfolio)
+        # Cycle start: reconcile every OPEN intent record BEFORE reading signals,
+        # so a prior cycle's working/timed-out order is adopted (not re-minted).
+        # Skipped on a dry run: it persists state, which a read-only run must not.
+        resync_results = () if dry_run else await _resync(broker)
         # Ownership scoping (plan rev 4.1 §3): the IBKR source's book ALREADY holds
         # only this scope's lots (``trades.reconcile`` filters by our cOID prefix), so
         # every lot in it is closable and no filter is applied (``owned=None``). The
@@ -234,11 +245,17 @@ async def run_cycle(
             placed = await _place_all(broker, intents)
             if isinstance(placed, Err):
                 placement_error = cast("FeedError", placed.error)
+                results = resync_results
             else:
-                results = tuple(placed.value)
-            if owns_book:
-                _record_owned(ledger, scope, results, now_ts)
+                placed_results = tuple(placed.value)
+                results = resync_results + placed_results
+                if owns_book:
+                    _record_owned(ledger, scope, placed_results, now_ts)
             ledger.touch_cycle(strategy_id, now_ts)
+            cutoff = cast(
+                "pd.Timestamp", now_ts - pd.Timedelta(days=_INTENT_RETENTION_DAYS)
+            )
+            ledger.prune(cutoff)
         await broker.close()
     return build_report(
         snapshot.portfolio,
@@ -249,6 +266,18 @@ async def run_cycle(
         cost=cost,
         placement_error=placement_error,
     )
+
+
+async def _resync(broker: LiveBroker) -> tuple[OrderResult, ...]:
+    """Adopt/mark OPEN intents at cycle start; a failed read leaves them OPEN.
+
+    A failure here is not fatal: placement's own pre-flight will fail closed with
+    the same read failure, reported per order.
+    """
+    resynced = await broker.resync()
+    if isinstance(resynced, Err):
+        return ()
+    return tuple(resynced.value)
 
 
 def _owned_ids(ledger: CycleLedger, scope: str) -> frozenset[str]:
