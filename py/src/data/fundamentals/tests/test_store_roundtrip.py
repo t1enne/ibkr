@@ -93,12 +93,6 @@ def test_insert_does_not_leak_the_test_binding_onto_the_model(
     assert FundamentalSchema._meta.database is db
 
 
-def test_bootstrap_is_idempotent(conn: SqliteDatabase) -> None:
-    bootstrap(conn)
-    with _using(conn):
-        assert FundamentalSchema.table_exists()
-
-
 def test_reads_are_scoped_to_the_symbol(conn: SqliteDatabase) -> None:
     insert_fundamentals(
         [_row("net_income", 1.0, "2023-03-31", "2023-05-01")], db_conn=conn

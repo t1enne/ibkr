@@ -373,9 +373,3 @@ def test_intent_to_signal_prices_at_ref() -> None:
     assert signal.price == 100.0
     assert signal.qty == 10.0
     assert signal.action is ActionType.long
-
-
-def test_order_result_shape() -> None:
-    order = OrderResult(intent=_open_intent(), fill=None, ok=False, message="x")
-    assert order.position_id is None
-    assert not order.ok

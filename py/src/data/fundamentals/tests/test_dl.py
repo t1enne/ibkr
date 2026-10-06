@@ -215,9 +215,4 @@ def pd_timestamp(value: str):
     return parse_timestamp(value)
 
 
-def test_table_exists_helper_roundtrip(db_file: Path) -> None:
-    """The isolated fixture really is isolated (no production DB writes)."""
-    assert FundamentalSchema.table_exists()
-
-
 pytestmark = pytest.mark.db

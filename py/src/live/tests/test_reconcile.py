@@ -249,15 +249,17 @@ def test_close_signal_targets_named_lot_only() -> None:
     assert order.qty == 4.0
 
 
-def test_long_to_long_holds() -> None:
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
-    # Already long and asked for long: side-only reconcile HOLDs (no resize).
-    assert reconcile((sig("long", qty=5.0),), book, CFG) == ()
-
-
-def test_short_to_short_holds() -> None:
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.short, pid="S1"))
-    assert reconcile((sig("short", qty=5.0),), book, CFG) == ()
+@pytest.mark.parametrize(
+    ("action", "side"),
+    [("long", ActionType.long), ("short", ActionType.short)],
+)
+def test_already_on_the_target_side_holds(
+    action: SignalAction, side: ActionType
+) -> None:
+    # Already on the signalled side and asked for the same: side-only reconcile
+    # HOLDs (no resize), for both long and short.
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, side, pid="L1"))
+    assert reconcile((sig(action, qty=5.0),), book, CFG) == ()
 
 
 def test_empty_owned_closes_nothing() -> None:

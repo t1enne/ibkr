@@ -127,4 +127,3 @@ def test_client_refuses_verify_false_off_localhost() -> None:
 def test_httpx_client_uses_the_configured_base_url() -> None:
     client = _client()
     assert str(client.http.base_url) == BASE
-    assert client.http is client.http  # one shared client, not per-call

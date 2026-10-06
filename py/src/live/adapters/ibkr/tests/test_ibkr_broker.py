@@ -17,7 +17,7 @@ import respx
 
 from src.bt.state import ActionType, PortfolioState, Position
 from src.data.ibkr.client import IbkrClient
-from src.exec.types import OrderSide, OrderType
+from src.exec.types import OrderType
 from src.live.adapters.ibkr.broker import MAX_REPLIES, IbkrBroker
 from src.live.broker import OrderResult
 from src.live.result import Err, Ok, Result
@@ -543,14 +543,6 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
     # identity-keyed (plan §4), so only the side/order distinguishes them here.
     assert '"side":"SELL"' in bodies[0] and '"side":"BUY"' in bodies[1]
     assert "20240603T143000" in bodies[0] and "20240603T143000" in bodies[1]
-
-
-def test_broker_satisfies_the_live_broker_protocol() -> None:
-    """A structural conformance check (the engine depends on the Protocol)."""
-    from src.live.broker import LiveBroker
-
-    broker = cast("LiveBroker", _broker())
-    assert broker is not None and OrderSide.BUY.value == "BUY"
 
 
 @respx.mock

@@ -21,6 +21,7 @@ def test_parse_positions_reads_signed_qty_and_symbol() -> None:
                 "contractDesc": "AAPL",
                 "position": -12.0,
                 "avgCost": 180.5,
+                "mktPrice": 123.5,
                 "currency": "USD",
             }
         ]
@@ -30,6 +31,7 @@ def test_parse_positions_reads_signed_qty_and_symbol() -> None:
     assert positions[0].symbol == "AAPL"
     assert positions[0].qty == -12.0  # net-per-instrument, signed
     assert positions[0].avg_cost == 180.5
+    assert positions[0].mkt_price == 123.5
 
 
 def test_parse_positions_skips_unidentifiable_and_zero() -> None:
@@ -55,13 +57,6 @@ def test_parse_positions_tolerates_string_numbers() -> None:
     )
     assert positions[0].qty == 5.0
     assert positions[0].avg_cost == 10.25
-
-
-def test_parse_positions_keeps_mkt_price() -> None:
-    positions, _ = parse_positions(
-        [{"conid": 1, "contractDesc": "AAPL", "position": 5, "mktPrice": 123.5}]
-    )
-    assert positions[0].mkt_price == 123.5
 
 
 def test_parse_executions_canonicalises_float_order_id() -> None:
