@@ -25,6 +25,10 @@ paper evidence in phase 3 (see §3/§4 and §6 `Phase 3.5`):
 Everything else in rev 3 stands, including the phase-split and the surviving open
 decisions.
 
+**Split (2026-10-05):** LMT orders, gap fills and unfilled outcomes moved to
+`docs/PLAN_LMT_ORDERS.md`. This plan is MKT-only; its §7.1 is retired there and its
+phase 4 no longer owns LMT carry-over/reprice/cancel-modify.
+
 ## Shipped status vs this plan (2026-10-05)
 
 Phases shipped and verified (all on `feat/live`), in order:
@@ -52,7 +56,7 @@ Phases shipped and verified (all on `feat/live`), in order:
   (`src/exec/ports.py`) and the live async `LiveBroker` (`src/live/broker.py`). Rev 3's
   "ONE `Broker` port" is effectively two. This is an explicit phase-4 decision (see §6),
   deferred because it is only load-bearing once LMT/`OrderRequest` must reach the live
-  edge.
+  edge — which is now the L3 blocker in `docs/PLAN_LMT_ORDERS.md` §4.
 - **D3 The keepalive lives in docker-compose**, as the user directed: the `ib-gateway`
   healthcheck does `curl -fsk /tickle | grep -q '"authenticated":true'` every 30s — the
   GET tickle IS the keepalive, and a logged-out session now reads UNHEALTHY instead of
@@ -169,10 +173,10 @@ def match_bar(order: OrderRequest, bars: pd.DataFrame) -> Fill | None
 ```
 
 - MKT: fills at the next bar's open (`tif=DAY` at that bar). Same rule as today.
-- LMT buy: fills only if `low <= limit`; price = `min(limit, open)` (a gapped-through
-  open is not improved on). LMT sell: `high >= limit`; price = `max(limit, open)`.
-- No fill: `None`, and the backtest reports it as an unfilled order rather than
-  pretending an instant fill. `tif=DAY` drops it at that bar; carry-over is phase 4.
+- LMT, gaps and unfilled outcomes are NO LONGER part of this plan — moved to
+  `docs/PLAN_LMT_ORDERS.md` (rev 1, 2026-10-05). The matcher's shipped LMT rules live in
+  `src/exec/matching.py`; this plan's bt run path emits MKT only, and no unfilled outcome
+  is reported by any `bt` report yet (that plan's L0/L1).
 - Friction (`spread_bps`, `slippage_bps`, adverse multiplier) is NOT the matcher's
   job: `match_bar` returns the frictionless base price, and the ADAPTER applies
   friction + commission. `SimExchange.match_bar(order, bars, *, spread_bps,
@@ -389,10 +393,11 @@ phase 4.
 - **Placement hygiene:** whole-share quantities (round and reject/flag fractional before
   submit — `compute_qty` currently returns 4 dp), and read `/iserver/account/orders`
   before re-sending after an ambiguous submit timeout, so a working order is seen instead
-  of duplicated. An LMT/working order is out of scope (phase 4) but the re-send guard is
-  not. ✓ (plus deviation D6's close-flat refusal, which is part of this hygiene)
-- **Decide `Broker` vs `LiveBroker`** convergence before phase 4 LMT: the shared
-  `OrderRequest` vocabulary needs `limit_price`/`tif` on the live edge.
+  of duplicated. An LMT/working order is out of scope (`docs/PLAN_LMT_ORDERS.md` L3) but
+  the re-send guard is not. ✓ (plus deviation D6's close-flat refusal, which is part of this hygiene)
+- **Decide `Broker` vs `LiveBroker`** convergence before any live LMT (see
+  `docs/PLAN_LMT_ORDERS.md` L3): the shared `OrderRequest` vocabulary needs
+  `limit_price`/`tif` on the live edge.
 - Proof, on the paper account: two scopes on one account each reconcile only their own
   book; an open→close round trip shows one closed row; a manual/foreign position is
   ignored without a warning storm; a parameter edit keeps the same scope's book; a
@@ -400,14 +405,16 @@ phase 4.
 
 ### Phase 4 — deferred (deliberately not phase 1)
 
-LMT carry-over and reprice, cancel/modify, resting per-lot `STP` orders (the rev 2 Q14
-decision), alerting for a halted cycle, `/iserver/account/trades` windowing beyond 7 days,
-multi-account allocation, IBKR market data.
+Resting per-lot `STP` orders (the rev 2 Q14 decision), alerting for a halted cycle,
+`/iserver/account/trades` windowing beyond 7 days, multi-account allocation, IBKR market
+data. LMT orders — carry-over, reprice, cancel/modify, unfilled reporting — are OUT of
+this plan: `docs/PLAN_LMT_ORDERS.md`, whose L3 (live LMT) is blocked on deviation D2 below.
 
 ## 7. Surviving open decisions
 
-1. **LMT in phase 3 or phase 4?** Shipping LMT live means owning unfilled orders across
-   cycles. Default: domain-ready in phase 0, live LMT in phase 4 unless a strategy needs it.
+1. **LMT in phase 3 or phase 4?** MOVED OUT: `docs/PLAN_LMT_ORDERS.md` (rev 1,
+   2026-10-05). The domain is ready (phase 0 shipped `OrderType.MKT|LMT`); nothing in
+   this plan places, rests or reports a limit order.
 2. **`StrategyConfig.broker`** — SHIPPED AS: both the config field (`Literal["sim","ibkr"]`,
    default `"sim"`, unknown value raises) AND the `--adapter` CLI flag exist;
    `resolve_broker` reads the `broker` key once (top-level, then `strategy_params`) so the
