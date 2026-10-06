@@ -74,6 +74,7 @@ def _broker(
     timeout_s: float = 0.0,
     monotonic: Callable[[], float] | None = None,
     now: Callable[[], pd.Timestamp] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> IbkrBroker:
     return IbkrBroker(
         IbkrClient(base_url=BASE, account=ACCOUNT),
@@ -86,6 +87,7 @@ def _broker(
         sleep=_no_sleep,
         monotonic=monotonic if monotonic is not None else lambda: 100.0,
         now=now if now is not None else (lambda: CYCLE_TS),
+        log=log,
     )
 
 
@@ -98,6 +100,18 @@ def _open_intent(decision_ts: pd.Timestamp | None = None) -> OrderIntent:
         reason="open long (flat->long)",
         decision_ts=decision_ts,
         cash_bound=1000.0,
+    )
+
+
+def _sized_open(symbol: str, qty: float, price: float, bound: float) -> OrderIntent:
+    """An OPEN intent sized against ``bound`` (the shared ``view.cash``)."""
+    return OrderIntent(
+        symbol=symbol,
+        action=ActionType.long,
+        qty=qty,
+        ref_price=price,
+        reason="open long (flat->long)",
+        cash_bound=bound,
     )
 
 
@@ -796,6 +810,93 @@ async def test_place_cohort_is_a_deterministic_loop_that_survives_one_failure() 
     assert (first.intent.action, first.ok) == (ActionType.close, False)
     assert "rejected" in first.message
     assert (second.intent.action, second.ok) == (ActionType.long, True)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_over_cash_open_cohort_is_scaled_by_one_shared_factor() -> None:
+    """Two opens at 100% of the shared cash each are scaled, not both sent full."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
+    messages: list[str] = []
+    broker = _broker(log=messages.append)
+
+    result = await broker.place_cohort(
+        (
+            _sized_open("AAPL", qty=100.0, price=100.0, bound=15000.0),
+            _sized_open("MSFT", qty=100.0, price=100.0, bound=15000.0),
+        )
+    )
+
+    assert isinstance(result, Ok)
+    results = cast("tuple[OrderResult, ...]", result.value)
+    assert all(r.ok for r in results)
+    # requested 20000 > budget 15000 -> scale 0.75 -> floor(100 * 0.75) = 75 each.
+    posted = sorted(
+        json.loads(call.request.content.decode())["orders"][0]["quantity"]
+        for call in submit.calls
+    )
+    assert posted == [75.0, 75.0]
+    notice = [m for m in messages if m.startswith("cohort scaled")]
+    assert len(notice) == 1
+    assert "AAPL" in notice[0] and "MSFT" in notice[0]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_lone_open_is_never_scaled() -> None:
+    """A lone open is full-size-or-reject: an over-bound one is refused, not shaved."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
+    messages: list[str] = []
+    broker = _broker(log=messages.append)
+
+    result = await broker.place_cohort(
+        (_sized_open("AAPL", qty=100.0, price=100.0, bound=5000.0),)
+    )
+
+    assert isinstance(result, Ok)
+    results = cast("tuple[OrderResult, ...]", result.value)
+    assert results[0].ok is False
+    assert not submit.called  # never submitted, and never scaled to half size
+    assert not any(m.startswith("cohort scaled") for m in messages)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_scaled_open_that_floors_to_zero_is_dropped() -> None:
+    """A scaled open whose whole-share qty is 0 is reported, never submitted."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
+    broker = _broker()
+
+    result = await broker.place_cohort(
+        (
+            _sized_open("AAPL", qty=100.0, price=100.0, bound=5000.0),
+            _sized_open("MSFT", qty=1.0, price=100.0, bound=5000.0),
+        )
+    )
+
+    assert isinstance(result, Ok)
+    results = cast("tuple[OrderResult, ...]", result.value)
+    by_symbol = {r.intent.symbol: r for r in results}
+    assert by_symbol["AAPL"].ok and by_symbol["AAPL"].intent.qty == 49.0
+    assert by_symbol["MSFT"].ok is False
+    assert "floors to 0 shares" in by_symbol["MSFT"].message
+    posted = [
+        json.loads(call.request.content.decode())["orders"][0]["quantity"]
+        for call in submit.calls
+    ]
+    assert posted == [49.0]  # only AAPL was sent
 
 
 @respx.mock

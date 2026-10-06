@@ -12,6 +12,10 @@ Three pure mappings live here, all table-tested and free of I/O:
 - ``sequence`` — the deterministic ``(seq, intent)`` ordering (closes first, then
   opens in the order reconcile emitted, i.e. ``config.symbols`` order). Re-running
   the same cycle therefore mints identical refs; the next bar gets fresh ones.
+- ``scale_open_cohort`` — the backtest's ONE shared cash scale applied to a live
+  over-cash OPEN cohort (whole-share floor), so an over-deployed multi-open cycle
+  is scaled the way the sim/backtest scales it rather than sending every open at
+  its individually-guarded full size.
 - ``classify_reply`` — the reply-confirmation vocabulary: an order ticket's
   response is either a success carrying an ``order_id``, a reply message that must
   be *confirmed* through ``POST /iserver/reply/{replyId}``, or a refusal to abort
@@ -35,11 +39,12 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import pandas as pd
 
+from src.bt.portfolio.pure import ScaleRecord
 from src.bt.state import ActionType
 from src.exec.refs import assign_seqs, order_ref as mint_ref
 from src.exec.types import Fill, OrderSide, OrderState, OrderType
@@ -213,6 +218,125 @@ def sequence(
     )
     seqs = assign_seqs([intent_identity(intent) for _, intent in ranked])
     return tuple((seq, intent) for seq, (_, intent) in zip(seqs, ranked, strict=True))
+
+
+# -- cohort cash scaling (backtest parity) -----------------------------------
+
+#: The 4 dp floor ``src.bt.portfolio.pure._scale_opens`` applies to a scaled qty.
+#: Matched here so live and backtest agree BEFORE the live-only whole-share step.
+_QTY_DP = 1e4
+
+
+@dataclass(frozen=True)
+class OpenDrop:
+    """A scaled OPEN the edge drops instead of sending a 0-share order."""
+
+    intent: OrderIntent
+    reason: str
+
+
+@dataclass(frozen=True)
+class CohortPlan:
+    """The edge's cohort decision: the (possibly rescaled) intents, the scale
+    report for the log, and the opens a scale-to-zero dropped."""
+
+    intents: tuple[OrderIntent, ...]
+    scale: ScaleRecord | None
+    dropped: tuple[OpenDrop, ...]
+
+
+def scale_open_cohort(intents: tuple[OrderIntent, ...]) -> CohortPlan:
+    """Mimic the backtest's ONE shared cash scale on a live OPEN cohort.
+
+    A lone open is full-size-or-reject and is NEVER scaled (the edge's per-intent
+    ``_open_cash_guard`` refuses it) — the legacy path, bit-identical to before.
+    Two or more opens were all sized against the ONE ``view.cash`` reconcile
+    carried to the edge as their shared ``cash_bound``; if their combined
+    reference-price notional exceeds that budget they compete for it and every
+    qty is scaled by ``min(1, budget / requested)``, mirroring
+    ``src.bt.portfolio.pure._scale_opens``. Two live-only consequences of orders
+    being whole shares: a scaled qty is FLOORED to whole shares (round-to-nearest
+    could resize it back UP past the budget), and one that floors to 0 shares is
+    DROPPED rather than sent as a 0-share order. An unprovable budget (opens
+    disagreeing on their bound) fails closed — every open is dropped, none sent.
+    """
+    opens = tuple(i for i in intents if i.action in (ActionType.long, ActionType.short))
+    if len(opens) <= 1:
+        return CohortPlan(intents=intents, scale=None, dropped=())
+    budget = _shared_cash_bound(opens)
+    if budget is None:
+        return _refuse_opens(
+            intents,
+            opens,
+            "cohort opens disagree on their cash bound; cannot prove a shared budget",
+        )
+    requested = sum(i.qty * i.ref_price for i in opens)
+    if requested <= 0.0 or budget <= 0.0:
+        return CohortPlan(intents=intents, scale=None, dropped=())
+    scale = min(1.0, budget / requested)
+    if scale >= 1.0:
+        return CohortPlan(intents=intents, scale=None, dropped=())
+    scaled, dropped, members = _apply_scale(opens, scale)
+    if not members:
+        return CohortPlan(intents=intents, scale=None, dropped=())
+    dropped_ids = {id(d.intent) for d in dropped}
+    new_intents = tuple(scaled.get(i, i) for i in intents if id(i) not in dropped_ids)
+    return CohortPlan(
+        intents=new_intents,
+        scale=ScaleRecord(
+            scale=scale, requested=requested, budget=budget, members=members
+        ),
+        dropped=tuple(dropped),
+    )
+
+
+def _shared_cash_bound(opens: tuple[OrderIntent, ...]) -> float | None:
+    """The one post-close cash the opens compete for, or ``None`` if unprovable."""
+    bounds = {i.cash_bound for i in opens}
+    if len(bounds) != 1:
+        return None
+    (bound,) = bounds
+    if bound is None or not math.isfinite(bound):
+        return None
+    return bound
+
+
+def _refuse_opens(
+    intents: tuple[OrderIntent, ...], opens: tuple[OrderIntent, ...], reason: str
+) -> CohortPlan:
+    """Fail closed: drop every open (keep non-opens) when the budget is unprovable."""
+    dropped_ids = {id(i) for i in opens}
+    kept = tuple(i for i in intents if id(i) not in dropped_ids)
+    return CohortPlan(
+        intents=kept,
+        scale=None,
+        dropped=tuple(OpenDrop(i, f"refused open {i.symbol}: {reason}") for i in opens),
+    )
+
+
+def _apply_scale(
+    opens: tuple[OrderIntent, ...], scale: float
+) -> tuple[dict[OrderIntent, OrderIntent], list[OpenDrop], tuple[str, ...]]:
+    """Scaled opens (whole shares), the drops, and the affected symbols."""
+    scaled: dict[OrderIntent, OrderIntent] = {}
+    dropped: list[OpenDrop] = []
+    members: list[str] = []
+    for intent in opens:
+        reduced = math.floor(intent.qty * scale * _QTY_DP) / _QTY_DP
+        whole = math.floor(reduced)
+        if whole <= 0:
+            dropped.append(
+                OpenDrop(
+                    intent,
+                    f"dropped open {intent.symbol}: scaled qty {reduced:g} floors "
+                    f"to 0 shares",
+                )
+            )
+            members.append(intent.symbol)
+        elif float(whole) != intent.qty:
+            scaled[intent] = replace(intent, qty=float(whole))
+            members.append(intent.symbol)
+    return scaled, dropped, tuple(members)
 
 
 # -- reply-confirmation vocabulary -------------------------------------------

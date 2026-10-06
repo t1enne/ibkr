@@ -57,6 +57,16 @@ _STRATEGY_FIELDS = frozenset(f.name for f in fields(StrategyConfig))
 _ADAPTERS = ("sim", "ibkr")
 
 
+def _stderr_log(message: str) -> None:
+    """Route the IBKR edge's diagnostics to stderr, never the report's stdout.
+
+    A scaled cohort and a cash-refused open are operator notices: they belong in
+    the cron log beside the run, not interleaved with the report the next
+    consumer parses off stdout.
+    """
+    click.echo(message, err=True)
+
+
 class GatewayNotReady(RuntimeError):
     """The broker gateway is not ready; the cycle never ran."""
 
@@ -132,7 +142,7 @@ def live_run(
             gateway.client,
             scope=scope,
             dry_run=dry_run,
-            log=click.echo,
+            log=_stderr_log,
         )
     else:
         if not cfg.portfolio_path:

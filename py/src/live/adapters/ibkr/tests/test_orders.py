@@ -7,9 +7,10 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.state import ActionType
+from src.bt.portfolio.pure import _scale_opens
+from src.bt.state import ActionType, FillEvent, PortfolioState, TradeSignal
 from src.exec.refs import order_ref
-from src.exec.types import OrderSide, OrderState, OrderType
+from src.exec.types import FixedCommission, OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     UnknownCloseLot,
@@ -22,6 +23,7 @@ from src.live.adapters.ibkr.orders import (
     is_terminal,
     order_side,
     order_state,
+    scale_open_cohort,
     sequence,
     status_to_fill,
 )
@@ -394,3 +396,96 @@ def test_is_fully_filled_false_when_a_terminal_filled_has_no_readable_fill() -> 
     # A terminal Filled with no readable cum_fill cannot be proven complete; the
     # caller reports it UNKNOWN rather than as a full fill (finding M7a).
     assert not is_fully_filled({"order_status": "Filled", "total_size": "10"}, 0.0)
+
+
+# --- cohort cash scaling (backtest parity) ----------------------------------
+
+
+def _open(symbol: str, qty: float, price: float, bound: float) -> OrderIntent:
+    return OrderIntent(
+        symbol=symbol,
+        action=ActionType.long,
+        qty=qty,
+        ref_price=price,
+        reason="open",
+        cash_bound=bound,
+    )
+
+
+def test_lone_open_is_never_scaled() -> None:
+    plan = scale_open_cohort((_open("AAPL", 100.0, 100.0, 5000.0),))
+    assert plan.scale is None and not plan.dropped
+    assert plan.intents[0].qty == 100.0
+
+
+def test_multi_open_cohort_scales_to_the_shared_bound() -> None:
+    plan = scale_open_cohort(
+        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 15000.0))
+    )
+    assert plan.scale is not None
+    assert plan.scale.scale == pytest.approx(0.75)
+    assert sorted(i.qty for i in plan.intents) == [75.0, 75.0]
+    assert plan.scale.members == ("AAPL", "MSFT")
+
+
+def test_cohort_that_already_fits_is_not_scaled() -> None:
+    plan = scale_open_cohort(
+        (_open("AAPL", 10.0, 100.0, 15000.0), _open("MSFT", 10.0, 100.0, 15000.0))
+    )
+    assert plan.scale is None and not plan.dropped
+
+
+def test_scaled_open_that_floors_to_zero_is_dropped() -> None:
+    plan = scale_open_cohort(
+        (_open("AAPL", 100.0, 100.0, 5000.0), _open("MSFT", 1.0, 100.0, 5000.0))
+    )
+    assert [d.intent.symbol for d in plan.dropped] == ["MSFT"]
+    assert sorted(i.qty for i in plan.intents) == [49.0]
+
+
+def test_opens_disagreeing_on_their_bound_fail_closed() -> None:
+    plan = scale_open_cohort(
+        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 9000.0))
+    )
+    assert plan.scale is None
+    assert sorted(d.intent.symbol for d in plan.dropped) == ["AAPL", "MSFT"]
+    assert plan.intents == ()
+
+
+def test_live_scale_matches_the_backtest_shared_scale() -> None:
+    """The edge applies the SAME shared factor ``_scale_opens`` derives."""
+    cash = 15000.0
+    fills = tuple(
+        FillEvent(
+            signal=TradeSignal(
+                action=ActionType.long,
+                symbol=sym,
+                timestamp=CYCLE_TS,
+                price=100.0,
+                qty=100.0,
+                fill_at_next_open=False,
+            ),
+            filled_qty=100.0,
+            executed_price=100.0,
+            commission=0.0,
+            slippage=0.0,
+            timestamp=CYCLE_TS,
+        )
+        for sym in ("AAPL", "MSFT")
+    )
+    portfolio = PortfolioState(
+        cash=cash, positions={}, trades=(), equity_curve=(), initial_capital=cash
+    )
+    scaled, record = _scale_opens(portfolio, fills, FixedCommission(0.0))
+    assert record is not None
+
+    plan = scale_open_cohort(
+        (_open("AAPL", 100.0, 100.0, cash), _open("MSFT", 100.0, 100.0, cash))
+    )
+    assert plan.scale is not None
+    assert plan.scale.scale == pytest.approx(record.scale) == pytest.approx(0.75)
+    assert (
+        sorted(i.qty for i in plan.intents)
+        == sorted(f.signal.qty for f in scaled)
+        == [75.0, 75.0]
+    )

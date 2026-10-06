@@ -25,6 +25,7 @@ from src.live.broker import OrderResult
 from src.live.cli import (
     _STRATEGY_FIELDS,
     _housekeeping,
+    _stderr_log,
     _strategy_config,
     _write_strategy_config,
     live_group,
@@ -488,6 +489,16 @@ def test_resolve_adapter_live_mode_must_name_its_adapter() -> None:
 
     with pytest.raises(click.UsageError, match="must name its adapter"):
         resolve_adapter(None, {}, _cfg(mode="live"))
+
+
+def test_ibkr_broker_log_goes_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A scaled-cohort/cash-refused notice must not pollute the report's stdout."""
+    _stderr_log("cohort scaled x0.7500: reduced AAPL, MSFT")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "cohort scaled x0.7500" in captured.err
 
 
 def test_ibkr_non_dry_run_builds_the_placing_broker(

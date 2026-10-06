@@ -60,6 +60,7 @@ from src.live.adapters.ibkr.orders import (
     order_side,
     order_state,
     order_status_of,
+    scale_open_cohort,
     sequence,
     status_to_fill,
 )
@@ -300,10 +301,36 @@ class IbkrBroker:
         settling), so a single failed order is reported as a failed ``OrderResult``
         and the loop continues: one bad symbol must not abandon the rest of the
         cycle. The cohort therefore never returns a cohort-level ``Err``.
+
+        Before placing, the cohort's opens are scaled by ONE shared cash factor —
+        ``scale_open_cohort``, the backtest's rule at the edge — so an over-cash
+        multi-open cycle is reduced the way the sim/backtest reduces it instead of
+        sending every open at its individually-guarded full size. A scaled or
+        dropped cohort writes ONE stderr line (via ``log``) naming the scale and
+        the affected symbols; a scaled-to-zero open is reported as a failed order,
+        never submitted.
         """
+        plan = scale_open_cohort(intents)
+        if plan.scale is not None:
+            report = plan.scale
+            self._log(
+                f"cohort scaled x{report.scale:.4f}: requested "
+                f"{report.requested:.2f} > budget {report.budget:.2f}; reduced "
+                f"{', '.join(report.members)}"
+            )
+        scaled = {intent_identity(i): i for i in plan.intents}
+        dropped = {intent_identity(d.intent): d for d in plan.dropped}
         results: list[OrderResult] = []
         for seq, intent in sequence(intents):
-            placed = await self.place(intent, seq=seq)
+            ident = intent_identity(intent)
+            drop = dropped.get(ident)
+            if drop is not None:
+                self._log(drop.reason)
+                results.append(
+                    OrderResult(intent=intent, fill=None, ok=False, message=drop.reason)
+                )
+                continue
+            placed = await self.place(scaled.get(ident, intent), seq=seq)
             if isinstance(placed, Err):
                 error = cast("FeedError", placed.error)
                 message = f"{error.kind}: {error.message}"
