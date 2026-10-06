@@ -85,6 +85,11 @@ def live_group() -> None:
     is_flag=True,
     help="Required to read a LIVE account (mode: live).",
 )
+@click.option(
+    "--no-gateway",
+    is_flag=True,
+    help="Skip the gateway readiness check (trust an externally kept-alive gateway).",
+)
 def live_run(
     config_path: str,
     dry_run: bool,
@@ -92,6 +97,7 @@ def live_run(
     fmt: str,
     adapter: str | None,
     allow_live: bool,
+    no_gateway: bool,
 ) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     cfg = load_live_config(config_path)
@@ -169,6 +175,7 @@ def live_run(
                     dry_run=dry_run,
                     gateway=gateway,
                     allow_live=allow_live,
+                    no_gateway=no_gateway,
                     cost=cost,
                 )
             )
@@ -192,6 +199,7 @@ async def _run_cycle(
     dry_run: bool,
     gateway: IbkrGateway | None,
     allow_live: bool,
+    no_gateway: bool,
     cost: CostProvenance,
 ) -> CycleReport:
     """Gate the cycle, then run it: resolve account + authz before any read.
@@ -199,7 +207,9 @@ async def _run_cycle(
     The gateway adapter is what this adds over the sim path, and it runs BEFORE
     ``run_cycle``: a cycle that cannot reach an authenticated broker session, or
     that is not permitted to trade the account it found, must fail without ever
-    touching the screen or the book.
+    touching the screen or the book. ``no_gateway`` (plan §7.5) trusts an
+    externally kept-alive gateway and skips the readiness probe — loudly, never
+    silently.
     """
     if gateway is not None:
         try:
@@ -214,9 +224,15 @@ async def _run_cycle(
         )
         if isinstance(decision, Err):
             raise GatewayNotReady(cast("FeedError", decision.error))
-        ready = await gateway.ensure_ready()
-        if isinstance(ready, Err):
-            raise GatewayNotReady(cast("FeedError", ready.error))
+        if no_gateway:
+            click.echo(
+                "gateway readiness check skipped (--no-gateway; "
+                "trusting an externally kept-alive gateway)"
+            )
+        else:
+            ready = await gateway.ensure_ready()
+            if isinstance(ready, Err):
+                raise GatewayNotReady(cast("FeedError", ready.error))
     try:
         return await run_cycle(
             cfg,

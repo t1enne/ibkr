@@ -433,7 +433,11 @@ this plan: `docs/PLAN_LMT_ORDERS.md`, whose L3 (live LMT) is blocked on deviatio
    report is unchanged because a bt-report change would move the phase-1 golden-parity
    fixtures, and the backtest is modelled end to end anyway (no broker source to name).
 4. **`mode` doubles as gateway login toggle and live guard** (`LiveConfig.mode`). Default: reuse it.
-5. **Who starts the gateway.** Default: `ensure_ready` in the cycle, flag to disable for cron.
+5. **Who starts the gateway.** SHIPPED AS: `ensure_ready` runs in the cycle before
+   the read by default; `--no-gateway` skips it for a cron run that trusts an
+   externally kept-alive gateway. The skip is never silent — the run prints that the
+   readiness check was skipped — and the flag is a harmless no-op on the sim adapter
+   (there is no gateway to probe).
 6. **`--allow-live` naming and no env var.** Default: as stated.
 7. **`adapter: "auto"`** — SHIPPED AS: there is NO `auto` token. `--adapter` accepts only `sim`/`ibkr`; `mode: "live"` must NAME its adapter (`--adapter` or a `broker` key) and a live run with neither hard-errors rather than defaulting to `sim`. `resolve_broker` reads the `broker` key once (top-level, then `strategy_params`) so the adapter choice and the "was it named?" flag cannot disagree.
 8. **New `FeedError` kinds.** SHIPPED AS: `rejected`, `unfilled`, `timeout` added;

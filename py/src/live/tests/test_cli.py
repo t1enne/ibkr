@@ -131,6 +131,7 @@ def test_live_run_help_lists_options() -> None:
     assert "--dry-run" in out.output
     assert "--max-age" in out.output
     assert "--format" in out.output
+    assert "--no-gateway" in out.output
 
 
 def test_live_run_missing_file_fails(tmp_path: Path) -> None:
@@ -615,3 +616,36 @@ def test_ibkr_ensures_ready_before_the_cycle(
     )
     assert out.exit_code == 0, out.output
     assert made[0].ready_calls == 1
+
+
+def test_no_gateway_skips_ensure_ready_and_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-gateway skips the readiness probe (loudly) yet still runs the cycle."""
+    made: list[_FakeGateway] = []
+    ran: dict[str, bool] = {}
+
+    def make_gateway(*a: object, **k: object) -> _FakeGateway:
+        gateway = _FakeGateway()
+        made.append(gateway)
+        return gateway
+
+    monkeypatch.setattr("src.live.cli.IbkrGateway", make_gateway)
+    monkeypatch.setattr("src.live.cli.IbkrClient", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.IbkrPortfolioSource", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        ran["cycle"] = True
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, broker="ibkr", mode="paper")
+    out = CliRunner().invoke(
+        live_group,
+        ["run", path, "--dry-run", "--adapter", "ibkr", "--no-gateway"],
+    )
+    assert out.exit_code == 0, out.output
+    assert made[0].ready_calls == 0  # probe skipped
+    assert ran.get("cycle") is True  # cycle still ran
+    assert "readiness check skipped" in out.output  # never silent

@@ -8,8 +8,11 @@ a ``Fill``.
 Rules:
   - MKT: fills at the bar's open.
   - LMT buy:  fills only if ``low <= limit``, at ``min(limit, open)`` — a bar
-    that gapped below the limit is not improved on.
-  - LMT sell: fills only if ``high >= limit``, at ``max(limit, open)``.
+    that gapped through the limit in our favour (open below the limit) fills at
+    the OPEN, i.e. BETTER than the limit.
+  - LMT sell: fills only if ``high >= limit``, at ``max(limit, open)`` — a bar
+    that gapped through the limit in our favour (open above the limit) fills at
+    the OPEN, i.e. BETTER than the limit.
 
 A bar the rule does not touch yields ``None``: an unfilled order, not an
 invented fill. ``DAY``/``IOC`` both resolve within the single bar given;

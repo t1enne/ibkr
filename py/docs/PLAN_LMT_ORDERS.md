@@ -37,11 +37,14 @@ return min(limit, open_) if low <= limit else None
 ```
 
 A bar whose open gapped *through* the limit in our favour therefore fills at the
-**open**, which is better than the limit — but `src/exec/matching.py`'s docstring
-and hexagonal plan §2 both say the opposite ("a bar that gapped below the limit
-is not improved on"). One of the two is wrong and the contradiction must be
-resolved before LMT is trusted; today the code is the realistic side and the
-prose is the wrong side.
+**open**, which is better than the limit. This was a live contradiction: the code
+is the realistic side, and `src/exec/matching.py`'s docstring and hexagonal plan
+§2 both said the opposite ("a bar that gapped below the limit is not improved
+on"). **Resolved (L0, prose+test only): the R realistic convention wins** — the
+prose was rewritten to state the shipped rule for BOTH sides (buy: `min(limit,
+open)`; sell: `max(limit, open)`), and the matcher table now pins the shipped
+truth (an exact-touch bar `low == limit` for a buy DOES fill, and an LMT with
+`limit_price=None` never fills). No behavior change.
 
 The honest choices, per side (buy shown; sell mirrors):
 
@@ -153,10 +156,12 @@ Order matters; none of this can ship before the decision it depends on.
 
 Each ships alone; MKT behavior must not move.
 
-- **L0 — resolve the gap contradiction.** Fix the wrong prose in
-  `src/exec/matching.py` + hexagonal plan §2 to state the shipped convention (R),
-  add the table case that pins strict-touch (T) as a non-fill, and
-  `make check`. No behavior change.
+- **L0 — resolve the gap contradiction.** SHIPPED (prose + tests only). The
+  wrong prose in `src/exec/matching.py` was rewritten to state the shipped
+  convention (R); hexagonal plan §2 already carried no contradictory parenthetical
+  (it points here), so nothing to fix there. The matcher table pins the shipped
+  truth: an exact-touch bar (`low == limit` for a buy) DOES fill (the matcher is
+  non-strict), and an LMT with `limit_price=None` never fills. No behavior change.
 - **L1 — unfilled is first-class, DAY-scoped.** Engine drains staged orders at
   the fill bar, drops unfilled ones, records `Unfilled` + the gap subsidy; report
   metric + `--trades` rows. Proof: MKT-only configs byte-identical (golden

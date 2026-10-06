@@ -46,12 +46,12 @@ def test_lmt_buy_touched_fills_at_limit() -> None:
     assert fill.price == 97.0  # min(limit, open)
 
 
-def test_lmt_buy_gap_through_open_is_not_improved_on() -> None:
-    # Bar gapped below the limit: fill at the open, not the better limit.
+def test_lmt_buy_gap_through_fills_better_at_open() -> None:
+    # Bar gapped through the limit in our favour: fill at the open (better).
     order = _order(OrderSide.BUY, OrderType.LMT, limit=90.0)
     fill = match_bar(order, _bars(80.0, 82.0, 75.0))
     assert fill is not None
-    assert fill.price == 80.0  # min(90, 80)
+    assert fill.price == 80.0  # min(90, 80): better than the limit
 
 
 def test_lmt_buy_missed_is_none() -> None:
@@ -66,11 +66,11 @@ def test_lmt_sell_touched_fills_at_limit() -> None:
     assert fill.price == 103.0  # max(limit, open)
 
 
-def test_lmt_sell_gap_through_open_is_not_improved_on() -> None:
+def test_lmt_sell_gap_through_fills_better_at_open() -> None:
     order = _order(OrderSide.SELL, OrderType.LMT, limit=110.0)
     fill = match_bar(order, _bars(120.0, 125.0, 118.0))
     assert fill is not None
-    assert fill.price == 120.0  # max(110, 120)
+    assert fill.price == 120.0  # max(110, 120): better than the limit
 
 
 def test_lmt_sell_missed_is_none() -> None:
@@ -94,7 +94,13 @@ def test_empty_bars_is_none() -> None:
         (OrderType.MKT, OrderSide.BUY, None, 100.0, 105.0, 95.0, 100.0),
         (OrderType.LMT, OrderSide.BUY, 97.0, 100.0, 105.0, 95.0, 97.0),
         (OrderType.LMT, OrderSide.BUY, 98.0, 100.0, 105.0, 99.0, None),
+        # Exact touch (low == limit) is a fill: the matcher is non-strict.
+        (OrderType.LMT, OrderSide.BUY, 95.0, 100.0, 105.0, 95.0, 95.0),
+        # An LMT with no limit price never fills.
+        (OrderType.LMT, OrderSide.BUY, None, 100.0, 105.0, 95.0, None),
         (OrderType.LMT, OrderSide.SELL, 103.0, 100.0, 105.0, 95.0, 103.0),
+        # Exact touch (high == limit) is a fill: the matcher is non-strict.
+        (OrderType.LMT, OrderSide.SELL, 105.0, 100.0, 105.0, 95.0, 105.0),
         (OrderType.LMT, OrderSide.SELL, 106.0, 100.0, 105.0, 95.0, None),
     ],
 )
