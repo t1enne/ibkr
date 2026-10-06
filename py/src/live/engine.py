@@ -21,7 +21,14 @@ from src.live.portfolio_source import PortfolioSource
 from src.live.reconcile import reconcile
 from src.live.result import Err
 from src.live.signals import live_signals
-from src.live.types import FeedError, LiveConfig, LiveSignal, OrderIntent
+from src.live.types import (
+    MODELLED_COST,
+    CostProvenance,
+    FeedError,
+    LiveConfig,
+    LiveSignal,
+    OrderIntent,
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +40,9 @@ class CycleReport:
     intents: tuple[OrderIntent, ...]
     results: tuple[OrderResult, ...]
     portfolio_before: PortfolioState
+    #: Which source produced this run's cost figures (plan §7.3). Defaults to the
+    #: all-modelled sim provenance; the CLI sets the broker-exact book for IBKR.
+    cost: CostProvenance = MODELLED_COST
 
 
 class StaleDataError(RuntimeError):
@@ -84,6 +94,7 @@ def build_report(
     intents: tuple[OrderIntent, ...],
     results: tuple[OrderResult, ...],
     as_of: pd.Timestamp,
+    cost: CostProvenance = MODELLED_COST,
 ) -> CycleReport:
     """Pure: assemble the cycle report. No clock, no I/O."""
     return CycleReport(
@@ -92,6 +103,7 @@ def build_report(
         intents=intents,
         results=results,
         portfolio_before=portfolio,
+        cost=cost,
     )
 
 
@@ -165,6 +177,7 @@ async def run_cycle(
     db_path: str | Path | None = None,
     now: pd.Timestamp | None = None,
     signal_source: SignalSource = live_signals,
+    cost: CostProvenance = MODELLED_COST,
 ) -> CycleReport:
     """One full batch pass. Not a loop; the caller drives cadence.
 
@@ -201,7 +214,9 @@ async def run_cycle(
             _record_owned(ledger, strategy_id, results, now_ts)
         ledger.touch_cycle(strategy_id, now_ts)
     await broker.close()
-    return build_report(snapshot.portfolio, signals, intents, results, now_ts)
+    return build_report(
+        snapshot.portfolio, signals, intents, results, now_ts, cost=cost
+    )
 
 
 def _owned_ids(ledger: CycleLedger, strategy_id: str) -> frozenset[str]:

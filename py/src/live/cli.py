@@ -43,7 +43,7 @@ from src.live.engine import (
 from src.live.ledger import SqliteLedger, config_hash
 from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
 from src.live.result import Err
-from src.live.types import FeedError, LiveConfig
+from src.live.types import CostProvenance, FeedError, LiveConfig, cost_provenance
 
 #: Sizing modes the shared ``SizingParams`` layer accepts.
 SizeMode = Literal["equity", "cash", "fixed"]
@@ -146,6 +146,10 @@ def live_run(
             ),
             click.echo,
         )
+    # Plan §7.3: label which source produced this run's costs. A resolved IBKR run
+    # books the broker's exact per-execution commission but still SIZES on the sim
+    # model — the report states both, so the mix is never ambiguous.
+    cost = cost_provenance(resolved)
     try:
         # The live file is a strategy config PLUS live-only keys; the screen
         # bridge (``load_strategy``) is strict and rejects those extras, so it
@@ -165,6 +169,7 @@ def live_run(
                     dry_run=dry_run,
                     gateway=gateway,
                     allow_live=allow_live,
+                    cost=cost,
                 )
             )
     except (StaleDataError, PortfolioFetchError, GatewayNotReady, ValueError) as exc:
@@ -187,6 +192,7 @@ async def _run_cycle(
     dry_run: bool,
     gateway: IbkrGateway | None,
     allow_live: bool,
+    cost: CostProvenance,
 ) -> CycleReport:
     """Gate the cycle, then run it: resolve account + authz before any read.
 
@@ -221,6 +227,7 @@ async def _run_cycle(
             config_path=config_path,
             max_age_days=max_age_days,
             dry_run=dry_run,
+            cost=cost,
         )
     finally:
         # The client is shared with the portfolio source and outlives the read;
@@ -387,6 +394,7 @@ def _render_json(report: CycleReport) -> str:
     """JSON at the edge — reuse the shared encoder for Timestamps/Enums."""
     doc = {
         "as_of": report.as_of,
+        "costs": asdict(report.cost),
         "signals": [asdict(s) for s in report.signals],
         "intents": [asdict(i) for i in report.intents],
         "results": [_result_dict(r) for r in report.results],
@@ -397,6 +405,9 @@ def _render_json(report: CycleReport) -> str:
 
 def _render_text(report: CycleReport) -> str:
     lines = [f"as_of: {report.as_of}"]
+    lines.append(
+        f"costs: bookkeeping={report.cost.bookkeeping} sizing={report.cost.sizing}"
+    )
     for sig in report.signals:
         lines.append(
             f"signal {sig.symbol} {sig.action} "

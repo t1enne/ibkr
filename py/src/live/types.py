@@ -22,6 +22,39 @@ from src.exec.types import OrderType
 #: produced: absence of a signal is HOLD downstream.
 SignalAction = Literal["long", "short", "close"]
 
+#: Which source produced a cost figure (plan §7.3). ``broker_executions`` is the
+#: broker's own per-execution number (exact); ``modelled`` is the sim
+#: ``CommissionModel`` approximation.
+CostSource = Literal["broker_executions", "modelled"]
+
+
+@dataclass(frozen=True)
+class CostProvenance:
+    """Which source produced each cost a live run reports (plan §7.3).
+
+    A live run can MIX sources, so this names BOTH sides rather than a single
+    tag: the IBKR read path books the broker's exact per-execution commission
+    into cash/lots (``bookkeeping``), while order sizing still runs the sim
+    commission model (``sizing``) — the broker does not report a fee for an
+    order it has not filled yet. A ``sim`` run is modelled on both sides. Two
+    explicit fields, never a lone "mixed" token, is what keeps the mix
+    unambiguous.
+    """
+
+    bookkeeping: CostSource
+    sizing: CostSource
+
+
+#: The all-modelled provenance: a sim run books and sizes from the same model.
+MODELLED_COST = CostProvenance(bookkeeping="modelled", sizing="modelled")
+
+
+def cost_provenance(adapter: str) -> CostProvenance:
+    """Cost provenance for the adapter that ran: broker-exact book on IBKR only."""
+    if adapter == "ibkr":
+        return CostProvenance(bookkeeping="broker_executions", sizing="modelled")
+    return MODELLED_COST
+
 
 @dataclass(frozen=True)
 class PortfolioSnapshot:

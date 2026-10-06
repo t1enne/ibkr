@@ -413,8 +413,18 @@ multi-account allocation, IBKR market data.
    `resolve_broker` reads the `broker` key once (top-level, then `strategy_params`) so the
    field and the flag cannot disagree, and `mode: "live"` must name its adapter.
 3. **`CommissionModel` for live.** Broker-reported commission from executions is exact;
-   the sim's model is an approximation. Default: record the broker's number in live and
-   make live and backtest reports state which source produced their costs.
+   the sim's model is an approximation. SHIPPED AS: the broker's number is the ONE source
+   of booked costs on the IBKR path (`Execution.commission` persisted into
+   `live_execution`; the ledger never re-models a booked fill), and the live report now
+   STATES which source produced its costs via `CycleReport.cost`
+   (`CostProvenance{bookkeeping,sizing}`). An IBKR run names
+   `bookkeeping=broker_executions` AND `sizing=modelled` — a run genuinely MIXES the two,
+   because the broker reports no fee for an unplaced order, so order sizing stays on the
+   sim model while booked cash/commission comes from the broker. A `sim` run is
+   `modelled` on both. Two explicit fields, never a lone "mixed" tag, so the mix reads
+   unambiguously in both the text and JSON report. Labeling is LIVE-ONLY: the backtest
+   report is unchanged because a bt-report change would move the phase-1 golden-parity
+   fixtures, and the backtest is modelled end to end anyway (no broker source to name).
 4. **`mode` doubles as gateway login toggle and live guard** (`LiveConfig.mode`). Default: reuse it.
 5. **Who starts the gateway.** Default: `ensure_ready` in the cycle, flag to disable for cron.
 6. **`--allow-live` naming and no env var.** Default: as stated.

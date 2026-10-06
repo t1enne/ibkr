@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,6 +36,7 @@ from src.live.types import (
     LiveSignal,
     OrderIntent,
     PortfolioSnapshot,
+    cost_provenance,
 )
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03"))
@@ -289,6 +291,22 @@ def test_render_report_text_is_deterministic_and_listed() -> None:
     assert "cash: 49000.00" in out
 
 
+def test_cost_provenance_is_broker_exact_book_only_for_ibkr() -> None:
+    assert cost_provenance("ibkr").bookkeeping == "broker_executions"
+    assert cost_provenance("ibkr").sizing == "modelled"  # sizing stays modelled
+    sim = cost_provenance("sim")
+    assert (sim.bookkeeping, sim.sizing) == ("modelled", "modelled")
+
+
+def test_render_report_states_both_cost_sources() -> None:
+    """A mixed IBKR run must name BOTH sources, not one ambiguous tag (plan §7.3)."""
+    report = replace(_report(), cost=cost_provenance("ibkr"))
+    text = render_report(report, "text")
+    assert "costs: bookkeeping=broker_executions sizing=modelled" in text
+    doc = json.loads(render_report(report, "json"))
+    assert doc["costs"] == {"bookkeeping": "broker_executions", "sizing": "modelled"}
+
+
 # --- dry-run (engine flag, exercised through the CLI's engine call) ---------
 
 
@@ -470,6 +488,28 @@ def test_ibkr_non_dry_run_builds_the_placing_broker(
     assert out.exit_code == 0, out.output
     assert isinstance(seen["broker"], IbkrBroker)
     assert seen["dry_run"] is False
+
+
+def test_live_run_labels_ibkr_cost_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI hands the report the broker-exact book provenance for an IBKR run."""
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr("src.live.cli.IbkrGateway", _FakeGateway)
+    monkeypatch.setattr("src.live.cli.IbkrClient", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.IbkrPortfolioSource", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        seen["cost"] = k.get("cost")
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, broker="ibkr", mode="paper")
+    out = CliRunner().invoke(live_group, ["run", path, "--adapter", "ibkr"])
+    assert out.exit_code == 0, out.output
+    assert seen["cost"] == cost_provenance("ibkr")
 
 
 def test_ibkr_dry_run_broker_still_refuses_to_place(
