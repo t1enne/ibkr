@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -50,6 +50,7 @@ from src.live.adapters.ibkr.trades import (
     StrategyBook,
     is_ours,
 )
+from src.live.lease import file_lease
 
 database = SqliteDatabase(None)
 
@@ -58,6 +59,26 @@ logger = logging.getLogger(__name__)
 #: Where a pre-conid ``live_position`` is preserved instead of dropped by migration.
 #: A name, not a schema: the rows kept here are the legacy table verbatim.
 _LEGACY_POSITION_TABLE = "live_position_legacy"
+
+
+class LedgerReadError(RuntimeError):
+    """A durable read failed for a reason OTHER than the table being absent.
+
+    Only a genuinely missing table (the ``--dry-run`` case) means "unwritten";
+    a lock, a corrupt image or a shape-drifted column must fail loudly, never be
+    reported as an empty book — an empty book reads downstream as "flat" and
+    re-opens everything.
+    """
+
+
+def _is_missing_table(error: peewee.OperationalError) -> bool:
+    """Whether *error* is the genuine ``no such table`` (dry-run) case.
+
+    peewee wraps every ``sqlite3.OperationalError`` (a lock, a bad column, a
+    missing table) as the same ``peewee.OperationalError`` type, so the message
+    is the only discriminator left.
+    """
+    return "no such table" in str(error)
 
 
 class _Base(Model):
@@ -124,13 +145,13 @@ class LiveCash(_Base):
 
 
 class LiveSimLot(_Base):
-    strategy_id = TextField()
+    scope = TextField()
     position_id = TextField()
     closed_at = IntegerField(null=True)
 
     class Meta:
         table_name = "live_sim_lot"
-        primary_key = CompositeKey("strategy_id", "position_id")
+        primary_key = CompositeKey("scope", "position_id")
 
 
 _MODELS = (
@@ -192,6 +213,29 @@ def _preserve_legacy_positions() -> None:
     )
 
 
+def _rekey_sim_lots() -> None:
+    """Re-key legacy ``live_sim_lot`` rows from the config hash to the scope.
+
+    Pre-4.1 sim ownership was keyed by ``strategy_id`` (the config hash), so a
+    parameter edit orphaned every opened lot; ownership is the scope. The column
+    is renamed in place (SQLite rewrites the composite PK) and backfilled through
+    the ``live_strategy`` audit link (``strategy_id`` -> ``scope``). A row with
+    no link keeps an empty scope — PRESERVED, never dropped.
+    """
+    if not _table_exists("live_sim_lot"):
+        return
+    columns = _table_columns("live_sim_lot")
+    if "scope" in columns or "strategy_id" not in columns:
+        return
+    database.execute_sql("ALTER TABLE live_sim_lot RENAME COLUMN strategy_id TO scope")
+    if _table_exists("live_strategy"):
+        database.execute_sql(
+            "UPDATE live_sim_lot SET scope = (SELECT s.scope FROM live_strategy s "
+            "WHERE s.strategy_id = live_sim_lot.scope) "
+            "WHERE scope IN (SELECT strategy_id FROM live_strategy)"
+        )
+
+
 def config_hash(config: Mapping[str, object]) -> str:
     """Pure: sha256 of canonical JSON (sorted keys, no whitespace) -> hex.
 
@@ -240,13 +284,14 @@ class SqliteLedger:
 
     @staticmethod
     def _migrate() -> None:
-        """Preserve a pre-4.1 position table and ALTER ``live_strategy`` for scope.
+        """Preserve a pre-4.1 position table, ALTER ``live_strategy`` and re-key sim lots.
 
         The old ``live_position`` (PK ``(strategy_id, position_id)``) cannot
         express a ``(scope, conid)`` row, so it is renamed to a kept copy and
         warned about — never dropped, which would erase durable position state
         the rolling trades window cannot rebuild. ``live_strategy`` gains
-        ``scope`` via ALTER so the audit rows survive.
+        ``scope`` via ALTER so the audit rows survive. ``live_sim_lot`` is
+        re-keyed from the config hash to the scope (rows preserved).
         """
         if _table_exists("live_position") and "conid" not in _table_columns(
             "live_position"
@@ -258,6 +303,7 @@ class SqliteLedger:
             database.execute_sql(
                 "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
             )
+        _rekey_sim_lots()
 
     @contextmanager
     def _write(self) -> Iterator[None]:
@@ -265,6 +311,17 @@ class SqliteLedger:
         self._ready_schema()
         with database.atomic():
             yield
+
+    def cycle_lease(self) -> AbstractContextManager[None]:
+        """Exclusive cross-process lease on this ledger's DB for a full cycle.
+
+        Held for the cycle's duration so a cron overlap or a racing human run
+        REFUSES to start rather than both placing off the same pre-order book.
+        The kernel drops the flock on process exit, so a crashed run never
+        wedges live trading; there is no TTL.
+        """
+        path = self._db_path if self._db_path is not None else _DEFAULT_DB_PATH
+        return file_lease(f"{path}.cycle.lock")
 
     # -- audit / metadata --------------------------------------------------
 
@@ -302,37 +359,36 @@ class SqliteLedger:
     # (``SYM_{ts}_{seq}``) and the mock fixture may hold lots the strategy never
     # opened. Ownership is recorded here so a sim close can only target a lot the
     # strategy OPENED (``owned`` in ``reconcile``); a fixture lot never opened is
-    # left alone. Keyed by ``strategy_id`` to mirror the pre-4.1 sim behaviour.
+    # left alone. Keyed by ``scope`` — a STABLE identity — so a config edit does
+    # not orphan every previously opened lot.
 
-    def record_sim_open(self, strategy_id: str, position_id: str) -> None:
+    def record_sim_open(self, scope: str, position_id: str) -> None:
         """Record a sim lot the strategy just opened (resurrects a closed one)."""
         with self._write():
             LiveSimLot.insert(
-                strategy_id=strategy_id, position_id=position_id, closed_at=None
+                scope=scope, position_id=position_id, closed_at=None
             ).on_conflict("REPLACE").execute()
 
     def mark_sim_closed(
-        self, strategy_id: str, position_id: str, closed_at: pd.Timestamp
+        self, scope: str, position_id: str, closed_at: pd.Timestamp
     ) -> None:
         """Stamp a sim lot closed; an unknown id is a no-op."""
         with self._write():
             LiveSimLot.update(closed_at=_ms(closed_at)).where(
-                (LiveSimLot.strategy_id == strategy_id)
-                & (LiveSimLot.position_id == position_id)
+                (LiveSimLot.scope == scope) & (LiveSimLot.position_id == position_id)
             ).execute()
 
-    def sim_open_ids(self, strategy_id: str) -> frozenset[str]:
-        """The sim lot ids this strategy currently owns (empty if unwritten)."""
+    def sim_open_ids(self, scope: str) -> frozenset[str]:
+        """The sim lot ids this scope currently owns (empty if unwritten)."""
         try:
             rows = (
                 LiveSimLot.select(LiveSimLot.position_id)
-                .where(
-                    (LiveSimLot.strategy_id == strategy_id)
-                    & LiveSimLot.closed_at.is_null()
-                )
+                .where((LiveSimLot.scope == scope) & LiveSimLot.closed_at.is_null())
                 .execute()
             )
-        except peewee.OperationalError:
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
             return frozenset()
         return frozenset(cast("str", r.position_id) for r in rows)
 
@@ -353,7 +409,9 @@ class SqliteLedger:
                     LiveExecution.scope == scope
                 )
             }
-        except peewee.OperationalError:
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
             return StrategyBook()
         return StrategyBook(
             rows=tuple(_model_to_book(row) for row in rows),
@@ -416,14 +474,18 @@ class SqliteLedger:
                 .where(LiveExecution.scope == scope)
                 .scalar()
             )
-        except peewee.OperationalError:
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
             return default_initial
         return initial + float(sunk)
 
     def initial_capital_of(self, scope: str) -> float:
         try:
             cash = LiveCash.get_or_none(LiveCash.scope == scope)
-        except peewee.OperationalError:
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
             return 0.0
         return float(cash.initial_capital) if cash is not None else 0.0
 

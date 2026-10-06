@@ -8,6 +8,7 @@ unfetchable portfolio rather than trading yesterday's intent.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -73,18 +74,21 @@ class CycleLedger(Protocol):
     """The ledger capabilities ``run_cycle`` needs: cycle stamp (audit) + sim lots.
 
     ``sim_open_ids`` / ``record_sim_open`` / ``mark_sim_closed`` back the sim
-    path's ownership scoping (a close may only target a lot the strategy opened).
-    The IBKR path never calls them: its book is ours by construction.
+    path's ownership scoping (a close may only target a lot the strategy opened),
+    keyed by the stable ``scope``. ``cycle_lease`` is the concurrency guard.
+    The IBKR path never calls the sim methods: its book is ours by construction.
     """
+
+    def cycle_lease(self) -> AbstractContextManager[None]: ...
 
     def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None: ...
 
-    def sim_open_ids(self, strategy_id: str) -> frozenset[str]: ...
+    def sim_open_ids(self, scope: str) -> frozenset[str]: ...
 
-    def record_sim_open(self, strategy_id: str, position_id: str) -> None: ...
+    def record_sim_open(self, scope: str, position_id: str) -> None: ...
 
     def mark_sim_closed(
-        self, strategy_id: str, position_id: str, closed_at: pd.Timestamp
+        self, scope: str, position_id: str, closed_at: pd.Timestamp
     ) -> None: ...
 
 
@@ -171,6 +175,7 @@ async def run_cycle(
     broker: LiveBroker,
     ledger: CycleLedger,
     strategy_id: str,
+    scope: str,
     config_path: str | None = None,
     max_age_days: int = 5,
     dry_run: bool = False,
@@ -181,52 +186,62 @@ async def run_cycle(
 ) -> CycleReport:
     """One full batch pass. Not a loop; the caller drives cadence.
 
+    A non-dry run holds *ledger*'s exclusive cycle lease for its whole duration:
+    an overlapping cron/human cycle refuses to start (``CycleInProgressError``)
+    instead of both placing off the same pre-order book.
+
+    ``strategy_id`` is the config-hash AUDIT key (``touch_cycle``); ``scope`` is
+    the stable OWNERSHIP key the sim lots are keyed by, so a config edit does
+    not orphan every open lot.
+
     ``dry_run=True`` computes signals + intents but places NOTHING and writes
-    NOTHING: the broker loop is skipped, ``results`` is empty, and no
-    ``touch_cycle`` write happens. Nothing is recorded, so the next cycle
-    recomputes the same intents.
+    NOTHING: the broker loop is skipped, ``results`` is empty, no ``touch_cycle``
+    write happens, and no lease is taken (a read-only run must not block a live
+    cycle). Nothing is recorded, so the next cycle recomputes the same intents.
     """
     now_ts = now if now is not None else pd.Timestamp.now(tz="UTC")
-    fetched = await source.fetch()
-    if isinstance(fetched, Err):
-        raise PortfolioFetchError(cast("FeedError", fetched.error))
-    snapshot = fetched.value
-    assert_data_fresh(config.symbols, max_age_days, now_ts, db_path)
-    assert config_path is not None, (
-        "run_cycle requires config_path for the screen bridge"
-    )
-    signals = signal_source(config_path, max_age_days)
-    # Align the simulated book with the fetched read so the SAME book is both
-    # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
-    broker.seed(snapshot.portfolio)
-    # Ownership scoping (plan rev 4.1 §3): the IBKR source's book ALREADY holds
-    # only this scope's lots (``trades.reconcile`` filters by our cOID prefix), so
-    # every lot in it is closable and no filter is applied (``owned=None``). The
-    # sim/mock book may hold exogenous fixture lots, so its closes are scoped to
-    # the lots the strategy is recorded as owning (``sim_open_ids``).
-    owns_book = getattr(source, "owns_book", True)
-    owned = _owned_ids(ledger, strategy_id) if owns_book else None
-    intents = reconcile(signals, snapshot.portfolio, config, owned)
-    results: tuple[OrderResult, ...] = ()
-    if not dry_run:
-        results = await _place_all(broker, intents)
-        if owns_book:
-            _record_owned(ledger, strategy_id, results, now_ts)
-        ledger.touch_cycle(strategy_id, now_ts)
-    await broker.close()
+    lease = nullcontext() if dry_run else ledger.cycle_lease()
+    with lease:
+        fetched = await source.fetch()
+        if isinstance(fetched, Err):
+            raise PortfolioFetchError(cast("FeedError", fetched.error))
+        snapshot = fetched.value
+        assert_data_fresh(config.symbols, max_age_days, now_ts, db_path)
+        assert config_path is not None, (
+            "run_cycle requires config_path for the screen bridge"
+        )
+        signals = signal_source(config_path, max_age_days)
+        # Align the simulated book with the fetched read so the SAME book is both
+        # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
+        broker.seed(snapshot.portfolio)
+        # Ownership scoping (plan rev 4.1 §3): the IBKR source's book ALREADY holds
+        # only this scope's lots (``trades.reconcile`` filters by our cOID prefix), so
+        # every lot in it is closable and no filter is applied (``owned=None``). The
+        # sim/mock book may hold exogenous fixture lots, so its closes are scoped to
+        # the lots the scope is recorded as owning (``sim_open_ids``).
+        owns_book = getattr(source, "owns_book", True)
+        owned = _owned_ids(ledger, scope) if owns_book else None
+        intents = reconcile(signals, snapshot.portfolio, config, owned)
+        results: tuple[OrderResult, ...] = ()
+        if not dry_run:
+            results = await _place_all(broker, intents)
+            if owns_book:
+                _record_owned(ledger, scope, results, now_ts)
+            ledger.touch_cycle(strategy_id, now_ts)
+        await broker.close()
     return build_report(
         snapshot.portfolio, signals, intents, results, now_ts, cost=cost
     )
 
 
-def _owned_ids(ledger: CycleLedger, strategy_id: str) -> frozenset[str]:
-    """Broker lot ids this strategy currently owns (scopes sim close intents)."""
-    return ledger.sim_open_ids(strategy_id)
+def _owned_ids(ledger: CycleLedger, scope: str) -> frozenset[str]:
+    """Broker lot ids the scope currently owns (scopes sim close intents)."""
+    return ledger.sim_open_ids(scope)
 
 
 def _record_owned(
     ledger: CycleLedger,
-    strategy_id: str,
+    scope: str,
     results: tuple[OrderResult, ...],
     now_ts: pd.Timestamp,
 ) -> None:
@@ -242,9 +257,9 @@ def _record_owned(
         intent = result.intent
         if intent.action is ActionType.close:
             if intent.position_id:
-                ledger.mark_sim_closed(strategy_id, intent.position_id, now_ts)
+                ledger.mark_sim_closed(scope, intent.position_id, now_ts)
         elif result.position_id:
-            ledger.record_sim_open(strategy_id, result.position_id)
+            ledger.record_sim_open(scope, result.position_id)
 
 
 async def _place_all(

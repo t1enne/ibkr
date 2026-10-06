@@ -21,6 +21,7 @@ from src.live.engine import (
     run_cycle,
 )
 from src.live.ledger import SqliteLedger
+from src.live.lease import CycleInProgressError
 from src.live.result import Err, Ok
 from src.live.types import (
     FeedError,
@@ -246,6 +247,7 @@ async def test_run_cycle_places_open_and_records_nothing_in_the_book(
         broker=FakeBroker(),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -273,6 +275,7 @@ async def test_run_cycle_close_yields_a_close_intent(tmp_path: Path) -> None:
         broker=FakeBroker(),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -302,6 +305,7 @@ async def test_sim_source_does_not_close_a_foreign_fixture_lot(tmp_path: Path) -
         broker=FakeBroker(),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -326,6 +330,7 @@ async def test_sim_source_closes_only_its_ledger_owned_lot(tmp_path: Path) -> No
         broker=FakeBroker(),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -348,6 +353,7 @@ async def test_sim_cycle_records_an_opened_lot_as_owned(tmp_path: Path) -> None:
         broker=FakeBroker(open_pid="AAPL_1"),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -355,6 +361,79 @@ async def test_sim_cycle_records_an_opened_lot_as_owned(tmp_path: Path) -> None:
     )
 
     assert ledger.sim_open_ids("S1") == frozenset({"AAPL_1"})
+
+
+@pytest.mark.asyncio
+async def test_sim_ownership_survives_a_config_hash_change(tmp_path: Path) -> None:
+    # A parameter edit changes the config-hash strategy_id, but ownership is the
+    # stable scope: the earlier lot stays closable (never HOLD-forever).
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.record_sim_open("momentum", "L1")
+
+    report = await run_cycle(
+        CFG,
+        source=SimSource(book(lot("L1"))),
+        broker=FakeBroker(),
+        ledger=ledger,
+        strategy_id="hash-after-edit",
+        scope="momentum",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(CLOSE),
+    )
+
+    assert [i.position_id for i in report.intents] == ["L1"]
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_refuses_when_a_cycle_lease_is_held(tmp_path: Path) -> None:
+    # A cron overlap / racing human run must refuse to start, not both place.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    with ledger.cycle_lease():
+        with pytest.raises(CycleInProgressError):
+            await run_cycle(
+                CFG,
+                source=FakeSource(book()),
+                broker=FakeBroker(),
+                ledger=ledger,
+                strategy_id="S1",
+                scope="S1",
+                config_path="x.json",
+                now=TS,
+                db_path=db,
+                signal_source=_source_fn(LONG_10),
+            )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_takes_no_lease(tmp_path: Path) -> None:
+    # A read-only run must never be blocked by a live cycle holding the lease.
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    with ledger.cycle_lease():
+        report = await run_cycle(
+            CFG,
+            source=FakeSource(book()),
+            broker=FakeBroker(),
+            ledger=ledger,
+            strategy_id="S1",
+            scope="S1",
+            config_path="x.json",
+            now=TS,
+            db_path=db,
+            dry_run=True,
+            signal_source=_source_fn(LONG_10),
+        )
+
+    assert [i.action for i in report.intents] == [ActionType.long]
 
 
 @pytest.mark.asyncio
@@ -370,6 +449,7 @@ async def test_sim_unnamed_open_records_nothing(tmp_path: Path) -> None:
         broker=FakeBroker(open_pid=None),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -394,6 +474,7 @@ async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
         broker=FakeBroker(reject=True),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -418,6 +499,7 @@ async def test_self_owned_source_closes_replayed_lot_with_empty_ledger(
         broker=FakeBroker(),
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -442,6 +524,7 @@ async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
         broker=broker,
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -476,6 +559,7 @@ async def test_dry_run_writes_no_peewee_live_tables(tmp_path: Path) -> None:
         broker=broker,
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         now=TS,
         db_path=db,
@@ -510,6 +594,7 @@ async def test_run_cycle_stale_data_raises(tmp_path: Path) -> None:
             broker=FakeBroker(),
             ledger=SqliteLedger(tmp_path / "l.sqlite"),
             strategy_id="S1",
+            scope="S1",
             config_path="x.json",
             now=TS,
             db_path=db,
@@ -532,6 +617,7 @@ async def test_run_cycle_fetch_error_raises(tmp_path: Path) -> None:
             broker=FakeBroker(),
             ledger=SqliteLedger(tmp_path / "l.sqlite"),
             strategy_id="S1",
+            scope="S1",
             config_path="x.json",
             now=TS,
             signal_source=_source_fn(()),

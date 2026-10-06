@@ -40,7 +40,8 @@ from src.live.engine import (
     StaleDataError,
     run_cycle,
 )
-from src.live.ledger import SqliteLedger, config_hash
+from src.live.lease import CycleInProgressError
+from src.live.ledger import LedgerReadError, SqliteLedger, config_hash
 from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
 from src.live.result import Err
 from src.live.types import CostProvenance, FeedError, LiveConfig, cost_provenance
@@ -170,6 +171,7 @@ def live_run(
                     broker=broker,
                     ledger=ledger,
                     strategy_id=strategy_id,
+                    scope=scope,
                     config_path=normalized_path,
                     max_age_days=max_age,
                     dry_run=dry_run,
@@ -179,7 +181,14 @@ def live_run(
                     cost=cost,
                 )
             )
-    except (StaleDataError, PortfolioFetchError, GatewayNotReady, ValueError) as exc:
+    except (
+        StaleDataError,
+        PortfolioFetchError,
+        GatewayNotReady,
+        CycleInProgressError,
+        LedgerReadError,
+        ValueError,
+    ) as exc:
         # ValueError: an unsized open raises by default policy — a traceback is
         # not a CLI contract.
         raise click.ClickException(str(exc)) from exc
@@ -194,6 +203,7 @@ async def _run_cycle(
     broker: LiveBroker,
     ledger: SqliteLedger,
     strategy_id: str,
+    scope: str,
     config_path: str,
     max_age_days: int,
     dry_run: bool,
@@ -240,6 +250,7 @@ async def _run_cycle(
             broker=broker,
             ledger=ledger,
             strategy_id=strategy_id,
+            scope=scope,
             config_path=config_path,
             max_age_days=max_age_days,
             dry_run=dry_run,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -327,14 +328,17 @@ class _RecordingLedger:
     def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None:
         self.touched += 1
 
-    def sim_open_ids(self, strategy_id: str) -> frozenset[str]:
+    def cycle_lease(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def sim_open_ids(self, scope: str) -> frozenset[str]:
         return frozenset(cast("str", p) for p in self.opens)
 
-    def record_sim_open(self, strategy_id: str, position_id: str) -> None:
+    def record_sim_open(self, scope: str, position_id: str) -> None:
         self.opens.append(position_id)
 
     def mark_sim_closed(
-        self, strategy_id: str, position_id: str, closed_at: pd.Timestamp
+        self, scope: str, position_id: str, closed_at: pd.Timestamp
     ) -> None:
         self.closed.append(position_id)
 
@@ -405,6 +409,7 @@ async def test_run_cycle_dry_run_places_nothing() -> None:
         broker=broker,
         ledger=ledger,
         strategy_id="S1",
+        scope="S1",
         config_path="x.json",
         max_age_days=0,
         dry_run=True,

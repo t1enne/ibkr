@@ -13,7 +13,13 @@ from src.data.db import get_connection
 from src.exec.refs import slug
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
-from src.live.ledger import SqliteLedger, config_hash, execution_cash_delta
+from src.live.ledger import (
+    LedgerReadError,
+    SqliteLedger,
+    config_hash,
+    execution_cash_delta,
+)
+from src.live.lease import CycleInProgressError
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
 OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
@@ -74,6 +80,51 @@ def test_constructing_a_ledger_writes_no_ddl(tmp_path: Path) -> None:
 def test_load_book_on_an_unwritten_db_is_empty(tmp_path: Path) -> None:
     SqliteLedger(tmp_path / "ledger.sqlite")
     assert SqliteLedger(tmp_path / "ledger.sqlite").load_book("S1") == StrategyBook()
+
+
+def test_unwritten_reads_are_empty_not_errors(tmp_path: Path) -> None:
+    # The dry-run case: an absent table means "unwritten", never a failure.
+    ledger = SqliteLedger(tmp_path / "ledger.sqlite")
+    assert ledger.cash_of("S1", 1000.0) == 1000.0
+    assert ledger.initial_capital_of("S1") == 0.0
+    assert ledger.sim_open_ids("S1") == frozenset()
+
+
+def test_load_book_raises_on_a_shape_drifted_table(tmp_path: Path) -> None:
+    # A table that exists but cannot be read (missing column) must NOT read as an
+    # empty book: an empty book is "flat" downstream, i.e. re-open everything.
+    db = tmp_path / "drift.sqlite"
+    with get_connection(db) as con:
+        con.execute("CREATE TABLE live_position (scope TEXT, wrong INTEGER)")
+        con.execute("CREATE TABLE live_execution (scope TEXT, wrong INTEGER)")
+    with pytest.raises(LedgerReadError):
+        SqliteLedger(db).load_book("S1")
+
+
+def test_cash_of_raises_on_a_shape_drifted_table(tmp_path: Path) -> None:
+    db = tmp_path / "drift.sqlite"
+    with get_connection(db) as con:
+        con.execute("CREATE TABLE live_cash (scope TEXT, wrong INTEGER)")
+    with pytest.raises(LedgerReadError):
+        SqliteLedger(db).cash_of("S1", 1000.0)
+
+
+def test_cycle_lease_refuses_a_second_holder(tmp_path: Path) -> None:
+    # A cron overlap / racing human run must REFUSE, not both place off one book.
+    path = tmp_path / "l.sqlite"
+    with SqliteLedger(path).cycle_lease():
+        with pytest.raises(CycleInProgressError):
+            with SqliteLedger(path).cycle_lease():
+                pass
+
+
+def test_cycle_lease_releases_on_exit(tmp_path: Path) -> None:
+    # The kernel drops the flock when the block ends, so a later cycle re-acquires.
+    path = tmp_path / "l.sqlite"
+    with SqliteLedger(path).cycle_lease():
+        pass
+    with SqliteLedger(path).cycle_lease():
+        pass
 
 
 def test_save_then_load_round_trips_one_row(ledger: SqliteLedger) -> None:
@@ -179,6 +230,33 @@ def test_migration_preserves_incompatible_legacy_position_table(
     # The migration is one-time: a second write neither re-warns nor loses rows.
     ledger.touch_cycle("h1", TS)
     assert "live_position_legacy" in _tables(db)
+
+
+def test_migration_rekeys_legacy_sim_lots_to_scope(tmp_path: Path) -> None:
+    # Pre-4.1 sim ownership was keyed by the config hash (strategy_id); re-key to
+    # the stable scope, preserving the rows (never dropped).
+    db = tmp_path / "legacy.sqlite"
+    with get_connection(db) as con:
+        con.execute(
+            "CREATE TABLE live_sim_lot (strategy_id TEXT, position_id TEXT, "
+            "closed_at INTEGER, PRIMARY KEY (strategy_id, position_id))"
+        )
+        con.execute("INSERT INTO live_sim_lot VALUES ('hash1','lot-1',NULL)")
+        con.execute("INSERT INTO live_sim_lot VALUES ('hash1','lot-2',123)")
+        con.execute(
+            "CREATE TABLE live_strategy (strategy_id TEXT PRIMARY KEY, "
+            "scope TEXT NOT NULL DEFAULT '', name TEXT, mode TEXT, "
+            "created_at INTEGER, last_cycle_at INTEGER)"
+        )
+        con.execute(
+            "INSERT INTO live_strategy VALUES ('hash1','momentum','n','paper',0,NULL)"
+        )
+    ledger = SqliteLedger(db)
+    ledger.record_sim_open("momentum", "lot-3")  # first write triggers migration
+    assert ledger.sim_open_ids("momentum") == frozenset({"lot-1", "lot-3"})
+    with get_connection(db) as con:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(live_sim_lot)")}
+    assert "scope" in cols and "strategy_id" not in cols
 
 
 pytestmark = pytest.mark.db
