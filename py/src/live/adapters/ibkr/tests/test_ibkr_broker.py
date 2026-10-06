@@ -493,6 +493,27 @@ async def test_lmt_intent_is_refused_without_submitting() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_stop_carrying_open_is_refused_without_submitting() -> None:
+    # No resting stop exists on this adapter: an open that carries a stop must be
+    # refused, not sent naked with the levels silently dropped from the report.
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.long,
+        qty=1.0,
+        ref_price=100.0,
+        reason="open long (flat->long)",
+        stop_loss=95.0,
+        take_profit=110.0,
+    )
+    error = _failure(await _broker().place(intent))
+    assert error.kind == "rejected"
+    assert "naked order" in error.message
+    assert "95.0" in error.message and "110.0" in error.message
+    assert len(respx.calls) == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_close_without_its_lot_is_an_error_not_a_skip() -> None:
     broker = _broker()
     broker.seed(_book({}))  # the replayed book holds no such lot

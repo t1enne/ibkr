@@ -19,8 +19,13 @@ Three pure mappings live here, all table-tested and free of I/O:
 - ``status_to_fill`` / ``order_state`` / ``is_terminal`` — ``orderStatus`` →
   the shared ``Fill`` and the terminal classifier.
 
-**MKT only.** ``build_ticket`` refuses an ``LMT`` intent outright: an unfilled
-live limit order has to be carried across cycles (or repriced), which is phase 4.
+**MKT only, and no resting stops.** ``build_ticket`` refuses an ``LMT`` intent
+outright: an unfilled live limit order has to be carried across cycles (or
+repriced), which is phase 4. It also refuses any intent that carries a
+``stop_loss``/``take_profit``: this adapter places no resting/bracket order, so
+honouring the intent is impossible and sending a naked order would silently drop
+the strategy's risk levels. The refusal is fail-closed — the caller reports a
+rejected order naming the levels rather than trading without a stop.
 """
 
 from __future__ import annotations
@@ -60,6 +65,10 @@ class OrderMappingError(ValueError):
 
 class UnsupportedOrderType(OrderMappingError):
     """A non-MKT order reached the live adapter; carry-over policy is phase 4."""
+
+
+class UnsupportedStopOrder(OrderMappingError):
+    """An intent carrying SL/TP reached the adapter; no resting order exists."""
 
 
 class UnknownCloseLot(OrderMappingError):
@@ -137,6 +146,13 @@ def build_ticket(
         raise UnsupportedOrderType(
             f"{intent.order_type.value} order for {intent.symbol} is not supported "
             f"live yet: LMT carry-over lands in phase 4 (MKT only in phase 3)"
+        )
+    if intent.stop_loss is not None or intent.take_profit is not None:
+        raise UnsupportedStopOrder(
+            f"{intent.symbol}: intent carries stop_loss={intent.stop_loss!r} "
+            f"take_profit={intent.take_profit!r} but the IBKR adapter places no "
+            f"resting stop (phase 4); refusing to place a naked order that would "
+            f"drop the risk levels"
         )
     whole = (
         math.floor(intent.qty)

@@ -14,6 +14,7 @@ from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     UnknownCloseLot,
     UnsupportedOrderType,
+    UnsupportedStopOrder,
     build_ticket,
     classify_reply,
     intent_identity,
@@ -37,6 +38,8 @@ def _intent(
     position_id: str | None = None,
     order_type: OrderType = OrderType.MKT,
     qty: float = 10.0,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
 ) -> OrderIntent:
     return OrderIntent(
         symbol=symbol,
@@ -46,6 +49,8 @@ def _intent(
         reason="test",
         position_id=position_id,
         order_type=order_type,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
     )
 
 
@@ -176,6 +181,26 @@ def test_build_ticket_rejects_lmt() -> None:
     with pytest.raises(UnsupportedOrderType, match="phase 4"):
         build_ticket(
             _intent(order_type=OrderType.LMT),
+            conid=1,
+            side=OrderSide.BUY,
+            scope=SCOPE,
+            cycle_ts=CYCLE_TS,
+            seq=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stop_loss", "take_profit"),
+    [(95.0, None), (None, 110.0), (95.0, 110.0)],
+)
+def test_build_ticket_refuses_an_intent_carrying_a_stop(
+    stop_loss: float | None, take_profit: float | None
+) -> None:
+    # The adapter places no resting stop: refusing beats silently sending a naked
+    # order whose risk levels the report would then imply were honoured.
+    with pytest.raises(UnsupportedStopOrder, match="naked order"):
+        build_ticket(
+            _intent(stop_loss=stop_loss, take_profit=take_profit),
             conid=1,
             side=OrderSide.BUY,
             scope=SCOPE,

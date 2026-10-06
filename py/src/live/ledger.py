@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -51,6 +52,12 @@ from src.live.adapters.ibkr.trades import (
 )
 
 database = SqliteDatabase(None)
+
+logger = logging.getLogger(__name__)
+
+#: Where a pre-conid ``live_position`` is preserved instead of dropped by migration.
+#: A name, not a schema: the rows kept here are the legacy table verbatim.
+_LEGACY_POSITION_TABLE = "live_position_legacy"
 
 
 class _Base(Model):
@@ -139,6 +146,52 @@ _MODELS = (
 _MS = 1000
 
 
+def _table_exists(name: str) -> bool:
+    """Whether *name* is a table in the bound database."""
+    return bool(
+        database.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchall()
+    )
+
+
+def _table_columns(name: str) -> set[str]:
+    """The column names of *name* (empty when the table does not exist)."""
+    return {str(row[1]) for row in database.execute_sql(f"PRAGMA table_info({name})")}
+
+
+def _preserve_legacy_positions() -> None:
+    """Preserve a pre-conid ``live_position`` and warn about the open rows it held.
+
+    A pre-4.1 ``live_position`` cannot be read into the conid-keyed book, but
+    dropping it would erase durable position state the rolling trades window
+    cannot rebuild. Rename it to a kept copy instead, naming any still-open rows
+    loudly: until an operator reconciles them, the strategy reads the symbol as
+    flat and could open again on top of a live position.
+    """
+    columns = _table_columns("live_position")
+    sql = "SELECT symbol, side, qty FROM live_position"
+    for symbol, side, qty in database.execute_sql(
+        sql + (" WHERE status = 'open'" if "status" in columns else "")
+    ).fetchall():
+        logger.warning(
+            "preserved legacy live_position open row %s %s qty=%s: the "
+            "conid-keyed book cannot reproduce it — reconcile it from %s before "
+            "trading, or the open may be doubled",
+            symbol,
+            side,
+            qty,
+            _LEGACY_POSITION_TABLE,
+        )
+    if _table_exists(_LEGACY_POSITION_TABLE):
+        # A previous run already kept a copy; nothing more to preserve here.
+        database.execute_sql("DROP TABLE live_position")
+        return
+    database.execute_sql(
+        f"ALTER TABLE live_position RENAME TO {_LEGACY_POSITION_TABLE}"
+    )
+
+
 def config_hash(config: Mapping[str, object]) -> str:
     """Pure: sha256 of canonical JSON (sorted keys, no whitespace) -> hex.
 
@@ -187,36 +240,24 @@ class SqliteLedger:
 
     @staticmethod
     def _migrate() -> None:
-        """Drop a pre-4.1 schema that cannot carry a per-conid book.
+        """Preserve a pre-4.1 position table and ALTER ``live_strategy`` for scope.
 
         The old ``live_position`` (PK ``(strategy_id, position_id)``) cannot
-        express a ``(scope, conid)`` row; it is dropped and rebuilt from the
-        trades window. ``live_strategy`` gains ``scope`` via ALTER so the audit
-        rows survive.
+        express a ``(scope, conid)`` row, so it is renamed to a kept copy and
+        warned about — never dropped, which would erase durable position state
+        the rolling trades window cannot rebuild. ``live_strategy`` gains
+        ``scope`` via ALTER so the audit rows survive.
         """
-
-        def rows(sql: str) -> list[tuple[object, ...]]:
-            return list(database.execute_sql(sql).fetchall())
-
-        def table_exists(name: str) -> bool:
-            return bool(
-                database.execute_sql(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                    (name,),
-                ).fetchall()
+        if _table_exists("live_position") and "conid" not in _table_columns(
+            "live_position"
+        ):
+            _preserve_legacy_positions()
+        if _table_exists("live_strategy") and "scope" not in _table_columns(
+            "live_strategy"
+        ):
+            database.execute_sql(
+                "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
             )
-
-        if table_exists("live_position"):
-            columns = {row[1] for row in rows("PRAGMA table_info(live_position)")}
-            if "conid" not in columns:
-                database.execute_sql("DROP TABLE live_position")
-        if table_exists("live_strategy"):
-            columns = {row[1] for row in rows("PRAGMA table_info(live_strategy)")}
-            if "scope" not in columns:
-                database.execute_sql(
-                    "ALTER TABLE live_strategy ADD COLUMN "
-                    "scope TEXT NOT NULL DEFAULT ''"
-                )
 
     @contextmanager
     def _write(self) -> Iterator[None]:

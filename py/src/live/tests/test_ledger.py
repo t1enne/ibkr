@@ -140,21 +140,45 @@ def test_prune_closed_deletes_only_old_closed(ledger: SqliteLedger) -> None:
     assert ledger.load_book("S1").rows == ()
 
 
-def test_migration_drops_incompatible_legacy_position_table(tmp_path: Path) -> None:
+def test_migration_preserves_incompatible_legacy_position_table(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A pre-conid live_position cannot be read into the conid-keyed book, but its
+    # durable open rows must NOT be dropped: they are preserved under a kept copy
+    # and named loudly, since the rolling trades window cannot rebuild them.
     db = tmp_path / "legacy.sqlite"
     with get_connection(db) as con:
         con.execute(
             "CREATE TABLE live_position (strategy_id TEXT, position_id TEXT, "
-            "status TEXT, PRIMARY KEY (strategy_id, position_id))"
+            "symbol TEXT, side TEXT, qty REAL, status TEXT, "
+            "PRIMARY KEY (strategy_id, position_id))"
+        )
+        con.execute(
+            "INSERT INTO live_position VALUES "
+            "('h1', 'lot-1', 'AAPL', 'long', 10.0, 'open')"
         )
         con.execute(
             "CREATE TABLE live_strategy (strategy_id TEXT PRIMARY KEY, name TEXT, "
             "mode TEXT, created_at INTEGER, last_cycle_at INTEGER)"
         )
     ledger = SqliteLedger(db)
-    ledger.ensure_strategy("h1", "momentum", "phase", "paper")
-    assert ledger.load_book("momentum") == StrategyBook()
-    assert {"live_execution", "live_cash"} <= _tables(db)
+    with caplog.at_level("WARNING", logger="src.live.ledger"):
+        ledger.ensure_strategy("h1", "momentum", "phase", "paper")
+
+    tables = _tables(db)
+    assert "live_position_legacy" in tables  # preserved, not dropped
+    assert {"live_position", "live_execution", "live_cash"} <= tables
+    with get_connection(db) as con:
+        kept = con.execute(
+            "SELECT symbol, side, qty FROM live_position_legacy"
+        ).fetchall()
+        fresh = con.execute("SELECT * FROM live_position").fetchall()
+    assert kept == [("AAPL", "long", 10.0)]
+    assert fresh == []  # the new conid-keyed book starts empty, not erased
+    assert any("AAPL" in r.message and "double" in r.message for r in caplog.records)
+    # The migration is one-time: a second write neither re-warns nor loses rows.
+    ledger.touch_cycle("h1", TS)
+    assert "live_position_legacy" in _tables(db)
 
 
 pytestmark = pytest.mark.db
