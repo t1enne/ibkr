@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+
 from peewee import SqliteDatabase
 
 from src.data.fundamentals.query import as_first_stated, load_stated
@@ -168,3 +169,6 @@ def test_insert_batches_large_payloads(conn: SqliteDatabase) -> None:
     assert insert_fundamentals(rows, batch_size=2, db_conn=conn) == len(rows)
     with _using(conn):
         assert FundamentalSchema.select().count() == len(rows)
+
+
+pytestmark = pytest.mark.db

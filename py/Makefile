@@ -8,7 +8,7 @@ help:
 	@echo "Usage:"
 	@echo "  make run  <cli-args>  — Run the CLI"
 	@echo "  make check            — Lint + format + typecheck + tests"
-	@echo "  make test             — Run all tests"
+	@echo "  make test             — Run all tests (fast + db + slow)"
 	@echo "  make lint             — Ruff check"
 	@echo "  make format           — Ruff format"
 	@echo "  make typecheck        — Ty check"
@@ -36,10 +36,10 @@ typecheck:
 	uv run ty check $(SRC)
 
 test:
-	uv run pytest $(SRC_DIRS) tests -v -m slow
+	uv run pytest $(SRC_DIRS) tests -v -m 'slow or not slow'
 
 test-fast:
-	uv run pytest $(SRC_DIRS) tests --no-header -q
+	uv run pytest $(SRC_DIRS) tests --no-header -q -m 'not slow and not db'
 
 check: lint format typecheck test-fast
 

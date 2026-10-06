@@ -9,6 +9,7 @@ from typing import cast
 import httpx
 import pandas as pd
 import pytest
+
 import respx
 
 from src.bt.state import ActionType
@@ -197,3 +198,6 @@ def _mock_reads(
     respx.get(f"{BASE}iserver/account/trades").mock(
         return_value=httpx.Response(200, json=trades)
     )
+
+
+pytestmark = pytest.mark.db

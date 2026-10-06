@@ -8,6 +8,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
+
 from src.data.db import get_connection
 from src.exec.refs import slug
 from src.exec.types import OrderSide
@@ -154,3 +155,6 @@ def test_migration_drops_incompatible_legacy_position_table(tmp_path: Path) -> N
     ledger.ensure_strategy("h1", "momentum", "phase", "paper")
     assert ledger.load_book("momentum") == StrategyBook()
     assert {"live_execution", "live_cash"} <= _tables(db)
+
+
+pytestmark = pytest.mark.db

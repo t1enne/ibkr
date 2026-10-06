@@ -48,6 +48,7 @@ pythonpath = ["src"]
 addopts = ["--import-mode=importlib", "-m not slow"]
 markers = [
 	"slow: long-running or process-pool-spawning tests, skipped by default (run with `pytest -m slow`)",
+	"db: tests that open a sqlite database (peewee or raw) — excluded from `make test-fast`",
 ]
 
 [dependency-groups]

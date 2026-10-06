@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+
 from peewee import SqliteDatabase
 
 from src.data.fundamentals.schema import (
@@ -261,3 +262,6 @@ def test_the_unique_index_is_enforced_by_sqlite(conn: SqliteDatabase) -> None:
         FundamentalSchema.insert(**payload).execute()
         with pytest.raises(Exception, match="UNIQUE"):
             FundamentalSchema.insert(**payload).execute()
+
+
+pytestmark = pytest.mark.db

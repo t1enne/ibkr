@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+
 import respx
 
 from src.data.fundamentals import dl as dlmod
@@ -217,3 +218,6 @@ def pd_timestamp(value: str):
 def test_table_exists_helper_roundtrip(db_file: Path) -> None:
     """The isolated fixture really is isolated (no production DB writes)."""
     assert FundamentalSchema.table_exists()
+
+
+pytestmark = pytest.mark.db

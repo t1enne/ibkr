@@ -8,6 +8,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
+
 from src.bt.state import ActionType, FillEvent, PortfolioState, Position
 from src.data.db import get_connection
 from src.live.broker import OrderResult, intent_to_signal
@@ -544,3 +545,6 @@ def test_build_report_is_pure() -> None:
     assert first == second
     assert first.as_of == TS
     assert first.portfolio_before == book()
+
+
+pytestmark = pytest.mark.db
