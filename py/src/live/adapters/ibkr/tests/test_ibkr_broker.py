@@ -263,7 +263,13 @@ async def test_reject_prompt_aborts_without_confirming() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_reply_loop_overflow_aborts() -> None:
+async def test_reply_loop_overflow_reports_unknown_when_order_not_found() -> None:
+    """MAX_REPLIES confirmations pressed, no matching working order: state UNKNOWN.
+
+    Every reply we confirmed was a ``{"confirmed": true}`` POST that can submit
+    the order, so the outcome is NOT "rejected": it is unresolved, never reported
+    as if nothing may be live (finding M2).
+    """
     respx.post(SUBMIT).mock(
         return_value=httpx.Response(
             200, json=[{"id": "r0", "message": ["again?"], "messageIds": ["o1"]}]
@@ -275,14 +281,81 @@ async def test_reply_loop_overflow_aborts() -> None:
         )
     )
     status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
-    _mock_no_working_orders()
+    working = respx.get(OPEN_ORDERS).mock(
+        return_value=httpx.Response(200, json={"orders": []})
+    )
 
     result = await _broker().place(_open_intent())
 
     error = _failure(result)
-    assert error.kind == "rejected"
-    assert f"after {MAX_REPLIES} replies" in error.message
+    assert error.kind == "unresolved"
+    assert "unknown" in error.message
     assert confirm.call_count == MAX_REPLIES  # bounded: we stopped pressing yes
+    assert working.called  # we ASKED whether an order is live before deciding
+    assert not status.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_reply_loop_overflow_adopts_a_live_order() -> None:
+    """The last confirm may have submitted the order: a working one is ADOPTED."""
+    from src.exec.types import OrderSide
+    from src.live.adapters.ibkr.orders import build_ticket, sequence
+
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "r0", "message": ["again?"], "messageIds": ["o1"]}]
+        )
+    )
+    respx.post(url__regex=rf"{REPLY}.*").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "r-next", "message": ["again?"], "messageIds": ["o1"]}]
+        )
+    )
+    seq = sequence((_open_intent(),))[0][0]
+    ticket = build_ticket(
+        _open_intent(),
+        conid=265598,
+        side=OrderSide.BUY,
+        scope=SCOPE,
+        cycle_ts=CYCLE_TS,
+        seq=seq,
+    )
+    respx.get(OPEN_ORDERS).mock(
+        side_effect=[
+            httpx.Response(200, json={"orders": []}),  # pre-flight: nothing yet
+            httpx.Response(
+                200, json={"orders": [{"orderId": ORDER_ID, "cOID": ticket.order_ref}]}
+            ),
+        ]
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+
+    placed = _ok(await _broker().place(_open_intent()))
+
+    assert placed.ok and placed.position_id == ORDER_ID
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_post_confirm_abort_reports_unknown_not_not_placed() -> None:
+    """An abort AFTER a confirmation is not "not placed" — the confirm may have submitted."""
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "r0", "message": ["confirm?"], "messageIds": ["o1"]}]
+        )
+    )
+    respx.post(f"{REPLY}r0").mock(
+        return_value=httpx.Response(200, json={"error": "order rejected"})
+    )
+    status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
+    _mock_no_working_orders()
+
+    error = _failure(await _broker().place(_open_intent()))
+
+    assert error.kind == "unresolved"
+    assert "not placed:" not in error.message
+    assert "order rejected" in error.message
     assert not status.called
 
 
@@ -438,6 +511,63 @@ async def test_wait_filled_timeout_is_typed_and_reports_the_partial() -> None:
     partial = _failure(await _broker().place(_open_intent()))
     assert partial.kind == "unfilled"
     assert "still Submitted after 0s with 0.25 of 1 filled" in partial.message
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_complete_fill_ahead_of_the_status_flip_is_a_fill() -> None:
+    """A filled order whose status has not flipped is a FILL, not an unfilled timeout.
+
+    ``cum_fill == total_size`` while the order still reads ``Submitted``: a fill
+    cannot exceed the size, so this is final (finding M7b) — no poll to the
+    deadline, no "unfilled ... 1 of 1 filled".
+    """
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "order_status": "Submitted",
+                "cum_fill": "1",
+                "total_size": "1",
+                "average_price": "100.5",
+            },
+        )
+    )
+    _mock_no_working_orders()
+
+    placed = _ok(await _broker().place(_open_intent()))
+
+    assert placed.ok and placed.fill is not None
+    assert (placed.fill.filled_qty, placed.fill.executed_price) == (1.0, 100.5)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_terminal_filled_without_a_readable_cum_fill_is_unresolved() -> None:
+    """A terminal ``Filled`` with a garbled ``cum_fill`` is NOT "nothing filled".
+
+    The order DID fill; only its size is unreadable, so it is reported unknown
+    (finding M7a) — never a zero-fill rejection an operator might answer by
+    re-placing by hand.
+    """
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(
+        return_value=httpx.Response(
+            200, json={"order_status": "Filled", "total_size": "1"}
+        )
+    )
+    _mock_no_working_orders()
+
+    error = _failure(await _broker().place(_open_intent()))
+
+    assert error.kind == "unresolved"
+    assert "nothing filled" not in error.message
+    assert "unknown" in error.message
 
 
 @respx.mock

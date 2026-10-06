@@ -41,7 +41,7 @@ from src.bt.state import ActionType, FillEvent, PortfolioState
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import lookup
 from src.exec.refs import assign_seqs
-from src.exec.types import Fill
+from src.exec.types import Fill, OrderState
 from src.live.adapters.ibkr.mapping import (
     canonical_order_id,
     opt_str,
@@ -56,6 +56,7 @@ from src.live.adapters.ibkr.orders import (
     is_fully_filled,
     is_terminal,
     order_side,
+    order_state,
     order_status_of,
     sequence,
     status_to_fill,
@@ -281,9 +282,13 @@ class IbkrBroker:
         Outcomes (all reported, none silently accepted):
 
         - terminal ``Filled`` for the whole size -> ``Ok`` with the fill;
+        - a complete fill whose status has not yet flipped (``cum_fill`` reaches
+          ``total_size``) -> ``Ok``, because a fill cannot exceed the size;
         - terminal non-filled status (``Cancelled``/``Inactive``) -> ``rejected``;
         - a partial fill on a dead order, or still working at the deadline ->
           ``unfilled``, carrying the qty that DID fill;
+        - a terminal ``Filled`` whose body omits/garbles ``cum_fill`` ->
+          ``unresolved`` (it filled; its size is unknown) — never "nothing filled";
         - nothing terminal within the timeout -> ``timeout``.
         """
         deadline = self._monotonic() + self._timeout_s
@@ -293,7 +298,9 @@ class IbkrBroker:
             if isinstance(fetched, Err):
                 return Err(cast("FeedError", fetched.error))
             status = fetched.value
-            if is_terminal(status):
+            if is_terminal(status) or is_fully_filled(
+                status, self._filled_qty(ticket, intent, status)
+            ):
                 return self._terminal_result(order_id, intent, ticket, status)
             if self._monotonic() >= deadline:
                 return self._unresolved_result(order_id, intent, ticket, status)
@@ -378,23 +385,26 @@ class IbkrBroker:
             if outcome.kind == "success":
                 return Ok(outcome.order_id)
             if outcome.kind == "abort":
-                return Err(
-                    FeedError(
-                        kind="rejected",
-                        message=f"order {ticket.order_ref} not placed: {outcome.message}",
+                if confirmations == 0:
+                    return Err(
+                        FeedError(
+                            kind="rejected",
+                            message=(
+                                f"order {ticket.order_ref} not placed: "
+                                f"{outcome.message}"
+                            ),
+                        )
                     )
+                return await self._resolve_after_confirms(
+                    ticket,
+                    f"aborted after {confirmations} confirmations: {outcome.message}",
                 )
             confirmations += 1
             if confirmations > MAX_REPLIES:
-                return Err(
-                    FeedError(
-                        kind="rejected",
-                        message=(
-                            f"order {ticket.order_ref} still asking for "
-                            f"confirmation after {MAX_REPLIES} replies; "
-                            f"last message: {outcome.message}"
-                        ),
-                    )
+                return await self._resolve_after_confirms(
+                    ticket,
+                    f"still asking for confirmation after {MAX_REPLIES} replies; "
+                    f"last message: {outcome.message}",
                 )
             self._log(
                 f"confirming {ticket.order_ref} reply {outcome.reply_id}: "
@@ -406,6 +416,35 @@ class IbkrBroker:
                 )
             except IbkrError as exc:
                 return Err(feed_error(exc.kind, f"confirm {ticket.order_ref}: {exc}"))
+
+    async def _resolve_after_confirms(
+        self, ticket: Ticket, reason: str
+    ) -> Result[str, FeedError]:
+        """A refusal AFTER we pressed yes: the order may be live, so never claim otherwise.
+
+        Every confirmation we sent was a ``{"confirmed": true}`` POST, which can
+        submit the order. So a refusal past the first confirmation cannot be
+        reported as "not placed". Ask the account by cOID: a working order is
+        ADOPTED (the caller then waits on its real status); when none is found the
+        state is genuinely UNKNOWN, reported as ``unresolved`` — never a rejection
+        a human might answer by placing the order a second time.
+        """
+        working = await self._working_order_id(ticket.order_ref)
+        if working is not None:
+            self._log(
+                f"{reason}; adopting working order {working} for {ticket.order_ref}"
+            )
+            return Ok(working)
+        return Err(
+            FeedError(
+                kind="unresolved",
+                message=(
+                    f"order {ticket.order_ref} {reason}; whether it was placed is "
+                    f"unknown (no working order carries the cOID) — do not assume "
+                    f"it was not placed"
+                ),
+            )
+        )
 
     async def _status(self, order_id: str) -> Result[dict[str, object], FeedError]:
         """One ``orderStatus`` read, as a typed value."""
@@ -430,6 +469,13 @@ class IbkrBroker:
             status, order_ref=ticket.order_ref, symbol=intent.symbol, side=ticket.side
         )
 
+    def _filled_qty(
+        self, ticket: Ticket, intent: OrderIntent, status: dict[str, object]
+    ) -> float:
+        """The readable filled quantity (0.0 when the body omits/garbles ``cum_fill``)."""
+        fill = self._filled(ticket, intent, status)
+        return fill.qty if fill is not None else 0.0
+
     def _terminal_result(
         self,
         order_id: str,
@@ -437,34 +483,61 @@ class IbkrBroker:
         ticket: Ticket,
         status: dict[str, object],
     ) -> Result[OrderResult, FeedError]:
-        """A terminal status -> a filled ``OrderResult`` or a typed failure."""
+        """A terminal (or completed) status -> a filled ``OrderResult`` or a typed failure."""
         raw = order_status_of(status)
         fill = self._filled(ticket, intent, status)
-        filled_qty = fill.qty if fill is not None else 0.0
-        if is_fully_filled(status, filled_qty):
-            assert fill is not None  # a full fill always carries qty > 0
-            position_id = intent.position_id if intent.position_id else order_id
-            message = (
-                f"{intent.action.value} {intent.symbol} qty={fill.qty:g} "
-                f"@ {fill.price:.4f} cOID={ticket.order_ref} order_id={order_id}"
-            )
-            self._log(message)
-            return Ok(
-                OrderResult(
-                    intent=intent,
-                    fill=self._fill_event(intent, ticket, fill),
-                    ok=True,
-                    message=message,
-                    position_id=position_id,
-                )
-            )
-        if filled_qty > 0:
+        if fill is None:
+            return self._no_readable_fill(order_id, intent, ticket, raw, status)
+        if not is_fully_filled(status, fill.qty):
             return Err(
                 FeedError(
                     kind="unfilled",
                     message=(
                         f"order {ticket.order_ref} ({order_id}) status {raw} with "
-                        f"only {filled_qty:g} of {intent.qty:g} filled"
+                        f"only {fill.qty:g} of {intent.qty:g} filled"
+                    ),
+                    symbol=intent.symbol,
+                )
+            )
+        position_id = intent.position_id if intent.position_id else order_id
+        message = (
+            f"{intent.action.value} {intent.symbol} qty={fill.qty:g} "
+            f"@ {fill.price:.4f} cOID={ticket.order_ref} order_id={order_id}"
+        )
+        self._log(message)
+        return Ok(
+            OrderResult(
+                intent=intent,
+                fill=self._fill_event(intent, ticket, fill),
+                ok=True,
+                message=message,
+                position_id=position_id,
+            )
+        )
+
+    def _no_readable_fill(
+        self,
+        order_id: str,
+        intent: OrderIntent,
+        ticket: Ticket,
+        raw: str,
+        status: dict[str, object],
+    ) -> Result[OrderResult, FeedError]:
+        """A terminal body with no readable fill quantity: unknown, not "nothing filled".
+
+        A terminal ``Filled`` with an omitted/garbled ``cum_fill`` is NOT a
+        zero-fill rejection — the order DID fill; only its size is unreadable, so
+        it is reported ``unresolved``. Only a terminal non-filled status
+        (``Cancelled``/``Inactive``) is a genuine nothing-filled rejection.
+        """
+        if order_state(status) is OrderState.FILLED:
+            return Err(
+                FeedError(
+                    kind="unresolved",
+                    message=(
+                        f"order {ticket.order_ref} ({order_id}) status {raw}: "
+                        f"terminal Filled but cum_fill unreadable — the order filled; "
+                        f"its quantity is unknown"
                     ),
                     symbol=intent.symbol,
                 )

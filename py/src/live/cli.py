@@ -425,6 +425,9 @@ def _render_json(report: CycleReport) -> str:
         "signals": [asdict(s) for s in report.signals],
         "intents": [asdict(i) for i in report.intents],
         "results": [_result_dict(r) for r in report.results],
+        "placement_error": (
+            asdict(report.placement_error) if report.placement_error else None
+        ),
         "portfolio_before": _portfolio_dict(report.portfolio_before),
     }
     return json.dumps(doc, default=_json_default, indent=2)
@@ -451,6 +454,9 @@ def _render_text(report: CycleReport) -> str:
             f"order {result.intent.symbol} {result.intent.action.value} "
             f"{status} {result.message}"
         )
+    if report.placement_error is not None:
+        error = report.placement_error
+        lines.append(f"placement_error: {error.kind}: {error.message}")
     lines.append(f"cash: {report.portfolio_before.cash:.2f}")
     lines.append(
         f"summary: {len(report.signals)} signals, "

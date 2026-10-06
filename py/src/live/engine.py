@@ -20,7 +20,7 @@ from src.data.db import get_connection
 from src.live.broker import LiveBroker, OrderResult
 from src.live.portfolio_source import PortfolioSource
 from src.live.reconcile import reconcile
-from src.live.result import Err
+from src.live.result import Err, Ok, Result
 from src.live.signals import live_signals
 from src.live.types import (
     MODELLED_COST,
@@ -44,6 +44,10 @@ class CycleReport:
     #: Which source produced this run's cost figures (plan §7.3). Defaults to the
     #: all-modelled sim provenance; the CLI sets the broker-exact book for IBKR.
     cost: CostProvenance = MODELLED_COST
+    #: A cohort-level placement failure: the broker refused the WHOLE cohort before
+    #: any per-order result existed, so ``results`` may be empty while the orders'
+    #: true state is unknown. ``None`` when placement produced per-order results.
+    placement_error: FeedError | None = None
 
 
 class StaleDataError(RuntimeError):
@@ -99,6 +103,7 @@ def build_report(
     results: tuple[OrderResult, ...],
     as_of: pd.Timestamp,
     cost: CostProvenance = MODELLED_COST,
+    placement_error: FeedError | None = None,
 ) -> CycleReport:
     """Pure: assemble the cycle report. No clock, no I/O."""
     return CycleReport(
@@ -108,6 +113,7 @@ def build_report(
         results=results,
         portfolio_before=portfolio,
         cost=cost,
+        placement_error=placement_error,
     )
 
 
@@ -223,14 +229,25 @@ async def run_cycle(
         owned = _owned_ids(ledger, scope) if owns_book else None
         intents = reconcile(signals, snapshot.portfolio, config, owned)
         results: tuple[OrderResult, ...] = ()
+        placement_error: FeedError | None = None
         if not dry_run:
-            results = await _place_all(broker, intents)
+            placed = await _place_all(broker, intents)
+            if isinstance(placed, Err):
+                placement_error = cast("FeedError", placed.error)
+            else:
+                results = tuple(placed.value)
             if owns_book:
                 _record_owned(ledger, scope, results, now_ts)
             ledger.touch_cycle(strategy_id, now_ts)
         await broker.close()
     return build_report(
-        snapshot.portfolio, signals, intents, results, now_ts, cost=cost
+        snapshot.portfolio,
+        signals,
+        intents,
+        results,
+        now_ts,
+        cost=cost,
+        placement_error=placement_error,
     )
 
 
@@ -265,15 +282,14 @@ def _record_owned(
 async def _place_all(
     broker: LiveBroker,
     intents: tuple[OrderIntent, ...],
-) -> tuple[OrderResult, ...]:
-    """Place the cycle's intents as ONE cohort; a cohort-level ``Err`` skips all.
+) -> Result[tuple[OrderResult, ...], FeedError]:
+    """Place the cycle's intents as ONE cohort; a cohort-level ``Err`` is surfaced.
 
     The book is NOT written from the placement result: it is advanced from the
     broker's own execution stream by the next cycle's ``reconcile`` (plan §3).
+    A cohort ``Err`` is returned AS-IS (never silently turned into "no orders"):
+    the report carries it so an operator sees the failure rather than "0 orders".
     """
     if not intents:
-        return ()
-    placed = await broker.place_cohort(tuple(intents))
-    if isinstance(placed, Err):
-        return ()
-    return tuple(placed.value)
+        return Ok(())
+    return await broker.place_cohort(tuple(intents))

@@ -309,6 +309,23 @@ def test_render_report_states_both_cost_sources() -> None:
     assert doc["costs"] == {"bookkeeping": "broker_executions", "sizing": "modelled"}
 
 
+def test_render_report_states_a_placement_error() -> None:
+    """A cohort-level failure is rendered, not silently "0 orders" (finding M1)."""
+    report = replace(
+        _report(),
+        results=(),
+        placement_error=FeedError(kind="transport", message="cohort refused"),
+    )
+    text = render_report(report, "text")
+    assert "placement_error: transport: cohort refused" in text
+    doc = json.loads(render_report(report, "json"))
+    assert doc["placement_error"] == {
+        "kind": "transport",
+        "message": "cohort refused",
+        "symbol": None,
+    }
+
+
 # --- dry-run (engine flag, exercised through the CLI's engine call) ---------
 
 

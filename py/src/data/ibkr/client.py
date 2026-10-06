@@ -310,14 +310,25 @@ class IbkrClient:
 
 
 def _as_list(body: object, field: str) -> list[object]:
-    """Coerce an endpoint body to a list (a bare list or a ``{..: {..: [..]}}``)."""
+    """Coerce an endpoint body to a list, or raise on an unreadable shape.
+
+    Accepts the two shapes the gateway serves — a bare list, or ``{field: [...]}``
+    under a wrapper. Anything else (a shape drift, an ``error`` body, a string)
+    raises :class:`IbkrError` rather than returning ``[]``: an empty list reads as
+    "no trades", which would silently drop the fills that gate duplicate opens.
+    """
     if isinstance(body, list):
         return list(body)
     if isinstance(body, dict):
         inner = cast("dict[str, object]", body).get(field)
         if isinstance(inner, list):
             return list(inner)
-    return []
+    raise IbkrError(
+        "transport",
+        f"unexpected {field} body shape (want a list or {{{field!r}: [...]}}): "
+        f"{body!r}",
+        field,
+    )
 
 
 _default: IbkrClient | None = None

@@ -310,15 +310,19 @@ def status_to_fill(
 
 
 def is_fully_filled(status: Mapping[str, object], filled: float) -> bool:
-    """True when a terminal ``Filled`` order really filled its whole size.
+    """True when the order filled its whole requested size.
 
-    ``total_size`` is what the ticket asked for; a body that omits it (or zeroes
-    it) cannot contradict a terminal ``Filled``, so the fill stands.
+    A readable ``total_size`` is authoritative: ``filled >= total`` is a complete
+    fill REGARDLESS of the status string, because a status can lag a fill
+    (``cum_fill == total_size`` while the order still reads ``Submitted``) and a
+    fill can never exceed the requested size. Only when ``total_size`` is absent
+    (or zeroed) do we fall back to a terminal ``Filled`` status; a body that
+    omits it cannot contradict a terminal ``Filled``.
     """
-    if order_state(status) is not OrderState.FILLED:
-        return False
     total = num(status.get("total_size"))
-    return total <= 0 or filled >= total
+    if total > 0:
+        return filled >= total
+    return order_state(status) is OrderState.FILLED
 
 
 __all__ = [

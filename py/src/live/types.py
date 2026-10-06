@@ -132,6 +132,7 @@ class FeedError:
         "rejected",
         "unfilled",
         "timeout",
+        "unresolved",
     ]
     message: str
     symbol: str | None = None
@@ -148,6 +149,7 @@ _FEED_KINDS = frozenset(
         "rejected",
         "unfilled",
         "timeout",
+        "unresolved",
     }
 )
 
@@ -164,7 +166,7 @@ def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
     resolved = kind if kind in _FEED_KINDS else "transport"
     return FeedError(
         kind=cast(
-            "Literal['auth', 'rate_limit', 'transport', 'bad_fixture', 'stale_data', 'rejected', 'unfilled', 'timeout']",
+            "Literal['auth', 'rate_limit', 'transport', 'bad_fixture', 'stale_data', 'rejected', 'unfilled', 'timeout', 'unresolved']",
             resolved,
         ),
         message=message,

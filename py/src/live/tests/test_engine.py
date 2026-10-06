@@ -140,6 +140,15 @@ class FakeBroker:
         return Ok(None)
 
 
+class ErrCohortBroker(FakeBroker):
+    """A broker whose cohort placement fails at the cohort level (a port-level Err)."""
+
+    async def place_cohort(
+        self, intents: tuple[OrderIntent, ...]
+    ) -> Err[tuple[OrderResult, ...], FeedError]:
+        return Err(FeedError(kind="transport", message="cohort refused"))
+
+
 def make_candle_db(path: Path, ticker: str | None, ts: pd.Timestamp | None) -> None:
     """A minimal candle table with one row (``None`` -> an empty universe DB)."""
     con = get_connection(path)
@@ -624,6 +633,34 @@ async def test_run_cycle_fetch_error_raises(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_run_cycle_cohort_error_is_surfaced_not_silently_empty(
+    tmp_path: Path,
+) -> None:
+    """A cohort-level ``Err`` must reach the report, not read as "0 orders" (M1)."""
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=ErrCohortBroker(),
+        ledger=ledger,
+        strategy_id="S1",
+        scope="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert report.results == ()
+    assert report.placement_error is not None
+    assert report.placement_error.kind == "transport"
+    assert "cohort refused" in report.placement_error.message
+
+
 def test_build_report_is_pure() -> None:
     args = (book(), (signal("long", 10.0),), (), ())
     first = build_report(*args, as_of=TS)
@@ -631,6 +668,13 @@ def test_build_report_is_pure() -> None:
     assert first == second
     assert first.as_of == TS
     assert first.portfolio_before == book()
+
+
+def test_build_report_carries_a_placement_error() -> None:
+    error = FeedError(kind="transport", message="cohort refused")
+    report = build_report(book(), (), (), (), as_of=TS, placement_error=error)
+    assert report.placement_error == error
+    assert report.results == ()
 
 
 pytestmark = pytest.mark.db

@@ -375,3 +375,22 @@ def test_is_fully_filled_requires_a_full_terminal_fill() -> None:
     assert not is_fully_filled({"order_status": "Cancelled"}, 0.0)
     # A body with no total_size cannot contradict a terminal Filled.
     assert is_fully_filled({"order_status": "Filled", "cum_fill": "10"}, 10.0)
+
+
+def test_is_fully_filled_when_filled_reaches_total_before_the_status_flips() -> None:
+    # cum_fill == total_size while the order still reads Submitted: a fill cannot
+    # exceed the size, so it is a complete fill regardless of the status string
+    # (finding M7b).
+    assert is_fully_filled(
+        {"order_status": "Submitted", "cum_fill": "10", "total_size": "10"}, 10.0
+    )
+    # A non-terminal body short of total_size is NOT yet a full fill.
+    assert not is_fully_filled(
+        {"order_status": "Submitted", "cum_fill": "4", "total_size": "10"}, 4.0
+    )
+
+
+def test_is_fully_filled_false_when_a_terminal_filled_has_no_readable_fill() -> None:
+    # A terminal Filled with no readable cum_fill cannot be proven complete; the
+    # caller reports it UNKNOWN rather than as a full fill (finding M7a).
+    assert not is_fully_filled({"order_status": "Filled", "total_size": "10"}, 0.0)

@@ -91,6 +91,34 @@ async def test_happy_path_parses_each_endpoint() -> None:
     assert await client.trades() == [{"execution_id": "e1"}]
 
 
+@respx.mock
+@pytest.mark.asyncio
+async def test_unreadable_list_body_is_an_error_not_empty() -> None:
+    """A shape drift must not read as "no trades" (finding M6).
+
+    An empty list is indistinguishable from "no trades", which would silently
+    drop the fills that gate duplicate opens, so a wrong container shape raises a
+    typed error the port maps to ``Err``.
+    """
+    respx.get(f"{BASE}iserver/account/trades").mock(
+        return_value=httpx.Response(200, json={"unexpected": {"trades": []}})
+    )
+    with pytest.raises(IbkrError) as excinfo:
+        await _client().trades()
+    assert excinfo.value.kind == "transport"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_unreadable_positions_body_is_an_error_not_empty() -> None:
+    respx.get(f"{BASE}portfolio/DU1234567/positions/0").mock(
+        return_value=httpx.Response(200, json="no positions")
+    )
+    with pytest.raises(IbkrError) as excinfo:
+        await _client().positions()
+    assert excinfo.value.kind == "transport"
+
+
 @pytest.mark.asyncio
 async def test_portfolio_call_without_account_is_auth_error() -> None:
     client = IbkrClient(base_url=BASE, account=None)
