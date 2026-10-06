@@ -37,7 +37,7 @@ from src.data.fundamentals.schema import (
     field_names,
     statement_of,
 )
-from src.utils import parse_timestamp
+from src.timestamps import parse_timestamp
 
 if TYPE_CHECKING:
     # Import-cycle guard: the DSL context runtime-imports this module's helpers,

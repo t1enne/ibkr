@@ -4,11 +4,17 @@ Only functions with >= 1 consumer remain. Visualization, live-trading, and ORM h
 were moved to their respective modules or deleted.
 """
 
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, cast
 import pandas as pd
 import numpy as np
 
 from src.data.resample import resample_ohlcv
+
+# ``to_optional_ts``/``parse_timestamp`` moved to the ``src.timestamps`` leaf so
+# ``src.data._shared`` can import them without reaching back into ``src.utils``
+# (which imports ``src.data.resample`` and closed an import cycle). Re-exported
+# here so every existing ``from src.utils import ...`` keeps working.
+from src.timestamps import parse_timestamp, to_optional_ts  # noqa: F401
 
 
 _DEFAULT_START = pd.Timestamp("2020-01-01")
@@ -98,28 +104,6 @@ def get_ts(ds: str) -> pd.Timestamp:
     if isinstance(_ts, pd.Timestamp):
         return _ts
     raise ValueError(f"Failed when creating timestamp for {ds}")
-
-
-def to_optional_ts(value: str | None) -> pd.Timestamp | None:
-    """Convert optional string to Optional[Timestamp]. NaT → None."""
-    if value is None:
-        return None
-    ts = pd.Timestamp(value)
-    if pd.isna(ts):
-        return None
-    assert isinstance(ts, pd.Timestamp), f"Expected Timestamp, got {type(ts)}"
-    return ts
-
-
-def parse_timestamp(value: Union[str, pd.Timestamp]) -> pd.Timestamp:
-    if isinstance(value, pd.Timestamp):
-        if pd.isna(value):
-            raise ValueError(f"Invalid timestamp: {value}")
-        return value
-    timestamp = pd.Timestamp(value)
-    if pd.isna(timestamp):
-        raise ValueError(f"Invalid timestamp: {value}")
-    return cast(pd.Timestamp, timestamp)
 
 
 # ── Private helpers ──────────────────────────────────────────────────────────

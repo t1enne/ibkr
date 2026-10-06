@@ -14,7 +14,7 @@ import click
 import json
 import pandas as pd
 
-from src.utils import to_optional_ts
+from src.timestamps import to_optional_ts
 from src.data.symbols import load_universe_config
 from src.data.db import query_candles
 from src.data.types import PreviewResult

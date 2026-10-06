@@ -17,7 +17,7 @@ from typing import Any
 import pandas as pd
 
 from src.data.fundamentals.schema import Form, FundamentalRow, Statement
-from src.utils import parse_timestamp
+from src.timestamps import parse_timestamp
 
 # ---------------------------------------------------------------------------
 # tag maps (US-GAAP, first match wins)
