@@ -37,10 +37,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import cast
 
 import pandas as pd
+from ib_rest_api_client.models import SecdefSearchResponseItem
 
 from src.bt.state import ActionType, FillEvent, PortfolioState
 from src.data.ibkr.client import IbkrClient, IbkrError
-from src.data.ibkr.lookup import lookup
+from src.data.ibkr.lookup import search_contracts
 from src.exec.refs import assign_seqs
 from src.exec.types import Fill, OrderState
 from src.live.adapters.ibkr.mapping import (
@@ -90,9 +91,39 @@ ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
 
 
+def _names_the_ticker(candidate: SecdefSearchResponseItem, ticker: str) -> bool:
+    """Whether *candidate*'s underlying symbol is exactly *ticker* (case-folded)."""
+    symbol = candidate.symbol
+    return isinstance(symbol, str) and symbol.strip().upper() == ticker.strip().upper()
+
+
 async def _default_conid_lookup(ticker: str) -> int:
-    """Resolve a ticker to its IBKR conid via the secdef search endpoint."""
-    conid = (await lookup(ticker)).conid
+    """Resolve *ticker* to its IBKR conid, VERIFYING it is the intended contract.
+
+    The search is by ticker, so an unverified first hit can put a real order on
+    the wrong instrument. Refuses (``ValueError`` -> a typed ``FeedError``) when
+    no candidate names the ticker, when the candidates name more than one conid
+    (ambiguous), or when the chosen contract is ``restricted``. Verified: the
+    contract's ``symbol`` equals the ticker, and ``search_contracts`` has already
+    restricted the set to US-stock listings (a US primary exchange or an ``STK``
+    section) — the search response carries no currency field, so that listing
+    filter is the instrument-type/currency guarantee available here.
+    """
+    candidates = await search_contracts(ticker)
+    matches = tuple(c for c in candidates if _names_the_ticker(c, ticker))
+    if not matches:
+        raise ValueError(
+            f"secdef search for {ticker} returned no contract naming {ticker}"
+        )
+    conids = {str(c.conid) for c in matches}
+    if len(conids) > 1:
+        raise ValueError(
+            f"ambiguous contract for {ticker}: candidate conids {sorted(conids)}"
+        )
+    chosen = matches[0]
+    if chosen.restricted is True:
+        raise ValueError(f"contract for {ticker} is restricted (not tradable)")
+    conid = chosen.conid
     if not isinstance(conid, str) or not conid.strip():
         raise ValueError(f"secdef search for {ticker} returned no conid")
     return int(conid)
@@ -147,6 +178,7 @@ class IbkrBroker:
         self._now = now if now is not None else lambda: pd.Timestamp.now(tz="UTC")
         self._log = log if log is not None else (lambda _message: None)
         self._book: PortfolioView | None = None
+        self._conid_cache: dict[str, int] = {}
 
     # -- LiveBroker --------------------------------------------------------
 
@@ -323,8 +355,18 @@ class IbkrBroker:
     # -- internals ---------------------------------------------------------
 
     async def _conid(self, symbol: str) -> int:
-        """The IBKR conid for *symbol* (an edge failure is a typed ``Err``)."""
-        return await self._conid_lookup(symbol)
+        """The IBKR conid for *symbol*, resolved once and cached for the run.
+
+        A cohort with several orders on one symbol pays the secdef search (and
+        its verification) once. A failed lookup is NOT cached — it raises before
+        the store, so a retry re-resolves rather than serving a stale miss.
+        """
+        cached = self._conid_cache.get(symbol)
+        if cached is not None:
+            return cached
+        conid = await self._conid_lookup(symbol)
+        self._conid_cache[symbol] = conid
+        return conid
 
     def _open_cash_guard(self, intent: OrderIntent) -> FeedError | None:
         """Refuse an open whose decision-time notional exceeds its funded cash bound.
@@ -550,7 +592,12 @@ class IbkrBroker:
                     symbol=intent.symbol,
                 )
             )
-        position_id = intent.position_id if intent.position_id else order_id
+        # The book names a lot by its conid (``portfolio_source`` sets
+        # ``position_id = str(conid)``), so the conid is the ONE handle a caller
+        # can correlate back to the book. An IBKR order id resolves to nothing in
+        # the book, so it is never reported. A close's intent already carries the
+        # targeted lot's conid; an open carries none.
+        position_id = intent.position_id or str(ticket.conid)
         message = (
             f"{intent.action.value} {intent.symbol} qty={fill.qty:g} "
             f"@ {fill.price:.4f} cOID={ticket.order_ref} order_id={order_id}"

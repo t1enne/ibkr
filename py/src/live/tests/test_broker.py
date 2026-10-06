@@ -21,7 +21,7 @@ from src.bt.state import (
 )
 from src.live.broker import OrderResult, SimulatedBroker, intent_to_signal
 from src.live.reconcile import reconcile
-from src.live.result import Ok, Result
+from src.live.result import Err, Ok, Result
 from src.live.types import FeedError, LiveConfig, LiveSignal, OrderIntent
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03"))
@@ -373,3 +373,22 @@ def test_intent_to_signal_prices_at_ref() -> None:
     assert signal.price == 100.0
     assert signal.qty == 10.0
     assert signal.action is ActionType.long
+
+
+class _FailingCohort(SimulatedBroker):
+    """A broker whose cohort path returns an ``Err`` (the edge never fails, but be safe)."""
+
+    async def place_cohort(
+        self, intents: tuple[OrderIntent, ...]
+    ) -> Result[tuple[OrderResult, ...], FeedError]:
+        return Err(FeedError(kind="transport", message="cohort refused"))
+
+
+@pytest.mark.asyncio
+async def test_place_propagates_a_cohort_err_without_relying_on_an_assert() -> None:
+    # place() must not assume place_cohort returned Ok: an assert is stripped
+    # under ``python -O``, so the Err must be passed through explicitly.
+    broker = _FailingCohort(_book(), ExecutionParams(), lambda _m: None)
+    result = await broker.place(_open_intent())
+    assert isinstance(result, Err)
+    assert cast("FeedError", result.error).message == "cohort refused"

@@ -44,6 +44,16 @@ from src.live.types import LiveConfig, LiveSignal, OrderIntent, PortfolioView
 
 Side = Literal["long", "short", "flat"]
 
+
+class UnknownSignalSymbol(ValueError):
+    """A signal named a symbol outside ``config.symbols``.
+
+    An explicit typed error (never a bare ``assert``): it must reject a stray
+    symbol even under ``python -O``, where asserts are stripped. Subclasses
+    ``ValueError`` so the existing CLI edge reports it as a usage error.
+    """
+
+
 #: Deterministic timestamp for the synthetic sizing fills. Only the discarded
 #: ``FillEvent``/trade timestamps depend on it — cash and positions do not — so a
 #: constant keeps reconcile pure and its sizing book reproducible.
@@ -123,7 +133,10 @@ def reconcile(
     """
     by_symbol = {sig.symbol: sig for sig in signals}
     extra = set(by_symbol) - set(config.symbols)
-    assert not extra, f"signal symbol not in config.symbols: {sorted(extra)}"
+    if extra:
+        raise UnknownSignalSymbol(
+            f"signal symbol not in config.symbols: {sorted(extra)}"
+        )
 
     closes: list[OrderIntent] = []
     specs: list[tuple[LiveSignal, Side, Side]] = []

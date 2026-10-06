@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, fields
@@ -18,6 +17,7 @@ from typing import Any, Literal, cast
 
 import click
 import pandas as pd
+import peewee
 
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
@@ -339,7 +339,11 @@ def _housekeeping(ledger: SqliteLedger, dry_run: bool) -> None:
     try:
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=90)
         ledger.prune_closed(cast("pd.Timestamp", cutoff))
-    except sqlite3.Error:  # housekeeping is non-fatal
+    except peewee.OperationalError:  # housekeeping is non-fatal
+        # peewee wraps sqlite3 errors (a lock, a busy DB) as peewee.OperationalError
+        # — NOT a sqlite3.Error — so this is the type a prune failure actually
+        # raises. The ledger's own reads catch the same type. LedgerReadError is
+        # not caught: prune_closed takes the WRITE path and never raises it.
         pass
 
 

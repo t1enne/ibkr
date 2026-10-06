@@ -332,7 +332,35 @@ class SqliteLedger:
     def ensure_strategy(
         self, strategy_id: str, scope: str, name: str, mode: str
     ) -> None:
+        """Record the strategy audit row; warn when a run reuses another's scope.
+
+        Ownership is the ``scope`` (one book, one cash seed, one cOID prefix), but
+        ``strategy_id`` is the config HASH — it changes on ANY parameter edit, so a
+        differing hash on the same scope is NORMAL (a tuned config). It is a real
+        danger only when a DIFFERENT config file reuses a scope: two strategies
+        then share one book, cash seed and cOID prefix (identical cOIDs within one
+        second). The two are indistinguishable here (no path is stored, and an edit
+        changes the hash), so this WARNS rather than refuses — a hard refuse would
+        wedge every config edit. Give the other config its own ``scope``.
+        """
         with self._write():
+            others = (
+                LiveStrategy.select(LiveStrategy.strategy_id)
+                .where(
+                    (LiveStrategy.scope == scope)
+                    & (LiveStrategy.strategy_id != strategy_id)
+                )
+                .execute()
+            )
+            for row in others:
+                logger.warning(
+                    "scope %r already belongs to strategy %s; strategy %s now shares "
+                    "its book, cash seed and cOID prefix — if these are two DIFFERENT "
+                    "configs, give this one its own scope",
+                    scope,
+                    row.strategy_id,
+                    strategy_id,
+                )
             LiveStrategy.insert(
                 strategy_id=strategy_id,
                 scope=scope,

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pandas as pd
+import peewee
 import pytest
 import click
 from click.testing import CliRunner
@@ -23,6 +24,7 @@ from src.bt.state import ActionType, ExecutionParams, PortfolioState, Position
 from src.live.broker import OrderResult
 from src.live.cli import (
     _STRATEGY_FIELDS,
+    _housekeeping,
     _strategy_config,
     _write_strategy_config,
     live_group,
@@ -30,6 +32,7 @@ from src.live.cli import (
     render_report,
 )
 from src.live.engine import CycleReport, run_cycle
+from src.live.ledger import SqliteLedger
 from src.live.result import Ok, Result
 from src.live.types import (
     FeedError,
@@ -671,3 +674,27 @@ def test_no_gateway_skips_ensure_ready_and_still_runs(
     assert made[0].ready_calls == 0  # probe skipped
     assert ran.get("cycle") is True  # cycle still ran
     assert "readiness check skipped" in out.output  # never silent
+
+
+class _RaisingLedger:
+    """A stand-in whose ``prune_closed`` raises *error* (housekeeping's input)."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def prune_closed(self, *a: object, **k: object) -> int:
+        raise self._error
+
+
+def test_housekeeping_swallows_a_locked_db_error() -> None:
+    # A locked/busy DB raises peewee.OperationalError, which is NOT a sqlite3.Error
+    # (peewee errors derive from Exception). Housekeeping must stay non-fatal.
+    locked = _RaisingLedger(peewee.OperationalError("database is locked"))
+    _housekeeping(cast("SqliteLedger", locked), dry_run=False)  # must not raise
+
+
+def test_housekeeping_does_not_swallow_a_programming_error() -> None:
+    # Only DB-level failures are non-fatal; a real bug must surface, not vanish.
+    broken = _RaisingLedger(RuntimeError("bug"))
+    with pytest.raises(RuntimeError, match="bug"):
+        _housekeeping(cast("SqliteLedger", broken), dry_run=False)

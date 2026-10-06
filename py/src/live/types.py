@@ -10,7 +10,7 @@ depends only on the minimal :class:`PortfolioView` Protocol that
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 import pandas as pd
 
@@ -126,39 +126,32 @@ class OrderIntent:
     cash_bound: float | None = None
 
 
+#: Every ``FeedError.kind`` a value may carry. The ONE definition: ``FeedError``
+#: uses it directly and ``feed_error`` validates against it, so the set and the
+#: Literal cannot drift apart.
+FeedKind = Literal[
+    "auth",
+    "rate_limit",
+    "transport",
+    "bad_fixture",
+    "stale_data",
+    "rejected",
+    "unfilled",
+    "timeout",
+    "unresolved",
+]
+
+#: Every ``FeedError.kind`` a value may carry, derived from the Literal above.
+_FEED_KINDS = frozenset(get_args(FeedKind))
+
+
 @dataclass(frozen=True)
 class FeedError:
     """A typed edge failure (portfolio fetch / order placement / data staleness)."""
 
-    kind: Literal[
-        "auth",
-        "rate_limit",
-        "transport",
-        "bad_fixture",
-        "stale_data",
-        "rejected",
-        "unfilled",
-        "timeout",
-        "unresolved",
-    ]
+    kind: FeedKind
     message: str
     symbol: str | None = None
-
-
-#: Every ``FeedError.kind`` a value may carry.
-_FEED_KINDS = frozenset(
-    {
-        "auth",
-        "rate_limit",
-        "transport",
-        "bad_fixture",
-        "stale_data",
-        "rejected",
-        "unfilled",
-        "timeout",
-        "unresolved",
-    }
-)
 
 
 def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
@@ -172,10 +165,7 @@ def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
     """
     resolved = kind if kind in _FEED_KINDS else "transport"
     return FeedError(
-        kind=cast(
-            "Literal['auth', 'rate_limit', 'transport', 'bad_fixture', 'stale_data', 'rejected', 'unfilled', 'timeout', 'unresolved']",
-            resolved,
-        ),
+        kind=cast("FeedKind", resolved),
         message=message,
         symbol=symbol,
     )

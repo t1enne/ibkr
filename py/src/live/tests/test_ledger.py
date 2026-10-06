@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import cast
 
@@ -60,6 +61,31 @@ def _tables(path: Path) -> set[str]:
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     return {r[0] for r in rows}
+
+
+def test_reusing_a_scope_with_a_different_strategy_warns(
+    ledger: SqliteLedger, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two configs sharing a name share one scope (book + cash + cOID prefix); a
+    # different strategy_id on an existing scope must be loud, not silent (L7).
+    ledger.ensure_strategy("hash-a", "momentum", "momentum", "paper")
+    with caplog.at_level(logging.WARNING, logger="src.live.ledger"):
+        ledger.ensure_strategy("hash-b", "momentum", "momentum", "paper")
+    assert any("momentum" in record.getMessage() for record in caplog.records)
+
+
+def test_same_scope_same_strategy_does_not_warn(
+    ledger: SqliteLedger, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The ordinary re-run (same config hash) must stay quiet.
+    ledger.ensure_strategy("hash-a", "momentum", "momentum", "paper")
+    with caplog.at_level(logging.WARNING, logger="src.live.ledger"):
+        ledger.ensure_strategy("hash-a", "momentum", "momentum", "paper")
+    assert not [
+        record
+        for record in caplog.records
+        if "belongs to strategy" in record.getMessage()
+    ]
 
 
 def test_config_hash_order_insensitive_over_keys() -> None:

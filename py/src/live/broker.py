@@ -28,7 +28,7 @@ from src.bt.state import (
     Position,
     TradeSignal,
 )
-from src.live.result import Ok, Result
+from src.live.result import Err, Ok, Result
 from src.live.types import FeedError, OrderIntent, PortfolioView
 
 
@@ -40,7 +40,7 @@ class OrderResult:
     fill: FillEvent | None  # None when rejected (simulated or broker)
     ok: bool
     message: str = ""
-    position_id: str | None = None  # broker lot id on an OPEN; None on a close
+    position_id: str | None = None  # book lot handle: the opened lot, or the closed lot
 
 
 class LiveBroker(Protocol):
@@ -262,8 +262,12 @@ class SimulatedBroker:
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]:
         """Route one order; a cohort of one, so a lone open fills or rejects as before."""
         placed = await self.place_cohort((intent,))
-        assert isinstance(placed, Ok)  # SimulatedBroker never fails at the edge
-        return Ok(cast("tuple[OrderResult, ...]", placed.value)[0])
+        if isinstance(placed, Err):
+            # Unreachable for this broker (place_cohort never fails at the edge),
+            # but an EXPLICIT branch that survives ``python -O`` — an ``assert``
+            # would be stripped and the ``.value`` below would then raise.
+            return Err(cast("FeedError", placed.error))
+        return Ok(placed.value[0])
 
     async def place_cohort(
         self, intents: tuple[OrderIntent, ...]

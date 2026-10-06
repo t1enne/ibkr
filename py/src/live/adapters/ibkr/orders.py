@@ -81,6 +81,9 @@ class Ticket:
 
     order_ref: str
     side: OrderSide
+    #: The resolved conid the order targets — the book's lot handle, carried so a
+    #: filled ``OrderResult`` can report the lot the fill will land on.
+    conid: int
     body: dict[str, object]
     #: True when the intent's fractional quantity was rounded to whole shares.
     rounded: bool = False
@@ -168,6 +171,7 @@ def build_ticket(
     return Ticket(
         order_ref=ref,
         side=side,
+        conid=conid,
         rounded=abs(intent.qty - whole) > 1e-9,
         body={
             "conid": conid,

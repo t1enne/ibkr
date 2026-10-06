@@ -11,6 +11,7 @@ import pytest
 from src.bt.state import ActionType, PortfolioState, Position
 from src.live.reconcile import (
     Side,
+    UnknownSignalSymbol,
     current_side,
     reconcile,
     size_qty,
@@ -208,8 +209,9 @@ def test_owned_filter_excludes_foreign_lot() -> None:
     assert order.position_id == "L1"
 
 
-def test_unknown_symbol_asserts() -> None:
-    with pytest.raises(AssertionError, match="TSLA"):
+def test_unknown_symbol_refused() -> None:
+    # A stray symbol is rejected by a typed error, NOT an assert (which -O strips).
+    with pytest.raises(UnknownSignalSymbol, match="TSLA"):
         reconcile((sig("long", qty=1.0, symbol="TSLA"),), pf(100_000.0), CFG)
 
 

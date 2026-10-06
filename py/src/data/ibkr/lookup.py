@@ -35,9 +35,14 @@ def _is_usd_stock(entry: SecdefSearchResponseItem) -> bool:
     return False
 
 
-async def lookup(ticker: str) -> SecdefSearchResponseItem:
+async def search_contracts(ticker: str) -> tuple[SecdefSearchResponseItem, ...]:
+    """Every US-stock secdef candidate for *ticker* (0..n, exchange-filtered).
+
+    The shared gateway search: ``lookup`` takes the first candidate; the live
+    conid resolver refuses an ambiguous set. Raises ``ValueError`` on a transport
+    error or an empty candidate set — never returns a partial result.
+    """
     try:
-        # r = await client.get("iserver/secdef/search", params={"symbol": ticker})
         r = await get_iserver_secdef_search.asyncio(
             client=default_client().rest,
             symbol=ticker,
@@ -47,15 +52,18 @@ async def lookup(ticker: str) -> SecdefSearchResponseItem:
         if not isinstance(r, list):
             raise ValueError(f"Failed to search contract for {ticker}")
 
-        data = [item for item in r if _is_usd_stock(item)]
+        data = tuple(item for item in r if _is_usd_stock(item))
         if not data:
             raise ValueError(f"No US stock contract found for {ticker}")
 
-        return data[0]
-
+        return data
     except Exception as e:
         raise ValueError(f"Failed to search contract for {ticker}: {e}")
-    raise ValueError(f"No contract found for {ticker}")
 
 
-__all__ = ["lookup"]
+async def lookup(ticker: str) -> SecdefSearchResponseItem:
+    """Resolve *ticker* to its first US-stock candidate (backtest data path)."""
+    return (await search_contracts(ticker))[0]
+
+
+__all__ = ["lookup", "search_contracts"]

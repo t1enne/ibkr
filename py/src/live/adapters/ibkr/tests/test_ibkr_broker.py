@@ -17,7 +17,9 @@ import respx
 
 from src.bt.state import ActionType, PortfolioState, Position
 from src.data.ibkr.client import IbkrClient
+from ib_rest_api_client.models import SecdefSearchResponseItem
 from src.exec.types import OrderType
+from src.live.adapters.ibkr import broker as broker_mod
 from src.live.adapters.ibkr.broker import MAX_REPLIES, IbkrBroker
 from src.live.broker import OrderResult
 from src.live.result import Err, Ok, Result
@@ -28,6 +30,9 @@ ACCOUNT = "DU452563"
 SCOPE = "momentum"
 CYCLE_TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T14:30:00Z"))
 ORDER_ID = "979320001"
+#: The conid the injected ``_conid`` resolves every ticker to. It is the book's
+#: lot handle, so a filled open reports it (not the IBKR order id).
+CONID = 265598
 
 SUBMIT = f"{BASE}iserver/account/{ACCOUNT}/orders"
 STATUS = f"{BASE}iserver/account/order/status/{ORDER_ID}"
@@ -56,7 +61,7 @@ def _mock_long_position() -> None:
 
 
 async def _conid(_ticker: str) -> int:
-    return 265598
+    return CONID
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -165,7 +170,7 @@ async def test_place_submits_then_waits_for_the_fill() -> None:
     result = await broker.place(_open_intent())
     placed = _ok(result)
     assert placed.ok
-    assert placed.position_id == ORDER_ID  # the canonical broker lot handle
+    assert placed.position_id == str(CONID)  # the book's lot handle (the conid)
     assert placed.fill is not None
     assert (placed.fill.filled_qty, placed.fill.executed_price) == (1.0, 100.5)
     posted = json.loads(submit.calls[0].request.content.decode())
@@ -334,7 +339,7 @@ async def test_reply_loop_overflow_adopts_a_live_order() -> None:
 
     placed = _ok(await _broker().place(_open_intent()))
 
-    assert placed.ok and placed.position_id == ORDER_ID
+    assert placed.ok and placed.position_id == str(CONID)
 
 
 @respx.mock
@@ -401,7 +406,7 @@ async def test_ambiguous_submit_adopts_a_working_order() -> None:
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
     placed = _ok(await _broker().place(_open_intent()))
-    assert placed.ok and placed.position_id == ORDER_ID
+    assert placed.ok and placed.position_id == str(CONID)
 
 
 @respx.mock
@@ -434,7 +439,7 @@ async def test_open_preflight_adopts_a_prior_cycle_order_by_decision_bar() -> No
 
     placed = _ok(await broker.place(intent))
 
-    assert placed.ok and placed.position_id == ORDER_ID
+    assert placed.ok and placed.position_id == str(CONID)
     assert not submit.called  # cycle 1's live order was adopted, not re-sent
 
 
@@ -848,3 +853,93 @@ async def test_close_on_a_flat_account_is_refused_before_submitting() -> None:
     assert isinstance(result, Err)
     assert "flat" in cast("FeedError", result.error).message
     assert submit.call_count == 0  # never sent
+
+
+# --- conid resolution: verification + caching (finding L10) -----------------
+
+
+def _contract(
+    conid: str, symbol: str, *, restricted: bool | None = None
+) -> SecdefSearchResponseItem:
+    """A US-stock search candidate (primary exchange NASDAQ passes ``_is_usd_stock``)."""
+    item = SecdefSearchResponseItem(
+        conid=conid, symbol=symbol, description="NASDAQ", restricted=restricted
+    )
+    return item
+
+
+async def _candidates(
+    *items: SecdefSearchResponseItem,
+) -> tuple[SecdefSearchResponseItem, ...]:
+    return items
+
+
+@pytest.mark.asyncio
+async def test_default_conid_lookup_returns_the_verified_conid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        broker_mod,
+        "search_contracts",
+        lambda _t: _candidates(_contract("265598", "AAPL")),
+    )
+    assert await broker_mod._default_conid_lookup("aapl") == 265598
+
+
+@pytest.mark.asyncio
+async def test_default_conid_lookup_refuses_ambiguity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two distinct conids also naming the ticker: refuse rather than pick one.
+    monkeypatch.setattr(
+        broker_mod,
+        "search_contracts",
+        lambda _t: _candidates(_contract("1", "AAPL"), _contract("2", "AAPL")),
+    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        await broker_mod._default_conid_lookup("AAPL")
+
+
+@pytest.mark.asyncio
+async def test_default_conid_lookup_refuses_a_mismatched_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The search for AAPL returned a contract for MSFT: never order on it.
+    monkeypatch.setattr(
+        broker_mod, "search_contracts", lambda _t: _candidates(_contract("1", "MSFT"))
+    )
+    with pytest.raises(ValueError, match="naming AAPL"):
+        await broker_mod._default_conid_lookup("AAPL")
+
+
+@pytest.mark.asyncio
+async def test_default_conid_lookup_refuses_a_restricted_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        broker_mod,
+        "search_contracts",
+        lambda _t: _candidates(_contract("1", "AAPL", restricted=True)),
+    )
+    with pytest.raises(ValueError, match="restricted"):
+        await broker_mod._default_conid_lookup("AAPL")
+
+
+@pytest.mark.asyncio
+async def test_conid_lookup_is_cached_per_symbol() -> None:
+    calls: list[str] = []
+
+    async def counting(ticker: str) -> int:
+        calls.append(ticker)
+        return CONID
+
+    broker = IbkrBroker(
+        IbkrClient(base_url=BASE, account=ACCOUNT),
+        scope=SCOPE,
+        account=ACCOUNT,
+        conid_lookup=counting,
+    )
+    first = await broker._conid("AAPL")
+    second = await broker._conid("AAPL")
+    assert (first, second) == (CONID, CONID)
+    assert calls == ["AAPL"]  # one round trip for the run, not one per order
