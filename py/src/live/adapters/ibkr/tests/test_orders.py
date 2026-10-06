@@ -11,6 +11,7 @@ from src.bt.state import ActionType
 from src.exec.refs import order_ref
 from src.exec.types import OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.orders import (
+    OrderMappingError,
     UnknownCloseLot,
     UnsupportedOrderType,
     build_ticket,
@@ -126,6 +127,49 @@ def test_build_ticket_close_uses_the_lot_side() -> None:
         seq=0,
     )
     assert ticket.body["side"] == "SELL"
+
+
+def test_build_ticket_close_floors_the_quantity() -> None:
+    # A reducing order must never round UP: a 1.6-share close sends 1 share, not
+    # 2 (2 would flip the 1.6 long into a 0.4 short — finding 2).
+    intent = _intent(action=ActionType.close, position_id="55", qty=1.6)
+    ticket = build_ticket(
+        intent,
+        conid=1,
+        side=order_side(intent, ActionType.long),
+        scope=SCOPE,
+        cycle_ts=CYCLE_TS,
+        seq=0,
+    )
+    assert ticket.body["quantity"] == 1.0
+    assert ticket.rounded
+
+
+def test_build_ticket_open_still_rounds_to_nearest() -> None:
+    # Only reducing orders floor; an open keeps round-to-nearest.
+    ticket = build_ticket(
+        _intent(qty=1.6),
+        conid=1,
+        side=OrderSide.BUY,
+        scope=SCOPE,
+        cycle_ts=CYCLE_TS,
+        seq=0,
+    )
+    assert ticket.body["quantity"] == 2.0
+
+
+def test_build_ticket_close_that_floors_to_zero_is_refused() -> None:
+    # A sub-share close floors to 0: refuse it, never send 1 (which would flip).
+    intent = _intent(action=ActionType.close, position_id="55", qty=0.6)
+    with pytest.raises(OrderMappingError, match="non-positive whole-share"):
+        build_ticket(
+            intent,
+            conid=1,
+            side=order_side(intent, ActionType.long),
+            scope=SCOPE,
+            cycle_ts=CYCLE_TS,
+            seq=0,
+        )
 
 
 def test_build_ticket_rejects_lmt() -> None:

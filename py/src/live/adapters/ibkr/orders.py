@@ -26,6 +26,7 @@ live limit order has to be carried across cycles (or repriced), which is phase 4
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -126,16 +127,22 @@ def build_ticket(
     identity that makes a re-sent cycle dedupe at IBKR. ``tif`` is always ``DAY``;
     an MKT order has no meaningful resting life in this phase. Quantities are
     whole shares (plan §7.14): a fractional ``qty`` is rounded and flagged, never
-    sent as-is. The side comes from ``order_side`` (the caller resolves a close's
-    lot side from the replayed book before it gets here), so this function never
-    guesses a direction.
+    sent as-is. A REDUCING order (``close``) FLOORS its quantity so it can never
+    overshoot the position it reduces; an opening order rounds to nearest. The
+    side comes from ``order_side`` (the caller resolves a close's lot side from
+    the replayed book before it gets here), so this function never guesses a
+    direction.
     """
     if intent.order_type is not OrderType.MKT:
         raise UnsupportedOrderType(
             f"{intent.order_type.value} order for {intent.symbol} is not supported "
             f"live yet: LMT carry-over lands in phase 4 (MKT only in phase 3)"
         )
-    whole = int(round(intent.qty))
+    whole = (
+        math.floor(intent.qty)
+        if intent.action is ActionType.close
+        else int(round(intent.qty))
+    )
     if whole <= 0:
         raise OrderMappingError(
             f"{intent.symbol}: quantity {intent.qty!r} rounds to {whole} shares; "

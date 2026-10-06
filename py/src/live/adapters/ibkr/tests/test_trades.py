@@ -47,6 +47,22 @@ def test_is_ours_uses_the_scope_slug_prefix() -> None:
     assert not is_ours(SCOPE, foreign)
 
 
+def test_is_ours_does_not_claim_a_longer_slug_scope() -> None:
+    # Scope "momentum" must NOT absorb refs minted by "momentum-v2"/"momentum-2"
+    # (slug keeps the dash): a prefix match let one scope's book absorb another's
+    # lots (finding 3). The scope segment must match exactly.
+    longer = _exec(
+        "o",
+        side=OrderSide.BUY,
+        qty=1,
+        price=1,
+        ref="momentum-v2-20240102T093000-000",
+    )
+    assert not is_ours("momentum", longer)
+    assert is_ours("momentum_v2", longer)  # slug("momentum_v2") == "momentum-v2"
+    assert is_ours("momentum", _exec("o", side=OrderSide.BUY, qty=1, price=1))
+
+
 def test_single_buy_opens_one_row() -> None:
     book, warnings = reconcile(
         SCOPE, (_exec("o1", side=OrderSide.BUY, qty=10, price=100),), StrategyBook()

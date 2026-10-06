@@ -256,6 +256,7 @@ def _close_intents(
             ref_price=sig.price,
             reason=f"close lot {pos.position_id} ({transition})",
             position_id=pos.position_id,
+            decision_ts=sig.bar_ts,
         )
         for pos in lots
     ]
@@ -309,6 +310,7 @@ def _open_intent(
         stop_loss=sig.stop_loss,
         take_profit=sig.take_profit,
         tag=sig.tag,
+        decision_ts=sig.bar_ts,
     )
 
 

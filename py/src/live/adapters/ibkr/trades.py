@@ -10,9 +10,11 @@ rows plus the confirmation window and returns the advanced book, so the caller
 
 Rules (plan §3):
 
-- **Ours** = the execution's ``order_ref`` starts with ``slug(scope)``. A ref
-  that is not ours is ignored by design (a human's trade is not our book), never
-  a mismatch and never a reason to place an order.
+- **Ours** = the execution's ``order_ref`` scope segment equals ``slug(scope)``
+  exactly (the ref minus its ``-{ts}-{seq}`` tail). A ref that is not ours is
+  ignored by design (a human's trade is not our book), never a mismatch and
+  never a reason to place an order. Exact-segment matching keeps scope
+  ``momentum`` from absorbing ``momentum-v2``'s fills.
 - **One row per conid.** Open / add / reduce / close per side and sign; a
   round trip leaves ONE closed row, not two open lots. ``entry_price`` is the
   VWAP of the opening executions of the *current* open interval.
@@ -98,8 +100,14 @@ class StrategyBook:
 
 
 def is_ours(scope: str, execution: Execution) -> bool:
-    """Ownership: the client order ref we minted is prefixed by ``slug(scope)``."""
-    return execution.order_ref.startswith(f"{slug(scope)}-")
+    """Ownership: the ref's scope segment equals ``slug(scope)`` exactly.
+
+    A ref is ``{slug}-{ts}-{seq}`` and neither ``ts`` nor ``seq`` contains a
+    ``-``, so the scope segment is the ref minus its last two segments. An exact
+    match (not a prefix) keeps scope ``momentum`` from claiming refs minted by
+    ``momentum-v2`` / ``momentum-2``.
+    """
+    return execution.order_ref.rsplit("-", 2)[0] == slug(scope)
 
 
 def _signed(execution: Execution) -> float:

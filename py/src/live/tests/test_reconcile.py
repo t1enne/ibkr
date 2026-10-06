@@ -87,6 +87,7 @@ def sig(
     qty: float = 0.0,
     symbol: str = "AAPL",
     pid: str | None = None,
+    bar_ts: pd.Timestamp | None = TS,
 ) -> LiveSignal:
     return LiveSignal(
         symbol=symbol,
@@ -97,7 +98,18 @@ def sig(
         price=100.0,
         qty=qty,
         position_id=pid,
+        bar_ts=bar_ts,
     )
+
+
+def test_intents_carry_the_decision_bar() -> None:
+    # The decision bar is the deterministic cOID anchor the broker re-mints a
+    # re-run from (finding 1); every emitted intent must carry it.
+    (open_,) = reconcile((sig("long", qty=10.0),), pf(100_000.0), CFG)
+    assert open_.decision_ts == TS
+    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
+    closes = reconcile((sig("close"),), book, CFG)
+    assert closes[0].decision_ts == TS
 
 
 def test_flat_to_long_opens() -> None:

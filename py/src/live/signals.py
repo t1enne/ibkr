@@ -117,4 +117,5 @@ def _to_live_signal(row: ScreenRow, action: SignalAction, price: float) -> LiveS
         signal_ts=row.sig_ts,
         price=price,
         qty=0.0,
+        bar_ts=row.ts,
     )

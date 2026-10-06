@@ -33,6 +33,16 @@ SUBMIT = f"{BASE}iserver/account/{ACCOUNT}/orders"
 STATUS = f"{BASE}iserver/account/order/status/{ORDER_ID}"
 REPLY = f"{BASE}iserver/reply/"
 POSITIONS = f"{BASE}portfolio/{ACCOUNT}/positions/0"
+OPEN_ORDERS = f"{BASE}iserver/account/orders"
+
+#: A decision bar distinct from the broker's wall clock, so a test can prove the
+#: cOID is anchored on the BAR, not ``now()``.
+BAR = cast("pd.Timestamp", pd.Timestamp("2024-06-03T20:00:00Z"))
+
+
+def _mock_no_working_orders() -> None:
+    """Pre-flight sees no working order carrying our cOID (a fresh submit)."""
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
 
 
 def _mock_long_position() -> None:
@@ -58,6 +68,7 @@ def _broker(
     dry_run: bool = False,
     timeout_s: float = 0.0,
     monotonic: Callable[[], float] | None = None,
+    now: Callable[[], pd.Timestamp] | None = None,
 ) -> IbkrBroker:
     return IbkrBroker(
         IbkrClient(base_url=BASE, account=ACCOUNT),
@@ -69,17 +80,18 @@ def _broker(
         timeout_s=timeout_s,
         sleep=_no_sleep,
         monotonic=monotonic if monotonic is not None else lambda: 100.0,
-        now=lambda: CYCLE_TS,
+        now=now if now is not None else (lambda: CYCLE_TS),
     )
 
 
-def _open_intent() -> OrderIntent:
+def _open_intent(decision_ts: pd.Timestamp | None = None) -> OrderIntent:
     return OrderIntent(
         symbol="AAPL",
         action=ActionType.long,
         qty=1.0,
         ref_price=100.0,
         reason="open long (flat->long)",
+        decision_ts=decision_ts,
     )
 
 
@@ -146,6 +158,7 @@ async def test_place_submits_then_waits_for_the_fill() -> None:
         )
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
     broker = _broker()
 
     result = await broker.place(_open_intent())
@@ -186,6 +199,7 @@ async def test_place_confirms_an_ordinary_reply_then_fills() -> None:
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
 
     placed = _ok(await _broker().place(_open_intent()))
 
@@ -211,6 +225,7 @@ async def test_place_confirms_a_second_reply_before_the_order_lands() -> None:
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
 
     placed = _ok(await _broker().place(_open_intent()))
 
@@ -235,6 +250,7 @@ async def test_reject_prompt_aborts_without_confirming() -> None:
         return_value=httpx.Response(500, json={"error": "must not be called"})
     )
     status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
+    _mock_no_working_orders()
 
     result = await _broker().place(_open_intent())
 
@@ -259,6 +275,7 @@ async def test_reply_loop_overflow_aborts() -> None:
         )
     )
     status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
+    _mock_no_working_orders()
 
     result = await _broker().place(_open_intent())
 
@@ -284,7 +301,7 @@ async def test_submit_transport_failure_is_typed() -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_ambiguous_submit_adopts_a_working_order() -> None:
-    """A working order with our cOID is SEEN, not re-sent (plan §6 phase 3.5)."""
+    """A POST that errored but landed: the working order is SEEN, not re-sent."""
     from src.exec.types import OrderSide
     from src.live.adapters.ibkr.orders import build_ticket, sequence
 
@@ -298,14 +315,53 @@ async def test_ambiguous_submit_adopts_a_working_order() -> None:
         cycle_ts=CYCLE_TS,
         seq=seq,
     )
-    respx.get(f"{BASE}iserver/account/orders").mock(
-        return_value=httpx.Response(
-            200, json={"orders": [{"orderId": ORDER_ID, "cOID": ticket.order_ref}]}
-        )
+    # The pre-flight sees nothing (the POST has not landed yet); the post-error
+    # re-check finds the order the failed POST actually placed.
+    respx.get(OPEN_ORDERS).mock(
+        side_effect=[
+            httpx.Response(200, json={"orders": []}),
+            httpx.Response(
+                200, json={"orders": [{"orderId": ORDER_ID, "cOID": ticket.order_ref}]}
+            ),
+        ]
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
     placed = _ok(await _broker().place(_open_intent()))
     assert placed.ok and placed.position_id == ORDER_ID
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_preflight_adopts_a_prior_cycle_order_by_decision_bar() -> None:
+    """The cross-cycle double-exposure guard (finding 1).
+
+    Cycle 1's open timed out while still live. Cycle 2 re-runs on the SAME
+    decision bar with a DIFFERENT wall clock: because the cOID is anchored on
+    the bar, the pre-flight finds cycle 1's working order and ADOPTS it — no
+    second submit, no second fill.
+    """
+    from src.exec.types import OrderSide
+    from src.live.adapters.ibkr.orders import build_ticket, sequence
+
+    intent = _open_intent(decision_ts=BAR)
+    seq = sequence((intent,))[0][0]
+    prior = build_ticket(
+        intent, conid=265598, side=OrderSide.BUY, scope=SCOPE, cycle_ts=BAR, seq=seq
+    )
+    submit = respx.post(SUBMIT).mock(return_value=httpx.Response(500, json={}))
+    respx.get(OPEN_ORDERS).mock(
+        return_value=httpx.Response(
+            200, json={"orders": [{"orderId": ORDER_ID, "cOID": prior.order_ref}]}
+        )
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    wall_clock = cast("pd.Timestamp", pd.Timestamp("2024-06-05T09:00:00Z"))
+    broker = _broker(now=lambda: wall_clock)
+
+    placed = _ok(await broker.place(intent))
+
+    assert placed.ok and placed.position_id == ORDER_ID
+    assert not submit.called  # cycle 1's live order was adopted, not re-sent
 
 
 # --- wait_filled outcomes ---------------------------------------------------
@@ -322,6 +378,7 @@ async def test_wait_filled_cancelled_is_rejected() -> None:
             200, json={"order_status": "Cancelled", "cum_fill": "0", "total_size": "1"}
         )
     )
+    _mock_no_working_orders()
     error = _failure(await _broker().place(_open_intent()))
     assert error.kind == "rejected"
     assert "nothing filled" in error.message
@@ -344,6 +401,7 @@ async def test_wait_filled_partial_reports_the_filled_qty() -> None:
             },
         )
     )
+    _mock_no_working_orders()
     error = _failure(await _broker().place(_open_intent()))
     assert error.kind == "unfilled"  # never silently accepted as success
     assert "only 0.5 of 1" in error.message
@@ -360,6 +418,7 @@ async def test_wait_filled_timeout_is_typed_and_reports_the_partial() -> None:
             200, json={"order_status": "Submitted", "cum_fill": "0", "total_size": "1"}
         )
     )
+    _mock_no_working_orders()
     error = _failure(await _broker().place(_open_intent()))
     assert error.kind == "timeout"
     assert "no terminal status" in error.message
@@ -396,6 +455,7 @@ async def test_wait_filled_polls_until_terminal() -> None:
             httpx.Response(200, json=_filled_status()),
         ]
     )
+    _mock_no_working_orders()
     broker = _broker(timeout_s=100.0, monotonic=lambda: next(ticks))
     placed = _ok(await broker.place(_open_intent()))
     assert placed.ok and placed.fill is not None
@@ -458,6 +518,7 @@ async def test_close_resolves_the_lot_side_from_the_seeded_book() -> None:
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
     _mock_long_position()
+    _mock_no_working_orders()
     broker = _broker()
     broker.seed(_long_lot("555000111"))
     intent = OrderIntent(
@@ -493,6 +554,7 @@ async def test_place_cohort_is_a_deterministic_loop_that_survives_one_failure() 
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
     _mock_long_position()
+    _mock_no_working_orders()
     broker = _broker()
     broker.seed(_long_lot("555000111"))
     open_intent = _open_intent()
@@ -522,6 +584,7 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
     _mock_long_position()
+    _mock_no_working_orders()
     broker = _broker()
     broker.seed(_long_lot("555000111"))
     close_intent = OrderIntent(

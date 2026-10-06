@@ -89,6 +89,19 @@ async def _default_conid_lookup(ticker: str) -> int:
     return int(conid)
 
 
+def _cycle_ts(intent: OrderIntent, fallback: pd.Timestamp) -> pd.Timestamp:
+    """The cOID's timestamp anchor: the intent's decision bar, else *fallback*.
+
+    A DETERMINISTIC anchor (the bar the order was decided on) makes a re-run on
+    the same data re-mint an identical ref, so IBKR dedupes it and the
+    working-order pre-flight can adopt it. A wall-clock anchor minted a fresh
+    ref every cycle, so an open whose ``wait_filled`` timed out became a second
+    live order on the next cycle (double exposure). ``fallback`` (the wall clock)
+    is used only when the intent never carried a bar — a direct/synthetic caller.
+    """
+    return intent.decision_ts if intent.decision_ts is not None else fallback
+
+
 class IbkrBroker:
     """``LiveBroker`` over the gateway: MKT orders, reply loop, bounded fill wait.
 
@@ -179,7 +192,7 @@ class IbkrBroker:
                 conid=conid,
                 side=side,
                 scope=self._scope,
-                cycle_ts=self._now(),
+                cycle_ts=_cycle_ts(intent, self._now()),
                 seq=resolved_seq,
             )
         except (OrderMappingError, ValueError, IbkrError) as exc:
@@ -189,12 +202,23 @@ class IbkrBroker:
             )
 
         # Safety guard (plan §6 phase 3.5): never send a REDUCING order for a
-        # conid the account is actually flat on. On a shared account the net is
-        # the sum of all scopes plus a human's, so a zero net is a hard "nothing
-        # to reduce" — this is the one place the account state is read.
+        # conid the account is actually flat on, and never send one when the
+        # account net cannot be READ. On a shared account the net is the sum of
+        # all scopes plus a human's, so a zero net is a hard "nothing to
+        # reduce"; an unreadable net fails CLOSED (a reducing order against an
+        # unknown net is how a close flips into an open).
         if intent.action is ActionType.close:
             net = await self._account_net(conid)
-            if net is not None and abs(net) <= _FLAT_EPS:
+            if net is None:
+                return Err(
+                    feed_error(
+                        "rejected",
+                        f"refused close {intent.symbol} (conid {conid}): account net "
+                        f"unreadable, cannot prove there is anything to reduce",
+                        symbol=intent.symbol,
+                    )
+                )
+            if abs(net) <= _FLAT_EPS:
                 return Err(
                     feed_error(
                         "rejected",
@@ -315,8 +339,21 @@ class IbkrBroker:
         return None
 
     async def _submit(self, account: str, ticket: Ticket) -> Result[str, FeedError]:
-        """POST the ticket and run the (bounded) reply-confirmation loop."""
+        """Adopt an already-working order, else POST and run the reply loop.
+
+        Before every submit we ask the account which orders are working and ADOPT
+        one carrying our cOID. Because the cOID is anchored on the decision bar,
+        a still-live order from a prior cycle (its ``wait_filled`` timed out) is
+        found here and never re-sent — the fix for cross-cycle double exposure.
+        """
         endpoint = f"iserver/account/{account}/orders"
+        working = await self._working_order_id(ticket.order_ref)
+        if working is not None:
+            self._log(
+                f"adopting already-working order {working} for {ticket.order_ref} "
+                f"via /iserver/account/orders"
+            )
+            return Ok(working)
         try:
             # The gateway rejects a bare order (400 "Missing orders"); it wants
             # the order(s) wrapped under an ``orders`` array.
