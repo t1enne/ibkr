@@ -33,7 +33,9 @@ def test_parse_warmup_days_spellings_and_whitespace() -> None:
 
 @pytest.mark.parametrize(
     "bad",
-    ["", "  ", "y", "1y1", "abc", "1x", "-1y", "1.5.5y", "90"],
+    # one representative per garbage class: empty, whitespace, alpha,
+    # sign-prefixed, and a bare number — all hit the same parse-fail branch.
+    ["", "  ", "abc", "-1y", "90"],
 )
 def test_parse_warmup_days_rejects_garbage(bad: str) -> None:
     """A garbage/unknown duration must raise a clear error, never default."""

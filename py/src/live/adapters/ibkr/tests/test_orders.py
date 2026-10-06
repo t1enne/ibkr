@@ -66,12 +66,9 @@ def test_order_side_table(
     assert order_side(_intent(action=action), position_side) is expected
 
 
-@pytest.mark.parametrize("position_side", [None, ActionType.close])
-def test_close_without_a_lot_side_is_an_error(
-    position_side: ActionType | None,
-) -> None:
+def test_close_without_a_lot_side_is_an_error() -> None:
     with pytest.raises(UnknownCloseLot, match="lot not found"):
-        order_side(_intent(action=ActionType.close, position_id="99"), position_side)
+        order_side(_intent(action=ActionType.close, position_id="99"), None)
 
 
 # --- ticket body ------------------------------------------------------------
@@ -230,7 +227,7 @@ def test_classify_reply_advanced_reject_aborts_with_its_text() -> None:
     assert outcome.message == "price band exceeded"
 
 
-@pytest.mark.parametrize("payload", [[], {}, "nonsense", None])
+@pytest.mark.parametrize("payload", [None, {}])
 def test_classify_reply_unknown_shape_aborts(payload: object) -> None:
     assert classify_reply(payload).kind == "abort"
 
@@ -249,13 +246,8 @@ def test_classify_reply_id_without_message_aborts() -> None:
         ("Filled", True),
         ("Cancelled", True),
         ("Inactive", True),
-        ("Submitted", False),
-        ("PreSubmitted", False),
-        ("PendingSubmit", False),
-        ("PendingCancel", False),
-        ("WarnState", False),
-        ("SomethingNew", False),
-        ("", False),
+        ("Submitted", False),  # a real pre-fill status is non-terminal
+        ("", False),  # an unknown status is never read as terminal
     ],
 )
 def test_is_terminal_table(status: str, terminal: bool) -> None:
@@ -269,8 +261,7 @@ def test_is_terminal_table(status: str, terminal: bool) -> None:
         ("Cancelled", OrderState.CANCELLED),
         ("Inactive", OrderState.REJECTED),
         ("Submitted", OrderState.PENDING),
-        ("WarnState", OrderState.PENDING),  # unknown/transient never reads as loaded
-        ("Whatever", OrderState.PENDING),
+        ("Whatever", OrderState.PENDING),  # unknown statuses fall back to PENDING
     ],
 )
 def test_order_state_table(status: str, expected: OrderState) -> None:

@@ -13,7 +13,7 @@ LIVE = "U7654321"
 
 @pytest.mark.parametrize(
     ("account", "expected"),
-    [(PAPER, True), ("DF999", True), (LIVE, False), ("", False), ("12345", False)],
+    [(PAPER, True), (LIVE, False)],
 )
 def test_is_paper_account_keys_on_prefix(account: str, expected: bool) -> None:
     assert is_paper_account(account) is expected

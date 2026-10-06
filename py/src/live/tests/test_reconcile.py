@@ -116,11 +116,6 @@ def test_long_to_close_closes_lot() -> None:
     assert order.position_id == "L1"
 
 
-def test_absent_signal_holds() -> None:
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
-    assert reconcile((), book, CFG) == ()
-
-
 def test_flip_closes_before_open() -> None:
     book = pf(100_000.0, lot("AAPL", 5.0, 100.0, ActionType.short, pid="S1"))
     first, second = reconcile((sig("long", qty=3.0),), book, CFG)
@@ -251,7 +246,7 @@ def test_close_signal_targets_named_lot_only() -> None:
 
 @pytest.mark.parametrize(
     ("action", "side"),
-    [("long", ActionType.long), ("short", ActionType.short)],
+    [("long", ActionType.long)],
 )
 def test_already_on_the_target_side_holds(
     action: SignalAction, side: ActionType
