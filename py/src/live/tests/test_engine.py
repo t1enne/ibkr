@@ -460,6 +460,45 @@ async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dry_run_writes_no_peewee_live_tables(tmp_path: Path) -> None:
+    """peewee lazy DDL: a dry-run cycle leaves the live models absent from
+    ``sqlite_master`` (create_tables never runs on a read-only path)."""
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger_path = tmp_path / "l.sqlite"
+    ledger = SqliteLedger(ledger_path)
+    broker = FakeBroker()
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=broker,
+        ledger=ledger,
+        strategy_id="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        dry_run=True,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert report.results == () and broker.placed == []
+    with get_connection(ledger_path) as con:
+        tables = {
+            r[0]
+            for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    live_tables = {
+        "live_strategy",
+        "live_position",
+        "live_execution",
+        "live_cash",
+        "live_sim_lot",
+    }
+    assert tables.isdisjoint(live_tables)  # peewee DDL withheld on a dry run
+
+
+@pytest.mark.asyncio
 async def test_run_cycle_stale_data_raises(tmp_path: Path) -> None:
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", OLD)
