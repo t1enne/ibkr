@@ -22,11 +22,7 @@ import peewee
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
 from src.bt.state import PortfolioState
-from src.bt.state.factories import (
-    create_execution_params,
-    create_initial_portfolio,
-    build_commission_model,
-)
+from src.bt.state.factories import create_initial_portfolio
 from src.bt.types import StrategyConfig
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.gateway import IbkrGateway
@@ -44,7 +40,13 @@ from src.live.lease import CycleInProgressError
 from src.live.ledger import LedgerReadError, SqliteLedger, config_hash
 from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
 from src.live.result import Err
-from src.live.types import CostProvenance, FeedError, LiveConfig, cost_provenance
+from src.live.types import (
+    CostProvenance,
+    FeedError,
+    LiveConfig,
+    cost_provenance,
+    exec_params_of,
+)
 
 #: Sizing modes the shared ``SizingParams`` layer accepts.
 SizeMode = Literal["equity", "cash", "fixed"]
@@ -140,17 +142,7 @@ def live_run(
         source = MockPortfolioSource(cfg.portfolio_path)
         broker = SimulatedBroker(
             create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
-            create_execution_params(
-                spread_bps=cfg.spread_bps,
-                slippage_bps=cfg.slippage_bps,
-                fixed_commission=cfg.commission,
-                commission_model=build_commission_model(
-                    cfg.commission,
-                    cfg.commission_per_share,
-                    cfg.commission_min,
-                    cfg.commission_max_pct,
-                ),
-            ),
+            exec_params_of(cfg),
             click.echo,
         )
     # Plan §7.3: label which source produced this run's costs. A resolved IBKR run

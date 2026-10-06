@@ -57,8 +57,10 @@ async def search_contracts(ticker: str) -> tuple[SecdefSearchResponseItem, ...]:
             raise ValueError(f"No US stock contract found for {ticker}")
 
         return data
+    except ValueError:
+        raise  # our own refusal (empty/ambiguous set) already carries the reason
     except Exception as e:
-        raise ValueError(f"Failed to search contract for {ticker}: {e}")
+        raise ValueError(f"Failed to search contract for {ticker}: {e}") from e
 
 
 async def lookup(ticker: str) -> SecdefSearchResponseItem:

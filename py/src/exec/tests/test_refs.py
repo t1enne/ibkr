@@ -66,3 +66,16 @@ def test_assign_seqs_breaks_collisions_deterministically() -> None:
     ids = [f"S{i}|long|" for i in range(500)]
     seqs = assign_seqs(ids)
     assert len(set(seqs)) == len(seqs)
+
+
+def test_assign_seqs_collision_is_input_order_independent() -> None:
+    # ``X184|long|`` and ``X444|long|`` collide on base seq 17612 (crc32). The
+    # bumped seq must follow SORTED identity order, so the assignment is a
+    # function of the identity SET, not the input order — a shifted batch cannot
+    # hand an intent another's seq (finding L2).
+    a, b = "X184|long|", "X444|long|"
+    assert assign_seqs([a])[0] == assign_seqs([b])[0]  # same base seq: collides
+    forward = dict(zip([a, b], assign_seqs([a, b]), strict=True))
+    reverse = dict(zip([b, a], assign_seqs([b, a]), strict=True))
+    assert forward == reverse
+    assert forward[a] < forward[b]  # the identity sorting later is bumped

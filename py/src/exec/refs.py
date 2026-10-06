@@ -55,7 +55,11 @@ def assign_seqs(identities: list[str]) -> list[int]:
     """
     assigned: dict[str, int] = {}
     taken: set[int] = set()
-    for identity in identities:
+    # Iterate the SORTED identity set, not the input order: which identity is
+    # bumped on a collision is then a function of the set alone, so a batch whose
+    # membership or ordering changed still assigns the same seq to the same
+    # intent. ``sorted(set(...))`` also gives duplicate identities one seq.
+    for identity in sorted(set(identities)):
         seq = _seq_of(identity)
         while seq in taken:
             seq = (seq + 1) % 100000

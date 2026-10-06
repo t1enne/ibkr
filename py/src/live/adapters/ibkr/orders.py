@@ -5,8 +5,10 @@ Three pure mappings live here, all table-tested and free of I/O:
 - ``build_ticket`` — an ``OrderIntent`` plus the conid we resolved for it becomes
   the ``singleOrderSubmissionRequest`` body IBKR wants (``conid``, ``side``,
   ``quantity``, ``orderType``, ``tif``, ``cOID``). The ``cOID`` is
-  ``refs.order_ref`` — the SAME deterministic scheme the sim side uses — so a
-  re-run of a cycle re-sends an identical ref and IBKR dedupes it.
+  ``refs.order_ref`` — the SAME deterministic scheme the sim side uses — anchored
+  on the intent's DECISION BAR, so a re-run on the same bar re-mints the identical
+  ref: IBKR dedupes it and the working-order pre-flight adopts it. A later bar
+  mints a fresh ref.
 - ``sequence`` — the deterministic ``(seq, intent)`` ordering (closes first, then
   opens in the order reconcile emitted, i.e. ``config.symbols`` order). Re-running
   the same cycle therefore mints identical refs; the next bar gets fresh ones.
@@ -136,7 +138,8 @@ def build_ticket(
     """Pure: intent + resolved conid + resolved side -> the IBKR ticket body.
 
     ``cOID`` is ``refs.order_ref(scope, cycle_ts, seq)`` — the deterministic
-    identity that makes a re-sent cycle dedupe at IBKR. ``tif`` is always ``DAY``;
+    identity that makes a re-sent order on the same decision bar dedupe at IBKR.
+    ``tif`` is always ``DAY``;
     an MKT order has no meaningful resting life in this phase. Quantities are
     whole shares (plan §7.14): a fractional ``qty`` is rounded and flagged, never
     sent as-is. A REDUCING order (``close``) FLOORS its quantity so it can never

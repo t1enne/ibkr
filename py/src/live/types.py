@@ -14,8 +14,9 @@ from typing import Literal, cast, get_args
 
 import pandas as pd
 
-from src.bt.state import ActionType, PortfolioState
+from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
+from src.bt.state.factories import build_commission_model, create_execution_params
 from src.exec.types import OrderType
 
 #: Actions the screen can emit that require a live decision. ``flat`` is never
@@ -178,7 +179,7 @@ class LiveConfig:
     strategy_type: str
     symbols: tuple[str, ...]
     initial_capital: float
-    strategy_params: dict[str, object]  # the screen's strategy params (verbatim)
+    strategy_params: dict[str, object]  # screen strategy params; never mutated
     bars: tuple[str, ...]  # bars[0] = signal interval
     warmup: str  # screen warm-up window, e.g. "1y"
     commission: float = 0.5  # fixed per-fill commission, matches StrategyConfig
@@ -202,3 +203,22 @@ class LiveConfig:
     #: Stable strategy identity (plan rev 4.1 §4). Defaults to the strategy name;
     #: the per-scope sqlite book key and the cOID prefix for fill attribution.
     scope: str = ""
+
+
+def exec_params_of(config: LiveConfig) -> ExecutionParams:
+    """The execution params a live cycle fills with, from its config.
+
+    ONE construction, shared by ``reconcile``'s sizing book and the CLI's sim
+    broker, so sizing and settlement agree byte-for-byte (finding L8).
+    """
+    return create_execution_params(
+        spread_bps=config.spread_bps,
+        slippage_bps=config.slippage_bps,
+        fixed_commission=config.commission,
+        commission_model=build_commission_model(
+            config.commission,
+            config.commission_per_share,
+            config.commission_min,
+            config.commission_max_pct,
+        ),
+    )

@@ -116,7 +116,6 @@ class LivePosition(_Base):
     take_profit = FloatField(null=True)
     tag = TextField(default="")
     order_ref = TextField(default="")
-    watermark = IntegerField(null=True)
 
     class Meta:
         table_name = "live_position"
@@ -544,10 +543,17 @@ class SqliteLedger:
 
 
 def _ms(ts: pd.Timestamp) -> int:
+    """Epoch-milliseconds of *ts*.
+
+    A tz-naive input is read as LOCAL time, so the stored integer is the absolute
+    instant; :func:`_ts` reads it back tagged UTC. The round trip preserves the
+    absolute time, not the tz label (display tz differs, the instant does not).
+    """
     return int(ts.timestamp() * _MS)
 
 
 def _ts(value: int | None) -> pd.Timestamp | None:
+    """Epoch-ms -> UTC ``Timestamp`` (see :func:`_ms`: absolute instant preserved)."""
     if value is None:
         return None
     return cast("pd.Timestamp", pd.Timestamp(value, unit="ms", tz="UTC"))
@@ -567,7 +573,6 @@ def _book_fields(row: BookRow) -> dict[str, object]:
         "take_profit": row.take_profit,
         "tag": row.tag,
         "order_ref": row.order_ref,
-        "watermark": _ms(row.watermark) if row.watermark is not None else None,
     }
 
 
@@ -585,5 +590,4 @@ def _model_to_book(row: LivePosition) -> BookRow:
         take_profit=cast("float | None", row.take_profit),
         tag=cast("str", row.tag),
         order_ref=cast("str", row.order_ref),
-        watermark=_ts(cast("int | None", row.watermark)),
     )

@@ -1,8 +1,7 @@
 """Live trading package — thin batch reconcile cycle over the existing layers.
 
 Reuses the backtest data/screen/portfolio layers and adds only the live edges
-(portfolio source, signals bridge) plus (later) the pure reconcile core. See
-``docs/HANDOFF_LIVE_TRADING.md``.
+(portfolio source, signals bridge) plus (later) the pure reconcile core.
 """
 
 from __future__ import annotations

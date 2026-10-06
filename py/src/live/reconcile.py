@@ -34,13 +34,17 @@ from src.bt.portfolio.pure import apply_fills
 from src.bt.size.pure import SizingParams, equity_of, sized_signal
 from src.bt.state import (
     ActionType,
-    ExecutionParams,
     PortfolioState,
     Position,
 )
-from src.bt.state.factories import create_execution_params, build_commission_model
 from src.live.broker import intent_to_signal, ref_candle, trade_signal
-from src.live.types import LiveConfig, LiveSignal, OrderIntent, PortfolioView
+from src.live.types import (
+    LiveConfig,
+    LiveSignal,
+    OrderIntent,
+    PortfolioView,
+    exec_params_of,
+)
 
 Side = Literal["long", "short", "flat"]
 
@@ -210,7 +214,7 @@ def _settled_book(
         equity_curve=(),
         initial_capital=portfolio.initial_capital,
     )
-    params = _exec_params(config)
+    params = exec_params_of(config)
     fills = tuple(
         execute_signal(
             intent_to_signal(intent, _SETTLE_TS, state),
@@ -338,19 +342,4 @@ def _sizing_params(config: LiveConfig) -> SizingParams:
             "size": config.size,
             "max_symbol_allocation": config.max_symbol_allocation,
         }
-    )
-
-
-def _exec_params(config: LiveConfig) -> ExecutionParams:
-    """The execution params the broker fills with (same construction the CLI uses)."""
-    return create_execution_params(
-        spread_bps=config.spread_bps,
-        slippage_bps=config.slippage_bps,
-        fixed_commission=config.commission,
-        commission_model=build_commission_model(
-            config.commission,
-            config.commission_per_share,
-            config.commission_min,
-            config.commission_max_pct,
-        ),
     )

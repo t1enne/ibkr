@@ -62,9 +62,8 @@ class Execution:
 class BookRow:
     """One scope-owned position keyed by conid; a closed one keeps ``closed_at``.
 
-    ``qty`` is absolute; the side lives on ``side``. ``watermark`` is the ts of
-    the last applied execution for the row (a re-apply guard, alongside the
-    per-execution applied set).
+    ``qty`` is absolute; the side lives on ``side``. Re-apply protection is the
+    ``StrategyBook.applied`` execution-id set, not anything on the row.
     """
 
     scope: str
@@ -79,7 +78,6 @@ class BookRow:
     take_profit: float | None
     tag: str
     order_ref: str
-    watermark: pd.Timestamp | None
 
     @property
     def is_open(self) -> bool:
@@ -154,7 +152,6 @@ def _apply(
                 qty=new_abs,
                 entry_price=blended,
                 order_ref=execution.order_ref,
-                watermark=execution.ts,
             ),
             tuple(warnings),
         )
@@ -164,7 +161,6 @@ def _apply(
                 row,
                 qty=row.qty - execution.qty,
                 order_ref=execution.order_ref,
-                watermark=execution.ts,
             ),
             tuple(warnings),
         )
@@ -175,7 +171,6 @@ def _apply(
                 qty=0.0,
                 closed_at=execution.ts,
                 order_ref=execution.order_ref,
-                watermark=execution.ts,
             ),
             tuple(warnings),
         )
@@ -208,7 +203,6 @@ def _open_row(
         take_profit=None,
         tag="",
         order_ref=execution.order_ref,
-        watermark=execution.ts,
     )
 
 

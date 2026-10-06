@@ -260,7 +260,7 @@ def test_live_run_passes_commission_to_execution_params(
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
         return _report()
 
-    monkeypatch.setattr("src.live.cli.create_execution_params", fake_exec)
+    monkeypatch.setattr("src.live.types.create_execution_params", fake_exec)
     monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
     monkeypatch.setattr("src.live.cli.MockPortfolioSource", lambda p: object())
     monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
