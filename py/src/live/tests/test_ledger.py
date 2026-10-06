@@ -179,6 +179,22 @@ def test_scopes_do_not_leak(ledger: SqliteLedger) -> None:
     assert {r.conid for r in ledger.load_book("beta").rows} == {2}
 
 
+def test_two_ledgers_on_two_paths_do_not_retarget_each_other(tmp_path: Path) -> None:
+    # peewee binds a model at CLASS level, so a single module-global database let a
+    # second SqliteLedger silently retarget the first's connection (writes landing
+    # in the wrong file, or a half-created schema). Each instance owns its db now.
+    a = SqliteLedger(tmp_path / "a.sqlite")
+    a.ensure_cash("S1", 111.0)
+    b = SqliteLedger(tmp_path / "b.sqlite")
+    b.ensure_cash("S1", 222.0)
+    a.ensure_cash("S2", 333.0)  # a still writes to its OWN file
+
+    assert a.initial_capital_of("S1") == 111.0
+    assert b.initial_capital_of("S1") == 222.0
+    assert a.initial_capital_of("S2") == 333.0
+    assert b.initial_capital_of("S2") == 0.0  # b never saw a's later write
+
+
 def test_prune_closed_deletes_only_old_closed(ledger: SqliteLedger) -> None:
     old = _exec("e1", ts=OLD)
     book, _ = reconcile("S1", (old,), StrategyBook())

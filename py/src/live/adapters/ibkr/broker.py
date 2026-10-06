@@ -31,6 +31,7 @@ cancel/modify, no resting stop, no bracket and no OCA order.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import cast
@@ -77,6 +78,13 @@ DEFAULT_TIMEOUT_S = 30.0
 
 #: Absolute account net below which the book is flat (the close safety guard).
 _FLAT_EPS = 1e-9
+
+#: Slack allowed on an OPEN's notional over its decision-time ``cash_bound`` before
+#: refusing: absorbs a normal reference-price gap between the decision bar and the
+#: fill, so an order sized to the full funded cash is not refused on a few cents of
+#: drift. A material over-deployment (an explicit-qty strategy sizing past cash, or
+#: a stale intent) still trips it.
+_OPEN_CASH_TOLERANCE = 0.02
 
 ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
@@ -228,6 +236,12 @@ class IbkrBroker:
                         symbol=intent.symbol,
                     )
                 )
+        else:
+            # An OPEN is funded by the scope's cash: re-check its notional at the
+            # edge against the decision-time bound the sizer used.
+            refused = self._open_cash_guard(intent)
+            if refused is not None:
+                return Err(refused)
 
         if ticket.rounded:
             self._log(
@@ -311,6 +325,43 @@ class IbkrBroker:
     async def _conid(self, symbol: str) -> int:
         """The IBKR conid for *symbol* (an edge failure is a typed ``Err``)."""
         return await self._conid_lookup(symbol)
+
+    def _open_cash_guard(self, intent: OrderIntent) -> FeedError | None:
+        """Refuse an open whose decision-time notional exceeds its funded cash bound.
+
+        The bound is ``intent.cash_bound`` — the EXACT cash reconcile passed to the
+        sizer (``view.cash``), so the edge re-checks the same quantity the sizer
+        clamped against. An intent that cannot state a bound, or a non-finite /
+        non-positive reference price, is UNDETERMINABLE and fails closed: the edge
+        holds no live quote, so it bounds the DECISION notional (catching an
+        explicit-qty strategy or a stale intent sizing past cash); the tolerance
+        only leaves room for a reference-price gap, not for a material over-deploy.
+        """
+        bound = intent.cash_bound
+        if bound is None or not math.isfinite(bound):
+            return feed_error(
+                "rejected",
+                f"refused open {intent.symbol}: no decision-time cash bound, cannot "
+                f"prove the scope funds the notional",
+                symbol=intent.symbol,
+            )
+        price = intent.ref_price
+        if not math.isfinite(price) or price <= 0:
+            return feed_error(
+                "rejected",
+                f"refused open {intent.symbol}: no usable reference price "
+                f"({price!r}) to bound the notional against the cash",
+                symbol=intent.symbol,
+            )
+        notional = intent.qty * price
+        if notional > bound * (1.0 + _OPEN_CASH_TOLERANCE):
+            return feed_error(
+                "rejected",
+                f"refused open {intent.symbol}: notional {notional:.2f} exceeds "
+                f"funded cash {bound:.2f} by more than {_OPEN_CASH_TOLERANCE:.0%}",
+                symbol=intent.symbol,
+            )
+        return None
 
     async def _account_net(self, conid: int) -> float | None:
         """The account's net quantity for *conid*, or ``None`` if it cannot be read.

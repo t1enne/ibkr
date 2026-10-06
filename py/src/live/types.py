@@ -117,6 +117,13 @@ class OrderIntent:
     #: The shared order vocabulary. Phase 3 places MKT only; an LMT intent is
     #: refused by the IBKR adapter until carry-over policy exists (phase 4).
     order_type: OrderType = OrderType.MKT
+    #: On an OPEN, the scope's funded cash the sizer clamped the quantity against
+    #: at decision time (the SAME ``PortfolioView.cash`` reconcile passed to
+    #: ``sized_signal``). The IBKR edge re-checks the order notional against it so
+    #: a gap between here and the fill cannot silently over-deploy the scope onto
+    #: margin. ``None`` on a close, and on an open from a caller that cannot state
+    #: it — the edge then refuses (fail-closed) rather than trading unbounded.
+    cash_bound: float | None = None
 
 
 @dataclass(frozen=True)

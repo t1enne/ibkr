@@ -92,6 +92,7 @@ def _open_intent(decision_ts: pd.Timestamp | None = None) -> OrderIntent:
         ref_price=100.0,
         reason="open long (flat->long)",
         decision_ts=decision_ts,
+        cash_bound=1000.0,
     )
 
 
@@ -640,6 +641,72 @@ async def test_stop_carrying_open_is_refused_without_submitting() -> None:
     assert "naked order" in error.message
     assert "95.0" in error.message and "110.0" in error.message
     assert len(respx.calls) == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_over_deploying_its_cash_bound_is_refused() -> None:
+    """An open whose notional exceeds the scope's funded cash is refused (M5).
+
+    The bound is the decision-time cash reconcile sized against; a stale or
+    explicit-qty open sizing past it must not reach the broker on margin.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.long,
+        qty=100.0,
+        ref_price=100.0,
+        reason="open long (flat->long)",
+        cash_bound=1000.0,
+    )
+    error = _failure(await _broker().place(intent))
+    assert error.kind == "rejected"
+    assert "exceeds funded cash" in error.message
+    assert submit.call_count == 0  # never sent
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_without_a_cash_bound_fails_closed() -> None:
+    """An intent that cannot state its funded cash is refused, not traded unbounded."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.long,
+        qty=1.0,
+        ref_price=100.0,
+        reason="open long (flat->long)",
+    )
+    error = _failure(await _broker().place(intent))
+    assert error.kind == "rejected"
+    assert "no decision-time cash bound" in error.message
+    assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_deploying_the_full_cash_bound_is_allowed() -> None:
+    """A full deployment (notional == bound) is within the guard, not over it."""
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.long,
+        qty=10.0,
+        ref_price=100.0,
+        reason="open long (flat->long)",
+        cash_bound=1000.0,
+    )
+    placed = _ok(await _broker().place(intent))
+    assert placed.ok
 
 
 @respx.mock

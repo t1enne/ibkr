@@ -311,6 +311,9 @@ def _open_intent(
         take_profit=sig.take_profit,
         tag=sig.tag,
         decision_ts=sig.bar_ts,
+        # The exact cash the sizer clamped against (the settled ``view``), carried
+        # to the edge so the notional guard re-checks the SAME quantity (finding M5).
+        cash_bound=portfolio.cash,
     )
 
 

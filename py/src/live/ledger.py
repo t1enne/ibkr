@@ -52,7 +52,12 @@ from src.live.adapters.ibkr.trades import (
 )
 from src.live.lease import file_lease
 
-database = SqliteDatabase(None)
+#: Template binding only: the model CLASSES are defined against this placeholder.
+#: Each ``SqliteLedger`` rebinds them (via ``bind_ctx``) to its OWN
+#: ``SqliteDatabase`` for every operation, so two ledgers on two paths never share
+#: a connection or retarget each other — peewee binds a model at CLASS level, so a
+#: single module-global database cannot serve two live instances.
+_TEMPLATE_DB = SqliteDatabase(None)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +88,7 @@ def _is_missing_table(error: peewee.OperationalError) -> bool:
 
 class _Base(Model):
     class Meta:
-        database = database
+        database = _TEMPLATE_DB
 
 
 class LiveStrategy(_Base):
@@ -167,21 +172,21 @@ _MODELS = (
 _MS = 1000
 
 
-def _table_exists(name: str) -> bool:
-    """Whether *name* is a table in the bound database."""
+def _table_exists(db: SqliteDatabase, name: str) -> bool:
+    """Whether *name* is a table in *db*."""
     return bool(
-        database.execute_sql(
+        db.execute_sql(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
         ).fetchall()
     )
 
 
-def _table_columns(name: str) -> set[str]:
-    """The column names of *name* (empty when the table does not exist)."""
-    return {str(row[1]) for row in database.execute_sql(f"PRAGMA table_info({name})")}
+def _table_columns(db: SqliteDatabase, name: str) -> set[str]:
+    """The column names of *name* in *db* (empty when the table does not exist)."""
+    return {str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})")}
 
 
-def _preserve_legacy_positions() -> None:
+def _preserve_legacy_positions(db: SqliteDatabase) -> None:
     """Preserve a pre-conid ``live_position`` and warn about the open rows it held.
 
     A pre-4.1 ``live_position`` cannot be read into the conid-keyed book, but
@@ -190,9 +195,9 @@ def _preserve_legacy_positions() -> None:
     loudly: until an operator reconciles them, the strategy reads the symbol as
     flat and could open again on top of a live position.
     """
-    columns = _table_columns("live_position")
+    columns = _table_columns(db, "live_position")
     sql = "SELECT symbol, side, qty FROM live_position"
-    for symbol, side, qty in database.execute_sql(
+    for symbol, side, qty in db.execute_sql(
         sql + (" WHERE status = 'open'" if "status" in columns else "")
     ).fetchall():
         logger.warning(
@@ -204,16 +209,14 @@ def _preserve_legacy_positions() -> None:
             qty,
             _LEGACY_POSITION_TABLE,
         )
-    if _table_exists(_LEGACY_POSITION_TABLE):
+    if _table_exists(db, _LEGACY_POSITION_TABLE):
         # A previous run already kept a copy; nothing more to preserve here.
-        database.execute_sql("DROP TABLE live_position")
+        db.execute_sql("DROP TABLE live_position")
         return
-    database.execute_sql(
-        f"ALTER TABLE live_position RENAME TO {_LEGACY_POSITION_TABLE}"
-    )
+    db.execute_sql(f"ALTER TABLE live_position RENAME TO {_LEGACY_POSITION_TABLE}")
 
 
-def _rekey_sim_lots() -> None:
+def _rekey_sim_lots(db: SqliteDatabase) -> None:
     """Re-key legacy ``live_sim_lot`` rows from the config hash to the scope.
 
     Pre-4.1 sim ownership was keyed by ``strategy_id`` (the config hash), so a
@@ -222,14 +225,14 @@ def _rekey_sim_lots() -> None:
     the ``live_strategy`` audit link (``strategy_id`` -> ``scope``). A row with
     no link keeps an empty scope — PRESERVED, never dropped.
     """
-    if not _table_exists("live_sim_lot"):
+    if not _table_exists(db, "live_sim_lot"):
         return
-    columns = _table_columns("live_sim_lot")
+    columns = _table_columns(db, "live_sim_lot")
     if "scope" in columns or "strategy_id" not in columns:
         return
-    database.execute_sql("ALTER TABLE live_sim_lot RENAME COLUMN strategy_id TO scope")
-    if _table_exists("live_strategy"):
-        database.execute_sql(
+    db.execute_sql("ALTER TABLE live_sim_lot RENAME COLUMN strategy_id TO scope")
+    if _table_exists(db, "live_strategy"):
+        db.execute_sql(
             "UPDATE live_sim_lot SET scope = (SELECT s.scope FROM live_strategy s "
             "WHERE s.strategy_id = live_sim_lot.scope) "
             "WHERE scope IN (SELECT strategy_id FROM live_strategy)"
@@ -270,7 +273,7 @@ class SqliteLedger:
         self._db_path = db_path
         self._schema_ready = False
         path = str(db_path) if db_path is not None else str(_DEFAULT_DB_PATH)
-        database.init(path)
+        self._database = SqliteDatabase(path)
 
     # -- lazy DDL / migration ---------------------------------------------
 
@@ -279,11 +282,10 @@ class SqliteLedger:
         if self._schema_ready:
             return
         self._migrate()
-        database.create_tables(_MODELS)
+        self._database.create_tables(_MODELS)
         self._schema_ready = True
 
-    @staticmethod
-    def _migrate() -> None:
+    def _migrate(self) -> None:
         """Preserve a pre-4.1 position table, ALTER ``live_strategy`` and re-key sim lots.
 
         The old ``live_position`` (PK ``(strategy_id, position_id)``) cannot
@@ -293,24 +295,26 @@ class SqliteLedger:
         ``scope`` via ALTER so the audit rows survive. ``live_sim_lot`` is
         re-keyed from the config hash to the scope (rows preserved).
         """
-        if _table_exists("live_position") and "conid" not in _table_columns(
-            "live_position"
+        db = self._database
+        if _table_exists(db, "live_position") and "conid" not in _table_columns(
+            db, "live_position"
         ):
-            _preserve_legacy_positions()
-        if _table_exists("live_strategy") and "scope" not in _table_columns(
-            "live_strategy"
+            _preserve_legacy_positions(db)
+        if _table_exists(db, "live_strategy") and "scope" not in _table_columns(
+            db, "live_strategy"
         ):
-            database.execute_sql(
+            db.execute_sql(
                 "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
             )
-        _rekey_sim_lots()
+        _rekey_sim_lots(db)
 
     @contextmanager
     def _write(self) -> Iterator[None]:
-        """A write: lazy DDL ensured once, then the statements run atomically."""
-        self._ready_schema()
-        with database.atomic():
-            yield
+        """A write: models bound to this ledger's db, lazy DDL once, then atomic."""
+        with self._database.bind_ctx(_MODELS):
+            self._ready_schema()
+            with self._database.atomic():
+                yield
 
     def cycle_lease(self) -> AbstractContextManager[None]:
         """Exclusive cross-process lease on this ledger's DB for a full cycle.
@@ -381,11 +385,12 @@ class SqliteLedger:
     def sim_open_ids(self, scope: str) -> frozenset[str]:
         """The sim lot ids this scope currently owns (empty if unwritten)."""
         try:
-            rows = (
-                LiveSimLot.select(LiveSimLot.position_id)
-                .where((LiveSimLot.scope == scope) & LiveSimLot.closed_at.is_null())
-                .execute()
-            )
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LiveSimLot.select(LiveSimLot.position_id)
+                    .where((LiveSimLot.scope == scope) & LiveSimLot.closed_at.is_null())
+                    .execute()
+                )
         except peewee.OperationalError as exc:
             if not _is_missing_table(exc):
                 raise LedgerReadError(str(exc)) from exc
@@ -397,18 +402,19 @@ class SqliteLedger:
     def load_book(self, scope: str) -> StrategyBook:
         """The durable rows + applied execution ids for *scope* (empty if unaware)."""
         try:
-            rows = (
-                LivePosition.select()
-                .where(LivePosition.scope == scope)
-                .order_by(LivePosition.conid)
-                .execute()
-            )
-            applied = {
-                e.execution_id
-                for e in LiveExecution.select(LiveExecution.execution_id).where(
-                    LiveExecution.scope == scope
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LivePosition.select()
+                    .where(LivePosition.scope == scope)
+                    .order_by(LivePosition.conid)
+                    .execute()
                 )
-            }
+                applied = {
+                    e.execution_id
+                    for e in LiveExecution.select(LiveExecution.execution_id).where(
+                        LiveExecution.scope == scope
+                    )
+                }
         except peewee.OperationalError as exc:
             if not _is_missing_table(exc):
                 raise LedgerReadError(str(exc)) from exc
@@ -465,15 +471,18 @@ class SqliteLedger:
         account summary: N strategies share one account's cash.
         """
         try:
-            cash = LiveCash.get_or_none(LiveCash.scope == scope)
-            initial = (
-                float(cash.initial_capital) if cash is not None else default_initial
-            )
-            sunk = (
-                LiveExecution.select(fn.COALESCE(fn.SUM(LiveExecution.cash_delta), 0.0))
-                .where(LiveExecution.scope == scope)
-                .scalar()
-            )
+            with self._database.bind_ctx(_MODELS):
+                cash = LiveCash.get_or_none(LiveCash.scope == scope)
+                initial = (
+                    float(cash.initial_capital) if cash is not None else default_initial
+                )
+                sunk = (
+                    LiveExecution.select(
+                        fn.COALESCE(fn.SUM(LiveExecution.cash_delta), 0.0)
+                    )
+                    .where(LiveExecution.scope == scope)
+                    .scalar()
+                )
         except peewee.OperationalError as exc:
             if not _is_missing_table(exc):
                 raise LedgerReadError(str(exc)) from exc
@@ -482,7 +491,8 @@ class SqliteLedger:
 
     def initial_capital_of(self, scope: str) -> float:
         try:
-            cash = LiveCash.get_or_none(LiveCash.scope == scope)
+            with self._database.bind_ctx(_MODELS):
+                cash = LiveCash.get_or_none(LiveCash.scope == scope)
         except peewee.OperationalError as exc:
             if not _is_missing_table(exc):
                 raise LedgerReadError(str(exc)) from exc
