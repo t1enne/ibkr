@@ -57,6 +57,12 @@ _STRATEGY_FIELDS = frozenset(f.name for f in fields(StrategyConfig))
 #: Adapters ``--adapter`` accepts. Phase 2 ships ``ibkr`` read-only.
 _ADAPTERS = ("sim", "ibkr")
 
+#: The exit code for an UNSAFE cycle (see ``CycleReport.is_unsafe``). Distinct
+#: from click's ``1`` (ClickException — config/stale-data/gateway failures) and
+#: ``2`` (UsageError), so cron can tell "the broker may be holding something we
+#: cannot see" apart from "the run could not start".
+_UNSAFE_EXIT_CODE = 3
+
 
 def _stderr_log(message: str) -> None:
     """Route the IBKR edge's diagnostics to stderr, never the report's stdout.
@@ -104,6 +110,15 @@ def live_group() -> None:
     is_flag=True,
     help="Skip the gateway readiness check (trust an externally kept-alive gateway).",
 )
+@click.option(
+    "--allow-unsafe",
+    is_flag=True,
+    help=(
+        "Exit 0 even when the cycle is unsafe (placement/resync error, or an "
+        "unresolved/wedged/timed-out order). For callers that consume the "
+        "report themselves; the default exits non-zero so cron can see it."
+    ),
+)
 def live_run(
     config_path: str,
     dry_run: bool,
@@ -112,6 +127,7 @@ def live_run(
     adapter: str | None,
     allow_live: bool,
     no_gateway: bool,
+    allow_unsafe: bool,
 ) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     cfg = load_live_config(config_path)
@@ -144,6 +160,7 @@ def live_run(
             scope=scope,
             intents=ledger,
             params=exec_params_of(cfg),
+            exposure=ledger,
             dry_run=dry_run,
             log=_stderr_log,
         )
@@ -199,6 +216,13 @@ def live_run(
         raise click.ClickException(str(exc)) from exc
     click.echo(render_report(report, fmt))
     _housekeeping(ledger, dry_run)
+    # The report already prints placement_error/resync_error/the unsafe outcomes,
+    # so the exit code is the machine-readable signal — never a duplicated message.
+    # stdout stays the parseable contract (a JSON document for ``--format json``);
+    # the exit code is out-of-band. Checked AFTER the housekeeping so a prune
+    # failure cannot change the verdict.
+    if not allow_unsafe and report.is_unsafe():
+        raise click.exceptions.Exit(_UNSAFE_EXIT_CODE)
 
 
 async def _run_cycle(

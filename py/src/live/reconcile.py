@@ -86,33 +86,6 @@ def target_side(sig: LiveSignal) -> Side:
     return "flat" if sig.action == "close" else sig.action
 
 
-def size_qty(price: float, portfolio: PortfolioView, config: LiveConfig) -> float:
-    """Shares for an unsized open at *price*, via the shared sizing layer.
-
-    Delegates to ``sized_signal`` so there is ONE sizing rule; equity comes from
-    the shared ``equity_of``, which now accepts the ``PortfolioView`` Protocol.
-    A non-finite price (NaN) or ``<= 0`` sizes to ``0.0`` rather than passing
-    garbage downstream.
-    """
-    if not math.isfinite(price) or price <= 0:
-        return 0.0
-    probe = trade_signal(
-        symbol="",
-        action=ActionType.long,
-        price=price,
-        qty=0.0,
-        ts=_SETTLE_TS,
-    )
-    sized = sized_signal(
-        probe,
-        equity_of(portfolio),
-        portfolio.cash,
-        ref_candle(price, "", _SETTLE_TS),
-        _sizing_params(config),
-    )
-    return sized.qty
-
-
 def reconcile(
     signals: tuple[LiveSignal, ...],
     portfolio: PortfolioView,

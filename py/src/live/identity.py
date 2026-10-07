@@ -208,6 +208,11 @@ class OrderOutcome(Enum):
     #: distinct, LOUD marker so an operator acts instead of reading one more
     #: ``unresolved`` line.
     WEDGED = "wedged"
+    #: An OPEN refused because the account net and the ledger's booked exposure on
+    #: the conid disagree (``FeedError.kind == "divergence"``): a fill we cannot
+    #: see may be live, or our book is ahead of the account. Distinct from a
+    #: broker ``rejected`` and from an order ``unresolved``.
+    DIVERGENCE = "divergence"
 
 
 #: Consecutive resyncs an OPEN record may stay unresolved before it is called

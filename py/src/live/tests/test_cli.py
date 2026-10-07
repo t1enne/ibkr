@@ -18,7 +18,7 @@ import pandas as pd
 import peewee
 import pytest
 import click
-from click.testing import CliRunner
+from click.testing import CliRunner, Result as CliResult
 
 from src.bt import load_strategy
 from src.bt.state import ActionType, ExecutionParams, PortfolioState, Position
@@ -376,6 +376,117 @@ def test_render_report_states_a_resync_error() -> None:
         "message": "open_orders failed",
         "symbol": None,
     }
+
+
+# --- exit code (cron must see an unsafe cycle) -------------------------------
+
+
+def _invoke_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report: CycleReport,
+    *extra: str,
+) -> CliResult:
+    """Run one CLI cycle with a scripted report, returning the CliRunner result."""
+
+    class FakeLedger:
+        def ensure_strategy(self, *a: object, **k: object) -> None: ...
+        def ensure_cash(self, *a: object, **k: object) -> None: ...
+        def prune_closed(self, *a: object, **k: object) -> int:
+            return 0
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        return report
+
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.cli.MockPortfolioSource", lambda p: object())
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    path = write_config(tmp_path, portfolio_path="pf.json")
+    return CliRunner().invoke(live_group, ["run", path, *extra])
+
+
+def _unsafe_result(outcome: OrderOutcome) -> OrderResult:
+    return OrderResult(
+        intent=_intent(),
+        fill=None,
+        ok=False,
+        message="x",
+        outcome=outcome,
+        error_kind=outcome.value,
+    )
+
+
+def test_clean_cycle_exits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = _invoke_run(tmp_path, monkeypatch, _report())
+    assert out.exit_code == 0, out.output
+
+
+def test_placement_error_exits_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = replace(
+        _report(), placement_error=FeedError(kind="transport", message="refused")
+    )
+    out = _invoke_run(tmp_path, monkeypatch, report)
+    assert out.exit_code == 3, out.output
+
+
+def test_resync_error_exits_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = replace(
+        _report(), resync_error=FeedError(kind="transport", message="open_orders")
+    )
+    out = _invoke_run(tmp_path, monkeypatch, report)
+    assert out.exit_code == 3, out.output
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        OrderOutcome.UNRESOLVED,
+        OrderOutcome.WEDGED,
+        OrderOutcome.TIMEOUT,
+        OrderOutcome.DIVERGENCE,
+    ],
+)
+def test_unknown_or_stuck_order_exits_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: OrderOutcome
+) -> None:
+    report = replace(_report(), results=(_unsafe_result(outcome),))
+    out = _invoke_run(tmp_path, monkeypatch, report)
+    assert out.exit_code == 3, out.output
+
+
+def test_json_stdout_stays_parseable_on_an_unsafe_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The JSON document is the stdout contract; the exit code is out-of-band.
+    report = replace(_report(), resync_error=FeedError(kind="transport", message="x"))
+    out = _invoke_run(tmp_path, monkeypatch, report, "--format", "json")
+    assert out.exit_code == 3
+    assert json.loads(out.output)["resync_error"]["kind"] == "transport"
+
+
+def test_allow_unsafe_suppresses_the_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = replace(_report(), results=(_unsafe_result(OrderOutcome.WEDGED),))
+    out = _invoke_run(tmp_path, monkeypatch, report, "--allow-unsafe")
+    assert out.exit_code == 0, out.output
+
+
+def test_is_unsafe_predicate_covers_errors_and_outcomes() -> None:
+    assert not _report().is_unsafe()
+    assert (
+        replace(_report(), results=(_unsafe_result(OrderOutcome.REJECTED),)).is_unsafe()
+        is False
+    )
+    assert replace(
+        _report(), placement_error=FeedError(kind="transport", message="x")
+    ).is_unsafe()
 
 
 # --- dry-run (engine flag, exercised through the CLI's engine call) ---------

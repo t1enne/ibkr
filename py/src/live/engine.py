@@ -18,6 +18,7 @@ import pandas as pd
 from src.bt.state import ActionType, PortfolioState
 from src.data.db import get_connection
 from src.live.broker import LiveBroker, OrderResult
+from src.live.identity import OrderOutcome
 from src.live.portfolio_source import PortfolioSource
 from src.live.reconcile import reconcile
 from src.live.result import Err, Ok, Result
@@ -52,6 +53,40 @@ class CycleReport:
     #: this, a HOLD cycle with no intents reports a clean "0 orders" while every
     #: OPEN intent was never re-checked. ``None`` when resync succeeded.
     resync_error: FeedError | None = None
+
+    def is_unsafe(self) -> bool:
+        """Whether this cycle failed to safely do its job (the exit-code predicate).
+
+        The ONE definition of "unsafe", so the CLI's exit code cannot drift from
+        the report it prints. A cycle is unsafe when placement or resync reported
+        a cohort-level error, or when any order result is in a state that leaves
+        the order's true disposition unknown or stuck:
+
+        - ``UNRESOLVED`` — a submit/confirm left "is it live?" unknown;
+        - ``WEDGED`` — an OPEN record nothing could settle across ``WEDGED_CYCLES``
+          resyncs, which needs an operator;
+        - ``TIMEOUT`` — still working at the deadline; not proven terminal;
+        - ``DIVERGENCE`` — an OPEN refused because the account net and our book
+          disagree on a conid; the account is in a state we cannot explain, so an
+          operator must look even though nothing was placed.
+
+        A clean cycle (``REJECTED``/``UNFILLED`` are terminal and honest, a
+        ``PLACED``/``ADOPTED`` fill is settled) is safe.
+        """
+        if self.placement_error is not None or self.resync_error is not None:
+            return True
+        return any(result.outcome in _UNSAFE_OUTCOMES for result in self.results)
+
+
+#: The order outcomes that mean the cycle did not safely reach a known state.
+_UNSAFE_OUTCOMES: frozenset[OrderOutcome] = frozenset(
+    {
+        OrderOutcome.UNRESOLVED,
+        OrderOutcome.WEDGED,
+        OrderOutcome.TIMEOUT,
+        OrderOutcome.DIVERGENCE,
+    }
+)
 
 
 #: A closed intent record older than this is housekeeping noise; OPEN records

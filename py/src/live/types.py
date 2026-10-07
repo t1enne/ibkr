@@ -143,6 +143,10 @@ FeedKind = Literal[
     "unfilled",
     "timeout",
     "unresolved",
+    #: The account net and the ledger's booked exposure on a conid disagree: a
+    #: fill we cannot see may be live (or our book is ahead of the account). An
+    #: OPEN is refused rather than placed on top of an unexplained position.
+    "divergence",
 ]
 
 #: Every ``FeedError.kind`` a value may carry, derived from the Literal above.

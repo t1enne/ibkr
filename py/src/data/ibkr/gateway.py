@@ -1,9 +1,10 @@
 """Gateway lifecycle: is the Client Portal Gateway up, authenticated, and alive?
 
-This is the live adapter for the `Gateway` port (``src/live/ports.py``). It wraps
-an :class:`~src.data.ibkr.client.IbkrClient` and answers two questions with typed
-values, never exceptions: *may I read the book right now?* (``is_ready``) and
-*make it so, or tell me why not* (``ensure_ready``).
+This is the CLI's readiness/keepalive adapter, used directly by ``ibkr live
+run`` (``src/live/cli.py``). It wraps an :class:`~src.data.ibkr.client.IbkrClient`
+and answers two questions with typed values, never exceptions: *may I read the
+book right now?* (``is_ready``) and *make it so, or tell me why not*
+(``ensure_ready``).
 
 ``ensure_ready`` performs the session check + keepalive: a ``GET /tickle`` keeps
 the session from idling out, and ``/iserver/auth/status`` decides readiness. It
@@ -33,7 +34,7 @@ def _authenticated(status: dict[str, Any]) -> bool:
 
 
 class IbkrGateway:
-    """``Gateway`` adapter: readiness probe + keepalive over one ``IbkrClient``."""
+    """Readiness probe + keepalive over one ``IbkrClient``."""
 
     def __init__(self, client: IbkrClient | None = None) -> None:
         self._client = client if client is not None else IbkrClient()

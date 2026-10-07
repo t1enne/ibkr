@@ -86,6 +86,8 @@ from src.live.identity import (
     ref_matches_key,
     ref_prefix,
 )
+from src.live.ledger_base import LedgerReadError
+from src.live.ports import BookExposure
 from src.live.result import Err, Ok, Result
 from src.live.types import FeedError, OrderIntent, PortfolioView, feed_error
 
@@ -107,6 +109,14 @@ _FLAT_EPS = 1e-9
 #: fill. A material over-deployment (an explicit-qty strategy, or a stale intent)
 #: still trips it.
 _OPEN_CASH_TOLERANCE = 0.02
+
+#: Slack allowed between the account net and the ledger's booked net on a conid
+#: before an OPEN is refused as a divergence. Our book and the account derive from
+#: the SAME fill quantities, so a true mismatch is at least a whole (or a
+#: fractional) share; only binary-float representation differs. This is a shares
+#: tolerance, kept tiny so a single unbooked share — the duplicate-open danger —
+#: cannot hide under it.
+_EXPOSURE_TOLERANCE = 1e-6
 
 ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
@@ -196,6 +206,7 @@ class IbkrBroker:
         intents: PendingIntents,
         params: ExecutionParams,
         account: str | None = None,
+        exposure: BookExposure | None = None,
         dry_run: bool = False,
         conid_lookup: ConidLookup | None = None,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
@@ -210,6 +221,7 @@ class IbkrBroker:
         self._intents = intents
         self._params = params
         self._account = account
+        self._exposure = exposure
         self._dry_run = dry_run
         self._conid_lookup = (
             conid_lookup if conid_lookup is not None else _default_conid_lookup
@@ -498,7 +510,8 @@ class IbkrBroker:
         shared account can never flip a smaller foreign net into an open. An
         unreadable net still fails closed. An OPEN is bounded by the decision-time
         ``cash_bound`` applied to the whole-share quantity the ticket will carry
-        (never the pre-round request, which could round up past the bound).
+        (never the pre-round request, which could round up past the bound), then
+        cross-checked against the account net (:meth:`_open_exposure_guard`).
         """
         if intent.action is ActionType.close:
             return await self._close_guard(intent, side, conid)
@@ -506,7 +519,84 @@ class IbkrBroker:
             whole = whole_quantity(intent)
         except OrderMappingError as exc:
             return feed_error("rejected", f"{intent.symbol}: {exc}", intent.symbol)
-        return self._open_cash_guard(intent, whole)
+        # The cash bound is LOCAL (no I/O): check it first so an intent that
+        # cannot even state its funding is refused without an account round trip.
+        refused = self._open_cash_guard(intent, whole)
+        if refused is not None:
+            return refused
+        return await self._open_exposure_guard(intent, conid)
+
+    async def _open_exposure_guard(
+        self, intent: OrderIntent, conid: int
+    ) -> FeedError | None:
+        """Refuse an open whose conid the account holds but our book cannot explain.
+
+        An OPEN routes to a fresh cOID whenever the predecessor's record is
+        terminal or pruned (see :meth:`_resolve`), so IBKR's own dedupe never
+        blocks a re-send. The only thing stopping a second full-size open is our
+        book, and the book is derived from the SAME lagging executions feed a
+        missed fill would hide in. So before opening we compare two independent
+        reads of the same conid:
+
+        - the ACCOUNT net (``positions_all`` — the broker's truth);
+        - the BOOKED net the ledger can account for (``BookExposure.net_exposure``,
+          summed over ALL scopes sharing this book — our durable rows).
+
+        They derive from the same fills, so in steady state they are equal. A
+        divergence beyond ``_EXPOSURE_TOLERANCE`` means one of two things, both
+        unsafe to open on: the account holds a fill we never booked (a live order
+        we cannot see), or our book is ahead of the account (a phantom lot).
+        Either way we REFUSE — this is a divergence check, NOT a cap: a legitimate
+        open is allowed precisely when the account net matches what every scope
+        books, so another scope holding the symbol is accounted for rather than
+        blocked.
+
+        This fires on a shared account where a human trades the same conid: that
+        is an unexplained net that is nobody's scope, EXACTLY the case to refuse
+        on until an operator reconciles it. Pending/open intent records are read
+        as part of the book (they are our rows) but are never credited as a
+        numeric excuse for a surplus — a fill in flight for a pending intent IS
+        the lag this guard exists to catch.
+
+        Fails CLOSED, like the rest of the edge: no oracle, an unreadable account
+        net, or an unreadable book all refuse the open. The refusal carries the
+        distinct ``divergence`` kind so an operator can tell it apart from a
+        broker ``rejected``/``unresolved``.
+        """
+        if self._exposure is None:
+            return feed_error(
+                "divergence",
+                f"refused open {intent.symbol} (conid {conid}): no exposure oracle, "
+                f"cannot cross-check the account against the book",
+                intent.symbol,
+            )
+        net = await self._account_net(conid)
+        if net is None:
+            return feed_error(
+                "divergence",
+                f"refused open {intent.symbol} (conid {conid}): account net "
+                f"unreadable, cannot prove the conid is flat in the account",
+                intent.symbol,
+            )
+        try:
+            booked = self._exposure.net_exposure(conid)
+        except LedgerReadError as exc:
+            return feed_error(
+                "divergence",
+                f"refused open {intent.symbol} (conid {conid}): booked exposure "
+                f"unreadable ({exc}), cannot cross-check the account",
+                intent.symbol,
+            )
+        if abs(net - booked) > _EXPOSURE_TOLERANCE:
+            return feed_error(
+                "divergence",
+                f"refused open {intent.symbol} (conid {conid}): account net {net:g} "
+                f"disagrees with the booked net {booked:g} across scopes (tol "
+                f"{_EXPOSURE_TOLERANCE:g}) — a fill we cannot see may be live, or "
+                f"our book is ahead of the account",
+                intent.symbol,
+            )
+        return None
 
     async def _close_guard(
         self, intent: OrderIntent, side: OrderSide, conid: int
@@ -1294,6 +1384,9 @@ def _outcome_for_kind(kind: str) -> OrderOutcome:
         "transport": OrderOutcome.UNRESOLVED,
         "auth": OrderOutcome.UNRESOLVED,
         "rate_limit": OrderOutcome.UNRESOLVED,
+        # A deliberate refusal on an unexplained account net — its own outcome, so
+        # it is neither a broker rejection nor an unresolved order.
+        "divergence": OrderOutcome.DIVERGENCE,
     }.get(kind, OrderOutcome.UNRESOLVED)
 
 

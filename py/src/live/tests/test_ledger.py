@@ -213,6 +213,24 @@ def test_scopes_do_not_leak(ledger: SqliteLedger) -> None:
     assert {r.conid for r in ledger.load_book("beta").rows} == {2}
 
 
+def test_net_exposure_sums_every_scope_on_a_conid(ledger: SqliteLedger) -> None:
+    # The OPEN cross-check needs the net ACROSS scopes: one long scope and one
+    # short scope on the same conid net together, matching what a shared account
+    # would show. An untouched conid is flat.
+    long_ex = _exec("e1", scope="alpha", conid=7, side=OrderSide.BUY, qty=10.0)
+    short_ex = _exec("e2", scope="beta", conid=7, side=OrderSide.SELL, qty=4.0)
+    abook, _ = reconcile("alpha", (long_ex,), StrategyBook())
+    bbook, _ = reconcile("beta", (short_ex,), StrategyBook())
+    ledger.save_book("alpha", abook, (long_ex,), 1000.0)
+    ledger.save_book("beta", bbook, (short_ex,), 1000.0)
+    assert ledger.net_exposure(7) == 6.0
+    assert ledger.net_exposure(999) == 0.0
+
+
+def test_net_exposure_on_an_unwritten_db_is_flat(tmp_path: Path) -> None:
+    assert SqliteLedger(tmp_path / "l.sqlite").net_exposure(1) == 0.0
+
+
 def test_two_ledgers_on_two_paths_do_not_retarget_each_other(tmp_path: Path) -> None:
     # peewee binds a model at CLASS level, so a single module-global database let a
     # second SqliteLedger silently retarget the first's connection (writes landing

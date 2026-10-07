@@ -37,6 +37,7 @@ from src.live.identity import (
     order_ref,
 )
 from src.live.result import Err, Ok, Result
+from src.live.ports import BookExposure
 from src.live.types import FeedError, OrderIntent
 
 BASE = "https://localhost:5000/v1/api/"
@@ -79,13 +80,16 @@ def _captured_working_order(ref: str, order_id: str = ORDER_ID) -> dict[str, obj
 
 @pytest.fixture(autouse=True)
 def _default_empty_executions():
-    """Default: the executions window is empty.
+    """Defaults for the two reads a bare ``place`` makes.
 
-    ``place`` sweeps the executions channel before minting when the durable store
-    cannot vouch for the predecessor; an empty read means no lost predecessor, so
-    most tests proceed to submit. A sweep-specific test overrides this route.
+    The executions window is empty: ``place`` sweeps it before minting when the
+    durable store cannot vouch for the predecessor, so an empty read means no
+    lost predecessor and most tests proceed to submit. The account is FLAT: the
+    OPEN exposure cross-check sees no unexplained net. A test that needs a
+    position re-mocks the same ``POSITIONS`` route (respx overrides it in place).
     """
     respx.get(TRADES).mock(return_value=httpx.Response(200, json={"trades": []}))
+    respx.get(POSITIONS).mock(return_value=httpx.Response(200, json=[]))
     yield
 
 
@@ -102,6 +106,16 @@ def _mock_long_position() -> None:
             json=[{"conid": 265598, "contractDesc": "AAPL", "position": 1}],
         )
     )
+
+
+class FakeExposure:
+    """A ``BookExposure`` with a fixed net on every conid (default: flat)."""
+
+    def __init__(self, net: float = 0.0) -> None:
+        self._net = net
+
+    def net_exposure(self, conid: int) -> float:
+        return self._net
 
 
 async def _conid(_ticker: str) -> int:
@@ -183,6 +197,7 @@ def _broker(
     now: Callable[[], pd.Timestamp] | None = None,
     log: Callable[[str], None] | None = None,
     intents: PendingIntents | None = None,
+    exposure: BookExposure | None = None,
     params: ExecutionParams | None = None,
 ) -> IbkrBroker:
     return IbkrBroker(
@@ -191,6 +206,7 @@ def _broker(
         intents=intents if intents is not None else FakeIntents(),
         params=params if params is not None else _FLAT_PARAMS,
         account=ACCOUNT,
+        exposure=exposure if exposure is not None else FakeExposure(),
         dry_run=dry_run,
         conid_lookup=_conid,
         poll_interval_s=0.0,
@@ -886,6 +902,93 @@ async def test_open_deploying_the_full_cash_bound_is_allowed() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_open_diverging_from_the_account_net_is_refused() -> None:
+    """B: a lagged executions feed leaves an account net our book cannot explain.
+
+    The account holds 1 AAPL but the ledger books a flat conid, so a fill we
+    cannot see may be live — a second full-size open would double it. Refused
+    with the distinct ``divergence`` kind, before any submit.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200, json=[{"conid": CONID, "contractDesc": "AAPL", "position": 1}]
+        )
+    )
+    error = _failure(await _broker().place(_open_intent()))
+    assert error.kind == "divergence"
+    assert submit.call_count == 0  # never sent
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_refused_when_our_book_is_ahead_of_the_account() -> None:
+    """B inverse: a phantom lot (book ahead of the account) is refused too."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    broker = _broker(exposure=FakeExposure(5.0))  # book long 5
+    error = _failure(await broker.place(_open_intent()))  # account flat
+    assert error.kind == "divergence"
+    assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_allowed_when_account_matches_the_booked_exposure() -> None:
+    """B positive control: a shared book that MATCHES the account is not blocked."""
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200, json=[{"conid": CONID, "contractDesc": "AAPL", "position": 5}]
+        )
+    )
+    broker = _broker(exposure=FakeExposure(5.0))  # another scope books the 5
+    placed = _ok(await broker.place(_open_intent()))
+    assert placed.ok
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_fails_closed_when_the_account_net_is_unreadable() -> None:
+    """B: an unreadable account read refuses the open, consistent with the edge."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(POSITIONS).mock(return_value=httpx.Response(500))
+    error = _failure(await _broker().place(_open_intent()))
+    assert error.kind == "divergence"
+    assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_fails_closed_without_an_exposure_oracle() -> None:
+    """B: no way to see the book is not a licence to open — refuse (fail closed)."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    broker = IbkrBroker(
+        IbkrClient(base_url=BASE, account=ACCOUNT),
+        scope=SCOPE,
+        intents=FakeIntents(),
+        params=_FLAT_PARAMS,
+        account=ACCOUNT,
+        conid_lookup=_conid,
+    )
+    error = _failure(await broker.place(_open_intent()))
+    assert error.kind == "divergence"
+    assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_close_without_its_lot_is_an_error_not_a_skip() -> None:
     broker = _broker()
     broker.seed(_book({}))  # the replayed book holds no such lot
@@ -1096,7 +1199,7 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
     _mock_long_position()
     _mock_no_working_orders()
-    broker = _broker()
+    broker = _broker(exposure=FakeExposure(1.0))
     broker.seed(_long_lot("555000111"))
     close_intent = OrderIntent(
         symbol="AAPL",

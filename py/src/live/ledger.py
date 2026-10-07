@@ -18,6 +18,12 @@ previous raw ``CREATE TABLE`` SQL column-for-column, so an existing phase-3.5
 book rows read back unchanged (``create_tables`` is ``IF NOT EXISTS`` and skips
 already-present matching tables). DDL stays lazy: ``create_tables`` runs only
 inside a WRITE path, never at import, never for a read/``--dry-run``.
+
+``SqliteLedger`` is the seam implementing the live Protocols; its per-domain
+methods live in their own mixins (``ledger_sim``, and the stores below) so each
+class stays small. Shared plumbing (the template binding, the base model, the
+epoch codec) is in ``ledger_base``; the lossless migrations are in
+``ledger_migration``. Every public method keeps its name and signature.
 """
 
 from __future__ import annotations
@@ -36,7 +42,6 @@ from peewee import (
     CompositeKey,
     FloatField,
     IntegerField,
-    Model,
     SqliteDatabase,
     TextField,
     fn,
@@ -59,44 +64,18 @@ from src.live.identity import (
     order_ref,
 )
 from src.live.lease import file_lease
-
-#: Template binding only: the model CLASSES are defined against this placeholder.
-#: Each ``SqliteLedger`` rebinds them (via ``bind_ctx``) to its OWN
-#: ``SqliteDatabase`` for every operation, so two ledgers on two paths never share
-#: a connection or retarget each other — peewee binds a model at CLASS level, so a
-#: single module-global database cannot serve two live instances.
-_TEMPLATE_DB = SqliteDatabase(None)
+from src.live.ledger_base import (
+    _Base,
+    _is_missing_table,
+    _ms,
+    _SqliteOps,
+    _ts,
+    LedgerReadError,
+)
+from src.live.ledger_migration import _restore_intents, migrate
+from src.live.ledger_sim import LiveSimLot, SimLotBook
 
 logger = logging.getLogger(__name__)
-
-#: Where a pre-conid ``live_position`` is preserved instead of dropped by migration.
-#: A name, not a schema: the rows kept here are the legacy table verbatim.
-_LEGACY_POSITION_TABLE = "live_position_legacy"
-
-
-class LedgerReadError(RuntimeError):
-    """A durable read failed for a reason OTHER than the table being absent.
-
-    Only a genuinely missing table (the ``--dry-run`` case) means "unwritten";
-    a lock, a corrupt image or a shape-drifted column must fail loudly, never be
-    reported as an empty book — an empty book reads downstream as "flat" and
-    re-opens everything.
-    """
-
-
-def _is_missing_table(error: peewee.OperationalError) -> bool:
-    """Whether *error* is the genuine ``no such table`` (dry-run) case.
-
-    peewee wraps every ``sqlite3.OperationalError`` (a lock, a bad column, a
-    missing table) as the same ``peewee.OperationalError`` type, so the message
-    is the only discriminator left.
-    """
-    return "no such table" in str(error)
-
-
-class _Base(Model):
-    class Meta:
-        database = _TEMPLATE_DB
 
 
 class LiveStrategy(_Base):
@@ -156,16 +135,6 @@ class LiveCash(_Base):
         table_name = "live_cash"
 
 
-class LiveSimLot(_Base):
-    scope = TextField()
-    position_id = TextField()
-    closed_at = IntegerField(null=True)
-
-    class Meta:
-        table_name = "live_sim_lot"
-        primary_key = CompositeKey("scope", "position_id")
-
-
 class LiveOrderIntent(_Base):
     """The durable owner of OPEN order state, keyed by the IDENTITY columns.
 
@@ -211,313 +180,9 @@ _CLOSED_INTENTS = [
     IntentState.REJECTED.value,
 ]
 
-# Timestamps round-trip through INTEGER epoch milliseconds — the same clock the
-# candle table uses, so a book row and a bar are comparable without a tz step.
-_MS = 1000
 
-
-def _table_exists(db: SqliteDatabase, name: str) -> bool:
-    """Whether *name* is a table in *db*."""
-    return bool(
-        db.execute_sql(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-        ).fetchall()
-    )
-
-
-def _table_columns(db: SqliteDatabase, name: str) -> set[str]:
-    """The column names of *name* in *db* (empty when the table does not exist)."""
-    return {str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})")}
-
-
-def _free_legacy_name(db: SqliteDatabase) -> str:
-    """A table name to keep a legacy ``live_position`` under, never overwriting one.
-
-    The canonical copy is ``live_position_legacy``; if that already exists (a
-    legacy-shaped ``live_position`` re-created after a prior migration), a fresh
-    ``live_position_legacy_<n>`` is chosen so EVERY copy is kept — a rename,
-    never a drop, so no row is ever lost.
-    """
-    if not _table_exists(db, _LEGACY_POSITION_TABLE):
-        return _LEGACY_POSITION_TABLE
-    n = 1
-    while _table_exists(db, f"{_LEGACY_POSITION_TABLE}_{n}"):
-        n += 1
-    return f"{_LEGACY_POSITION_TABLE}_{n}"
-
-
-def _preserve_legacy_positions(db: SqliteDatabase) -> None:
-    """Preserve a pre-conid ``live_position`` under a kept copy and warn.
-
-    A pre-4.1 ``live_position`` cannot be read into the conid-keyed book, but
-    dropping it would erase durable position state the rolling trades window
-    cannot rebuild. RENAME it to a kept copy (a fresh name when one is already
-    kept, so a re-created table is preserved too) instead of dropping, naming any
-    still-open rows loudly: until an operator reconciles them, the strategy reads
-    the symbol as flat and could open again on top of a live position.
-    """
-    columns = _table_columns(db, "live_position")
-    target = _free_legacy_name(db)
-    sql = "SELECT symbol, side, qty FROM live_position"
-    for symbol, side, qty in db.execute_sql(
-        sql + (" WHERE status = 'open'" if "status" in columns else "")
-    ).fetchall():
-        logger.warning(
-            "preserved legacy live_position open row %s %s qty=%s: the "
-            "conid-keyed book cannot reproduce it — reconcile it from %s before "
-            "trading, or the open may be doubled",
-            symbol,
-            side,
-            qty,
-            target,
-        )
-    db.execute_sql(f"ALTER TABLE live_position RENAME TO {target}")
-
-
-def _rekey_sim_lots(db: SqliteDatabase) -> None:
-    """Re-key legacy ``live_sim_lot`` rows from the config hash to the scope.
-
-    Pre-4.1 sim ownership was keyed by ``strategy_id`` (the config hash), so a
-    parameter edit orphaned every opened lot; ownership is the scope. The column
-    is renamed in place (SQLite rewrites the composite PK) and backfilled through
-    the ``live_strategy`` audit link (``strategy_id`` -> ``scope``). A row with
-    no link keeps an empty scope — PRESERVED, never dropped.
-    """
-    if not _table_exists(db, "live_sim_lot"):
-        return
-    columns = _table_columns(db, "live_sim_lot")
-    if "scope" in columns or "strategy_id" not in columns:
-        return
-    db.execute_sql("ALTER TABLE live_sim_lot RENAME COLUMN strategy_id TO scope")
-    if _table_exists(db, "live_strategy"):
-        db.execute_sql(
-            "UPDATE live_sim_lot SET scope = (SELECT s.scope FROM live_strategy s "
-            "WHERE s.strategy_id = live_sim_lot.scope) "
-            "WHERE scope IN (SELECT strategy_id FROM live_strategy)"
-        )
-
-
-def _primary_key_columns(db: SqliteDatabase, name: str) -> set[str]:
-    """The primary-key column names of *name* (from ``PRAGMA table_info``)."""
-    return {
-        str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})") if row[5]
-    }
-
-
-_LEGACY_INTENT_TABLE = "live_order_intent_legacy"
-
-
-def _free_intent_legacy_name(db: SqliteDatabase) -> str:
-    """A kept table name for a legacy ``live_order_intent``, never overwriting one."""
-    if not _table_exists(db, _LEGACY_INTENT_TABLE):
-        return _LEGACY_INTENT_TABLE
-    n = 1
-    while _table_exists(db, f"{_LEGACY_INTENT_TABLE}_{n}"):
-        n += 1
-    return f"{_LEGACY_INTENT_TABLE}_{n}"
-
-
-def _rekey_order_intents(db: SqliteDatabase) -> str | None:
-    """Rename a legacy ``(scope, token)`` intent table to a kept copy, or ``None``.
-
-    Also normalises any NULL ``position_id`` to ``''`` in the legacy copy (so it
-    survives reading as an open). No-op when the table is already keyed by the
-    identity columns, or absent. RENAME, never drop.
-    """
-    if not _table_exists(db, "live_order_intent"):
-        return None
-    if _primary_key_columns(db, "live_order_intent") == {
-        "scope",
-        "symbol",
-        "action",
-        "position_id",
-    }:
-        return None
-    legacy = _free_intent_legacy_name(db)
-    db.execute_sql("ALTER TABLE live_order_intent RENAME TO " + legacy)
-    db.execute_sql(f"UPDATE {legacy} SET position_id = '' WHERE position_id IS NULL")
-    return legacy
-
-
-def _add_intent_columns(db: SqliteDatabase) -> None:
-    """Add the post-4.1 intent columns to an EXISTING identity-keyed table.
-
-    Additive only (``ALTER ... ADD COLUMN``), never a drop, so a live table keeps
-    its rows. No-op when the table is absent or still the legacy
-    ``(scope, token)`` shape (that one is re-keyed rather than altered).
-    """
-    if not _table_exists(db, "live_order_intent"):
-        return
-    columns = _table_columns(db, "live_order_intent")
-    if not {"scope", "symbol", "action", "position_id"} <= columns:
-        return
-    if "tif" not in columns:
-        db.execute_sql(
-            "ALTER TABLE live_order_intent ADD COLUMN tif TEXT NOT NULL DEFAULT 'DAY'"
-        )
-    if "stuck_cycles" not in columns:
-        db.execute_sql(
-            "ALTER TABLE live_order_intent ADD COLUMN stuck_cycles INTEGER NOT NULL "
-            "DEFAULT 0"
-        )
-
-
-def _restore_intents(db: SqliteDatabase, legacy: str) -> None:
-    """Copy re-keyed legacy intent rows into the fresh identity-keyed table.
-
-    Runs after ``create_tables`` rebuilt ``live_order_intent``. Every legacy row
-    is copied (a rename+copy, never a drop); ``OR IGNORE`` guards the (already
-    handled) token-collision case where two identities would otherwise collide on
-    the identity PK. A legacy table whose columns do not match the expected shape
-    is left intact rather than raising on the first write of every cycle — its
-    rows stay preserved under the kept copy.
-    """
-    required = {
-        "scope",
-        "token",
-        "symbol",
-        "action",
-        "position_id",
-        "state",
-        "attempt",
-        "order_ref",
-        "order_id",
-        "decision_ts",
-        "updated_at",
-    }
-    columns = _table_columns(db, legacy)
-    if not required <= columns:
-        logger.warning(
-            "legacy intent table %s has an unexpected shape (%s); rows preserved "
-            "in place, not restored",
-            legacy,
-            sorted(columns),
-        )
-        return
-    db.execute_sql(
-        f"INSERT OR IGNORE INTO live_order_intent "
-        f"(scope, token, symbol, action, position_id, state, attempt, order_ref, "
-        f"order_id, decision_ts, tif, stuck_cycles, updated_at) "
-        f"SELECT scope, token, symbol, action, COALESCE(position_id, ''), state, "
-        f"attempt, order_ref, order_id, decision_ts, 'DAY', 0, updated_at "
-        f"FROM {legacy}"
-    )
-
-
-def config_hash(config: Mapping[str, object]) -> str:
-    """Pure: sha256 of canonical JSON (sorted keys, no whitespace) -> hex.
-
-    An AUDIT key only (which config revision placed what) — never an ownership
-    filter, because a parameter edit would then orphan a live lot (§4).
-    """
-    payload = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _cash_delta(execution: Execution) -> float:
-    """Signed cash flow of one execution: a SELL credits, a BUY debits (net of fee)."""
-    gross = execution.qty * execution.price
-    if execution.side is OrderSide.SELL:
-        return gross - execution.commission
-    return -(gross + execution.commission)
-
-
-#: Public name for the cash-flow helper (used by the IBKR portfolio source).
-execution_cash_delta = _cash_delta
-
-
-class SqliteLedger:
-    """peewee-backed per-scope book. One database per ledger, bound on init.
-
-    Construction writes NOTHING (no DDL): a ``--dry-run`` that only reads must
-    leave the schema untouched. The schema is created lazily on the first
-    write; reads of a missing table return an empty book.
-    """
-
-    def __init__(self, db_path: str | Path | None = None) -> None:
-        self._db_path = db_path
-        self._schema_ready = False
-        path = str(db_path) if db_path is not None else str(_DEFAULT_DB_PATH)
-        self._database = SqliteDatabase(path)
-
-    # -- lazy DDL / migration ---------------------------------------------
-
-    def _ready_schema(self) -> None:
-        """Create the live tables exactly once, on the first WRITE only.
-
-        The migration + DDL run in ONE ``BEGIN IMMEDIATE`` transaction. That takes
-        the SQLite write lock up front, so two processes racing the first
-        migration (the overlap the cycle lease guards against) are SERIALIZED: the
-        second blocks until the first commits, re-reads the migrated schema and is
-        a no-op. There is no check-then-act window, so neither a ``no such table``
-        nor a double-drop race is reachable. It is deliberately NOT wrapped in the
-        cycle lease — ``ensure_strategy``/``ensure_cash`` write before ``run_cycle``
-        takes the lease, and re-taking it here would deadlock a cycle already
-        holding it. What this does NOT do: it does not serialize those later
-        idempotent writes against a live cycle; each is its own atomic write, and
-        the lease remains the cross-process guard for placement.
-        """
-        if self._schema_ready:
-            return
-        with self._database.atomic(lock_type="IMMEDIATE"):
-            legacy_intents = self._migrate()
-            self._database.create_tables(_MODELS)
-            if legacy_intents is not None:
-                _restore_intents(self._database, legacy_intents)
-        self._schema_ready = True
-
-    def _migrate(self) -> str | None:
-        """Preserve a pre-4.1 position table, ALTER ``live_strategy`` and re-key the
-        legacy ``(scope, token)`` intent table to the identity columns.
-
-        The old ``live_position`` (PK ``(strategy_id, position_id)``) cannot
-        express a ``(scope, conid)`` row, so it is renamed to a kept copy and
-        warned about — never dropped, which would erase durable position state
-        the rolling trades window cannot rebuild. ``live_strategy`` gains
-        ``scope`` via ALTER so the audit rows survive. ``live_sim_lot`` is
-        re-keyed from the config hash to the scope (rows preserved).
-
-        An e362843 ``live_order_intent`` (PK ``(scope, token)``) is RENAMED to a
-        kept copy, never dropped, so a crc32 token collision can no longer alias
-        two identities once the re-keyed table is rebuilt and its rows restored.
-        Returns the legacy table name for the post-create copy.
-        """
-        db = self._database
-        if _table_exists(db, "live_position") and "conid" not in _table_columns(
-            db, "live_position"
-        ):
-            _preserve_legacy_positions(db)
-        if _table_exists(db, "live_strategy") and "scope" not in _table_columns(
-            db, "live_strategy"
-        ):
-            db.execute_sql(
-                "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
-            )
-        _rekey_sim_lots(db)
-        legacy = _rekey_order_intents(db)
-        _add_intent_columns(db)
-        return legacy
-
-    @contextmanager
-    def _write(self) -> Iterator[None]:
-        """A write: models bound to this ledger's db, lazy DDL once, then atomic."""
-        with self._database.bind_ctx(_MODELS):
-            self._ready_schema()
-            with self._database.atomic():
-                yield
-
-    def cycle_lease(self) -> AbstractContextManager[None]:
-        """Exclusive cross-process lease on this ledger's DB for a full cycle.
-
-        Held for the cycle's duration so a cron overlap or a racing human run
-        REFUSES to start rather than both placing off the same pre-order book.
-        The kernel drops the flock on process exit, so a crashed run never
-        wedges live trading; there is no TTL.
-        """
-        path = self._db_path if self._db_path is not None else _DEFAULT_DB_PATH
-        return file_lease(f"{path}.cycle.lock")
-
-    # -- audit / metadata --------------------------------------------------
+class MetadataStore(_SqliteOps):
+    """Ledger mixin: the audit/metadata tables (``live_strategy``/``live_cash``)."""
 
     def ensure_strategy(
         self, strategy_id: str, scope: str, name: str, mode: str
@@ -574,48 +239,9 @@ class SqliteLedger:
                 LiveStrategy.strategy_id == strategy_id
             ).execute()
 
-    # -- sim/mock lot ownership (position_id keyed) ------------------------
-    #
-    # The per-scope book above is conid-keyed because IBKR names lots by conid.
-    # The sim/mock path has no conid: its broker mints a synthetic ``position_id``
-    # (``SYM_{ts}_{seq}``) and the mock fixture may hold lots the strategy never
-    # opened. Ownership is recorded here so a sim close can only target a lot the
-    # strategy OPENED (``owned`` in ``reconcile``); a fixture lot never opened is
-    # left alone. Keyed by ``scope`` — a STABLE identity — so a config edit does
-    # not orphan every previously opened lot.
 
-    def record_sim_open(self, scope: str, position_id: str) -> None:
-        """Record a sim lot the strategy just opened (resurrects a closed one)."""
-        with self._write():
-            LiveSimLot.insert(
-                scope=scope, position_id=position_id, closed_at=None
-            ).on_conflict("REPLACE").execute()
-
-    def mark_sim_closed(
-        self, scope: str, position_id: str, closed_at: pd.Timestamp
-    ) -> None:
-        """Stamp a sim lot closed; an unknown id is a no-op."""
-        with self._write():
-            LiveSimLot.update(closed_at=_ms(closed_at)).where(
-                (LiveSimLot.scope == scope) & (LiveSimLot.position_id == position_id)
-            ).execute()
-
-    def sim_open_ids(self, scope: str) -> frozenset[str]:
-        """The sim lot ids this scope currently owns (empty if unwritten)."""
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
-                    LiveSimLot.select(LiveSimLot.position_id)
-                    .where((LiveSimLot.scope == scope) & LiveSimLot.closed_at.is_null())
-                    .execute()
-                )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return frozenset()
-        return frozenset(cast("str", r.position_id) for r in rows)
-
-    # -- book --------------------------------------------------------------
+class BookStore(_SqliteOps):
+    """Ledger mixin: the conid-keyed book, its executions and its cash seed."""
 
     def load_book(self, scope: str) -> StrategyBook:
         """The durable rows + applied execution ids for *scope* (empty if unaware)."""
@@ -732,14 +358,42 @@ class SqliteLedger:
                 .execute()
             )
 
-    # -- pending order intents (PendingIntents) ----------------------------
-    #
-    # The durable owner of OPEN order state. Reads tolerate a missing table
-    # (empty), like ``load_book``; writes create it lazily. The identity columns
-    # (scope/symbol/action/position_id) are the primary key, so two intents whose
-    # crc32 tokens collide stay separately addressable by IDENTITY. NOTE: that is
-    # a ROW-level guarantee only — the broker still attributes a working order by
-    # the token-keyed ref prefix, so two colliding keys share a prefix there.
+    def net_exposure(self, conid: int) -> float:
+        """Signed net quantity the book holds on *conid*, summed over ALL scopes.
+
+        Long rows add, short rows subtract, so the result is the net a broker
+        account would show if every booked fill were the whole story. A missing
+        table reads as a flat (0.0) book — the dry-run case; a genuine read
+        failure still raises (:class:`LedgerReadError`), never a silent zero.
+        """
+        try:
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LivePosition.select(LivePosition.side, LivePosition.qty)
+                    .where(
+                        (LivePosition.conid == conid) & LivePosition.closed_at.is_null()
+                    )
+                    .execute()
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return 0.0
+        return sum(
+            float(row.qty) if row.side == "long" else -float(row.qty) for row in rows
+        )
+
+
+class IntentStore(_SqliteOps):
+    """Ledger mixin: the durable owner of OPEN order state (``PendingIntents``).
+
+    Reads tolerate a missing table (empty), like ``load_book``; writes create it
+    lazily. The identity columns (scope/symbol/action/position_id) are the primary
+    key, so two intents whose crc32 tokens collide stay separately addressable by
+    IDENTITY. NOTE: that is a ROW-level guarantee only — the broker still
+    attributes a working order by the token-keyed ref prefix, so two colliding
+    keys share a prefix there.
+    """
 
     def load(self, key: IntentKey) -> IntentRecord | None:
         """The durable record for *key*, or ``None`` when unwritten."""
@@ -850,21 +504,86 @@ class SqliteLedger:
             )
 
 
-def _ms(ts: pd.Timestamp) -> int:
-    """Epoch-milliseconds of *ts*.
+class SqliteLedger(MetadataStore, BookStore, IntentStore, SimLotBook):
+    """peewee-backed per-scope book. One database per ledger, bound on init.
 
-    A tz-naive input is read as LOCAL time, so the stored integer is the absolute
-    instant; :func:`_ts` reads it back tagged UTC. The round trip preserves the
-    absolute time, not the tz label (display tz differs, the instant does not).
+    Construction writes NOTHING (no DDL): a ``--dry-run`` that only reads must
+    leave the schema untouched. The schema is created lazily on the first
+    write; reads of a missing table return an empty book.
     """
-    return int(ts.timestamp() * _MS)
+
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        self._db_path = db_path
+        self._schema_ready = False
+        path = str(db_path) if db_path is not None else str(_DEFAULT_DB_PATH)
+        self._database = SqliteDatabase(path)
+
+    # -- lazy DDL / migration ---------------------------------------------
+
+    def _ready_schema(self) -> None:
+        """Create the live tables exactly once, on the first WRITE only.
+
+        The migration + DDL run in ONE ``BEGIN IMMEDIATE`` transaction. That takes
+        the SQLite write lock up front, so two processes racing the first
+        migration (the overlap the cycle lease guards against) are SERIALIZED: the
+        second blocks until the first commits, re-reads the migrated schema and is
+        a no-op. There is no check-then-act window, so neither a ``no such table``
+        nor a double-drop race is reachable. It is deliberately NOT wrapped in the
+        cycle lease — ``ensure_strategy``/``ensure_cash`` write before ``run_cycle``
+        takes the lease, and re-taking it here would deadlock a cycle already
+        holding it. What this does NOT do: it does not serialize those later
+        idempotent writes against a live cycle; each is its own atomic write, and
+        the lease remains the cross-process guard for placement.
+        """
+        if self._schema_ready:
+            return
+        with self._database.atomic(lock_type="IMMEDIATE"):
+            legacy_intents = migrate(self._database)
+            self._database.create_tables(_MODELS)
+            if legacy_intents is not None:
+                _restore_intents(self._database, legacy_intents)
+        self._schema_ready = True
+
+    @contextmanager
+    def _write(self) -> Iterator[None]:
+        """A write: models bound to this ledger's db, lazy DDL once, then atomic."""
+        with self._database.bind_ctx(_MODELS):
+            self._ready_schema()
+            with self._database.atomic():
+                yield
+
+    def cycle_lease(self) -> AbstractContextManager[None]:
+        """Exclusive cross-process lease on this ledger's DB for a full cycle.
+
+        Held for the cycle's duration so a cron overlap or a racing human run
+        REFUSES to start rather than both placing off the same pre-order book.
+        The kernel drops the flock on process exit, so a crashed run never
+        wedges live trading; there is no TTL.
+        """
+        path = self._db_path if self._db_path is not None else _DEFAULT_DB_PATH
+        return file_lease(f"{path}.cycle.lock")
 
 
-def _ts(value: int | None) -> pd.Timestamp | None:
-    """Epoch-ms -> UTC ``Timestamp`` (see :func:`_ms`: absolute instant preserved)."""
-    if value is None:
-        return None
-    return cast("pd.Timestamp", pd.Timestamp(value, unit="ms", tz="UTC"))
+def config_hash(config: Mapping[str, object]) -> str:
+    """Pure: sha256 of canonical JSON (sorted keys, no whitespace) -> hex.
+
+    An AUDIT key only (which config revision placed what) — never an ownership
+    filter, because a parameter edit would then orphan a live lot (§4).
+    """
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _cash_delta(execution: Execution) -> float:
+    """Signed cash flow of one execution: a SELL credits, a BUY debits (net of fee)."""
+    gross = execution.qty * execution.price
+    if execution.side is OrderSide.SELL:
+        return gross - execution.commission
+    return -(gross + execution.commission)
+
+
+#: Public name for the cash-flow helper (used by the IBKR portfolio source).
+execution_cash_delta = _cash_delta
 
 
 def _intent_fields(record: IntentRecord) -> dict[str, object]:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import pandas as pd
@@ -14,7 +14,6 @@ from src.live.reconcile import (
     UnknownSignalSymbol,
     current_side,
     reconcile,
-    size_qty,
     target_side,
 )
 from src.live.types import LiveConfig, LiveSignal, PortfolioView, SignalAction
@@ -147,7 +146,6 @@ def test_sized_open_uses_config() -> None:
     cfg = _cfg(symbols=("AAPL",), size=0.5)
     book = pf(100_000.0)
     (order,) = reconcile((sig("long", qty=0.0),), book, cfg)
-    assert order.qty == size_qty(100.0, book, cfg)
     assert order.qty == 500.0
 
 
@@ -194,9 +192,13 @@ def test_flip_sizes_open_against_freed_cash() -> None:
     assert open_.qty == 4.9952
 
 
-def test_size_qty_nan_price_is_zero() -> None:
-    cfg = _cfg(symbols=("AAPL",), size=0.5)
-    assert size_qty(float("nan"), pf(100_000.0), cfg) == 0.0
+def test_nan_price_open_is_refused() -> None:
+    # The real open path guards a non-finite price: ``_open_intent`` zeroes it, the
+    # sizer then returns <= 0 and reconcile RAISES rather than place an order sized
+    # by garbage.
+    bad = replace(sig("long", qty=0.0), price=float("nan"))
+    with pytest.raises(ValueError, match="unsized open AAPL"):
+        reconcile((bad,), pf(100_000.0), _cfg(symbols=("AAPL",), size=0.5))
 
 
 def test_owned_filter_excludes_foreign_lot() -> None:
