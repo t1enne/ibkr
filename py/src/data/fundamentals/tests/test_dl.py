@@ -1,4 +1,4 @@
-"""`data fundamentals dl` tests — SEC mocked at HTTP, DB isolated to a temp file.
+"""SEC fundamentals ingest tests (driven by `data dl`) — SEC mocked at HTTP, DB isolated to a temp file.
 
 Covers the ingest path end-to-end: payload -> rows -> DB -> recap, with the
 window filter and the "no CIK" skip. The recap is what the CLI prints, so a

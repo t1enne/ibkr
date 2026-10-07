@@ -1,26 +1,24 @@
-"""`data fundamentals dl` — download SEC EDGAR fundamentals for symbols.
+"""SEC EDGAR fundamentals ingest — fetch payloads, persist rows, report counts.
 
-Mirrors the `data dl` UX (positional SYMBOLS or --universe, `--from`/`--to`
-bounds the *filing* window, `--refresh` bypasses the on-disk payload cache) and
-prints a per-symbol recap like `data query` does for candles: how many periods
-landed and over what filing span, so "did anything arrive?" is answerable from
-the command output rather than a second query.
+Driven by the merged `data dl` command (positional SYMBOLS or --universe); the
+`--from`/`--to` bounds here apply to the *filing* date, and `--refresh`
+bypasses the on-disk payload cache. ``download`` returns per-symbol counts and
+``_recap_line`` renders one line each, so "did anything arrive?" is answerable
+from the command output rather than a second query.
 
 Fetching and persistence are separate concerns here: ``download`` returns the
-counts (pure-ish, HTTP + DB edges only), the command renders them.
+counts (pure-ish, HTTP + DB edges only), the caller renders them.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Optional
 
-import click
 import pandas as pd
 
-from src.data._shared import resolve_symbol_list
 from src.data.fundamentals.normalize import sec_payload_to_rows
 from src.data.fundamentals.schema import FundamentalRow, bootstrap, insert_fundamentals
 from src.data.fundamentals.sec_client import download_fundamentals
@@ -126,72 +124,19 @@ def _recap_line(recap: DownloadRecap) -> str:
     return f"{recap.symbol}: {written}  {recap.periods} fiscal periods  filed {span}"
 
 
-@click.command(name="dl")
-@click.argument("symbols", nargs=-1, required=False)
-@click.option(
-    "--universe",
-    "-U",
-    help="Universe file PATH (e.g. 'universes/nsdq.json'). Overrides positional SYMBOLS.",
-)
-@click.option(
-    "--from",
-    "-f",
-    "from_date",
-    help="Only filings on/after this date (YYYY-MM-DD)",
-)
-@click.option(
-    "--to", "-t", "to_date", help="Only filings on/before this date (YYYY-MM-DD)"
-)
-@click.option(
-    "--refresh",
-    is_flag=True,
-    help="Bypass the on-disk payload cache and re-fetch from SEC.",
-)
-@click.option(
-    "--cache",
-    "cache_path",
-    default=None,
-    help="Payload cache directory (default: ../data/fundamentals_cache).",
-)
-def dl_cmd(
-    symbols: tuple[str, ...],
-    universe: Optional[str],
-    from_date: Optional[str],
-    to_date: Optional[str],
-    refresh: bool,
-    cache_path: Optional[str],
-):
-    """Download SEC EDGAR fundamentals for SYMBOLS or --universe.
+def report(
+    recaps: tuple[DownloadRecap, ...],
+    echo: Callable[[str], None],
+) -> None:
+    """Write the batch total plus one recap line per symbol via ``echo``.
 
-    Stores sparse fiscal rows in the local DB; re-run after new filings appear.
+    ``echo`` is injected so the merged ``data dl`` command owns the destination
+    (stderr) and this module never imports ``click``.
     """
-    import asyncio
-
-    symbols_list = resolve_symbol_list(symbols, universe)
-    f_date = date.fromisoformat(from_date) if from_date else None
-    t_date = date.fromisoformat(to_date) if to_date else None
-
-    recaps = asyncio.run(
-        download(
-            symbols_list,
-            from_date=f_date,
-            to_date=t_date,
-            refresh=refresh,
-            cache=cache_path,
-        )
-    )
-
     total = sum(r.rows for r in recaps)
-    click.echo(
-        f"{len(recaps)} symbols, {total} rows written to the local DB\n", err=True
-    )
+    echo(f"{len(recaps)} symbols, {total} rows written to the local DB")
     for recap in recaps:
-        click.echo(_recap_line(recap), err=True)
+        echo(_recap_line(recap))
 
 
-def register(group: click.Group) -> None:
-    """Register this command onto the data group."""
-    group.add_command(dl_cmd)
-
-
-__all__ = ["download", "DownloadRecap", "dl_cmd", "register"]
+__all__ = ["download", "DownloadRecap", "report"]
