@@ -452,10 +452,11 @@ def on_candle(ctx):
 
 All CLI groups under the `py` root command — also callable via `make run <subcommand> <args>`:
 
-| Group  | Commands                                    | Description                                                                  |
-| ------ | ------------------------------------------- | ---------------------------------------------------------------------------- |
-| `data` | `dl`, `query`, `preview`, `fundamentals dl` | Sync/download OHLCV from IBKR, query local DB; SEC EDGAR fundamentals        |
+| Group  | Commands                                      | Description                                                                  |
+| ------ | --------------------------------------------- | ---------------------------------------------------------------------------- |
+| `data` | `dl`, `query`, `preview`, `fundamentals dl`   | Sync/download OHLCV from IBKR, query local DB; SEC EDGAR fundamentals        |
 | `bt`   | `run`, `sweep`, `split`, `optimize`, `screen` | Backtesting engine, hyperparam sweep, IS/OOS validation, walk-forward tuning, live-intent screening |
+| `live` | `run`, `abandon`                              | One-shot reconcile cycle against the IBKR account (paper or live); see README § Live Trading |
 
 ### `bt sweep` — hyperparameter sweep
 
@@ -585,6 +586,22 @@ The run flattens its book at the final bar, so the last fills are `_finalize`,
 **not** strategy intent — read them as the engine's realized book, not as
 signals to act on. Off by default so payloads and byte-for-byte output are
 unchanged for existing intent consumers.
+
+### Live consumption (`ibkr live run`)
+
+A live cycle loads the **same strategy JSON** and runs the strategy's own
+`on_candle` through the screen bridge for the current bar, then reconciles that
+resulting posture against the live book. There is no backtest replay: the
+strategy is the only source of intent, and everything downstream (sizing, cash
+boundedness, order identity) belongs to `src/live`.
+
+When authoring, that means the live edge acts on **posture only** — `long`,
+`short`, `flat`, plus an explicit `qty` when the strategy sizes itself. It places
+market DAY orders, and an intent carrying stop-loss or take-profit is **refused**
+rather than sent naked, so a stop-dependent strategy is not live-ready until that
+changes. `scope` (defaulting to the strategy name) is the ownership key for the
+live book and the order-id prefix — two configs sharing a name share one book,
+its cash and its fills.
 
 ### Parallelism (`--workers`)
 
