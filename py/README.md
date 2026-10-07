@@ -374,6 +374,87 @@ fast (<~2s), more workers will only add overhead.
 
 All commands usable via `make run <subcommand> <args>`.
 
+## Live Trading
+
+`src/live/` runs the **same strategies the backtester runs**, as a one-shot
+reconcile cycle you schedule yourself (there is no daemon):
+
+```bash
+# Reconcile and report; place nothing, write nothing, take no lock.
+uv run ibkr live run strats/pass/<config>.json --adapter sim --dry-run
+
+# Place through the Client Portal Gateway on a real account.
+uv run ibkr live run strats/pass/<config>.json --adapter ibkr --allow-live
+
+# Clear one wedged intent key so the next cycle may re-mint it.
+uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
+```
+
+`--adapter sim` settles a paper book locally from a JSON fixture; `--adapter ibkr`
+places real orders. The adapter defaults to the config's `broker` key. A config
+with `"mode": "paper"` pointed at a live account is **refused** — `--allow-live`
+is the explicit acknowledgement. See `ibkr live run --help` for the rest.
+
+### The cycle
+
+lease → fetch the book → freshness check → seed the broker → re-check open orders
+→ read signals → reconcile → place the cohort → record outcomes → prune.
+Nothing is placed until the book is fresh **and** the broker's working orders have
+been read successfully.
+
+Reconcile diffs **posture, not size**: closes always precede opens (so a close
+funds the same cycle's open), absence of a signal is HOLD — never flatten — and
+an order that only partially fills is a completed entry whose residual is not
+chased; the shortfall is reported on the order instead.
+
+### Order identity
+
+Every order carries a client order id of the form `scope_tag-token-attempt`,
+derived only from `(scope, symbol, action, position_id)` plus a re-send counter —
+**never** from the clock or the decision bar. A re-run over the same decision
+therefore re-uses the same id, while a legitimate re-send after a partial fill
+gets a fresh one. The durable `live_order_intent` table records what was sent,
+and a cycle that cannot prove what happened to an order reports it as unknown
+rather than guessing. Adoption looks for our own `order_ref` on the gateway's
+working-orders read, so an order placed by any other client can never be adopted.
+
+### Guards on the order edge
+
+- **close** — refused unless the account net is readable, is on the side being
+  reduced, and is at least as large as the quantity sent, so a close cannot flip
+  into an open on a shared account.
+- **open** — the notional is bounded by the cash the sizer used, and the account
+  net must agree with the net the ledger accounts for across all scopes; an
+  unexplained net means a fill we cannot see.
+- **cohort** — opens share ONE cash scale, the backtest's own rule including its
+  commission reserve, and a closing quantity is floored so it can never overshoot
+  the lot.
+- **unsupported** — stop-loss, take-profit and limit orders are **refused**, not
+  silently dropped; the live edge places market DAY orders only.
+
+### State and locking
+
+One sqlite file (the same `../data/db.sqlite` the candles live in, overridable)
+holds `live_strategy`, `live_cash`, `live_position`, `live_execution`,
+`live_sim_lot` and `live_order_intent`, alongside `*_legacy` tables kept by past
+migrations. Migrations **rename rather than drop**, so an upgrade preserves
+history. A cycle holds an OS advisory lock next to the database
+(`<db>.cycle.lock`), so two overlapping cycles cannot place off the same book.
+
+### Exit codes
+
+| code | meaning |
+| ---- | ------- |
+| `0` | clean cycle |
+| `1` | config / stale data / gateway failure |
+| `2` | usage error |
+| `3` | **unsafe cycle** — placement or resync error, or an order left unresolved, wedged, timed out or diverged |
+
+Cron should alert on anything non-zero. `--allow-unsafe` forces `0` for callers
+that consume the report themselves; it does not belong in a scheduled run.
+
+Open gaps and the review backlog are tracked in [todo.md](todo.md).
+
 ## Toolchain
 
 | Tool                        | Purpose            |
@@ -432,6 +513,11 @@ print(get_backtest_results_analysis(results.pf))
 
 The `ib-rest-api-client` package is a local dependency (`../ib-rest-api-client`), generated from `openapi.spec.json` (IBKR's OpenAPI spec).
 
+> **Note:** the checked-in spec is **stale for `/iserver/account/orders`** — it
+> lists no `order_ref`/`cOID` field, while the live Gateway echoes the client
+> order id as `order_ref`. Captured responses under
+> `src/live/adapters/ibkr/tests/fixtures/` are the contract for that endpoint.
+
 ### Setup
 
 Run the Gateway login script before any data sync or API call:
@@ -460,3 +546,4 @@ cd ../py && uv sync
 
 - **Strategy authoring & backtesting workflow**: [SKILL.md](SKILL.md) — read before any strategy work
 - **Coding standards for contributors**: [AGENTS.md](AGENTS.md)
+- **Open live-trading work**: [todo.md](todo.md)

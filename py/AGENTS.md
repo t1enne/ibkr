@@ -213,6 +213,85 @@ Don't re-derive this list from the DB per task; trust the snapshot above. If you
 need a fresh one: `SELECT ticker, COUNT(*), MIN(timestamp), MAX(timestamp) FROM
 candle GROUP BY ticker ORDER BY ticker`.
 
+## Live trading (`src/live`)
+
+One-shot reconcile cycles over the **same strategy JSON** the backtester loads.
+There is no daemon — you schedule it. Open work: `todo.md`.
+
+```bash
+uv run ibkr live run strats/pass/<cfg>.json --adapter sim --dry-run  # places/writes nothing
+uv run ibkr live run strats/pass/<cfg>.json --adapter ibkr --allow-live
+uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
+```
+
+- `--allow-live` is required to read a `live` account; a `paper` config pointed
+  at a live account is refused. The adapter defaults to the config's `broker`.
+- **Exit codes are the machine contract:** `0` clean, `1` config/stale/gateway
+  (`ClickException`), `2` usage, `3` **unsafe cycle**. Alert on non-zero.
+  `--allow-unsafe` is for report-consuming callers only — never put it in a
+  scheduled run.
+- `--dry-run` must place nothing, write nothing and take no lease. Tests assert
+  zero DDL on a dry run; keep them passing.
+- `ibkr live abandon` clears OUR durable record only. It does not cancel anything
+  at the broker, so verify broker-side before passing `--yes`, or the next cycle
+  places a duplicate.
+
+### Invariants — do not weaken these
+
+1. **Never POST after a failed working-orders read.** Fail closed: a duplicate
+   order is unbounded exposure, a skipped cycle is recoverable next bar.
+2. **The order ref is bar-free** — `scope_tag-token-attempt`, from
+   `(scope, symbol, action, position_id)` plus a re-send counter, never the clock
+   or the bar. A durable id must not move because a sibling in the same batch
+   appeared, and a re-send must never reuse an attempt.
+3. **Ambiguity is never reported as "not placed".** Absence from the gateway's
+   working-orders read proves nothing: that endpoint lists working orders **and**
+   orders filled/cancelled in the current session. Unknown is reported as
+   `unresolved`, never as `rejected`.
+4. **`live_order_intent` is the only owner of OPEN state.** Never re-mint an
+   order whose predecessor is still OPEN or still working; never downgrade a
+   `WORKING` record to `UNRESOLVED` (it carries the provenance a later cycle
+   needs).
+5. **Adoption matches our own `order_ref` by exact `scope_tag` prefix.** Never
+   symbol+side — the account is shared with other scopes and with a human.
+
+Also: migrations **rename, never drop**, and re-keys preserve rows; the close and
+open guards fail **closed** on every unknown, and the open guard may be excused
+only by our own already-confirmed reducing fills (a same-cycle flip) — do not
+widen that; stop-loss/take-profit and LMT are **refused**, never silently sent
+naked and never implied in the report; a partially filled entry is not topped up.
+
+### Gateway contract
+
+`/iserver/account/orders` echoes our client order id as **`order_ref`** (not
+`cOID`), and an order we did not place carries no `order_ref` at all. The repo's
+`openapi.spec.json` is **stale** for this endpoint and must not be edited to
+match. **Any test touching a gateway response shape parses a captured fixture**
+from `src/live/adapters/ibkr/tests/fixtures/` — a hand-built mock invented the
+wrong field name and hid the bug through several review passes.
+
+### Testing the live path
+
+- Live code is async + HTTP: `pytest-asyncio` with `respx`.
+- A mock that stands for broker state must **move** when our order lands. A
+  constant account position held across a close hid a real refusal bug.
+- The sim adapter settles cohorts with the backtest's own rule
+  (`src/bt/portfolio/pure.py`) and the same shared cash scale. Do not fork the
+  rule for live — if live must differ, change the shared rule deliberately and
+  say so.
+- Strategies, configs and research scripts are validated by RUNNING them, not by
+  unit tests (see § Alpha research) — the live edge itself is not exempt.
+- A test that passes both before and after your change is a characterisation
+  test, not a regression test. Say which one you wrote.
+
+### Where state lives
+
+One sqlite file (the same `../data/db.sqlite` the candles use, overridable via
+`db_path`): `live_strategy`, `live_cash`, `live_position`, `live_execution`,
+`live_sim_lot`, `live_order_intent`, plus `*_legacy` tables preserved by past
+migrations. The cycle lease is an OS advisory lock on `<db>.cycle.lock` — sound
+on a single host with a local filesystem only.
+
 ## Language & Toolchain
 
 - **Python 3.14+** (required)
@@ -402,6 +481,20 @@ src/bt/
 ├── risk/pure.py        # Stop-loss / take-profit checks
 ├── indicators.py       # Technical indicators (pure functions)
 └── metrics.py          # Performance metrics (pure functions)
+
+src/live/
+├── identity.py         # IntentKey / IntentRecord / order identity (bar-free cOID)
+├── reconcile.py        # pure: signals + book → OrderIntent[] (posture diff)
+├── engine.py           # the cycle: lease → resync → reconcile → place → record
+├── broker.py           # LiveBroker / PortfolioSource Protocol seams + sim broker
+├── ports.py            # small injected seams (e.g. BookExposure)
+├── lease.py            # exclusive cycle lock
+├── ledger.py           # SqliteLedger seam over the stores below
+├── ledger_base.py      # schema/template/DDL/migration plumbing
+├── ledger_sim.py       # sim-lot book
+├── ledger_migration.py # preserve-don't-drop migrations and re-keys
+├── cli.py              # `ibkr live run` / `abandon`, report rendering, exit codes
+└── adapters/ibkr/      # the real edge: broker, orders, trades, mapping, authz
 ```
 
 #### Module naming
@@ -436,6 +529,9 @@ Strategies are defined in JSON files loaded via `load_strategy()` → `StrategyC
 
 - The IBKR data sync layer uses `httpx` with `asyncio`.
 - The backtest engine itself is synchronous (pure computation). Async only at the I/O boundary.
+- The live cycle (`src/live/engine.py`) is async end to end: it awaits the portfolio
+  read, the broker's working-orders read and every placement. Reconcile is pure and
+  synchronous — keep I/O out of it so it stays directly testable.
 - Use `pytest-asyncio` for testing async code.
 - Use `respx` for mocking HTTP in async tests.
 
