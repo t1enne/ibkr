@@ -43,7 +43,7 @@ When implementing a feature or fix:
 1. **Understand** — read relevant strategy code, types, and tests. Don't guess.
 2. **Plan** — state approach before writing. If unclear, ask.
 3. **Implement** — minimum code that works. Pure functions, immutable state, full type annotations.
-4. **Test** — every new computation gets a test, **except** strategies, strategy configs, scripts and research — those are validated by *running* them, never by unit tests (see § Alpha research). Run `make test` before declaring done.
+4. **Test** — every new computation gets a test, **except** strategies, strategy configs, scripts and research — those are validated by _running_ them, never by unit tests (see § Alpha research). Run `make test` before declaring done.
 5. **Verify** — `make check` must pass (lint + format + typecheck + tests).
 
 ### Running things
@@ -115,16 +115,6 @@ real fills, the final-bar flatten included (see SKILL.md § `bt screen`).
 - **The 6:** `momentum`, `macd_divergence`, `mfi_divergence`, `obv_divergence`, `rsi_divergence` (fresh signals) + `rs` (relative strength — cross-sectional ranking; fires by construction, so DON'T count it as corroboration).
 - **Benchmarks:** `rs` needs its benchmark in-state (raises otherwise); `momentum` gates on `QQQ`. Pass `benchmarks=['QQQ','SPY']`.
 
-### Run all screens over a universe (ready-made)
-
-```bash
-uv run python scripts/run_screens.py   # nsdq + QQQ/SPY, latest 1d bar, convergence view
-```
-
-Loads `universes/nsdq.json`, runs every discovered screen, separates
-**absolute-screen convergence** (2+ fresh-signal screens, same direction) from
-the `rs` overlay. Extend this script before writing a new one.
-
 ### Wire-up
 
 ```python
@@ -137,8 +127,6 @@ results = init_screen("mfi_divergence").on_state(daily, resolve_screen_params("m
 
 For a cursor-safe walk across history use `screen_over_history(...)`.
 
-
-
 ~All ~300 tickers plus ~1.8M hourly candles already live in the local candle DB.
 Before assuming data is missing, check it here first — most "is data present?"
 questions are answered by one query.
@@ -149,11 +137,11 @@ questions are answered by one query.
   (`/home/nasrt/Documents/code/dev/ibkr/data/db.sqlite`), NOT inside this `py/`
   dir. ~166 MB, `journal_mode=wal`.
   - `src/data/db.py::_DEFAULT_DB_PATH` resolves it file-relative
-  (correct — use this).
+    (correct — use this).
   - `src/data/types.py::db_path` resolves it via
-  `os.getcwd()/../data/...`, so it depends on the CWD being the repo's parent.
-  Prefer `query_candles`/`get_connection` from `src.data.db` over the peewee
-  instance.
+    `os.getcwd()/../data/...`, so it depends on the CWD being the repo's parent.
+    Prefer `query_candles`/`get_connection` from `src.data.db` over the peewee
+    instance.
 - `sqlite3` CLI may not be installed. Query with Python instead:
   `python -c "import sqlite3; c=sqlite3.connect('../data/db.sqlite')"`, or use
   the CLI below.
@@ -326,7 +314,7 @@ def process(data: Any) -> Any: ...
 
 #### Rules
 
-- **Use `Protocol` for dependency injection** — the codebase uses `ExecutionFn`, `RiskCheckFn`, `PositionSizerFn`, `DataLoaderFn` for engine-handler seams. Follow this pattern. Never pass raw `Callable` when a Protocol exists or should exist. (Strategy *authoring* has its own seam: a ``@strategy``-produced callable of ``StrategyContext`` — not a raw ``StrategyFn`` Protocol; see §4.)
+- **Use `Protocol` for dependency injection** — the codebase uses `ExecutionFn`, `RiskCheckFn`, `PositionSizerFn`, `DataLoaderFn` for engine-handler seams. Follow this pattern. Never pass raw `Callable` when a Protocol exists or should exist. (Strategy _authoring_ has its own seam: a `@strategy`-produced callable of `StrategyContext` — not a raw `StrategyFn` Protocol; see §4.)
 - **Use `@dataclass(frozen=True)` for state.** Immutable state makes backtesting deterministic and testable. See `Tick`, `PortfolioState`, `BacktestState`, `FillEvent`, etc.
 - **Use `Literal` for enums of strings.** Prefer `Literal["long", "short", "close"]` over bare `str`.
 - **Use `TypedDict`** for structured dicts when a dataclass would be overkill.
@@ -418,7 +406,7 @@ def apply_fill(portfolio: PortfolioState, fill: FillEvent) -> None:
 - **`replace()` for state updates.** Use `dataclasses.replace()` when modifying frozen dataclasses.
 - **Return new state, never mutate.** Every function in the pipeline takes state in, returns new state out.
 - **Compose functions,** don't chain methods. The backtest engine composes `strategy_fn → exec_handler → risk_handler`.
-- **Protocol-based injection** over class inheritance. Engine-handler seams are Protocols (`ExecutionFn`, `RiskCheckFn`, …); strategy *authoring* is the stateful DSL (a ``@strategy``-decorated pure function of ``StrategyContext``) — the only supported authoring surface. See §9 for how the engine feeds a decorated strategy's ``on_candle``.
+- **Protocol-based injection** over class inheritance. Engine-handler seams are Protocols (`ExecutionFn`, `RiskCheckFn`, …); strategy _authoring_ is the stateful DSL (a `@strategy`-decorated pure function of `StrategyContext`) — the only supported authoring surface. See §9 for how the engine feeds a decorated strategy's `on_candle`.
 - **No side effects in pure functions.** I/O (DB, HTTP, file) belongs at the edges.
 - **Use `merge_bt_state`** for partial state updates — it's the established pattern.
 
@@ -464,7 +452,7 @@ def on_candle(ctx: StrategyContext):
 - **High level only.** One-line purpose + contract (inputs, outputs, invariants,
   failure modes). Leave derivation, history, thresholds and worked examples to
   code and tests.
-- Docstrings document *intent and guarantees*, never current results. If a fact
+- Docstrings document _intent and guarantees_, never current results. If a fact
   is bound to change, it does not belong in a docstring.
 
 ### 5. Code Organization
@@ -537,17 +525,17 @@ Strategies are defined in JSON files loaded via `load_strategy()` → `StrategyC
 
 ### 9. Engine Data Flow to `on_candle`
 
-How the engine feeds data to a decorated strategy's ``on_candle(ctx)``. The DSL
-adapter exposes the engine state via ``ctx``: ``ctx.state`` (the BacktestState / CandleStore
-below), ``ctx.candle`` (the current Candle), and ``ctx.params`` (typed ``Params`` subclass or
+How the engine feeds data to a decorated strategy's `on_candle(ctx)`. The DSL
+adapter exposes the engine state via `ctx`: `ctx.state` (the BacktestState / CandleStore
+below), `ctx.candle` (the current Candle), and `ctx.params` (typed `Params` subclass or
 raw dict). Read the engine-internal names below with that mapping.
 
 #### `on_candle` fires once per timestamp
 
-The engine calls the strategy's ``on_candle`` **only when ``ctx.candle.symbol``
+The engine calls the strategy's `on_candle` **only when `ctx.candle.symbol`
 is the last symbol** in `config.symbols`. With `["AAPL", "GOOGL", "MSFT"]`,
 the generator yields → AAPL → GOOGL → MSFT per timestamp before moving to the
-next timestamp. ``on_candle`` fires on MSFT.
+next timestamp. `on_candle` fires on MSFT.
 
 **Why:** At that point `state.candles` contains all symbols' data up to the
 current timestamp. If the engine fired on every symbol, the first symbol's
@@ -596,7 +584,7 @@ in DSL as `ctx.state.candles`). The candle generator interleaves HTF candles
 (e.g. `"4h"`) at boundaries after all base candles for that timestamp, and the
 engine fires the strategy only on base-interval candles — HTF-only candles are
 merely accumulated and never trigger signal generation. A strategy reads HTF
-structure from the store (``ctx.ta`` serves only the base/signal interval):
+structure from the store (`ctx.ta` serves only the base/signal interval):
 
 ```python
 @strategy(bars="1h")

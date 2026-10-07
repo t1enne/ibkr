@@ -227,24 +227,32 @@ uv run ibkr bt screen <strategy.json> --trades          # + executed-trade table
 uv run ibkr data query AAPL
 uv run ibkr data query --universe universes/nsdq.json
 
-# Download / refresh candles (see `data dl` runbook below)
+# Download / refresh candles + SEC fundamentals (see `data dl` runbook below)
 uv run ibkr data dl AAPL MSFT --from 2019-01-01
 
 # Pipe workflows
 uv run ibkr data query AAPL --from 2024-01-01 | uv run ibkr bt run strategy.json
 ```
 
-### `data dl` — download / refresh OHLCV
+### `data dl` — download / refresh OHLCV **and** SEC fundamentals
 
 ```bash
 uv run ibkr data dl AAPL MSFT --from 2019-01-01   # backfill + refresh tail
 uv run ibkr data dl --universe universes/nsdq.json --from 2019-01-01
 ```
 
-Idempotent (`on_conflict_ignore`); safe to call as-is. `--from` sets the history
-floor — earlier = deeper backfill plus the trailing tail in one call. Its
-`0 fetch gaps`/`up to date` tail is *post-download* output and can print even on
-a successful fill; always confirm with:
+One command, two transports: candles come from the IBKR Gateway (bounded by
+`--from`/`--to`, idempotent, `on_conflict_ignore`); SEC EDGAR fundamentals come
+directly from SEC (no Gateway, payloads cached on disk) as sparse fiscal rows,
+reported in a `fundamentals:` recap block. The symbol list is resolved once for
+both, and the SEC pass always runs. `--fundamentals-from`/`--fundamentals-to`
+bound the *filing* date, `--refresh-fundamentals` bypasses the SEC payload
+cache, `--fundamentals-cache` sets its directory. The candle window is
+deliberately not applied to filings.
+
+`--from` sets the history floor — earlier = deeper backfill plus the trailing
+tail in one call. Its `0 fetch gaps`/`up to date` tail is *post-download* output
+and can print even on a successful fill; always confirm with:
 
 ```bash
 uv run ibkr data query AAPL        # max date should advance
@@ -257,7 +265,8 @@ uv run python -c "import httpx;print(httpx.get('https://localhost:5000/v1/api/is
 uv run python scripts/login_ibkr.py   # else login (.env holds creds)
 ```
 
-`data query`/`preview` need no login — only `data dl` touches the live Gateway.
+`data query`/`preview` need no login, and the SEC fundamentals half of
+`data dl` doesn't either — only its candle half touches the live Gateway.
 
 ### `bt sweep` — hyperparameter sweep
 

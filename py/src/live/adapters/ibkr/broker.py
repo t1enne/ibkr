@@ -45,6 +45,7 @@ from ib_rest_api_client.models import SecdefSearchResponseItem
 from src.bt.state import ActionType, ExecutionParams, FillEvent, PortfolioState
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import search_contracts
+from src.data.types import SymbolSchema
 from src.exec.types import Fill, OrderSide, OrderState
 from src.live.adapters.ibkr.mapping import parse_executions, parse_positions
 from src.live.adapters.ibkr.orders import (
@@ -141,13 +142,54 @@ def _names_the_ticker(candidate: SecdefSearchResponseItem, ticker: str) -> bool:
     return isinstance(symbol, str) and symbol.strip().upper() == ticker.strip().upper()
 
 
+def _db_conid_for_ticker(ticker: str) -> int | None:
+    """The conid our candle DB ``symbol`` table pairs with *ticker*, if any.
+
+    A PREFERENCE, never an override: used only as a tie-break among secdef
+    candidates that share a ticker. ``None`` when the ticker is unknown to the
+    DB or the table is unreadable (a read-only helper, so a missing fixture DB
+    degrades to no preference rather than a raise).
+    """
+    try:
+        s = SymbolSchema.get_or_none(SymbolSchema.ticker == ticker.strip().upper())
+    except Exception:
+        return None
+    return int(s.conid) if s is not None else None
+
+
+def _prefer_db_conid(
+    matches: tuple[SecdefSearchResponseItem, ...], ticker: str
+) -> SecdefSearchResponseItem:
+    """Pick one candidate when several share *ticker*, preferring the DB's conid.
+
+    The secdef search routinely returns multiple listings of one ticker (e.g.
+    SHOP — two US STK rows, only one of which is the contract our data/backtest
+    treats as SHOP). The candle DB ``symbol`` row is the authoritative local
+    answer: among the candidates, the one whose conid matches it wins. If none
+    does, we fail closed — a live order must never land on a guess.
+    """
+    known = _db_conid_for_ticker(ticker)
+    preferred = [c for c in matches if known is not None and str(c.conid) == str(known)]
+    if preferred:
+        return preferred[0]
+    hosts = ", ".join(
+        f"{c.conid} [{c.description}]"
+        for c in sorted(matches, key=lambda c: str(c.conid))
+    )
+    raise ValueError(
+        f"ambiguous contract for {ticker}: candidates {hosts} "
+        f"(none matches DB conid {known or 'unknown'})"
+    )
+
+
 async def _default_conid_lookup(ticker: str) -> int:
     """Resolve *ticker* to its IBKR conid, VERIFYING it is the intended contract.
 
     The search is by ticker, so an unverified first hit can put a real order on
     the wrong instrument. Refuses (``ValueError`` -> a typed ``FeedError``) when
-    no candidate names the ticker, when the candidates name more than one conid
-    (ambiguous), or when the chosen contract is ``restricted``.
+    no candidate names the ticker, when the candidates share no single conid AND
+    none matches the candle DB's conid for the ticker (ambiguous), or when the
+    chosen contract is ``restricted``.
     """
     candidates = await search_contracts(ticker)
     matches = tuple(c for c in candidates if _names_the_ticker(c, ticker))
@@ -156,11 +198,12 @@ async def _default_conid_lookup(ticker: str) -> int:
             f"secdef search for {ticker} returned no contract naming {ticker}"
         )
     conids = {str(c.conid) for c in matches}
-    if len(conids) > 1:
-        raise ValueError(
-            f"ambiguous contract for {ticker}: candidate conids {sorted(conids)}"
-        )
-    chosen = matches[0]
+    if len(conids) == 1:
+        chosen = matches[0]
+    elif len(conids) > 1:
+        chosen = _prefer_db_conid(matches, ticker)
+    else:
+        raise ValueError(f"secdef search for {ticker} returned no conid")
     if chosen.restricted is True:
         raise ValueError(f"contract for {ticker} is restricted (not tradable)")
     conid = chosen.conid

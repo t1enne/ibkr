@@ -118,6 +118,16 @@ Either state the bound or keep the counter monotonic independently of retention.
 
 ## P2 — deferred decisions (need a call, not just code)
 
+### [ ] Live stop-loss / take-profit — designed, not implemented
+
+Plan: `docs/PLAN_LIVE_STOPS.md` (rev 1). Today a stop-carrying strategy is
+refused every cycle **at exit 0** (D3's shape), so many DSL strategies are
+untradeable live. The plan ships a resting `STP` (`GTC`) child plus a per-cycle
+breach backstop, behind `LiveConfig.allow_stops` (default OFF), in five slices;
+it also fixes the missing level persistence on the IBKR path and the cancel
+needs-confirmation rule. Slice 1 (vocabulary + migration, zero behaviour change)
+needs no gateway.
+
 ### [ ] Partial-open top-up — revisit only on measurement
 
 Decision taken: the posture diff compares **sides**, never sizes, so a partial

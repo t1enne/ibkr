@@ -132,6 +132,46 @@ def test_live_signals_maps_actionable_rows(monkeypatch) -> None:
     assert bbb.qty == 0.0
 
 
+def test_live_signals_carries_row_executable_fields(monkeypatch) -> None:
+    """A strategy-sized row keeps its qty/sl/tp/tag on the live path.
+
+    Regression: the bridge hardcoded ``qty=0.0``, so a DSL strategy that sizes
+    its own opens (``ctx.long(..., size=, size_mode="equity")``) arrived at
+    reconcile unsized and raised ``unsized open``. It also must NOT forward the
+    row's ``position_id``: that id is a backtest lot id, and a close carrying it
+    matches no live (conid-keyed) lot — a silent no-op exit.
+    """
+    sig_ts = _ts("2024-06-01")
+    ts = _ts("2024-06-03")
+    rows = (
+        ScreenRow(
+            symbol="AAA",
+            action="long",
+            score=1.0,
+            signals=("breakout",),
+            ts=ts,
+            sig_ts=sig_ts,
+            price=42.5,
+            qty=27.35,
+            stop_loss=38.0,
+            take_profit=52.0,
+            position_id="pos-1",
+            tag="vwatr",
+        ),
+    )
+    _stub(monkeypatch, rows, _state(_store({"AAA": _frame([1.0, 2.0, 42.5])})))
+
+    (sig,) = signals.live_signals("ignored.json")
+
+    assert sig.qty == 27.35
+    assert sig.stop_loss == 38.0
+    assert sig.take_profit == 52.0
+    assert sig.tag == "vwatr"
+    # The row's id is a BACKTEST lot id (``symbol_ts_seq``); live lots are keyed
+    # by conid, so forwarding it would make every close match no lot and vanish.
+    assert sig.position_id is None
+
+
 def test_live_signals_forwards_max_age_days_as_none(monkeypatch) -> None:
     seen: dict[str, object] = {}
 

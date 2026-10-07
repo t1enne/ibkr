@@ -33,6 +33,7 @@ import json
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -173,6 +174,45 @@ _MODELS = (
     LiveOrderIntent,
 )
 
+
+@dataclass(frozen=True)
+class StrategyAudit:
+    """One ``live_strategy`` audit row: which config revision wrote this scope.
+
+    ``strategy_id`` is the config HASH (an audit key, never an ownership filter);
+    ``created_at``/``last_cycle_at`` are the epoch-ms columns read back as UTC
+    timestamps (``None`` when unwritten).
+    """
+
+    strategy_id: str
+    scope: str
+    name: str
+    mode: str
+    created_at: pd.Timestamp | None
+    last_cycle_at: pd.Timestamp | None
+
+
+@dataclass(frozen=True)
+class ExecutionRecord:
+    """One stored fill (``live_execution``) projected for the report.
+
+    ``live_execution`` stores ``conid`` but no symbol, so ``symbol`` is resolved
+    from the scope's book rows (the conid's symbol, ``""`` when no row remains).
+    ``ts`` is the fill's UTC instant.
+    """
+
+    scope: str
+    execution_id: str
+    conid: int
+    symbol: str
+    side: str
+    qty: float
+    price: float
+    commission: float
+    cash_delta: float
+    ts: pd.Timestamp | None
+
+
 #: The terminal (closed) intent states ``prune`` is allowed to delete.
 _CLOSED_INTENTS = [
     IntentState.FILLED.value,
@@ -183,6 +223,33 @@ _CLOSED_INTENTS = [
 
 class MetadataStore(_SqliteOps):
     """Ledger mixin: the audit/metadata tables (``live_strategy``/``live_cash``)."""
+
+    def scopes_of_store(self) -> tuple[str, ...]:
+        """Every scope the store knows about, sorted (empty when unwritten).
+
+        The union of the tables that carry a ``scope`` column, so a scope whose
+        strategy row was never written but which holds lots, cash or intents is
+        still reported. A genuinely missing table contributes nothing; any other
+        read failure raises ``LedgerReadError``.
+        """
+        found: set[str] = set()
+        with self._database.bind_ctx(_MODELS):
+            for model in (
+                LiveStrategy,
+                LiveCash,
+                LivePosition,
+                LiveExecution,
+                LiveOrderIntent,
+                LiveSimLot,
+            ):
+                try:
+                    rows = model.select(model.scope).distinct().execute()
+                except peewee.OperationalError as exc:
+                    if not _is_missing_table(exc):
+                        raise LedgerReadError(str(exc)) from exc
+                    continue
+                found.update(str(row.scope) for row in rows)
+        return tuple(sorted(found))
 
     def ensure_strategy(
         self, strategy_id: str, scope: str, name: str, mode: str
@@ -238,6 +305,28 @@ class MetadataStore(_SqliteOps):
             LiveStrategy.update(last_cycle_at=_ms(at)).where(
                 LiveStrategy.strategy_id == strategy_id
             ).execute()
+
+    def strategies_of(self, scope: str) -> tuple[StrategyAudit, ...]:
+        """Every audit row sharing *scope*, oldest first (empty if the table is absent).
+
+        Read-only: this is the ``ibkr live pf`` view of which config revisions have
+        written the scope. A missing table (the never-written case) reads as empty,
+        like the book reads; any OTHER ``OperationalError`` is a genuine read
+        failure and raises :class:`LedgerReadError` rather than reporting nothing.
+        """
+        try:
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LiveStrategy.select()
+                    .where(LiveStrategy.scope == scope)
+                    .order_by(LiveStrategy.created_at, LiveStrategy.strategy_id)
+                    .execute()
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return ()
+        return tuple(_audit_of(row) for row in rows)
 
 
 class BookStore(_SqliteOps):
@@ -306,6 +395,34 @@ class BookStore(_SqliteOps):
                     cash_delta=_cash_delta(execution),
                     ts=_ms(execution.ts),
                 ).on_conflict("IGNORE").execute()
+
+    def executions_of(self, scope: str) -> tuple[ExecutionRecord, ...]:
+        """Stored fill history for *scope*, oldest first (empty if unwritten).
+
+        One :class:`ExecutionRecord` per applied fill, `ts` ascending, with
+        `symbol` resolved from the conid's book row (`""` when none remains). A
+        missing table (a never-written scope) reads as empty; a genuine read
+        failure raises :class:`LedgerReadError`.
+        """
+        try:
+            with self._database.bind_ctx(_MODELS):
+                symbols = {
+                    int(row.conid): cast("str", row.symbol)
+                    for row in LivePosition.select(
+                        LivePosition.conid, LivePosition.symbol
+                    )
+                }
+                rows = (
+                    LiveExecution.select()
+                    .where(LiveExecution.scope == scope)
+                    .order_by(LiveExecution.ts)
+                    .execute()
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return ()
+        return tuple(_model_to_execution(row, symbols) for row in rows)
 
     def cash_of(self, scope: str, default_initial: float = 0.0) -> float:
         """Per-scope cash: ``initial_capital`` advanced by the scope's own fills.
@@ -425,6 +542,27 @@ class IntentStore(_SqliteOps):
             return ()
         return tuple(_model_to_intent(row) for row in rows)
 
+    def intents_of(self, scope: str) -> tuple[IntentRecord, ...]:
+        """Every stored order intent for *scope*, newest first (empty if unwritten).
+
+        Unlike :meth:`load_open`, not restricted to OPEN states: the full audit
+        trail (filled / unfilled / rejected included) is what the report shows.
+        A missing table reads as empty; a genuine read failure raises.
+        """
+        try:
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LiveOrderIntent.select()
+                    .where(LiveOrderIntent.scope == scope)
+                    .order_by(LiveOrderIntent.updated_at.desc())
+                    .execute()
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return ()
+        return tuple(_model_to_intent(row) for row in rows)
+
     def save(self, record: IntentRecord) -> None:
         """Upsert *record* keyed on its identity columns.
 
@@ -518,6 +656,11 @@ class SqliteLedger(MetadataStore, BookStore, IntentStore, SimLotBook):
         path = str(db_path) if db_path is not None else str(_DEFAULT_DB_PATH)
         self._database = SqliteDatabase(path)
 
+    @property
+    def db_path(self) -> str:
+        """The resolved sqlite path this ledger is bound to (read-only)."""
+        return str(self._database.database)
+
     # -- lazy DDL / migration ---------------------------------------------
 
     def _ready_schema(self) -> None:
@@ -610,6 +753,17 @@ def _intent_fields(record: IntentRecord) -> dict[str, object]:
     }
 
 
+def _audit_of(row: LiveStrategy) -> StrategyAudit:
+    return StrategyAudit(
+        strategy_id=cast("str", row.strategy_id),
+        scope=cast("str", row.scope),
+        name=cast("str", row.name),
+        mode=cast("str", row.mode),
+        created_at=_ts(cast("int | None", row.created_at)),
+        last_cycle_at=_ts(cast("int | None", row.last_cycle_at)),
+    )
+
+
 def _model_to_intent(row: LiveOrderIntent) -> IntentRecord:
     return IntentRecord(
         key=IntentKey(
@@ -645,6 +799,25 @@ def _book_fields(row: BookRow) -> dict[str, object]:
         "tag": row.tag,
         "order_ref": row.order_ref,
     }
+
+
+def _model_to_execution(
+    row: LiveExecution, symbols: Mapping[int, str]
+) -> ExecutionRecord:
+    """Project a stored execution, resolving its symbol from *symbols* (conid space)."""
+    conid = int(cast("int", row.conid))
+    return ExecutionRecord(
+        scope=cast("str", row.scope),
+        execution_id=cast("str", row.execution_id),
+        conid=conid,
+        symbol=symbols.get(conid, ""),
+        side=cast("str", row.side),
+        qty=float(cast("float", row.qty)),
+        price=float(cast("float", row.price)),
+        commission=float(cast("float", row.commission)),
+        cash_delta=float(cast("float", row.cash_delta)),
+        ts=_ts(cast("int | None", row.ts)),
+    )
 
 
 def _model_to_book(row: LivePosition) -> BookRow:

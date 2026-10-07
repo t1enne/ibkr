@@ -76,9 +76,9 @@ class PortfolioSnapshot:
 class LiveSignal:
     """Actionable intent from the screen (mirrors ``ScreenRow``, actionable only).
 
-    ``qty`` is always ``0.0`` from the current screen bridge: a ``ScreenRow``
-    carries no quantity, so sizing must come from config via ``SizingParams``.
-    A ``0.0`` here means "unsized — size at reconcile".
+    ``qty`` is the row's executable share count: > 0 when the strategy sized
+    its own open (``ctx.long(..., size=, size_mode=)``), ``0.0`` when the open
+    is engine-sized. A ``0.0`` here means "unsized — size at reconcile".
     """
 
     symbol: str
@@ -94,6 +94,9 @@ class LiveSignal:
     bar_ts: pd.Timestamp | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
+    #: Target lot for a close, in the LIVE book's id space (conid). The screen
+    #: bridge never sets it — a ``ScreenRow`` id is a backtest lot id, which
+    #: matches no live lot; absent means "close the symbol's whole owned book".
     position_id: str | None = None
     tag: str = ""
 

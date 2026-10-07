@@ -45,7 +45,11 @@ def live_signals(
     through; a ``flat`` row with a ``sig_ts`` becomes a ``close`` (see module
     docstring). The local age filter drops a stale posture. A row whose
     base-interval frame is missing/empty or whose last close is non-finite or
-    ``<= 0`` is dropped. Pure mapping; the only I/O is the screen run.
+    ``<= 0`` is dropped. The row's executable fields (``qty``, ``stop_loss``,
+    ``take_profit``, ``tag``) are carried through verbatim, so a strategy that
+    sizes its own opens (``ctx.long(..., size=)``) keeps that sizing on the live
+    path; ``position_id`` is not (see ``_to_live_signal``). Pure mapping; the
+    only I/O is the screen run.
     """
     screen = run_screen_from_strategy(config_path, max_age_days=None)
     rows, state = screen.rows, screen.state
@@ -116,6 +120,14 @@ def _to_live_signal(row: ScreenRow, action: SignalAction, price: float) -> LiveS
         reasons=row.signals,
         signal_ts=row.sig_ts,
         price=price,
-        qty=0.0,
+        qty=float(row.qty),
         bar_ts=row.ts,
+        stop_loss=row.stop_loss,
+        take_profit=row.take_profit,
+        # ``position_id`` is deliberately NOT forwarded: a row's id lives in the
+        # BACKTEST lot space (``symbol_ts_seq``), while live lots are keyed by
+        # conid. Carrying it would make ``reconcile._close_intents`` match no lot
+        # and turn every exit into a silent no-op. Absent, a close covers the
+        # symbol's whole owned book, which is what the strategy asked for.
+        tag=row.tag,
     )

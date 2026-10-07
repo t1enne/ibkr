@@ -355,7 +355,9 @@ def test_render_report_carries_outcome_and_kind_on_a_failed_result() -> None:
         ),
     )
     text = render_report(report, "text")
-    assert "order AAPL long unresolved (kind=unresolved) unresolved: ambiguous" in text
+    assert (
+        "unresolved" in text and "ambiguous" in text
+    )  # table cells, not a run-on line
     assert "rejected" not in text
     doc = json.loads(render_report(report, "json"))
     result = doc["results"][0]

@@ -316,7 +316,7 @@ uv run pytest src/bt/risk/tests/ -v
 - **Don't invent a workflow.** Check for an existing `bt` subcommand first.
 - **Don't launder output.** A re-derived metric or `grep`-ed report is not evidence.
 - **Data availability**: when an agent needs candles that are missing/stale, just run `data dl` (see the runbook below) — `data query` only _reads_ the local DB and never fetches.
-- **Data sources are separate.** `data dl` fetches candles only, via the IBKR Gateway. Company fundamentals = `data fundamentals dl` (SEC EDGAR, no Gateway). US macro = `scripts/fetch_macro_fred.py` (`FRED_API_KEY` is configured, writes `assets/*.csv`). Missing fundamentals/macro is not fixed by `data dl`.
+- **Two sources, one command.** `data dl` fetches candles via the IBKR Gateway **and** company fundamentals from SEC EDGAR (no Gateway, disk-cached) — one symbol list, both passes, always. US macro = `scripts/fetch_macro_fred.py` (`FRED_API_KEY` is configured, writes `assets/*.csv`) is separate and not fixed by `data dl`.
 - **Bar size**: strategies expect the bar size in config to match available data. Most data is `1h`.
 - **HTF lookahead**: `state.candles.get((sym, freq))` and the DSL `ctx.ta`
   `interval=` reads are both safe (cursor-truncated).
@@ -326,7 +326,7 @@ uv run pytest src/bt/risk/tests/ -v
   (stateful DSL), fed per candle from `state.candles`. No engine `model_updater`
   is involved.
 
-## `data dl` — one-shot candle download (when data is missing/stale)
+## `data dl` — one-shot candle + fundamentals download (when data is missing/stale)
 
 When a backtest has no data or a symbol's daily read looks stale, just attempt:
 
@@ -334,6 +334,11 @@ When a backtest has no data or a symbol's daily read looks stale, just attempt:
 uv run ibkr data dl AAPL MSFT --from 2019-01-01        # backfill + refresh
 uv run ibkr data dl --universe universes/nsdq.json --from 2019-01-01
 ```
+
+One command, two independent sources: candles from the IBKR Gateway (bounded
+by `--from`/`--to`) **and** SEC EDGAR fundamentals (direct SEC HTTP, no
+Gateway). The symbol list is resolved once and feeds both passes; the SEC pass
+always runs.
 
 Idempotent and gap-based; `--from` earlier = deeper history. Don't loop chunks.
 Its `0 fetch gaps`/`up to date` tail can print even on success, so confirm the
@@ -350,27 +355,28 @@ uv run python -c "import httpx;print(httpx.get('https://localhost:5000/v1/api/is
 uv run python scripts/login_ibkr.py   # else login
 ```
 
-## `data fundamentals dl` — SEC EDGAR fundamentals (optional strategy data)
+## SEC EDGAR fundamentals (part of `data dl`, no Gateway needed)
 
-Downloads SEC EDGAR (XBRL) filings into the local DB as **sparse fiscal rows**
-— one row per `(ticker, statement, field, period)` filing (~5 rows per symbol
-per year, not a daily grid). No Gateway needed (direct SEC HTTP):
+The same command stores SEC EDGAR (XBRL) filings in the local DB as **sparse
+fiscal rows** — one row per `(ticker, statement, field, period)` filing (~5
+rows per symbol per year, not a daily grid), plus a `fundamentals:` recap block:
 
 ```bash
-uv run ibkr data fundamentals dl AAPL MSFT                     # positional symbols
-uv run ibkr data fundamentals dl --universe universes/nsdq.json
-uv run ibkr data fundamentals dl AAPL --from 2024-01-01 --to 2024-12-31 --refresh
+uv run ibkr data dl AAPL MSFT --from 2019-01-01        # candles + fundamentals
+uv run ibkr data dl AAPL --from 2019-01-01 --refresh-fundamentals   # ignore SEC cache
 ```
 
-Options:
+Fundamentals options (they only affect the SEC pass):
 
-- `--from/-f`, `--to/-t` — bound the **filing** window (the `filed` date, not
-  the fiscal period: a 10-K filed in 2024 restates 2022's period, and excluding
-  it by period would drop exactly the point-in-time facts we keep).
-- `--refresh` — bypass the on-disk payload cache and re-fetch from SEC.
-- `--cache` — payload cache dir (default `../data/fundamentals_cache`).
+- `--fundamentals-from`, `--fundamentals-to` — bound the **filing** window (the
+  `filed` date, not the fiscal period: a 10-K filed in 2024 restates 2022's
+  period, and excluding it by period would drop exactly the point-in-time facts
+  we keep). Unset by default — the candle `--from` is deliberately **not**
+  imposed, so as-first-stated history keeps its earliest filings.
+- `--refresh-fundamentals` — bypass the on-disk payload cache and re-fetch.
+- `--fundamentals-cache` — payload cache dir (default `../data/fundamentals_cache`).
 
-Idempotent. Per-symbol recap prints rows written (or `up to date` when `0`),
+Idempotent. The per-symbol recap prints rows written (or `up to date` when `0`),
 fiscal periods landed, and the filed span — re-run after new filings appear.
 Symbols SEC has no CIK for (ETF, non-US registrant) report `0 rows` without
 aborting the batch.
@@ -454,7 +460,7 @@ All CLI groups under the `py` root command — also callable via `make run <subc
 
 | Group  | Commands                                      | Description                                                                  |
 | ------ | --------------------------------------------- | ---------------------------------------------------------------------------- |
-| `data` | `dl`, `query`, `preview`, `fundamentals dl`   | Sync/download OHLCV from IBKR, query local DB; SEC EDGAR fundamentals        |
+| `data` | `dl`, `query`, `preview`                    | Sync/download OHLCV from IBKR **and** SEC EDGAR fundamentals (one `dl`), query local DB |
 | `bt`   | `run`, `sweep`, `split`, `optimize`, `screen` | Backtesting engine, hyperparam sweep, IS/OOS validation, walk-forward tuning, live-intent screening |
 | `live` | `run`, `abandon`                              | One-shot reconcile cycle against the IBKR account (paper or live); see README § Live Trading |
 

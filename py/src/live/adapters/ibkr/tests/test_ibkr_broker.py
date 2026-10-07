@@ -1484,15 +1484,32 @@ async def test_default_conid_lookup_returns_the_verified_conid(
 
 
 @pytest.mark.asyncio
-async def test_default_conid_lookup_refuses_ambiguity(
+async def test_default_conid_lookup_prefers_the_db_conid_on_ambiguity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Two distinct conids also naming the ticker: refuse rather than pick one.
+    # Two US STK rows share the ticker; the candle DB pairs AAPL with conid 2,
+    # so that candidate wins instead of the raise.
     monkeypatch.setattr(
         broker_mod,
         "search_contracts",
         lambda _t: _candidates(_contract("1", "AAPL"), _contract("2", "AAPL")),
     )
+    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda t: 2)
+    assert await broker_mod._default_conid_lookup("AAPL") == 2
+
+
+@pytest.mark.asyncio
+async def test_default_conid_lookup_refuses_ambiguity_without_a_db_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two distinct conids also naming the ticker and NEITHER matches the DB conid:
+    # refuse, naming each candidate's description, rather than pick one.
+    monkeypatch.setattr(
+        broker_mod,
+        "search_contracts",
+        lambda _t: _candidates(_contract("1", "AAPL"), _contract("2", "AAPL")),
+    )
+    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda t: None)
     with pytest.raises(ValueError, match="ambiguous"):
         await broker_mod._default_conid_lookup("AAPL")
 

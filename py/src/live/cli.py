@@ -21,6 +21,7 @@ import peewee
 
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
+from src.bt.table import Col, Table, render as render_table
 from src.bt.state import ActionType, PortfolioState
 from src.bt.state.factories import create_initial_portfolio
 from src.bt.types import StrategyConfig
@@ -39,6 +40,15 @@ from src.live.engine import (
 from src.live.lease import CycleInProgressError
 from src.live.identity import OPEN_STATES, IntentKey, IntentState
 from src.live.ledger import LedgerReadError, SqliteLedger, config_hash
+from src.live.pf import (
+    BrokerSide,
+    PfReport,
+    StoreSide,
+    read_ibkr_broker,
+    read_sim_broker,
+    read_store,
+    render_pf,
+)
 from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
 from src.live.result import Err
 from src.live.types import (
@@ -97,7 +107,7 @@ def live_group() -> None:
 @click.option(
     "--adapter",
     type=click.Choice(_ADAPTERS),
-    default=None,
+    default="ibkr",
     help="Broker adapter; defaults to the config's `broker` key.",
 )
 @click.option(
@@ -389,6 +399,205 @@ def live_abandon(
 live_group.add_command(live_abandon)
 
 
+@click.command("pf")
+@click.argument(
+    "config_path",
+    required=False,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
+)
+@click.option(
+    "--adapter",
+    type=click.Choice(_ADAPTERS),
+    default=None,
+    help="Broker to read; a filter over which broker side is included. "
+    "Absent = store-only (no broker read).",
+)
+@click.option(
+    "--allow-live",
+    is_flag=True,
+    help="Required to read a LIVE account (implies mode: live without a config).",
+)
+@click.option(
+    "--no-gateway",
+    is_flag=True,
+    help="Skip the gateway readiness check (trust an externally kept-alive gateway).",
+)
+def live_pf(
+    config_path: str | None,
+    fmt: str,
+    adapter: str | None,
+    allow_live: bool,
+    no_gateway: bool,
+) -> None:
+    """Show scopes and their orders/trades, plus the broker side when read.
+
+    With CONFIG_PATH the report covers that config's scope. WITHOUT it, EVERY
+    scope the store knows about. Either way each scope renders its own lots,
+    order intents and stored fills (all read from OUR durable store).
+
+    ``--adapter`` is a FILTER, not a requirement: given, it selects the broker
+    to read (``ibkr`` account-wide, or a config's ``sim`` fixture) and the report
+    includes the broker block + divergence; absent, the report is store-only and
+    no broker is touched — so a bare strategy config reads without a
+    ``portfolio_path``. Without a config, a live account needs ``--allow-live``.
+
+    Nothing is placed and nothing is written: no lease is taken, no strategy row
+    is ensured and no DDL runs (a read of an unwritten db is an empty store, not a
+    creation). The exit code is 0 (report printed), 1 (a config/gateway/read
+    failure) or 2 (usage) — there is no unsafe path here.
+    """
+    ledger = SqliteLedger()
+    try:
+        report = (
+            _all_scopes_report(ledger, adapter, allow_live, no_gateway)
+            if config_path is None
+            else _config_report(ledger, config_path, adapter, allow_live, no_gateway)
+        )
+    except (GatewayNotReady, ValueError, LedgerReadError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(render_pf(report, fmt))
+
+
+def _all_scopes_report(
+    ledger: SqliteLedger,
+    adapter: str | None,
+    allow_live: bool,
+    no_gateway: bool,
+) -> PfReport:
+    """Every scope in the store, plus a broker read when ``--adapter`` names one."""
+    scopes = ledger.scopes_of_store()
+    stores = tuple(read_store(ledger, scope) for scope in scopes)
+    broker = _pf_broker(adapter, None, None, stores, allow_live, no_gateway)
+    return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker)
+
+
+def _config_report(
+    ledger: SqliteLedger,
+    config_path: str,
+    adapter: str | None,
+    allow_live: bool,
+    no_gateway: bool,
+) -> PfReport:
+    """The config's scope, plus a broker read when one is resolved."""
+    cfg = load_live_config(config_path)
+    raw = _read_json(config_path)
+    store = read_store(ledger, cfg.scope, initial_capital=cfg.initial_capital)
+    broker = _pf_broker(adapter, raw, cfg, (store,), allow_live, no_gateway)
+    return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=(store,), broker=broker)
+
+
+def _pf_broker(
+    adapter: str | None,
+    raw: Mapping[str, object] | None,
+    cfg: LiveConfig | None,
+    stores: tuple[StoreSide, ...],
+    allow_live: bool,
+    no_gateway: bool,
+) -> BrokerSide | None:
+    """Resolve the broker to read (if any) and read it.
+
+    ``--adapter`` wins; otherwise a config's EXPLICITLY-named ``broker`` key; a
+    config that never named one reads NO broker (store-only), so ``live pf
+    <strategy.json>`` works without a ``portfolio_path``. A ``sim`` read without
+    a ``portfolio_path`` degrades to a warning, never a usage error. Without a
+    config the mode is ``live`` when ``--allow-live`` and ``paper`` otherwise.
+    """
+    resolved = adapter
+    if resolved is None and raw is not None and cfg is not None:
+        name, named = resolve_broker(raw, cfg.strategy_params)
+        resolved = name if named else None
+    if resolved is None:
+        return None
+    if resolved == "sim":
+        if cfg is None or not cfg.portfolio_path:
+            return _skipped_broker(
+                "sim", "no portfolio_path in config (broker read skipped)"
+            )
+        owned = frozenset(
+            i
+            for store in stores
+            for i in (*(lot.id for lot in store.lots), *store.sim_open_ids)
+        )
+        return asyncio.run(read_sim_broker(cfg, owned))
+    mode: Literal["paper", "live"] = (
+        cfg.mode if cfg is not None else ("live" if allow_live else "paper")
+    )
+    owned = frozenset(lot.id for store in stores for lot in store.lots)
+    return asyncio.run(
+        _read_ibkr_pf(
+            mode,
+            tuple(store.scope for store in stores),
+            owned,
+            allow_live,
+            no_gateway,
+        )
+    )
+
+
+def _skipped_broker(adapter: str, reason: str) -> BrokerSide:
+    """A broker block that carries only a warning — no positions, no orders."""
+    return BrokerSide(
+        adapter=adapter,
+        source="",
+        account="",
+        net_liquidation=None,
+        cash=None,
+        positions=(),
+        working_orders=(),
+        ours_orders=(),
+        warnings=(reason,),
+    )
+
+
+async def _read_ibkr_pf(
+    mode: Literal["paper", "live"],
+    scopes: tuple[str, ...],
+    owned: frozenset[str],
+    allow_live: bool,
+    no_gateway: bool,
+) -> BrokerSide:
+    """Gate then read the IBKR book: resolve account + authz before any read.
+
+    Mirrors ``_run_cycle``'s gate order exactly — reach an authenticated session,
+    prove *mode* may read the account, then probe readiness — so a pf read is
+    refused under the same rules as a cycle. A read failure is a typed
+    ``GatewayNotReady`` (exit 1), never a traceback. The client is ALWAYS closed
+    in the ``finally``; nothing is placed and no lease is taken.
+    """
+    gateway = IbkrGateway(IbkrClient())
+    try:
+        try:
+            account = await gateway.client.resolve_account()
+        except IbkrError as exc:
+            raise GatewayNotReady(FeedError(kind="auth", message=str(exc))) from exc
+        decision = authorize(
+            mode=mode, account=account, allow_live=allow_live, dry_run=True
+        )
+        if isinstance(decision, Err):
+            raise GatewayNotReady(cast("FeedError", decision.error))
+        if no_gateway:
+            _stderr_log(
+                "gateway readiness check skipped (--no-gateway; "
+                "trusting an externally kept-alive gateway)"
+            )
+        else:
+            ready = await gateway.ensure_ready()
+            if isinstance(ready, Err):
+                raise GatewayNotReady(cast("FeedError", ready.error))
+        try:
+            return await read_ibkr_broker(gateway.client, account, scopes, owned)
+        except IbkrError as exc:
+            raise GatewayNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
+    finally:
+        await gateway.aclose()
+
+
+live_group.add_command(live_pf)
+
+
 def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
     """Dump a strategy-only projection of *strategy* into *tmp*; return its path.
 
@@ -512,40 +721,109 @@ def _render_json(report: CycleReport) -> str:
     return json.dumps(doc, default=_json_default, indent=2)
 
 
+_SIGNAL_COLS = (
+    Col("symbol"),
+    Col("action"),
+    Col("score", ">"),
+    Col("price", ">"),
+)
+_INTENT_COLS = (
+    Col("symbol"),
+    Col("action"),
+    Col("qty", ">"),
+    Col("ref", ">"),
+    Col("reason"),
+)
+_RESULT_COLS = (
+    Col("symbol"),
+    Col("action"),
+    Col("outcome"),
+    Col("kind"),
+    Col("qty", ">"),
+    Col("filled", ">"),
+    Col("message"),
+)
+
+
 def _render_text(report: CycleReport) -> str:
-    lines = [f"as_of: {report.as_of}"]
-    lines.append(
-        f"costs: bookkeeping={report.cost.bookkeeping} sizing={report.cost.sizing}"
+    """The cycle as block-aligned tables (``src.bt.table``), not run-on rows.
+
+    Scalars stay lines; every list — signals, intents, order results — is one
+    table with a title, so a wide order's message column reads instead of
+    fighting a ``key=value`` header. The last column of the results table is the
+    message, which is allowed to grow; the rest stay tight.
+    """
+    blocks: list[list[str]] = [[f"as_of: {report.as_of}"]]
+    blocks.append(
+        [f"costs: bookkeeping={report.cost.bookkeeping} sizing={report.cost.sizing}"]
     )
-    for sig in report.signals:
-        lines.append(
-            f"signal {sig.symbol} {sig.action} "
-            f"score={sig.score:.4f} price={sig.price:.4f}"
+    blocks.append(
+        _title_table(
+            "signals",
+            _SIGNAL_COLS,
+            tuple(
+                (sig.symbol, str(sig.action), f"{sig.score:.4f}", f"{sig.price:.4f}")
+                for sig in report.signals
+            ),
         )
-    for intent in report.intents:
-        lines.append(
-            f"intent {intent.symbol} {intent.action.value} "
-            f"qty={intent.qty:g} @ {intent.ref_price:.4f} ({intent.reason})"
+    )
+    blocks.append(
+        _title_table(
+            "intents",
+            _INTENT_COLS,
+            tuple(
+                (
+                    intent.symbol,
+                    intent.action.value,
+                    f"{intent.qty:g}",
+                    f"{intent.ref_price:.4f}",
+                    intent.reason,
+                )
+                for intent in report.intents
+            ),
         )
-    for result in report.results:
-        status = result.outcome.value
-        kind = f" (kind={result.error_kind})" if result.error_kind else ""
-        lines.append(
-            f"order {result.intent.symbol} {result.intent.action.value} "
-            f"{status}{kind}{_partial_note(result)} {result.message}"
+    )
+    blocks.append(
+        _title_table(
+            "orders",
+            _RESULT_COLS,
+            tuple(
+                (
+                    result.intent.symbol,
+                    result.intent.action.value,
+                    result.outcome.value,
+                    result.error_kind or "-",
+                    f"{result.intent.qty:g}",
+                    f"{result.filled_qty:g}" if result.filled_qty is not None else "-",
+                    f"{result.message}{_partial_note(result)}",
+                )
+                for result in report.results
+            ),
         )
+    )
     if report.resync_error is not None:
         error = report.resync_error
-        lines.append(f"resync_error: {error.kind}: {error.message}")
+        blocks.append([f"resync_error: {error.kind}: {error.message}"])
     if report.placement_error is not None:
         error = report.placement_error
-        lines.append(f"placement_error: {error.kind}: {error.message}")
-    lines.append(f"cash: {report.portfolio_before.cash:.2f}")
-    lines.append(
-        f"summary: {len(report.signals)} signals, "
-        f"{len(report.intents)} intents, {len(report.results)} orders"
+        blocks.append([f"placement_error: {error.kind}: {error.message}"])
+    blocks.append([f"cash: {report.portfolio_before.cash:.2f}"])
+    blocks.append(
+        [
+            f"summary: {len(report.signals)} signals, "
+            f"{len(report.intents)} intents, {len(report.results)} orders"
+        ]
     )
-    return "\n".join(lines)
+    return "\n\n".join("\n".join(block) for block in blocks)
+
+
+def _title_table(
+    title: str, columns: tuple[Col, ...], rows: tuple[tuple[str, ...], ...]
+) -> list[str]:
+    """A titled table block, or ``"<title>: none"`` when there is nothing to show."""
+    if not rows:
+        return [f"{title}: none"]
+    return [f"{title}:", *render_table(Table(columns=columns, rows=rows))]
 
 
 def _result_dict(result: OrderResult) -> dict[str, object]:
