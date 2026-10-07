@@ -26,6 +26,7 @@ from src.live.adapters.ibkr.broker import MAX_REPLIES, IbkrBroker
 from src.live.broker import OrderResult
 from src.live.ledger import SqliteLedger
 from src.live.identity import (
+    WEDGED_CYCLES,
     OPEN_STATES,
     IntentKey,
     IntentRecord,
@@ -58,6 +59,22 @@ TRADES = f"{BASE}iserver/account/trades"
 #: bar-free scheme the cOID ignores it (INV-2); it only drives the DAY-order
 #: rollover and the audit field.
 BAR = cast("pd.Timestamp", pd.Timestamp("2024-06-03T20:00:00Z"))
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _captured_working_order(ref: str, order_id: str = ORDER_ID) -> dict[str, object]:
+    """A REAL captured working-order row (gateway build 10.50.1a) for our key.
+
+    Row 0 of the captured fixture is OURS (it carries ``order_ref``); its field
+    SET is the gateway's, so a test can no longer invent a ``cOID`` key — the
+    hand-built mocks that injected ``cOID`` are exactly what hid the parser
+    reading the wrong field.
+    """
+    rows = json.loads((_FIXTURES / "gateway_working_orders.json").read_text())["orders"]
+    ours = dict(rows[0])
+    ours["order_ref"] = ref
+    ours["orderId"] = int(order_id)
+    return ours
 
 
 @pytest.fixture(autouse=True)
@@ -428,7 +445,7 @@ async def test_reply_loop_overflow_adopts_a_live_order() -> None:
     respx.get(OPEN_ORDERS).mock(
         side_effect=[
             httpx.Response(200, json={"orders": []}),  # pre-flight: nothing yet
-            httpx.Response(200, json={"orders": [{"orderId": ORDER_ID, "cOID": ref}]}),
+            httpx.Response(200, json={"orders": [_captured_working_order(ref)]}),
         ]
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
@@ -499,7 +516,7 @@ async def test_ambiguous_submit_adopts_a_working_order() -> None:
     respx.get(OPEN_ORDERS).mock(
         side_effect=[
             httpx.Response(200, json={"orders": []}),
-            httpx.Response(200, json={"orders": [{"orderId": ORDER_ID, "cOID": ref}]}),
+            httpx.Response(200, json={"orders": [_captured_working_order(ref)]}),
         ]
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
@@ -525,7 +542,7 @@ async def test_later_bar_adopts_an_order_minted_on_an_earlier_bar() -> None:
     submit = respx.post(SUBMIT).mock(return_value=httpx.Response(500, json={}))
     respx.get(OPEN_ORDERS).mock(
         return_value=httpx.Response(
-            200, json={"orders": [{"orderId": ORDER_ID, "cOID": prior_ref}]}
+            200, json={"orders": [_captured_working_order(prior_ref)]}
         )
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
@@ -560,7 +577,7 @@ async def test_confirm_post_adopts_when_a_working_order_appears() -> None:
     respx.get(OPEN_ORDERS).mock(
         side_effect=[
             httpx.Response(200, json={"orders": []}),  # pre-flight
-            httpx.Response(200, json={"orders": [{"orderId": ORDER_ID, "cOID": ref}]}),
+            httpx.Response(200, json={"orders": [_captured_working_order(ref)]}),
         ]
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
@@ -668,7 +685,7 @@ async def test_wait_filled_timeout_is_typed_and_reports_the_partial() -> None:
         )
     )
     partial = _failure(await _broker().place(_open_intent()))
-    assert partial.kind == "unfilled"
+    assert partial.kind == "timeout"  # still live at the deadline, not a dead order
     assert "still Submitted after 0s with 0.25 of 1 filled" in partial.message
 
 
@@ -1355,7 +1372,7 @@ async def test_resync_adopts_a_prior_working_order_at_cycle_start() -> None:
     respx.get(OPEN_ORDERS).mock(
         return_value=httpx.Response(
             200,
-            json={"orders": [{"orderId": ORDER_ID, "cOID": order_ref(key, 0)}]},
+            json={"orders": [_captured_working_order(order_ref(key, 0))]},
         )
     )
     broker = _broker(intents=intents)
@@ -1569,9 +1586,9 @@ async def test_lost_intent_row_sweep_fails_closed_when_the_executions_read_fails
 @respx.mock
 @pytest.mark.asyncio
 async def test_deadline_partial_settles_working_not_terminal() -> None:
-    """Block2: a partial at the wait deadline keeps the intent WORKING.
+    """Block2/N3: a partial at the wait deadline keeps the intent WORKING.
 
-    The order is STILL LIVE, so stamping it UNFILLED (terminal) would let the next\n    cycle re-mint a duplicate. The partial is reported in the message; the durable\n    state stays OPEN so resync re-checks it.\n"""
+    The order is STILL LIVE, so stamping it UNFILLED (terminal) would let the next\n    cycle re-mint a duplicate. The reported OUTCOME must agree with that durable\n    state — non-terminal vocabulary, never ``unfilled``/``rejected`` — so an\n    operator does not read a live order as dead.\n"""
     intent = _open_intent()
     key = intent_key(SCOPE, intent)
     intents = FakeIntents()
@@ -1590,10 +1607,14 @@ async def test_deadline_partial_settles_working_not_terminal() -> None:
         )
     )
     _mock_no_working_orders()
+    broker = _broker(intents=intents)
 
-    error = _failure(await _broker(intents=intents).place(intent))
+    result = await broker.place_cohort((intent,))
 
-    assert error.kind == "unfilled"  # the partial is reported
+    assert isinstance(result, Ok)
+    (failed,) = cast("tuple[OrderResult, ...]", result.value)
+    assert failed.ok is False
+    assert failed.outcome not in (OrderOutcome.UNFILLED, OrderOutcome.REJECTED)
     record = intents.load(key)
     assert record is not None and record.state is IntentState.WORKING
 
@@ -1658,3 +1679,347 @@ async def test_broker_places_over_the_real_sqlite_ledger(tmp_path: Path) -> None
     assert record.order_id == ORDER_ID
     assert record.order_ref == order_ref(key, 0)
     assert ledger.load_open(SCOPE) == ()
+
+
+# --- N4: a dead same-session order must not block a legitimate re-send -------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_cancelled_same_session_order_does_not_block_a_resend() -> None:
+    """N4: ``/iserver/account/orders`` lists cancelled session orders.
+
+    The parsed status is terminal, so the row must be skipped when building the
+    working index — otherwise it is adopted and the broker waits on a dead order,
+    blocking the legitimate re-send for the rest of the session.
+    """
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.UNFILLED,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id="OLD",
+            decision_ts=None,
+        )
+    )
+    cancelled = _captured_working_order(order_ref(key, 0))
+    cancelled["status"] = "Cancelled"
+    cancelled["order_ccp_status"] = "Cancelled"
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(OPEN_ORDERS).mock(
+        return_value=httpx.Response(200, json={"orders": [cancelled]})
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+
+    placed = _ok(await _broker(intents=intents).place(intent))
+
+    assert placed.ok
+    assert submit.called  # the dead order did NOT block the re-send
+    record = intents.load(key)
+    assert record is not None and record.attempt == 1  # a NEW attempt
+
+
+# --- N1: a status read failure must not wedge a key forever ------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_status_read_failure_settles_a_rolled_day_order_unfilled() -> None:
+    """N1: the status endpoint only covers the CURRENT session (503 otherwise).
+
+    A DAY order cannot outlive its session, so once its day has rolled and the
+    status cannot be read it has expired unfilled — settle it (re-mintable) rather
+    than leaving the record immortal.
+    """
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id=ORDER_ID,
+            decision_ts=cast("pd.Timestamp", pd.Timestamp("2024-06-03T20:00:00Z")),
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    respx.get(STATUS).mock(side_effect=httpx.ConnectError("down"))
+
+    broker = _broker(
+        intents=intents,
+        now=lambda: cast("pd.Timestamp", pd.Timestamp("2024-06-05T09:00:00Z")),
+    )
+    await broker.resync()
+
+    record = intents.load(key)
+    assert record is not None and record.state is IntentState.UNFILLED
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_status_read_failure_same_day_keeps_working() -> None:
+    """N1: a same-day unreadable status is NOT proof the order is gone."""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id=ORDER_ID,
+            decision_ts=CYCLE_TS,
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    respx.get(STATUS).mock(side_effect=httpx.ConnectError("down"))
+
+    await _broker(intents=intents, now=lambda: CYCLE_TS).resync()
+
+    record = intents.load(key)
+    assert record is not None and record.state is IntentState.WORKING
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_wedged_key_is_surfaced_distinctly_after_n_resyncs() -> None:
+    """N1: an OPEN key nothing can settle across WEDGED_CYCLES resyncs is LOUD.
+
+    A distinct ``WEDGED`` outcome in the report (not one more ``unresolved`` line)
+    names the operator escape, so a broker-side cancel the gateway cannot confirm
+    does not sit silent forever.
+    """
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id=ORDER_ID,
+            decision_ts=CYCLE_TS,
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    respx.get(STATUS).mock(side_effect=httpx.ConnectError("down"))
+    broker = _broker(intents=intents, now=lambda: CYCLE_TS)
+
+    for _ in range(WEDGED_CYCLES - 1):
+        quiet = await broker.resync()
+        assert isinstance(quiet, Ok)
+        assert not [
+            r
+            for r in cast("tuple[OrderResult, ...]", quiet.value)
+            if r.outcome is OrderOutcome.WEDGED
+        ]
+    loud = await broker.resync()
+
+    assert isinstance(loud, Ok)
+    wedged = [
+        r
+        for r in cast("tuple[OrderResult, ...]", loud.value)
+        if r.outcome is OrderOutcome.WEDGED
+    ]
+    assert len(wedged) == 1 and "abandon" in wedged[0].message
+    record = intents.load(key)
+    assert record is not None and record.stuck_cycles == WEDGED_CYCLES
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_gtc_order_is_not_expired_by_a_day_roll() -> None:
+    """N1: the day-roll expiry is gated on the persisted ``tif`` (a GTC survives)."""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id=ORDER_ID,
+            decision_ts=cast("pd.Timestamp", pd.Timestamp("2024-06-03T20:00:00Z")),
+            tif="GTC",
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    respx.get(STATUS).mock(side_effect=httpx.ConnectError("down"))
+
+    broker = _broker(
+        intents=intents,
+        now=lambda: cast("pd.Timestamp", pd.Timestamp("2024-06-05T09:00:00Z")),
+    )
+    await broker.resync()
+
+    record = intents.load(key)
+    assert record is not None and record.state is IntentState.WORKING
+
+
+# --- N5: a falsy order id is UNKNOWN, never a real id ------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_resync_treats_an_empty_order_id_as_unknown() -> None:
+    """N5: ``canonical_order_id(None)`` is ``''``; a falsy id must be unknown.
+
+    Otherwise the record never ages and ``_status('')`` errors every cycle.
+    """
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.UNRESOLVED,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id="",
+            decision_ts=None,
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
+
+    await _broker(intents=intents).resync()
+
+    assert not status.called  # no status read for an empty id
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_working_row_with_no_readable_order_id_is_not_adopted() -> None:
+    """N5: a working row we cannot join (no id) is skipped, never adopted."""
+    intent = _open_intent()
+    row = _captured_working_order(order_ref(intent_key(SCOPE, intent), 0))
+    del row["orderId"]
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(OPEN_ORDERS).mock(
+        return_value=httpx.Response(200, json={"orders": [row]})
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+
+    placed = _ok(await _broker().place(intent))
+
+    assert placed.ok and submit.called
+
+
+# --- N6: the skip branch must not downgrade a WORKING record -----------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_skip_does_not_downgrade_a_working_record() -> None:
+    """N6: a WORKING record's provenance (ref/id) must survive a skip, not be erased."""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id=ORDER_ID,
+            decision_ts=None,
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+
+    error = _failure(await _broker(intents=intents).place(intent))
+
+    assert error.kind == "unresolved"
+    record = intents.load(key)
+    assert record is not None and record.state is IntentState.WORKING  # not erased
+
+
+# --- N8: the durable attempt never regresses ---------------------------------
+
+
+def test_attempt_of_never_regresses_the_stored_attempt() -> None:
+    """N8: ``_attempt_of`` takes the MAX of the ref tail and the stored attempt."""
+    key = intent_key(SCOPE, _open_intent())
+    existing = IntentRecord(
+        key=key,
+        state=IntentState.WORKING,
+        attempt=5,
+        order_ref=order_ref(key, 5),
+        order_id="1",
+        decision_ts=None,
+    )
+    assert broker_mod._attempt_of(order_ref(key, 0), existing) == 5
+    assert broker_mod._attempt_of(order_ref(key, 7), existing) == 7
+    assert broker_mod._attempt_of("garbage", existing) == 5  # unreadable tail
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_adopting_an_older_working_order_does_not_lower_the_attempt() -> None:
+    """N8: ``_persist_working`` must not persist an attempt BELOW the live record."""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=5,
+            order_ref=order_ref(key, 5),
+            order_id=ORDER_ID,
+            decision_ts=None,
+        )
+    )
+    respx.get(OPEN_ORDERS).mock(
+        return_value=httpx.Response(
+            200,
+            json={"orders": [_captured_working_order(order_ref(key, 0))]},
+        )
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+
+    await _broker(intents=intents).resync()
+
+    record = intents.load(key)
+    assert record is not None and record.attempt == 5
+
+
+# --- N3: the reported outcome follows the durable state, never a bare kind ---
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_status_transport_failure_reports_unresolved_not_rejected() -> None:
+    """N3: a transport failure while polling a LIVE order is never 'rejected'.
+
+    The durable state is WORKING (the order may be live), so the reported outcome
+    maps transport/auth/rate_limit to the unknown/unresolved vocabulary.
+    """
+    intent = _open_intent()
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(side_effect=httpx.ConnectError("down"))
+    _mock_no_working_orders()
+    broker = _broker(intents=FakeIntents())
+
+    result = await broker.place_cohort((intent,))
+
+    assert isinstance(result, Ok)
+    (failed,) = cast("tuple[OrderResult, ...]", result.value)
+    assert failed.ok is False
+    assert failed.outcome is OrderOutcome.UNRESOLVED
+    assert failed.error_kind in {"transport", "auth", "rate_limit"}

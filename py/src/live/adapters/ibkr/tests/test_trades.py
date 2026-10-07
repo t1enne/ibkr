@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import cast
 
 import pandas as pd
@@ -9,6 +11,7 @@ import pandas as pd
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, is_ours, reconcile
+from src.live.identity import ref_is_ours
 
 SCOPE = "momentum"
 
@@ -222,3 +225,19 @@ def test_separate_scopes_keep_separate_books() -> None:
     bbook, _ = reconcile("beta", (a, b), StrategyBook())
     assert [r.qty for r in abook.rows] == [10]
     assert [r.qty for r in bbook.rows] == [5]
+
+
+def test_a_captured_pre_upgrade_order_ref_is_not_ours() -> None:
+    """A ref from the OLD (pre-identity-layer) scheme is never considered ours.
+
+    The captured trade carries ``511350df-7f3f2b38-20261005T1749-000`` — a shape
+    the current identity layer cannot mint, so neither the trades attribution nor
+    the identity helpers may claim it.
+    """
+    raw = json.loads(
+        (Path(__file__).parent / "fixtures" / "gateway_trades.json").read_text()
+    )
+    ref = raw["trades"][0]["order_ref"]
+    assert ref == "511350df-7f3f2b38-20261005T1749-000"  # the captured value
+    assert not ref_is_ours(SCOPE, ref)
+    assert not is_ours(SCOPE, _exec("o", side=OrderSide.BUY, qty=1, price=1, ref=ref))

@@ -233,16 +233,19 @@ def placement_order(intents: Sequence[OrderIntent]) -> tuple[OrderIntent, ...]:
 
 
 def parse_working_order(entry: object) -> WorkingOrder | None:
-    """Parse one open-orders entry into a ``WorkingOrder`` (``None`` if unusable).
+    """Parse one open-orders entry into a ``WorkingOrder`` (``None`` if not ours).
 
-    A row with no ``cOID`` cannot be attributed to a scope, so it is skipped
-    rather than guessed at. Every other field is best-effort: only the ref and
-    the order id drive adoption, the rest is diagnostic.
+    The gateway echoes our client order id in ``order_ref`` (measured live; a
+    foreign order placed through another client or the UI carries NO ``order_ref``
+    key at all). So a row without an ``order_ref`` can never be ours and is
+    dropped explicitly — a scope prefix can never match a row we did not place by
+    construction. Every other field is best-effort: only the ref and the order id
+    drive adoption, the rest is diagnostic.
     """
     if not isinstance(entry, Mapping):
         return None
     body = cast("Mapping[str, object]", entry)
-    order_ref = opt_str(body.get("cOID")).strip()
+    order_ref = opt_str(body.get("order_ref")).strip()
     if not order_ref:
         return None
     return WorkingOrder(
@@ -503,9 +506,14 @@ def order_status_of(status: Mapping[str, object]) -> str:
     return opt_str(status.get("order_status")).strip()
 
 
+def is_terminal_status(status: str) -> bool:
+    """True when a raw status string is one an order never leaves."""
+    return status in _TERMINAL_STATUSES
+
+
 def is_terminal(status: Mapping[str, object]) -> bool:
     """True when the order's status will not change again."""
-    return order_status_of(status) in _TERMINAL_STATUSES
+    return is_terminal_status(order_status_of(status))
 
 
 def order_state(status: Mapping[str, object]) -> OrderState:
@@ -564,6 +572,7 @@ __all__ = [
     "classify_reply",
     "is_fully_filled",
     "is_terminal",
+    "is_terminal_status",
     "match_working",
     "order_side",
     "order_state",

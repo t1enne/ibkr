@@ -34,7 +34,13 @@ from src.live.cli import (
     render_report,
 )
 from src.live.engine import CycleReport, run_cycle
-from src.live.identity import OrderOutcome
+from src.live.identity import (
+    IntentKey,
+    IntentRecord,
+    IntentState,
+    OrderOutcome,
+    order_ref,
+)
 from src.live.ledger import SqliteLedger
 from src.live.result import Ok, Result
 from src.live.types import (
@@ -348,7 +354,7 @@ def test_render_report_carries_outcome_and_kind_on_a_failed_result() -> None:
         ),
     )
     text = render_report(report, "text")
-    assert "order AAPL long unresolved unresolved: ambiguous" in text
+    assert "order AAPL long unresolved (kind=unresolved) unresolved: ambiguous" in text
     assert "rejected" not in text
     doc = json.loads(render_report(report, "json"))
     result = doc["results"][0]
@@ -796,3 +802,67 @@ def test_housekeeping_does_not_swallow_a_programming_error() -> None:
     broken = _RaisingLedger(RuntimeError("bug"))
     with pytest.raises(RuntimeError, match="bug"):
         _housekeeping(cast("SqliteLedger", broken), dry_run=False)
+
+
+# --- N1: the operator escape for a wedged key --------------------------------
+
+
+def _wedged_ledger(tmp_path: Path) -> tuple[SqliteLedger, IntentKey]:
+    ledger = SqliteLedger(tmp_path / "abandon.sqlite")
+    key = IntentKey(
+        scope="momentum", symbol="AAPL", action=ActionType.long, position_id=None
+    )
+    ledger.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id="97932",
+            decision_ts=TS,
+        )
+    )
+    return ledger, key
+
+
+def test_abandon_clears_a_wedged_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape verb settles a wedged OPEN key terminal so the next cycle re-mints."""
+    ledger, key = _wedged_ledger(tmp_path)
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: ledger)
+
+    out = CliRunner().invoke(
+        live_group,
+        [
+            "abandon",
+            "--scope",
+            "momentum",
+            "--symbol",
+            "AAPL",
+            "--action",
+            "long",
+            "--yes",
+        ],
+    )
+
+    assert out.exit_code == 0, out.output
+    record = ledger.load(key)
+    assert record is not None and record.state is IntentState.UNFILLED
+
+
+def test_abandon_requires_explicit_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verb is irreversible-ish; without --yes it explains the duplicate risk."""
+    ledger, key = _wedged_ledger(tmp_path)
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: ledger)
+
+    out = CliRunner().invoke(
+        live_group,
+        ["abandon", "--scope", "momentum", "--symbol", "AAPL", "--action", "long"],
+    )
+
+    assert out.exit_code != 0
+    record = ledger.load(key)
+    assert record is not None and record.state is IntentState.WORKING  # untouched

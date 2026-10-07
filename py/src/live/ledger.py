@@ -184,6 +184,10 @@ class LiveOrderIntent(_Base):
     order_ref = TextField()
     order_id = TextField(null=True)
     decision_ts = IntegerField(null=True)
+    #: The time-in-force the order was placed with (see ``identity.DEFAULT_TIF``).
+    tif = TextField(default="DAY")
+    #: Consecutive resyncs this OPEN record stayed unresolved (wedged-key alarm).
+    stuck_cycles = IntegerField(default=0)
     updated_at = IntegerField()
 
     class Meta:
@@ -335,20 +339,68 @@ def _rekey_order_intents(db: SqliteDatabase) -> str | None:
     return legacy
 
 
+def _add_intent_columns(db: SqliteDatabase) -> None:
+    """Add the post-4.1 intent columns to an EXISTING identity-keyed table.
+
+    Additive only (``ALTER ... ADD COLUMN``), never a drop, so a live table keeps
+    its rows. No-op when the table is absent or still the legacy
+    ``(scope, token)`` shape (that one is re-keyed rather than altered).
+    """
+    if not _table_exists(db, "live_order_intent"):
+        return
+    columns = _table_columns(db, "live_order_intent")
+    if not {"scope", "symbol", "action", "position_id"} <= columns:
+        return
+    if "tif" not in columns:
+        db.execute_sql(
+            "ALTER TABLE live_order_intent ADD COLUMN tif TEXT NOT NULL DEFAULT 'DAY'"
+        )
+    if "stuck_cycles" not in columns:
+        db.execute_sql(
+            "ALTER TABLE live_order_intent ADD COLUMN stuck_cycles INTEGER NOT NULL "
+            "DEFAULT 0"
+        )
+
+
 def _restore_intents(db: SqliteDatabase, legacy: str) -> None:
     """Copy re-keyed legacy intent rows into the fresh identity-keyed table.
 
     Runs after ``create_tables`` rebuilt ``live_order_intent``. Every legacy row
     is copied (a rename+copy, never a drop); ``OR IGNORE`` guards the (already
     handled) token-collision case where two identities would otherwise collide on
-    the identity PK.
+    the identity PK. A legacy table whose columns do not match the expected shape
+    is left intact rather than raising on the first write of every cycle — its
+    rows stay preserved under the kept copy.
     """
+    required = {
+        "scope",
+        "token",
+        "symbol",
+        "action",
+        "position_id",
+        "state",
+        "attempt",
+        "order_ref",
+        "order_id",
+        "decision_ts",
+        "updated_at",
+    }
+    columns = _table_columns(db, legacy)
+    if not required <= columns:
+        logger.warning(
+            "legacy intent table %s has an unexpected shape (%s); rows preserved "
+            "in place, not restored",
+            legacy,
+            sorted(columns),
+        )
+        return
     db.execute_sql(
         f"INSERT OR IGNORE INTO live_order_intent "
         f"(scope, token, symbol, action, position_id, state, attempt, order_ref, "
-        f"order_id, decision_ts, updated_at) "
+        f"order_id, decision_ts, tif, stuck_cycles, updated_at) "
         f"SELECT scope, token, symbol, action, COALESCE(position_id, ''), state, "
-        f"attempt, order_ref, order_id, decision_ts, updated_at FROM {legacy}"
+        f"attempt, order_ref, order_id, decision_ts, 'DAY', 0, updated_at "
+        f"FROM {legacy}"
     )
 
 
@@ -442,7 +494,9 @@ class SqliteLedger:
                 "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
             )
         _rekey_sim_lots(db)
-        return _rekey_order_intents(db)
+        legacy = _rekey_order_intents(db)
+        _add_intent_columns(db)
+        return legacy
 
     @contextmanager
     def _write(self) -> Iterator[None]:
@@ -681,11 +735,11 @@ class SqliteLedger:
     # -- pending order intents (PendingIntents) ----------------------------
     #
     # The durable owner of OPEN order state. Reads tolerate a missing table
-    # (empty), like ``load_book``; writes create it lazily. A stored row whose
-    # symbol/action/position_id disagrees with the token's key is a crc32
-    # collision: it is warned about and treated as ABSENT, so a foreign identity
-    # is never adopted. (A true collision-bump would require identity to consult
-    # the store, which the pure ``IntentKey.token`` forbids.)
+    # (empty), like ``load_book``; writes create it lazily. The identity columns
+    # (scope/symbol/action/position_id) are the primary key, so two intents whose
+    # crc32 tokens collide stay separately addressable by IDENTITY. NOTE: that is
+    # a ROW-level guarantee only — the broker still attributes a working order by
+    # the token-keyed ref prefix, so two colliding keys share a prefix there.
 
     def load(self, key: IntentKey) -> IntentRecord | None:
         """The durable record for *key*, or ``None`` when unwritten."""
@@ -831,6 +885,8 @@ def _intent_fields(record: IntentRecord) -> dict[str, object]:
         "decision_ts": (
             _ms(record.decision_ts) if record.decision_ts is not None else None
         ),
+        "tif": record.tif,
+        "stuck_cycles": record.stuck_cycles,
         "updated_at": _ms(now),
     }
 
@@ -850,6 +906,8 @@ def _model_to_intent(row: LiveOrderIntent) -> IntentRecord:
         order_ref=cast("str", row.order_ref),
         order_id=cast("str | None", row.order_id),
         decision_ts=_ts(cast("int | None", row.decision_ts)),
+        tif=cast("str", row.tif),
+        stuck_cycles=int(cast("int", row.stuck_cycles)),
     )
 
 

@@ -125,6 +125,12 @@ def attempt_of(order_ref: str) -> int | None:
         return None
 
 
+#: The time-in-force every live ticket carries today (an MKT order has no
+#: resting life beyond its session). Persisted on the record so the day-roll
+#: expiry inference names the rule rather than assuming it.
+DEFAULT_TIF = "DAY"
+
+
 class IntentState(Enum):
     """The lifecycle of one intent's durable record (persisted on every change)."""
 
@@ -153,6 +159,14 @@ class IntentRecord:
     order_ref: str
     order_id: str | None
     decision_ts: pd.Timestamp | None
+    #: The time-in-force the order was placed with. Persisted so the DAY-rollover
+    #: expiry rule is explicit and stays correct if GTC is ever introduced (only a
+    #: DAY order cannot survive its session). Defaulted for older rows.
+    tif: str = DEFAULT_TIF
+    #: Consecutive cycle-start resyncs that left this OPEN record unresolved (no
+    #: working order, status unreadable or still non-terminal). A wedged key is
+    #: surfaced in the report once this reaches ``WEDGED_CYCLES``.
+    stuck_cycles: int = 0
 
 
 @dataclass(frozen=True)
@@ -190,6 +204,16 @@ class OrderOutcome(Enum):
     UNFILLED = "unfilled"
     TIMEOUT = "timeout"
     UNRESOLVED = "unresolved"
+    #: An OPEN record nothing could settle across ``WEDGED_CYCLES`` resyncs: a
+    #: distinct, LOUD marker so an operator acts instead of reading one more
+    #: ``unresolved`` line.
+    WEDGED = "wedged"
+
+
+#: Consecutive resyncs an OPEN record may stay unresolved before it is called
+#: WEDGED and surfaced distinctly. Small enough to surface within a session, large
+#: enough to absorb a transient gateway 503 / a single missed cron cycle.
+WEDGED_CYCLES = 3
 
 
 class PendingIntents(Protocol):
@@ -223,7 +247,9 @@ class PendingIntents(Protocol):
 
 
 __all__ = [
+    "DEFAULT_TIF",
     "OPEN_STATES",
+    "WEDGED_CYCLES",
     "IntentKey",
     "IntentRecord",
     "IntentState",

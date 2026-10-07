@@ -480,8 +480,11 @@ def test_a_token_collision_cannot_alias_two_distinct_identities(
     """D7: the identity columns key the table, so a crc32 collision never aliases.
 
     Two distinct intents whose TOKENS collide (forced here by rewriting one) stay
-    separately addressable — the token is a plain column, not the key — so cycle
-    2 wanting A can never adopt or overwrite B's live order.
+    separately addressable by IDENTITY — the token is a plain column, not the key
+    — so a write for A can never overwrite B's ROW. This is a ROW-level guarantee
+    ONLY: the broker still attributes a working order by the token-keyed ref
+    prefix, so two colliding keys share a prefix there and their orders can still
+    be bridged at the broker layer.
     """
     key = _key("AAPL")
     foreign = replace(key, symbol="MSFT")
@@ -574,3 +577,76 @@ def test_pruned_terminal_record_mints_the_next_attempt_at_zero(
     # The counter restarts at 0 once the prior row is pruned (fresh cOID reuse).
     record = ledger.open_attempt(key, TS, TS)
     assert record.attempt == 0
+
+
+def test_intent_record_roundtrips_tif_and_stuck_cycles(ledger: SqliteLedger) -> None:
+    """N1: the new columns persist and read back (tif + wedged counter)."""
+    key = _key("AAPL")
+    ledger.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id="1",
+            decision_ts=TS,
+            tif="GTC",
+            stuck_cycles=2,
+        )
+    )
+    record = ledger.load(key)
+    assert record is not None
+    assert (record.tif, record.stuck_cycles) == ("GTC", 2)
+
+
+def test_existing_identity_table_gains_the_new_columns_additively(
+    tmp_path: Path,
+) -> None:
+    """N1: an existing identity-keyed table is ALTERed in place, rows preserved."""
+    path = tmp_path / "ledger.sqlite"
+    with get_connection(path) as con:
+        con.executescript(
+            """
+            CREATE TABLE live_order_intent (
+                scope TEXT NOT NULL, token TEXT NOT NULL, symbol TEXT NOT NULL,
+                action TEXT NOT NULL, position_id TEXT NOT NULL, state TEXT NOT NULL,
+                attempt INTEGER NOT NULL, order_ref TEXT NOT NULL,
+                order_id TEXT, decision_ts INTEGER, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (scope, symbol, action, position_id)
+            );
+            INSERT INTO live_order_intent VALUES
+              ('S1','t','AAPL','long','','working',0,'r0','o0',NULL,1);
+            """
+        )
+    ledger = SqliteLedger(path)
+    assert ledger.prune(TS) == 0  # first write triggers the additive migration
+    record = ledger.load(_key("AAPL"))
+    assert record is not None  # the row survived the ALTER
+    assert (record.tif, record.stuck_cycles) == ("DAY", 0)  # SQL defaults
+
+
+def test_restore_tolerates_an_unexpected_legacy_shape(tmp_path: Path) -> None:
+    """N7: a legacy table with a mismatched shape is preserved, never raised on.
+
+    Without the column guard the restore SELECT names a missing column, so the
+    first write of EVERY cycle raises.
+    """
+    path = tmp_path / "ledger.sqlite"
+    with get_connection(path) as con:
+        con.executescript(
+            """
+            CREATE TABLE live_order_intent (
+                scope TEXT NOT NULL, token TEXT NOT NULL, symbol TEXT NOT NULL,
+                action TEXT NOT NULL, position_id TEXT, state TEXT NOT NULL,
+                attempt INTEGER NOT NULL, order_id TEXT, decision_ts INTEGER,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (scope, token)
+            );
+            INSERT INTO live_order_intent VALUES
+              ('S1','t','AAPL','long',NULL,'working',0,'o0',NULL,1);
+            """
+        )
+    ledger = SqliteLedger(path)
+    assert ledger.prune(TS) == 0  # does not raise
+    # The legacy rows are kept under the migrated copy, never dropped.
+    assert "live_order_intent_legacy" in _tables(path)

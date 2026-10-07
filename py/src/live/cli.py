@@ -21,7 +21,7 @@ import peewee
 
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
-from src.bt.state import PortfolioState
+from src.bt.state import ActionType, PortfolioState
 from src.bt.state.factories import create_initial_portfolio
 from src.bt.types import StrategyConfig
 from src.data.ibkr.client import IbkrClient, IbkrError
@@ -37,6 +37,7 @@ from src.live.engine import (
     run_cycle,
 )
 from src.live.lease import CycleInProgressError
+from src.live.identity import OPEN_STATES, IntentKey, IntentState
 from src.live.ledger import LedgerReadError, SqliteLedger, config_hash
 from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
 from src.live.result import Err
@@ -319,6 +320,51 @@ def resolve_broker(
 live_group.add_command(live_run)
 
 
+@click.command("abandon")
+@click.option("--scope", required=True, help="Ownership scope of the wedged key.")
+@click.option("--symbol", required=True, help="Symbol of the wedged key.")
+@click.option("--action", type=click.Choice(["long", "short", "close"]), required=True)
+@click.option("--position-id", default=None, help="Target lot for a close key.")
+@click.option("--yes", "confirmed", is_flag=True, help="Acknowledge the warning.")
+def live_abandon(
+    scope: str, symbol: str, action: str, position_id: str | None, confirmed: bool
+) -> None:
+    """Clear ONE wedged OPEN intent key so the next cycle may re-mint it.
+
+    WARNING (irreversible): this clears only OUR durable record. It does NOT
+    cancel anything at the broker. If an order for the key is still live
+    broker-side, the next cycle will place a DUPLICATE. Verify broker-side FIRST
+    (the order is cancelled/expired), then pass --yes.
+    """
+    if not confirmed:
+        raise click.UsageError(
+            "abandon clears our durable record only and does NOT cancel the broker "
+            "order; if it is still live the next cycle duplicates it. Verify "
+            "broker-side, then re-run with --yes."
+        )
+    ledger = SqliteLedger()
+    key = IntentKey(
+        scope=scope,
+        symbol=symbol,
+        action=ActionType(action),
+        position_id=position_id,
+    )
+    record = ledger.load(key)
+    if record is None:
+        raise click.ClickException(f"no intent record for {scope}/{symbol}/{action}")
+    if record.state not in OPEN_STATES:
+        click.echo(f"key {scope}/{symbol}/{action} is already {record.state.value}")
+        return
+    ledger.close(key, IntentState.UNFILLED, record.order_id, pd.Timestamp.now(tz="UTC"))
+    click.echo(
+        f"abandoned {scope}/{symbol}/{action}: {record.state.value} -> unfilled "
+        f"(order_id={record.order_id or 'unknown'}) — next cycle may re-mint"
+    )
+
+
+live_group.add_command(live_abandon)
+
+
 def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
     """Dump a strategy-only projection of *strategy* into *tmp*; return its path.
 
@@ -459,9 +505,10 @@ def _render_text(report: CycleReport) -> str:
         )
     for result in report.results:
         status = result.outcome.value
+        kind = f" (kind={result.error_kind})" if result.error_kind else ""
         lines.append(
             f"order {result.intent.symbol} {result.intent.action.value} "
-            f"{status} {result.message}"
+            f"{status}{kind} {result.message}"
         )
     if report.resync_error is not None:
         error = report.resync_error

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import math
+from pathlib import Path
 from typing import cast
 
 import pandas as pd
@@ -50,6 +52,18 @@ from src.live.types import OrderIntent
 
 CYCLE_TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T14:30:00Z"))
 SCOPE = "momentum"
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _captured_working_orders() -> list[dict[str, object]]:
+    """The orders captured from a real Paper gateway (build 10.50.1a).
+
+    Row 0 is OURS (carries ``order_ref``); rows 1+ are foreign (NO ``order_ref``).
+    The field set is the gateway's, so a test can no longer invent a field — the
+    hand-built ``cOID`` mocks hid the parser reading the wrong key.
+    """
+    raw = json.loads((_FIXTURES / "gateway_working_orders.json").read_text())
+    return cast("list[dict[str, object]]", raw["orders"])
 
 
 def replace_intent(intent: OrderIntent, **changes: object) -> OrderIntent:
@@ -247,26 +261,41 @@ def test_placement_order_puts_closes_first_deterministically() -> None:
     assert placement_order(closes + opens) == placement_order(closes + opens)
 
 
-def test_parse_working_order_reads_the_coid_and_order_id() -> None:
-    parsed = parse_working_order(
-        {
-            "cOID": "momentum-1a2b3c4d-00",
-            "orderId": 979320001.0,
-            "conid": "265598",
-            "ticker": "AAPL",
-            "side": "BUY",
-            "order_status": "Submitted",
-            "filledQuantity": "0",
-        }
-    )
+def test_parse_working_order_reads_the_captured_order_ref_and_order_id() -> None:
+    # Measured live: the gateway echoes the client order id in ``order_ref`` (NOT
+    # ``cOID``). Driven by the captured row so a mock cannot invent the field.
+    parsed = parse_working_order(_captured_working_orders()[0])
     assert parsed is not None
-    assert parsed.order_ref == "momentum-1a2b3c4d-00"
-    assert parsed.order_id == "979320001"  # canonicalised str(int(...))
+    assert parsed.order_ref == "probe-9b9e2e"
+    assert parsed.order_id == "453346548"  # canonicalised str(int(...))
     assert parsed.symbol == "AAPL"
     assert parsed.conid == 265598
+    assert parsed.status == "PreSubmitted"
 
 
-@pytest.mark.parametrize("entry", [None, {}, {"orderId": 1}, {"cOID": ""}])
+def test_parse_working_order_drops_a_captured_foreign_row() -> None:
+    # A foreign order (another client / the UI) carries NO ``order_ref`` key, so a
+    # scope prefix can never match it — it can never be adopted.
+    assert parse_working_order(_captured_working_orders()[1]) is None
+
+
+def test_captured_ours_row_is_matched_and_foreign_rows_are_never_adopted() -> None:
+    key = intent_key(SCOPE, _intent("AAPL"))
+    prefix = ref_prefix(key)
+    rows = _captured_working_orders()
+    ours = dict(rows[0])
+    ours["order_ref"] = order_ref(key, 0)
+    parsed: list[WorkingOrder] = []
+    for row in (ours, *rows[1:]):
+        row_parsed = parse_working_order(row)
+        if row_parsed is not None:
+            parsed.append(row_parsed)
+    assert [p.order_ref for p in parsed] == [order_ref(key, 0)]  # foreign rows dropped
+    match = match_working(parsed, prefix)
+    assert match is not None and match.order_ref == order_ref(key, 0)
+
+
+@pytest.mark.parametrize("entry", [None, {}, {"orderId": 1}, {"order_ref": ""}])
 def test_parse_working_order_skips_unattributable_rows(entry: object) -> None:
     assert parse_working_order(entry) is None
 

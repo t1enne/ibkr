@@ -55,6 +55,7 @@ from src.live.adapters.ibkr.orders import (
     classify_reply,
     is_fully_filled,
     is_terminal,
+    is_terminal_status,
     match_working,
     order_side,
     order_state,
@@ -69,7 +70,9 @@ from src.live.adapters.ibkr.orders import (
 from src.live.adapters.ibkr.trades import Execution
 from src.live.broker import OrderResult, position_side_of, trade_signal
 from src.live.identity import (
+    DEFAULT_TIF,
     OPEN_STATES,
+    WEDGED_CYCLES,
     IntentKey,
     IntentRecord,
     IntentState,
@@ -157,11 +160,16 @@ async def _default_conid_lookup(ticker: str) -> int:
 
 
 def _attempt_of(order_ref_str: str, existing: IntentRecord | None) -> int:
-    """The attempt in *order_ref_str*'s dashless hex tail, else the record's prior one."""
+    """The HIGHEST of the attempt in *order_ref_str*'s tail and the record's own.
+
+    Adoption must never REGRESS the durable attempt: a working order whose ref
+    parses to a lower attempt than the record already reached still leaves the
+    record's attempt as the floor (``max``), so a later re-send keeps minting
+    strictly higher cOIDs.
+    """
+    prior = existing.attempt if existing is not None else 0
     parsed = attempt_of(order_ref_str)
-    if parsed is not None:
-        return parsed
-    return existing.attempt if existing is not None else 0
+    return prior if parsed is None else max(parsed, prior)
 
 
 def _day_rolled(decision_ts: pd.Timestamp | None, now: pd.Timestamp) -> bool:
@@ -232,11 +240,13 @@ class IbkrBroker:
         A working order carrying an OPEN key's prefix is ADOPTED and persisted
         WORKING. Otherwise the record's known ``order_id`` is asked directly:
         terminal Filled -> FILLED, Cancelled/Inactive -> UNFILLED/REJECTED, still
-        working -> WORKING, and a DAY order gone with no fill after its day rolled
-        -> UNFILLED. A record with no ``order_id`` stays OPEN (an empty working
-        read is not proof when the id is unknown) and a failing status read keeps
-        it WORKING (retried next cycle). A failed open-orders read returns ``Err``
-        and leaves every record untouched.
+        working -> WORKING, and a DAY order gone (or its status unreadable) after
+        its day rolled -> UNFILLED, so a close that could never be confirmed can
+        still settle and the key re-mint. A record with no ``order_id`` stays OPEN
+        (an empty working read is not proof when the id is unknown). A record left
+        unresolved across ``WEDGED_CYCLES`` resyncs is surfaced as a distinct
+        WEDGED row — a failed open-orders read returns ``Err`` and leaves every
+        record untouched.
         """
         records = self._intents.load_open(self._scope)
         if not records:
@@ -247,6 +257,7 @@ class IbkrBroker:
         working = tuple(index.value.values())
         now = self._now()
         adopted: list[OrderResult] = []
+        alarm: list[OrderResult] = []
         for record in records:
             found = match_working(
                 working, ref_prefix(record.key), prefer=record.order_ref
@@ -255,8 +266,12 @@ class IbkrBroker:
                 self._persist_working(record.key, found, record.decision_ts)
                 adopted.append(_adopted_result(record, found))
                 continue
-            await self._resync_status(record, now)
-        return Ok(tuple(adopted))
+            if await self._resync_status(record, now):
+                continue
+            stuck = self._bump_stuck(record)
+            if stuck.stuck_cycles >= WEDGED_CYCLES:
+                alarm.append(_wedged_result(stuck))
+        return Ok(tuple(adopted) + tuple(alarm))
 
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]:
         """Submit or ADOPT one MKT order and settle its outcome.
@@ -447,11 +462,16 @@ class IbkrBroker:
         return conid
 
     async def _working_index(self) -> Result[dict[str, WorkingOrder], FeedError]:
-        """Every working order keyed by ``cOID``, or ``Err`` when the read fails.
+        """Every WORKING, joinable order of ours keyed by ``cOID``, or ``Err``.
 
         A failed read is ALWAYS an ``Err`` — never ``None`` or an empty index —
         so the caller fails closed (no POST) rather than mistaking "unreadable"
-        for "nothing working" (the fail-open bug this replaces).
+        for "nothing working" (the fail-open bug this replaces). A foreign row
+        (no ``order_ref``) is dropped by the parser; a row with no readable
+        ``order_id`` cannot be joined or waited on and is skipped; and a row the
+        gateway lists as already terminal (it lists filled/cancelled orders for
+        the session) must NOT be adopted — adopting a dead order would block a
+        legitimate re-send.
         """
         try:
             raw = await self._client.open_orders()
@@ -460,8 +480,11 @@ class IbkrBroker:
         index: dict[str, WorkingOrder] = {}
         for entry in raw:
             parsed = parse_working_order(entry)
-            if parsed is not None:
-                index.setdefault(parsed.order_ref, parsed)
+            if parsed is None or not parsed.order_id:
+                continue
+            if is_terminal_status(parsed.status):
+                continue
+            index.setdefault(parsed.order_ref, parsed)
         return Ok(index)
 
     async def _pre_guard(
@@ -578,9 +601,11 @@ class IbkrBroker:
         all. An OPEN record in any other state is SKIPPED — ``UNRESOLVED`` means
         an ambiguous POST left 'whether it is live' unknown, so a clean read that
         lists nothing is NOT proof it was never placed (``/iserver/account/orders``
-        lists WORKING orders, so absence cannot tell 'never sent' from 'sent and
-        filled'), and a known ``order_id`` with no working order is likewise not
-        proof. A record in a terminal state submits a fresh attempt.
+        lists WORKING orders AND any order filled or cancelled in the CURRENT
+        session, so absence cannot tell 'never sent' from 'sent and filled', and
+        cannot even prove a same-session order has stopped working), and a known
+        ``order_id`` with no working order is likewise not proof. A record in a
+        terminal state submits a fresh attempt.
         """
         existing = self._intents.load(key)
         found = match_working(
@@ -600,7 +625,7 @@ class IbkrBroker:
             return Resolution(
                 "submit", None, "pending intent was never confirmed placed"
             )
-        if existing.order_id is None:
+        if not existing.order_id:
             return Resolution(
                 "skip",
                 None,
@@ -986,28 +1011,50 @@ class IbkrBroker:
         )
 
     def _persist_unresolved(self, key: IntentKey) -> None:
-        """Stamp the record UNRESOLVED: an ambiguous POST left state unknown."""
-        if self._intents.load(key) is not None:
-            self._intents.close(key, IntentState.UNRESOLVED, None, self._now())
+        """Stamp the record UNRESOLVED when an ambiguous POST left state unknown.
 
-    async def _resync_status(self, record: IntentRecord, now: pd.Timestamp) -> None:
-        """Resolve an OPEN record that has no working order but a known order id.
-
-        An UNRESOLVED record with NO order id is also resolvable, but only once
-        its DAY order has rolled over: a DAY order that is gone after its day is
-        expired unfilled. Before that rollover, no evidence (no working order, no
-        id) may age it out — whether it was placed-and-just-listed is still
-        unknown (blocker 1).
+        A WORKING record is NEVER downgraded: it already carries the order
+        provenance (ref/id) a later cycle needs to decide, and UNRESOLVED would
+        erase it.
         """
-        if record.order_id is None:
-            if record.state is IntentState.UNRESOLVED and _day_rolled(
-                record.decision_ts, now
+        existing = self._intents.load(key)
+        if existing is None or existing.state is IntentState.WORKING:
+            return
+        self._intents.close(key, IntentState.UNRESOLVED, None, self._now())
+
+    def _bump_stuck(self, record: IntentRecord) -> IntentRecord:
+        """Increment an OPEN record's wedged-key counter (resync could not resolve it)."""
+        updated = replace(record, stuck_cycles=record.stuck_cycles + 1)
+        self._intents.save(updated)
+        return updated
+
+    async def _resync_status(self, record: IntentRecord, now: pd.Timestamp) -> bool:
+        """Resolve an OPEN record with no working order; True when settled or known.
+
+        False means the record's true state is STILL UNKNOWN this cycle (a failed
+        status read on a session that can no longer see the order, or an id-less
+        UNRESOLVED record before its day rolls) — the caller counts it toward the
+        wedged-key alarm. A record with a known id is asked directly; when that
+        read FAILS, the same DAY-rollover inference the id-less branch applies is
+        used, because the status endpoint only covers the current brokerage
+        session and a DAY order cannot outlive its session — so once its day has
+        rolled and nothing is working it has expired unfilled (re-mintable).
+        """
+        if not record.order_id:
+            if record.state is IntentState.UNRESOLVED and self._day_expired(
+                record, now
             ):
                 self._intents.close(record.key, IntentState.UNFILLED, None, now)
-            return
+                return True
+            return False
         fetched = await self._status(record.order_id)
         if isinstance(fetched, Err):
-            return  # keep WORKING; retried next cycle
+            if self._day_expired(record, now):
+                self._intents.close(
+                    record.key, IntentState.UNFILLED, record.order_id, now
+                )
+                return True
+            return False  # whether it is live is unknown; retried next cycle
         status = fetched.value
         state = order_state(status)
         if state is OrderState.FILLED:
@@ -1016,11 +1063,17 @@ class IbkrBroker:
             new_state = IntentState.UNFILLED
         elif state is OrderState.REJECTED:
             new_state = IntentState.REJECTED
-        elif _day_rolled(record.decision_ts, now):
+        elif self._day_expired(record, now):
             new_state = IntentState.UNFILLED
         else:
             new_state = IntentState.WORKING
         self._intents.close(record.key, new_state, record.order_id, now)
+        return True
+
+    @staticmethod
+    def _day_expired(record: IntentRecord, now: pd.Timestamp) -> bool:
+        """Whether the record's DAY order can no longer be working (its day rolled)."""
+        return record.tif == DEFAULT_TIF and _day_rolled(record.decision_ts, now)
 
     # -- internals: account / status reads --------------------------------
 
@@ -1183,7 +1236,7 @@ class IbkrBroker:
             IntentState.WORKING,
             Err(
                 FeedError(
-                    kind="unfilled" if filled_qty > 0 else "timeout",
+                    kind="timeout",
                     message=message,
                     symbol=intent.symbol,
                 )
@@ -1223,17 +1276,25 @@ class IbkrBroker:
 
 
 def _outcome_for_kind(kind: str) -> OrderOutcome:
-    """The ``OrderOutcome`` a placement failure's error kind reports.
+    """The ``OrderOutcome`` a failure's kind reports (never a terminal guess).
 
-    Only rejected flags a genuine refusal; an unresolved POST, a timeout, or an
-    unfilled-but-dead order each carry their own outcome so a duplicate-risk
-    event never renders as a plain "rejected" (INV-3).
+    The kind is chosen to AGREE with the durable state the failing branch
+    settled, so this is just the state's disposition in kind form: a still-live
+    deadline is ``timeout`` and a dead order is ``unfilled``/``rejected``. An
+    unreadable/auth/rate-limited read is an UNKNOWN state, so it maps to
+    ``unresolved`` — and an unknown kind NEVER defaults to ``REJECTED`` (a
+    transport failure while polling a live order must not render as a refusal an
+    operator answers by re-placing).
     """
     return {
-        "unresolved": OrderOutcome.UNRESOLVED,
-        "timeout": OrderOutcome.TIMEOUT,
+        "rejected": OrderOutcome.REJECTED,
         "unfilled": OrderOutcome.UNFILLED,
-    }.get(kind, OrderOutcome.REJECTED)
+        "timeout": OrderOutcome.TIMEOUT,
+        "unresolved": OrderOutcome.UNRESOLVED,
+        "transport": OrderOutcome.UNRESOLVED,
+        "auth": OrderOutcome.UNRESOLVED,
+        "rate_limit": OrderOutcome.UNRESOLVED,
+    }.get(kind, OrderOutcome.UNRESOLVED)
 
 
 def _failed(intent: OrderIntent, message: str, kind: str = "rejected") -> OrderResult:
@@ -1265,6 +1326,39 @@ def _adopted_result(record: IntentRecord, found: WorkingOrder) -> OrderResult:
         message=f"adopted {found.order_ref} order_id={found.order_id}",
         position_id=record.key.position_id,
         outcome=OrderOutcome.ADOPTED,
+    )
+
+
+def _wedged_result(record: IntentRecord) -> OrderResult:
+    """A distinct, LOUD report row for an OPEN key nothing could settle.
+
+    Emitted once an OPEN record's ``stuck_cycles`` reaches ``WEDGED_CYCLES`` so a
+    never-resolvable intent (a broker-side cancel the gateway cannot confirm, a
+    persistently unreadable status endpoint) surfaces instead of one more
+    ``unresolved`` line. The message names the operator escape.
+    """
+    where = f"/{record.key.position_id}" if record.key.position_id else ""
+    intent = OrderIntent(
+        symbol=record.key.symbol,
+        action=record.key.action,
+        qty=0.0,
+        ref_price=0.0,
+        reason=f"WEDGED {record.state.value} across {record.stuck_cycles} resyncs",
+        position_id=record.key.position_id,
+    )
+    return OrderResult(
+        intent=intent,
+        fill=None,
+        ok=False,
+        message=(
+            f"WEDGED key {record.key.symbol}/{record.key.action.value}{where}: "
+            f"{record.state.value} order_id={record.order_id or 'unknown'} "
+            f"unresolved across {record.stuck_cycles} resyncs — the broker session "
+            f"cannot confirm it. Verify broker-side, then `ibkr live abandon`."
+        ),
+        position_id=record.key.position_id,
+        outcome=OrderOutcome.WEDGED,
+        error_kind="unresolved",
     )
 
 

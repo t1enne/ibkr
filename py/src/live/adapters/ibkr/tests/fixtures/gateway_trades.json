@@ -1,0 +1,34 @@
+{
+  "_captured": "live Paper gateway /iserver/account/trades, 2026-10-07, build 10.50.1a. Account/clearing fields replaced with placeholders. order_ref echoes the cOID supplied at submission - note the row below was minted by an OLDER ref scheme, which the current identity layer does NOT consider ours (pre-upgrade refs never match).",
+  "trades": [
+    {
+      "execution_id": "0000e0d5.6ac44bfb.01.01",
+      "symbol": "AAPL",
+      "supports_tax_opt": "1",
+      "side": "B",
+      "order_description": "Bot 1 @ 333.18 on EDGEA",
+      "trade_time": "20261005-17:49:01",
+      "trade_time_r": 1791222541000,
+      "size": 1.0,
+      "price": "333.18",
+      "order_ref": "511350df-7f3f2b38-20261005T1749-000",
+      "exchange": "EDGEA",
+      "commission": "1.0",
+      "net_amount": 333.18,
+      "account": "DU000000",
+      "accountCode": "DU000000",
+      "account_allocation_name": "DU000000",
+      "company_name": "APPLE INC",
+      "contract_description_1": "AAPL",
+      "sec_type": "STK",
+      "listing_exchange": "NASDAQ.NMS",
+      "conid": 265598,
+      "conidEx": "265598@EDGEA",
+      "clearing_id": "IB",
+      "clearing_name": "IB",
+      "liquidation_trade": "0",
+      "is_event_trading": "0",
+      "order_id": 1469916425
+    }
+  ]
+}
