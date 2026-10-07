@@ -292,6 +292,21 @@ class IbkrBroker:
         ``Err`` and NO POST follows. Any POST that can submit is settled by a
         SUCCESSFUL working-orders read: absence in a FAILED read is
         ``unresolved``, never "not placed".
+
+        A lone placement carries no confirmed close of our own this cycle, so the
+        exposure guard is given a zero in-cycle delta; a cohort leg threads the
+        delta its own already-confirmed closes produced (:meth:`place_cohort`).
+        """
+        return await self._place(intent, in_cycle_delta=0.0)
+
+    async def _place(
+        self, intent: OrderIntent, *, in_cycle_delta: float
+    ) -> Result[OrderResult, FeedError]:
+        """One placement, excusing ``in_cycle_delta`` of our own confirmed closes.
+
+        ``in_cycle_delta`` is the signed net change this cycle's already-confirmed
+        reducing fills made to the ACCOUNT on the guard's conid; it is passed in
+        explicitly (never stored) so nothing leaks across cycles.
         """
         if self._dry_run:
             return Err(
@@ -318,7 +333,7 @@ class IbkrBroker:
             return Err(cast("FeedError", prepared.error))
         side, conid = prepared.value
         key = intent_key(self._scope, intent)
-        refused = await self._pre_guard(intent, side, conid)
+        refused = await self._pre_guard(intent, side, conid, in_cycle_delta)
         if refused is not None:
             return Err(refused)
         # INV-1: a SUCCESSFUL working-orders read is a precondition for ANY POST.
@@ -367,6 +382,7 @@ class IbkrBroker:
         dropped = {intent_key(self._scope, d.intent): d for d in plan.dropped}
         results: list[OrderResult] = []
         close_failed = False
+        in_cycle_delta = 0.0
         for intent in placement_order(intents):
             ident = intent_key(self._scope, intent)
             drop = dropped.get(ident)
@@ -382,7 +398,9 @@ class IbkrBroker:
                 self._log(message)
                 results.append(_failed(intent, message))
                 continue
-            placed = await self.place(scaled.get(ident, intent))
+            placed = await self._place(
+                scaled.get(ident, intent), in_cycle_delta=in_cycle_delta
+            )
             if isinstance(placed, Err):
                 error = cast("FeedError", placed.error)
                 message = f"{error.kind}: {error.message}"
@@ -390,6 +408,12 @@ class IbkrBroker:
                 results.append(_failed(intent, message, error.kind, error.filled_qty))
             else:
                 results.append(placed.value)
+                # The close's fill has moved the ACCOUNT net but not our durable
+                # book yet; carry its signed change so a same-cohort OPEN is not
+                # refused as a divergence our own close fully explains.
+                in_cycle_delta += _confirmed_reduce_delta(
+                    intent, placed.value, position_side_of(self._book, intent)
+                )
             if intent.action is ActionType.close and not results[-1].ok:
                 close_failed = True
         return Ok(tuple(results))
@@ -500,7 +524,11 @@ class IbkrBroker:
         return Ok(index)
 
     async def _pre_guard(
-        self, intent: OrderIntent, side: OrderSide, conid: int
+        self,
+        intent: OrderIntent,
+        side: OrderSide,
+        conid: int,
+        in_cycle_delta: float,
     ) -> FeedError | None:
         """The pre-submit safety guards, run before any working-orders read.
 
@@ -511,7 +539,9 @@ class IbkrBroker:
         unreadable net still fails closed. An OPEN is bounded by the decision-time
         ``cash_bound`` applied to the whole-share quantity the ticket will carry
         (never the pre-round request, which could round up past the bound), then
-        cross-checked against the account net (:meth:`_open_exposure_guard`).
+        cross-checked against the account net (:meth:`_open_exposure_guard`) net of
+        ``in_cycle_delta`` — the signed change this cohort's own confirmed closes
+        already made to the account.
         """
         if intent.action is ActionType.close:
             return await self._close_guard(intent, side, conid)
@@ -524,10 +554,10 @@ class IbkrBroker:
         refused = self._open_cash_guard(intent, whole)
         if refused is not None:
             return refused
-        return await self._open_exposure_guard(intent, conid)
+        return await self._open_exposure_guard(intent, conid, in_cycle_delta)
 
     async def _open_exposure_guard(
-        self, intent: OrderIntent, conid: int
+        self, intent: OrderIntent, conid: int, in_cycle_delta: float
     ) -> FeedError | None:
         """Refuse an open whose conid the account holds but our book cannot explain.
 
@@ -540,7 +570,18 @@ class IbkrBroker:
 
         - the ACCOUNT net (``positions_all`` — the broker's truth);
         - the BOOKED net the ledger can account for (``BookExposure.net_exposure``,
-          summed over ALL scopes sharing this book — our durable rows).
+          summed over ALL scopes sharing this book — our durable rows) plus
+          ``in_cycle_delta``.
+
+        ``in_cycle_delta`` is the signed net change THIS cohort's already-confirmed
+        reducing fills made to the account (signed to match ``net_exposure``: a
+        close of a long lot sells and subtracts, a short cover adds). A same-cycle
+        close->open flip places the close first and awaits it to terminal, so by
+        the open's guard the account has already applied our close while the
+        durable book still shows the pre-close lot; crediting our own confirmed
+        closes keeps that legitimate flip from reading as a divergence. It excuses
+        ONLY a change our own sends produced: a divergence larger than the delta,
+        or one with no confirmed close behind it, is still refused.
 
         They derive from the same fills, so in steady state they are equal. A
         divergence beyond ``_EXPOSURE_TOLERANCE`` means one of two things, both
@@ -587,13 +628,13 @@ class IbkrBroker:
                 f"unreadable ({exc}), cannot cross-check the account",
                 intent.symbol,
             )
-        if abs(net - booked) > _EXPOSURE_TOLERANCE:
+        if abs(net - (booked + in_cycle_delta)) > _EXPOSURE_TOLERANCE:
             return feed_error(
                 "divergence",
                 f"refused open {intent.symbol} (conid {conid}): account net {net:g} "
-                f"disagrees with the booked net {booked:g} across scopes (tol "
-                f"{_EXPOSURE_TOLERANCE:g}) — a fill we cannot see may be live, or "
-                f"our book is ahead of the account",
+                f"disagrees with the booked net {booked:g} plus our in-cycle closes "
+                f"{in_cycle_delta:+g} (tol {_EXPOSURE_TOLERANCE:g}) — a fill we "
+                f"cannot see may be live, or our book is ahead of the account",
                 intent.symbol,
             )
         return None
@@ -1393,6 +1434,26 @@ def _outcome_for_kind(kind: str) -> OrderOutcome:
     }.get(kind, OrderOutcome.UNRESOLVED)
 
 
+def _confirmed_reduce_delta(
+    intent: OrderIntent, result: OrderResult, lot_side: ActionType | None
+) -> float:
+    """The signed change a confirmed reducing fill already made to the ACCOUNT net.
+
+    Signed to match ``BookExposure.net_exposure`` (a long lot adds, a short lot
+    subtracts): a close of a LONG lot sells and lowers the account net by the
+    filled qty (negative), a SHORT cover raises it (positive). Anything that is
+    not a confirmed reducing fill — a non-close, a refusal, an unknown fill size,
+    or a close whose lot side cannot be read — contributes nothing, so the guard
+    credits no excuse and still refuses on its own merits.
+    """
+    if intent.action is not ActionType.close or not result.ok:
+        return 0.0
+    filled = result.filled_qty
+    if filled is None or lot_side is None:
+        return 0.0
+    return -filled if lot_side is ActionType.long else filled
+
+
 def _failed(
     intent: OrderIntent,
     message: str,
@@ -1412,7 +1473,16 @@ def _failed(
 
 
 def _adopted_result(record: IntentRecord, found: WorkingOrder) -> OrderResult:
-    """The report row for an order adopted at cycle start (a synthetic intent)."""
+    """The report row for an order adopted at cycle start (a synthetic intent).
+
+    ``filled_qty`` is UNKNOWN (``None``), not the working row's current fill: the
+    durable intent record does not store the ask, so an adopted row cannot say how
+    much of the original order is still unfilled. Reporting ``found.filled_qty``
+    against a synthetic intent whose ``qty`` is that same number would fabricate a
+    zero shortfall — a partially-filled working order rendered as "filled to ask".
+    The synthetic intent keeps a displayable ``qty``; only the shortfall claim is
+    withheld.
+    """
     intent = OrderIntent(
         symbol=record.key.symbol,
         action=record.key.action,
@@ -1428,7 +1498,7 @@ def _adopted_result(record: IntentRecord, found: WorkingOrder) -> OrderResult:
         message=f"adopted {found.order_ref} order_id={found.order_id}",
         position_id=record.key.position_id,
         outcome=OrderOutcome.ADOPTED,
-        filled_qty=found.filled_qty,
+        filled_qty=None,
     )
 
 

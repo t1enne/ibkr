@@ -108,6 +108,26 @@ def _mock_long_position() -> None:
     )
 
 
+def _mock_flip_positions() -> None:
+    """The account FLIPS flat once our close fills: long 1, then nothing.
+
+    A close->open flip places and awaits the close to terminal BEFORE the open's
+    guard runs, so the account has already applied our close (flat) while the
+    durable book still shows the pre-close lot. Serving the post-close account to
+    the open's guard is what a real flip looks like; the constant
+    ``_mock_long_position`` hid the D1 bug by never moving off the held lot.
+    """
+    respx.get(POSITIONS).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=[{"conid": CONID, "contractDesc": "AAPL", "position": 1}],
+            ),
+            httpx.Response(200, json=[]),
+        ]
+    )
+
+
 class FakeExposure:
     """A ``BookExposure`` with a fixed net on every conid (default: flat)."""
 
@@ -1197,7 +1217,7 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    _mock_long_position()
+    _mock_flip_positions()
     _mock_no_working_orders()
     broker = _broker(exposure=FakeExposure(1.0))
     broker.seed(_long_lot("555000111"))
@@ -1221,6 +1241,95 @@ async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
     assert '"side":"SELL"' in bodies[0] and '"side":"BUY"' in bodies[1]
     assert "20240603T143000" not in bodies[0]
     assert f'"cOID":"{SCOPE}-' in bodies[0] and f'"cOID":"{SCOPE}-' in bodies[1]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_flip_close_then_open_is_allowed_once_the_close_fills() -> None:
+    """D1: a same-cycle close->open flip is NOT refused as a divergence.
+
+    The cohort places the close first and awaits it to terminal before the open.
+    By the open's guard the account has already applied our close (flat) while the
+    durable book still shows the pre-close long lot, so ``net`` is 0 against a
+    ``booked`` of 1. Before the fix ``abs(net - booked) > tol`` refused the
+    legitimate open with ``divergence``; the guard must credit our own confirmed
+    close (delta -1) and ALLOW it.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_flip_positions()
+    _mock_no_working_orders()
+    broker = _broker(exposure=FakeExposure(1.0))
+    broker.seed(_long_lot("555000111"))
+    close_intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=1.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+
+    result = await broker.place_cohort((_open_intent(), close_intent))
+
+    assert isinstance(result, Ok)
+    placed = cast("tuple[OrderResult, ...]", result.value)
+    opens = [r for r in placed if r.intent.action is ActionType.long]
+    assert opens and opens[0].ok, opens  # the flip's open landed, not DIVERGENCE
+    assert opens[0].outcome is OrderOutcome.PLACED
+    assert submit.call_count == 2  # close AND open both sent
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_flip_open_is_refused_when_the_account_holds_more_than_our_close() -> (
+    None
+):
+    """D1 control: the delta excuses ONLY our own close, never a foreign net.
+
+    The account holds 6, we book 1, and our close sells 1 — so the account still
+    shows 5 while ``booked + delta`` is 0. That 5 is a holding our sends did not
+    produce, so the open must STILL be refused: the in-cycle delta is not a blanket
+    excuse for an unexplained net.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    respx.get(POSITIONS).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=[{"conid": CONID, "contractDesc": "AAPL", "position": 6}],
+            ),
+            httpx.Response(
+                200,
+                json=[{"conid": CONID, "contractDesc": "AAPL", "position": 5}],
+            ),
+        ]
+    )
+    _mock_no_working_orders()
+    broker = _broker(exposure=FakeExposure(1.0))
+    broker.seed(_long_lot("555000111"))
+    close_intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=1.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+
+    result = await broker.place_cohort((_open_intent(), close_intent))
+
+    assert isinstance(result, Ok)
+    placed = cast("tuple[OrderResult, ...]", result.value)
+    opens = [r for r in placed if r.intent.action is ActionType.long]
+    assert opens and not opens[0].ok
+    assert opens[0].error_kind == "divergence"
+    assert submit.call_count == 1  # the close was sent; the open was refused
 
 
 @respx.mock
@@ -1485,8 +1594,47 @@ async def test_resync_adopts_a_prior_working_order_at_cycle_start() -> None:
     assert isinstance(adopted, Ok)
     results = cast("tuple[OrderResult, ...]", adopted.value)
     assert [r.outcome for r in results] == [OrderOutcome.ADOPTED]
+    assert results[0].filled_qty is None  # the ask is not durably stored -> unknown
     record = intents.load(key)
     assert record is not None and record.state is IntentState.WORKING
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_adopted_working_order_reports_an_unknown_shortfall_not_a_zero() -> None:
+    """D4: a PARTIAL adopted row must not fabricate a zero shortfall.
+
+    The durable intent record stores no ask, so an adopted order's shortfall is
+    genuinely unknown. The old row set ``filled_qty`` to the working row's partial
+    fill against a synthetic intent of the SAME qty, so the shortfall was
+    identically 0.0 — a half-filled working order rendered as "filled to ask".
+    The row now reports the unknown as ``None``.
+    """
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id=ORDER_ID,
+            decision_ts=None,
+        )
+    )
+    row = _captured_working_order(order_ref(key, 0))
+    row["filledQuantity"] = 0.5  # a PARTIAL working order: half filled
+    respx.get(OPEN_ORDERS).mock(
+        return_value=httpx.Response(200, json={"orders": [row]})
+    )
+
+    adopted = await _broker(intents=intents).resync()
+
+    assert isinstance(adopted, Ok)
+    result = cast("tuple[OrderResult, ...]", adopted.value)[0]
+    assert result.outcome is OrderOutcome.ADOPTED
+    assert result.filled_qty is None  # unknown, never a fabricated 0.0
 
 
 @respx.mock

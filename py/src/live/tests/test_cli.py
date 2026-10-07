@@ -437,6 +437,53 @@ def test_render_report_leaves_a_shortfall_unknown_when_the_fill_is() -> None:
     assert "partial=" not in render_report(report, "text")
 
 
+def test_render_report_reports_an_adopted_shortfall_as_unknown() -> None:
+    """D4: an adopted row carries no fill size, so its shortfall is unknown.
+
+    The broker no longer fabricates ``filled_qty=0.0`` on an adopted row (the ask
+    is not durably recorded), so the renderer must print the shortfall as ``None``,
+    never a misleading ``0.0``.
+    """
+    adopted = OrderResult(
+        intent=_intent(),
+        fill=None,
+        ok=True,
+        message="adopted order",
+        outcome=OrderOutcome.ADOPTED,
+        filled_qty=None,
+    )
+    report = replace(_report(), results=(adopted,))
+
+    assert "partial=" not in render_report(report, "text")
+    result = json.loads(render_report(report, "json"))["results"][0]
+    assert result["filled"] is None
+    assert result["shortfall"] is None
+
+
+def test_render_report_does_not_annotate_a_zero_fill_refusal() -> None:
+    """D5: a rejection that filled NOTHING is not ``partial=``.
+
+    ``filled_qty=0.0`` is set on a plain rejection and on a timeout that filled
+    nothing, so annotating whenever the shortfall exceeds zero rendered
+    ``partial=0/10 short=10`` and emptied the label of meaning.
+    """
+    intent = replace(_intent(), qty=10.0)
+    refused = OrderResult(
+        intent=intent,
+        fill=None,
+        ok=False,
+        message="rejected: no market data",
+        outcome=OrderOutcome.REJECTED,
+        error_kind="rejected",
+        filled_qty=0.0,
+    )
+    report = replace(_report(), results=(refused,))
+
+    text = render_report(report, "text")
+    assert "partial=" not in text
+    assert "short=10" not in text
+
+
 # --- exit code (cron must see an unsafe cycle) -------------------------------
 
 

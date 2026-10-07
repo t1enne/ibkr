@@ -572,18 +572,21 @@ def _shortfall(result: OrderResult) -> float | None:
 
 
 def _partial_note(result: OrderResult) -> str:
-    """The filled/short annotation for a partial order, else an empty string.
+    """The filled/short annotation for a GENUINE partial, else an empty string.
 
     A partial entry is not chased (the posture diff compares sides, never sizes),
     so this shortfall is the only trace that the live position came in under what
     the sizer asked for. Reported rather than acted on: under-filling errs toward
     LESS exposure than intended, and silently is the thing to avoid.
+
+    Only a fill STRICTLY between nothing and the ask is a partial: a zero-fill
+    refusal or timeout carries ``filled_qty=0.0`` and is not "partial", so
+    annotating it would leave the label meaning nothing.
     """
-    short = _shortfall(result)
-    if short is None or short <= 0.0:
+    filled = result.filled_qty
+    if filled is None or not 0.0 < filled < result.intent.qty:
         return ""
-    filled = result.filled_qty or 0.0
-    return f" partial={filled:g}/{result.intent.qty:g} short={short:g}"
+    return f" partial={filled:g}/{result.intent.qty:g} short={result.intent.qty - filled:g}"
 
 
 def _portfolio_dict(portfolio: PortfolioState) -> dict[str, object]:
