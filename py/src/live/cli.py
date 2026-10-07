@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import tempfile
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, fields
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TextIO, cast
 
 import click
 import pandas as pd
@@ -67,6 +69,10 @@ _STRATEGY_FIELDS = frozenset(f.name for f in fields(StrategyConfig))
 #: Adapters ``--adapter`` accepts. Phase 2 ships ``ibkr`` read-only.
 _ADAPTERS = ("sim", "ibkr")
 
+#: A sleep seam so a watch loop's cadence is injectable in tests (never slept
+#: through the wall clock). ``time.sleep`` is the production default.
+SleepFn = Callable[[float], None]
+
 #: The exit code for an UNSAFE cycle (see ``CycleReport.is_unsafe``). Distinct
 #: from click's ``1`` (ClickException — config/stale-data/gateway failures) and
 #: ``2`` (UsageError), so cron can tell "the broker may be holding something we
@@ -108,7 +114,10 @@ def live_group() -> None:
     "--adapter",
     type=click.Choice(_ADAPTERS),
     default="ibkr",
-    help="Broker adapter; defaults to the config's `broker` key.",
+    show_default=True,
+    help="Broker adapter to run through. Defaults to `ibkr`, so the flag is the "
+    "ONE namesake: a config's `broker` key no longer selects it (it still "
+    "describes the config for readers, and `live pf` still honours it).",
 )
 @click.option(
     "--allow-live",
@@ -134,7 +143,7 @@ def live_run(
     dry_run: bool,
     max_age: int,
     fmt: str,
-    adapter: str | None,
+    adapter: str,
     allow_live: bool,
     no_gateway: bool,
     allow_unsafe: bool,
@@ -142,7 +151,7 @@ def live_run(
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
-    resolved = resolve_adapter(adapter, raw, cfg)
+    resolved = adapter
     # Scope key derives from the ORIGINAL raw config, never the temp projection
     # (the strategy-only file lives at a random path and must not change scope).
     strategy_id = config_hash(raw)
@@ -302,43 +311,20 @@ async def _run_cycle(
             await gateway.aclose()
 
 
-def resolve_adapter(
-    cli_adapter: str | None,
-    raw: Mapping[str, object],
-    cfg: LiveConfig,
-) -> str:
-    """Which adapter this run uses (plan §7.7).
-
-    The ``--adapter`` flag wins; otherwise the config's ``broker`` key (the phase
-    1.5 ``StrategyConfig.broker`` field — its first real consumer). ``mode: live``
-    must NAME its adapter in one of those two places: falling through to the
-    ``sim`` default would let a live run quietly never touch the broker, so it is
-    a hard error instead.
-    """
-    if cli_adapter in _ADAPTERS:
-        return cli_adapter
-    _, named = resolve_broker(raw, cfg.strategy_params)
-    if named:
-        return cfg.broker
-    if cfg.mode == "live":
-        raise click.UsageError(
-            "mode 'live' must name its adapter: pass --adapter or set "
-            "'broker' in the config (no default is assumed for a live run)"
-        )
-    return cfg.broker
-
-
 def resolve_broker(
     raw: Mapping[str, object], params: Mapping[str, object]
 ) -> tuple[str, bool]:
     """The ONE read of the config's ``broker`` key: ``(name, was_named_explicitly)``.
 
-    ``StrategyConfig.broker`` (the phase-1.5 field), ``LiveConfig.broker`` and
-    ``resolve_adapter``'s "was it named?" probe previously resolved the key in
-    three places and disagreed when it lived in ``strategy_params``. They now all
-    go through this: flat/top-level wins, then ``strategy_params``, then the
-    ``sim`` default. The explicit-named flag comes from the same scan, so it can
-    never contradict the resolved name.
+    ``StrategyConfig.broker``, ``LiveConfig.broker`` and ``live pf``'s probe
+    previously resolved the key in three places and disagreed when it lived in
+    ``strategy_params``. They now all go through this: flat/top-level wins, then
+    ``strategy_params``, then the ``sim`` default. The explicit-named flag comes
+    from the same scan, so it can never contradict the resolved name.
+
+    ``live run`` no longer consults this for adapter SELECTION (its ``--adapter``
+    always carries a value, ``ibkr`` by default); it is the description of the
+    config, used by ``live pf`` and by the sim broker's own construction.
     """
     for source in (raw, params):
         if "broker" in source:
@@ -425,12 +411,23 @@ live_group.add_command(live_abandon)
     is_flag=True,
     help="Skip the gateway readiness check (trust an externally kept-alive gateway).",
 )
+@click.option(
+    "--watch",
+    "watch_seconds",
+    type=click.FloatRange(min=0, min_open=True),
+    default=None,
+    help=(
+        "Refresh the report every SECONDS until Ctrl-C (a polling view). "
+        "Absent = one-shot, exactly as before."
+    ),
+)
 def live_pf(
     config_path: str | None,
     fmt: str,
     adapter: str | None,
     allow_live: bool,
     no_gateway: bool,
+    watch_seconds: float | None,
 ) -> None:
     """Show scopes and their orders/trades, plus the broker side when read.
 
@@ -444,12 +441,26 @@ def live_pf(
     no broker is touched — so a bare strategy config reads without a
     ``portfolio_path``. Without a config, a live account needs ``--allow-live``.
 
+    ``--watch SECONDS`` turns the one-shot report into a polling view: the store
+    and broker are re-read and re-rendered every SECONDS until Ctrl-C (exit 0).
+    The gateway is authenticated and the ledger constructed ONCE for the whole
+    session, so no tick runs DDL, takes a lease or re-gates. On a TTY the screen
+    is a flicker-free alternate screen, restored on exit; off a TTY (a pipe or a
+    cron log) each frame is appended after a separator, so ``>> log`` stays
+    readable and NOT ONE escape byte is written. ``--watch`` with ``--format
+    json`` is refused: a machine format has no use for an endless refresh.
+
     Nothing is placed and nothing is written: no lease is taken, no strategy row
     is ensured and no DDL runs (a read of an unwritten db is an empty store, not a
     creation). The exit code is 0 (report printed), 1 (a config/gateway/read
     failure) or 2 (usage) — there is no unsafe path here.
     """
+    if watch_seconds is not None and fmt == "json":
+        raise click.ClickException("--watch cannot be combined with --format json")
     ledger = SqliteLedger()
+    if watch_seconds is not None:
+        _watch_pf(ledger, config_path, adapter, allow_live, no_gateway, watch_seconds)
+        return
     try:
         report = (
             _all_scopes_report(ledger, adapter, allow_live, no_gateway)
@@ -552,20 +563,19 @@ def _skipped_broker(adapter: str, reason: str) -> BrokerSide:
     )
 
 
-async def _read_ibkr_pf(
+async def _gate_ibkr_pf(
     mode: Literal["paper", "live"],
-    scopes: tuple[str, ...],
-    owned: frozenset[str],
     allow_live: bool,
     no_gateway: bool,
-) -> BrokerSide:
-    """Gate then read the IBKR book: resolve account + authz before any read.
+) -> tuple[IbkrGateway, str]:
+    """Open ONE authenticated session and gate it: account, authz, readiness.
 
     Mirrors ``_run_cycle``'s gate order exactly — reach an authenticated session,
     prove *mode* may read the account, then probe readiness — so a pf read is
-    refused under the same rules as a cycle. A read failure is a typed
-    ``GatewayNotReady`` (exit 1), never a traceback. The client is ALWAYS closed
-    in the ``finally``; nothing is placed and no lease is taken.
+    refused under the same rules as a cycle. Returns the OPEN gateway and the
+    resolved account; the caller owns ``aclose``. A failure is a typed
+    ``GatewayNotReady`` (exit 1), never a traceback. ``--no-gateway`` keeps the
+    session without probing readiness, exactly as the one-shot path does.
     """
     gateway = IbkrGateway(IbkrClient())
     try:
@@ -587,12 +597,272 @@ async def _read_ibkr_pf(
             ready = await gateway.ensure_ready()
             if isinstance(ready, Err):
                 raise GatewayNotReady(cast("FeedError", ready.error))
+        return gateway, account
+    except BaseException:
+        await gateway.aclose()
+        raise
+
+
+async def _read_ibkr_pf(
+    mode: Literal["paper", "live"],
+    scopes: tuple[str, ...],
+    owned: frozenset[str],
+    allow_live: bool,
+    no_gateway: bool,
+) -> BrokerSide:
+    """Gate then read the IBKR book: resolve account + authz before any read.
+
+    The one-shot path: gate (``_gate_ibkr_pf``), read the book once, then close.
+    The client is ALWAYS closed in the ``finally``; nothing is placed and no lease
+    is taken.
+    """
+    gateway, account = await _gate_ibkr_pf(mode, allow_live, no_gateway)
+    try:
         try:
             return await read_ibkr_broker(gateway.client, account, scopes, owned)
         except IbkrError as exc:
             raise GatewayNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
     finally:
         await gateway.aclose()
+
+
+#: The alternate-screen + cursor escapes a TTY refresh uses (never a pipe's).
+_ALT_SCREEN_ON = "\x1b[?1049h"
+_ALT_SCREEN_OFF = "\x1b[?1049l"
+_CURSOR_HIDE = "\x1b[?25l"
+_CURSOR_SHOW = "\x1b[?25h"
+_CLEAR_HOME = "\x1b[H\x1b[2J"
+#: The rule a NON-TTY watch appends between frames, so a log stays readable.
+_TICK_SEPARATOR = "-" * 72
+
+
+def _watch_pf(
+    ledger: SqliteLedger,
+    config_path: str | None,
+    adapter: str | None,
+    allow_live: bool,
+    no_gateway: bool,
+    interval: float,
+) -> None:
+    """Re-read the store + broker and re-render every *interval* until Ctrl-C.
+
+    The one-shot plumbing runs ONCE — the ledger is reused (so no tick can DDL),
+    and an ``ibkr`` session is authenticated before the loop and only its book is
+    re-read per tick. A per-tick read failure is rendered as a typed error line
+    and the loop keeps going. Teardown restores the screen on every exit path.
+    """
+    session = _open_watch_session(ledger, config_path, adapter, allow_live, no_gateway)
+    try:
+        watch_pf_loop(
+            session.frame,
+            interval,
+            tty=sys.stdout.isatty(),
+            sleeper=time.sleep,
+            out=sys.stdout,
+        )
+    finally:
+        session.close()
+
+
+@dataclass(frozen=True)
+class _WatchSession:
+    """A watch's per-tick frame plus its teardown (closes any open gateway)."""
+
+    frame: Callable[[], str]
+    close: Callable[[], None]
+
+
+def _open_watch_session(
+    ledger: SqliteLedger,
+    config_path: str | None,
+    adapter: str | None,
+    allow_live: bool,
+    no_gateway: bool,
+) -> _WatchSession:
+    """Resolve the watch's frame + teardown ONCE, before the loop starts.
+
+    An ``ibkr`` read (with or without a config) opens ONE gateway on ONE
+    persistent event loop — the client is authenticated here and only its book is
+    re-read per tick, so the connection pool is never rebound to a fresh loop. A
+    store-only or ``sim`` read needs no session at all (the fixture is re-read per
+    tick). No lease is taken and no DDL runs: the frame calls the same read
+    helpers the one-shot path uses.
+    """
+    if config_path is None:
+        if adapter == "ibkr":
+            return _ibkr_watch_session(
+                ledger,
+                ledger.scopes_of_store,
+                0.0,
+                "live" if allow_live else "paper",
+                allow_live,
+                no_gateway,
+            )
+        return _WatchSession(_store_frame(ledger, None, adapter), _noop)
+    cfg = load_live_config(config_path)
+    raw = _read_json(config_path)
+    name = adapter
+    if name is None:
+        resolved, named = resolve_broker(raw, cfg.strategy_params)
+        name = resolved if named else None
+    if name != "ibkr":
+        return _WatchSession(
+            _store_frame(ledger, cfg if name is not None else None, name), _noop
+        )
+    return _ibkr_watch_session(
+        ledger,
+        lambda: (cfg.scope,),
+        cfg.initial_capital,
+        cfg.mode,
+        allow_live,
+        no_gateway,
+    )
+
+
+def _ibkr_watch_session(
+    ledger: SqliteLedger,
+    scopes_fn: Callable[[], tuple[str, ...]],
+    initial_capital: float,
+    mode: Literal["paper", "live"],
+    allow_live: bool,
+    no_gateway: bool,
+) -> _WatchSession:
+    """Gate ONE ibkr session on a persistent loop, then read only the book.
+
+    The loop is held for the whole watch: an ``httpx.AsyncClient`` binds to the
+    loop that first runs it, so a fresh ``asyncio.run`` per tick would rebind the
+    pool. ``close`` releases the client and the loop on every exit path.
+    *scopes_fn* is re-evaluated per tick, so a scope written mid-watch joins the
+    read — the same coverage the one-shot path gives at its own instant.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        gateway, account = loop.run_until_complete(
+            _gate_ibkr_pf(mode, allow_live, no_gateway)
+        )
+    except BaseException:
+        loop.close()
+        raise
+
+    def frame() -> str:
+        scopes = scopes_fn()
+        stores = tuple(
+            read_store(ledger, scope, initial_capital=initial_capital)
+            for scope in scopes
+        )
+        owned = frozenset(lot.id for store in stores for lot in store.lots)
+        broker = loop.run_until_complete(
+            read_ibkr_broker(gateway.client, account, scopes, owned)
+        )
+        return render_pf(
+            PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
+            "text",
+        )
+
+    def close() -> None:
+        loop.run_until_complete(gateway.aclose())
+        loop.close()
+
+    return _WatchSession(frame, close)
+
+
+def _store_frame(
+    ledger: SqliteLedger, cfg: LiveConfig | None, adapter: str | None
+) -> Callable[[], str]:
+    """A store (+ sim broker) frame builder for the scopes a watch covers."""
+
+    def frame() -> str:
+        stores, broker = _store_and_broker(ledger, cfg, adapter)
+        return render_pf(
+            PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
+            "text",
+        )
+
+    return frame
+
+
+def _store_and_broker(
+    ledger: SqliteLedger, cfg: LiveConfig | None, adapter: str | None
+) -> tuple[tuple[StoreSide, ...], BrokerSide | None]:
+    """Re-read the store side and (for ``sim``) the fixture, per tick.
+
+    Only the store and the sim fixture are re-read here — a non-sim broker would
+    need a live session, which the watch holds open itself. Mirrors
+    ``_all_scopes_report``/``_config_report`` for the store half.
+    """
+    if cfg is None:
+        stores = tuple(read_store(ledger, scope) for scope in ledger.scopes_of_store())
+    else:
+        stores = (read_store(ledger, cfg.scope, initial_capital=cfg.initial_capital),)
+    if adapter != "sim" or cfg is None:
+        return stores, None
+    if not cfg.portfolio_path:
+        return stores, _skipped_broker(
+            "sim", "no portfolio_path in config (broker read skipped)"
+        )
+    owned = frozenset(
+        i
+        for store in stores
+        for i in (*(lot.id for lot in store.lots), *store.sim_open_ids)
+    )
+    return stores, asyncio.run(read_sim_broker(cfg, owned))
+
+
+def watch_pf_loop(
+    frame: Callable[[], str],
+    interval: float,
+    *,
+    tty: bool,
+    out: TextIO,
+    sleeper: SleepFn = time.sleep,
+) -> None:
+    """Paint *frame* every *interval* seconds until Ctrl-C, then exit 0.
+
+    On a TTY the frame is drawn on the alternate screen with the cursor hidden,
+    so a refresh never flickers into scrollback; OFF a TTY each frame is appended
+    after a separator rule and NOT ONE escape byte is written. A failing frame is
+    rendered as an ``error:`` line — a watch outlives a transient read failure.
+    The screen and cursor are restored in ``finally``, so Ctrl-C (and any exit
+    path) leaves the terminal as it was found. *sleeper* is the cadence seam.
+    """
+    first = True
+    try:
+        if tty:
+            out.write(_ALT_SCREEN_ON + _CURSOR_HIDE)
+            out.flush()
+        while True:
+            _paint(_safe_frame(frame), tty=tty, first=first, out=out)
+            first = False
+            sleeper(interval)
+    except KeyboardInterrupt:
+        return
+    finally:
+        if tty:
+            out.write(_CURSOR_SHOW + _ALT_SCREEN_OFF)
+        out.flush()
+
+
+def _paint(text: str, *, tty: bool, first: bool, out: TextIO) -> None:
+    """Draw one frame: a cleared alternate screen, or an appended rule + frame."""
+    if tty:
+        out.write(_CLEAR_HOME + text + "\n")
+    else:
+        prefix = "" if first else _TICK_SEPARATOR + "\n"
+        out.write(prefix + text + "\n")
+    out.flush()
+
+
+def _safe_frame(frame: Callable[[], str]) -> str:
+    """One tick's frame; a per-tick read failure is a typed error line, not a stop."""
+    try:
+        return frame()
+    except Exception as exc:
+        return f"error: {exc}"
+
+
+def _noop() -> None:
+    """A teardown that owns nothing (a store-only or sim watch has no session)."""
+    return None
 
 
 live_group.add_command(live_pf)

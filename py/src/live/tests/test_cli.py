@@ -12,12 +12,11 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import pandas as pd
 import peewee
 import pytest
-import click
 from click.testing import CliRunner, Result as CliResult
 
 from src.bt import load_strategy
@@ -161,7 +160,7 @@ def test_live_run_empty_portfolio_path_usage_error(
 
     monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
     path = write_config(tmp_path, portfolio_path="", mode="paper")
-    out = CliRunner().invoke(live_group, ["run", path])
+    out = CliRunner().invoke(live_group, ["run", path, "--adapter", "sim"])
     assert out.exit_code != 0
     assert "portfolio_path" in out.output
 
@@ -718,50 +717,7 @@ async def test_run_cycle_dry_run_places_nothing() -> None:
     assert ledger.touched == 0  # write-free: not even the cycle stamp
 
 
-# --- adapter resolution (phase 2) -------------------------------------------
-
-
-def _cfg(
-    *, broker: str = "sim", mode: str = "paper", strategy_params: dict | None = None
-) -> LiveConfig:
-    return LiveConfig(
-        strategy_type="vwatr_div_dsl",
-        symbols=("AAPL",),
-        initial_capital=50000.0,
-        strategy_params=strategy_params or {},
-        bars=("1d",),
-        warmup="300d",
-        broker=cast("Any", broker),
-        mode=cast("Any", mode),
-    )
-
-
-def test_resolve_adapter_cli_flag_wins_over_config() -> None:
-    from src.live.cli import resolve_adapter
-
-    assert resolve_adapter("sim", {"broker": "ibkr"}, _cfg(broker="ibkr")) == "sim"
-    assert resolve_adapter("ibkr", {}, _cfg()) == "ibkr"
-
-
-def test_resolve_adapter_falls_back_to_config_broker() -> None:
-    from src.live.cli import resolve_adapter
-
-    assert resolve_adapter(None, {"broker": "ibkr"}, _cfg(broker="ibkr")) == "ibkr"
-    assert resolve_adapter(None, {}, _cfg()) == "sim"
-
-
-def test_resolve_adapter_reads_broker_from_strategy_params() -> None:
-    from src.live.cli import resolve_adapter
-
-    cfg = _cfg(broker="ibkr", strategy_params={"broker": "ibkr"})
-    assert resolve_adapter(None, {}, cfg) == "ibkr"
-
-
-def test_resolve_adapter_live_mode_must_name_its_adapter() -> None:
-    from src.live.cli import resolve_adapter
-
-    with pytest.raises(click.UsageError, match="must name its adapter"):
-        resolve_adapter(None, {}, _cfg(mode="live"))
+# --- adapter selection -------------------------------------------------------
 
 
 def test_ibkr_broker_log_goes_to_stderr(
@@ -870,7 +826,7 @@ def test_sim_path_never_builds_a_gateway(
 
     monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
     path = write_config(tmp_path, portfolio_path="pf.json")
-    out = CliRunner().invoke(live_group, ["run", path, "--dry-run"])
+    out = CliRunner().invoke(live_group, ["run", path, "--dry-run", "--adapter", "sim"])
     assert out.exit_code == 0, out.output
 
 
@@ -932,7 +888,9 @@ def test_sim_json_run_keeps_broker_logs_off_stdout(
 
     monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
     path = write_config(tmp_path, portfolio_path="pf.json")
-    out = CliRunner().invoke(live_group, ["run", path, "-F", "json"])
+    out = CliRunner().invoke(
+        live_group, ["run", path, "-F", "json", "--adapter", "sim"]
+    )
     assert out.exit_code == 0, out.output
     json.loads(out.stdout)  # stdout is a clean JSON document, not log + JSON
     assert "AAPL long qty=1" in out.stderr  # the notice went to stderr instead

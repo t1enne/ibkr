@@ -11,6 +11,7 @@ deliberate diff rather than an accident.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 from typing import cast
@@ -27,7 +28,7 @@ from src.data.ibkr.client import IbkrClient
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
 from src.exec.refs import scope_tag
-from src.live.cli import live_group, load_live_config
+from src.live.cli import live_group, load_live_config, watch_pf_loop
 from src.live.identity import IntentKey, IntentState, order_ref
 from src.live.ledger import ExecutionRecord, SqliteLedger
 from src.live.pf import (
@@ -42,6 +43,7 @@ from src.live.pf import (
     render_pf,
 )
 from src.live.types import LiveConfig
+from src.live.result import Ok
 
 TS: pd.Timestamp = cast(pd.Timestamp, pd.Timestamp("2024-06-03T15:00:00Z"))
 
@@ -663,3 +665,221 @@ def test_read_ibkr_broker_marks_owned_and_splits_orders(tmp_path: Path) -> None:
     assert [lot.side for lot in side.positions] == ["long", "short"]
     assert [o.order_ref for o in side.ours_orders] == [f"{scope_tag('S1')}-deadbeef-00"]
     assert len(side.working_orders) == 2  # the no-ref row is dropped, not shown
+
+
+# --- (f) --watch polling refresh ---------------------------------------------
+
+
+class _FakeSleeper:
+    """A cadence seam that never sleeps: raises ``KeyboardInterrupt`` on the Nth tick."""
+
+    def __init__(self, stop_after: int) -> None:
+        self._stop_after = stop_after
+        self.calls = 0
+        self.intervals: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls += 1
+        self.intervals.append(seconds)
+        if self.calls >= self._stop_after:
+            raise KeyboardInterrupt
+
+
+def test_watch_loop_terminates_via_the_injected_sleeper() -> None:
+    """Regression: the loop's cadence is the injected seam — Ctrl-C ends it, exit 0."""
+    sleeper = _FakeSleeper(stop_after=3)
+    frames: list[str] = []
+
+    def frame() -> str:
+        frames.append(f"frame-{len(frames)}")
+        return frames[-1]
+
+    out = io.StringIO()
+    watch_pf_loop(frame, 2.5, tty=False, out=out, sleeper=sleeper)
+
+    assert sleeper.calls == 3  # the fake sleeper is what stopped the loop
+    assert sleeper.intervals == [2.5, 2.5, 2.5]
+    assert frames == ["frame-0", "frame-1", "frame-2"]
+
+
+def test_watch_loop_on_a_non_tty_emits_zero_escape_bytes() -> None:
+    """Regression: a piped watch appends frames with a separator, never an ANSI byte."""
+    sleeper = _FakeSleeper(stop_after=2)
+    out = io.StringIO()
+    watch_pf_loop(
+        lambda: "as_of: 2024-06-03\nstores:\n", 1.0, tty=False, out=out, sleeper=sleeper
+    )
+
+    text = out.getvalue()
+    assert "\x1b" not in text  # not one escape byte into a cron log
+    assert text == (
+        "as_of: 2024-06-03\nstores:\n\n" + "-" * 72 + "\nas_of: 2024-06-03\nstores:\n\n"
+    )
+
+
+def test_watch_loop_on_a_tty_uses_and_restores_the_alternate_screen() -> None:
+    """Regression: a TTY refresh hides the cursor, clears per tick and restores on exit."""
+    sleeper = _FakeSleeper(stop_after=1)
+    out = io.StringIO()
+    watch_pf_loop(lambda: "frame", 1.0, tty=True, out=out, sleeper=sleeper)
+
+    text = out.getvalue()
+    assert text.startswith("\x1b[?1049h\x1b[?25l")  # enter alt screen, hide cursor
+    assert text.endswith("\x1b[?25h\x1b[?1049l")  # show cursor, leave alt screen
+    assert "\x1b[H\x1b[2J" in text  # cleared + homed per tick
+
+
+def test_watch_loop_renders_a_failing_tick_and_keeps_looping() -> None:
+    """Regression: a mid-watch read failure is an error line, never a dead loop."""
+    sleeper = _FakeSleeper(stop_after=3)
+    out = io.StringIO()
+    seen: list[int] = []
+
+    def frame() -> str:
+        seen.append(len(seen))
+        if len(seen) == 2:
+            raise RuntimeError("broker hiccup")
+        return f"tick-{len(seen)}"
+
+    watch_pf_loop(frame, 1.0, tty=False, out=out, sleeper=sleeper)
+
+    assert len(seen) == 3  # the loop survived the failing tick
+    assert "tick-1" in out.getvalue()
+    assert "error: broker hiccup" in out.getvalue()
+    assert "tick-3" in out.getvalue()
+
+
+def test_cli_watch_reuses_one_ledger_and_one_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: N ticks build ONE ledger and gate ONE gateway (never per tick)."""
+    db = tmp_path / "ledger.sqlite"
+    ledger_builds: list[str] = []
+    gateway_builds: list[int] = []
+
+    def _ledger(*args: object, **kwargs: object) -> SqliteLedger:
+        ledger_builds.append("built")
+        return SqliteLedger(db)
+
+    class _AccountClient:
+        async def resolve_account(self) -> str:
+            return "DU1234"
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Gateway:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            gateway_builds.append(1)
+            self._client = _AccountClient()
+
+        @property
+        def client(self) -> _AccountClient:
+            return self._client
+
+        async def ensure_ready(self) -> object:
+            return Ok(None)
+
+        async def aclose(self) -> None:
+            return None
+
+    target = tmp_path / "cfg.json"
+    target.write_text(json.dumps({**BASE_CONFIG, "mode": "paper"}))
+    monkeypatch.setattr("src.live.cli.SqliteLedger", _ledger)
+    monkeypatch.setattr("src.live.cli.IbkrGateway", _Gateway)
+    monkeypatch.setattr("src.live.cli.time.sleep", _FakeSleeper(stop_after=3))
+
+    out = CliRunner().invoke(
+        live_group, ["pf", str(target), "--adapter", "ibkr", "--watch", "2"]
+    )
+
+    assert out.exit_code == 0, out.output
+    assert len(ledger_builds) == 1  # ONE ledger across every tick
+    assert len(gateway_builds) == 1  # ONE authenticated gateway across every tick
+    assert _tables(db) == set()  # a watching read wrote no DDL
+
+
+def test_cli_watch_rejects_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an endless JSON document is refused, not looped."""
+    monkeypatch.setattr(
+        "src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(tmp_path / "l.sqlite")
+    )
+    out = CliRunner().invoke(live_group, ["pf", "-F", "json", "--watch", "1"])
+    assert out.exit_code == 1
+    assert "--watch cannot be combined with --format json" in out.output
+
+
+def test_cli_watch_requires_a_positive_interval() -> None:
+    """Regression: ``--watch 0`` is a usage error (never a hot spin)."""
+    out = CliRunner().invoke(live_group, ["pf", "--watch", "0"])
+    assert out.exit_code == 2
+
+
+def test_cli_one_shot_is_unchanged_without_watch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: no ``--watch`` -> today's one-shot path, byte-identical output."""
+    db = tmp_path / "ledger.sqlite"
+    ledger = SqliteLedger(db)
+    ledger.ensure_strategy("hash-a", "S1", "S1", "paper")
+    ledger.ensure_cash("S1", 40000.0)
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(db))
+
+    out = CliRunner().invoke(live_group, ["pf"])
+    assert out.exit_code == 0, out.output
+    assert out.output.startswith("as_of: ")
+    assert "stores:" in out.output
+    assert "\x1b" not in out.output
+    assert not out.output.rstrip().endswith("-" * 72)  # no watch separator
+
+
+def test_cli_watch_without_a_config_still_reads_the_ibkr_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a no-config ``--adapter ibkr`` watch reads the account, not the store alone.
+
+    The one-shot path reads the broker whenever ``--adapter`` names one, config or
+    not; a watch that silently narrowed to store-only would drop the divergence
+    block the whole report exists to show.
+    """
+    db = tmp_path / "ledger.sqlite"
+    gateway_builds: list[int] = []
+
+    def _ledger(*args: object, **kwargs: object) -> SqliteLedger:
+        return SqliteLedger(db)
+
+    class _AccountClient:
+        async def resolve_account(self) -> str:
+            return "DU1234"
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Gateway:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            gateway_builds.append(1)
+            self._client = _AccountClient()
+
+        @property
+        def client(self) -> _AccountClient:
+            return self._client
+
+        async def ensure_ready(self) -> object:
+            return Ok(None)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("src.live.cli.SqliteLedger", _ledger)
+    monkeypatch.setattr("src.live.cli.IbkrGateway", _Gateway)
+    monkeypatch.setattr("src.live.cli.time.sleep", _FakeSleeper(stop_after=2))
+
+    out = CliRunner().invoke(
+        live_group, ["pf", "--adapter", "ibkr", "--allow-live", "--watch", "1"]
+    )
+
+    assert out.exit_code == 0, out.output
+    assert len(gateway_builds) == 1  # the no-config watch gates ONE session
+    assert _tables(db) == set()  # and still writes no DDL

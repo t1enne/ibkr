@@ -505,7 +505,7 @@ def _store_block(stores: tuple[StoreSide, ...]) -> list[str]:
     scope. ``id`` is the config hash truncated for display; ``rev`` is the audit
     row count, so the truncated id still reads as the latest revision.
     """
-    lines = [f"stores:"]
+    lines = ["stores:"]
     lines.extend(render(Table(columns=_STORE_COLS, rows=_store_rows(stores))))
     return lines
 

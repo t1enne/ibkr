@@ -52,6 +52,56 @@ hand-built mock for a contract-shaped response.
 - **Test:** an unsafe cycle under `--allow-unsafe` exits 0 **and** emits the
   stderr note.
 
+### [ ] D10 — per-symbol staleness is ungated: one fresh symbol masks a dead one
+
+- **Where:** `src/live/engine.py:190-195` (`assert_data_fresh`), `:234` (default
+  `max_age_days=5`, `:263` call), `src/live/signals.py:93-95` (`_is_fresh`).
+- **Problem:** the freshness gate compares the **universe's NEWEST** bar to the
+  wall clock — `_newest_ms` is `SELECT MAX(timestamp) … WHERE ticker IN
+  (universe)`, so *any* one fresh symbol satisfies it. `_is_fresh` then compares
+  the row's data bar (`row.ts`) to its **posture** bar (`row.sig_ts`) — both
+  derived from data, never from `now`. Neither check is per-symbol wall-clock. A
+  symbol whose feed died is traded on ancient bars for as long as any other
+  symbol in the universe stays fresh. The DB's known stale tail (ETFs ending
+  2026-02-20 vs core names ending 2026-08-07) is exactly that population.
+- **Fix sketch:** gate each symbol on `now − its own newest bar`, not the universe
+  `MAX`; a per-symbol bar older than its bar cadence is a hard stale error for
+  that symbol (drop the row, or fail the cycle).
+- **Test:** a universe with one fresh and one dead symbol is refused (or the dead
+  row is dropped), not silently traded.
+
+### [ ] D11 — no cancel/modify path anywhere; the only stop-out is manual TWS
+
+- **Where:** `src/live/adapters/ibkr/__init__.py:6` ("LMT carry-over,
+  cancel/modify, resting stops and brackets stay phase 4");
+  `src/live/cli.py:375-381` (`ibkr live abandon` "clears our durable record only
+  and does NOT cancel the broker order").
+- **Problem:** zero cancel in non-test `src/live` (grep confirms). A working order
+  is only ever removed by DAY expiry. If a placement wedges, the operator's only
+  recourse is manual TWS, and `abandon` warns that re-minting the key over a
+  still-live broker order **duplicates** it. Same phase-4 root as the stop-loss
+  gap (P2 `Live stop-loss / take-profit`) and the `abandon` verb item under
+  "Never reviewed independently".
+- **Fix sketch:** a broker cancel by `order_ref`/`order_id`, wired into the
+  stuck-cycle path and `abandon`; resting stops/brackets follow (phase 4).
+- **Test:** a wedged working order is cancelled at the broker before the key is
+  re-minted.
+
+### [ ] D12 — no portfolio-level risk limits and no flatten-all command
+
+- **Where:** `src/live/reconcile.py:8` ("Absence of a signal is HOLD — never
+  flatten"); nothing in `src/live` matches `max_loss` / `kill` / `daily_loss` /
+  `max_positions` (grep confirms); the per-cohort cash scale is the only bound.
+- **Problem:** there is no kill switch: no max gross/net exposure cap, no
+  max-positions cap, no flatten-all. A strategy going HOLD on every symbol leaves
+  the whole book on by design, and drawdown is bounded only per-cohort, never at
+  the portfolio level. Hard dependency: without D13 (no persisted equity) a
+  daily-loss kill cannot even be computed.
+- **Fix sketch:** a portfolio exposure/position cap checked before the cycle, and
+  a `flatten` verb emitting closing orders for the scope's live lots.
+- **Test:** a book over the exposure cap opens nothing; `flatten` emits one close
+  per live lot and reaches flat.
+
 ---
 
 ## P1 — smaller correctness / hygiene
@@ -113,6 +163,112 @@ whether a close is emitted at all.
 90-day-old cOID can be re-minted. Safe against IBKR's dedupe windows, but the
 invariant as written ("attempt is monotonic per key") is not what is implemented.
 Either state the bound or keep the counter monotonic independently of retention.
+
+### [ ] D13 — live NAV / equity is never persisted, so there is no drawdown or daily-loss monitor
+
+- **Where:** `src/live/portfolio_source.py:74` and `src/live/reconcile.py:198,221`
+  each set `equity_curve=()`.
+- **Problem:** the live book carries cash and positions but no equity series;
+  scope equity is never persisted. So no drawdown, no daily-loss monitor, no
+  "am I up" from our own data — the account summary is display-only
+  (`src/live/adapters/ibkr/portfolio_source.py:12`). This is the enabling gap
+  behind D12's kill switch.
+- **Fix sketch:** persist a per-scope equity mark per cycle (own cash + positions
+  valued at the cycle's reference prices) and compute drawdown from it.
+
+### [ ] D14 — data ingestion is not wired to the live path; the freshness default is far too loose
+
+- **Where:** `src/live/engine.py:168-207` (`assert_data_fresh` only READS the DB);
+  `src/live/cli.py:110` (`--max-age` default `5` days).
+- **Problem:** nothing in the live path downloads bars. If cron does not run
+  `ibkr data dl` first, the cycle trades whatever is in the DB (or errors). The
+  `5`-day default is far looser than any bar cadence — a daily strategy trading a
+  5-day-old bar passes the gate. Undocumented operational dependency, and it blunts
+  D10's gate further.
+- **Fix sketch:** document the `data dl` prerequisite in the run/cron unit (see P2
+  `No scheduling artifact`) and set `--max-age` to the strategy's bar cadence.
+
+### [ ] D15 — scope cash is derived from our own executions; a missed fill is unreconciled and two scopes can over-allocate
+
+- **Where:** `src/live/ledger.py:12-13` ("per-scope cash is derived from the
+  scope's own executions, never read from the account summary");
+  `src/live/adapters/ibkr/portfolio_source.py:12`.
+- **Problem:** cash and equity are the scope's `initial_capital` advanced by its
+  own fills. A fill we never reconcile (7-day window lapse, contract drift —
+  `ledger.py:3`) leaves cash permanently wrong with no account-side cross-check.
+  Two scopes on one shared account each size against their own book; there is no
+  cross-scope budget, so together they can over-allocate the account's real cash.
+- **Fix sketch:** a periodic account-vs-sum-of-scopes warning (per-scope need not
+  match, but the SUM must not exceed the account).
+
+### [ ] D16 — shorting has no locate/borrow handling (shorts may silently never open)
+
+- **Where:** `src/live/reconcile.py:279` can emit `ActionType.short`.
+- **Problem:** IBKR equity shorts need a locate/borrow and margin; a refusal
+  decodes as `rejected`, which is excluded from `_UNSAFE_OUTCOMES` (D3), so the
+  cycle exits 0 and the short silently never opens. Overlaps D3.
+- **Fix sketch:** surface a hard-to-borrow / locate refusal as its own unsafe
+  outcome; fail the open loudly, or pre-screen borrowability.
+
+### [ ] D17 — MKT DAY only, and no execution-quality measure in the report
+
+- **Where:** `src/live/adapters/ibkr/orders.py:28,171-174,197,215` (MKT only,
+  `tif` always `DAY`); fill price is never diffed against the expected/ref price
+  anywhere in the live report. `slippage_bps` (`src/live/types.py:210`) is a
+  sizing input, not a measurement.
+- **Problem:** with MKT DAY there is no limit discipline and no feedback on
+  execution quality — live fills are never compared to the reference price, so
+  realised slippage is invisible and cannot inform whether LMT carry-over (D11 /
+  phase 4) is warranted.
+- **Fix sketch:** report realised slippage = (fill price − ref price)/ref price
+  per fill.
+
+### [ ] D18 — the live book shares `data/db.sqlite` with candles and research; no backup/checkpoint policy
+
+- **Where:** `src/data/db.py:14-15` (default DB path `../data/db.sqlite`);
+  `src/live/ledger.py:7-8` ("Tables live in the SAME candle DB").
+- **Problem:** the durable live position store sits in the same SQLite file as
+  bulk candle/research data, with no backup, no `wal_checkpoint`/VACUUM policy
+  (grep confirms). A corrupt or bloated research write can take the live book with
+  it; there is no snapshot to restore from.
+- **Fix sketch:** periodic checkpoint + file backup of the live tables, or a
+  separate DB file for the live book.
+
+### [ ] D19 — a scaled live cohort prints no shortfall (silent undersizing)
+
+- **Where:** `src/live/reconcile.py:157` (a partial entry stands, never topped
+  up); `src/live/adapters/ibkr/orders.py:438` (`scale_open_cohort` rewrites
+  `intent.qty` via `replace`), so the ticket carries the scaled qty and the
+  shortfall denominator is the already-scaled qty (see D7 for the rounding cousin).
+- **Problem:** a cohort rescaled down by the shared-cash scale prints **no**
+  shortfall at all, because the intent was rewritten before the fill was compared
+  to it. This is D8's live half; the partial-entry permanence is the P2
+  `Partial-open top-up` decision and the missing ask column is noted there.
+- **Fix sketch:** report the scale and the pre-scale target structurally (as D8
+  argues for the sim side), so a live undersize is visible.
+
+### [ ] VERIFY — currency is carried but ignored in the cash math (non-USD names)
+
+- **Where:** `src/live/adapters/ibkr/mapping.py:36,47` (`currency` on the position
+  and summary rows), `:138,164` (read from the payload); grep shows `currency`
+  appears ONLY in `mapping.py` — no cash/qty math consults it.
+- **Check:** some configured universes include non-USD names
+  (`strats/pass/momentum_compression_breakout_ae_gate_SPY.json:40,79` — CCEP,
+  NBIS). If a non-USD fill is booked as USD, the scope's cash and every derived
+  size are wrong. Confirm whether IBKR reports these in USD (they can trade USD on
+  a US venue) before treating this as a defect — a claim only once checked.
+
+### [ ] VERIFY — gateway credential source
+
+- **Where:** no `os.environ`/`getenv` anywhere in `src/live` (grep confirms);
+  credentials load in `src/data/ibkr/login.py:27-113` (`IBKR_USERNAME` /
+  `IBKR_PASSWORD` via `.env`, `os.environ`), and the gateway URL from
+  `src/data/ibkr/client.py:85`.
+- **Check:** taken together this reads as resolved — credentials come from the
+  environment / a gitignored `.env` (`.gitignore:16`), and NO `strats/*.json`
+  carries password/token/secret/credential (grep confirms). Confirm the exact
+  loader path the live entrypoint uses and that no committed file names them,
+  before go-live. Enter as a claim only once checked.
 
 ---
 
