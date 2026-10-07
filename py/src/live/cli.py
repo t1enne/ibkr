@@ -532,7 +532,7 @@ def _render_text(report: CycleReport) -> str:
         kind = f" (kind={result.error_kind})" if result.error_kind else ""
         lines.append(
             f"order {result.intent.symbol} {result.intent.action.value} "
-            f"{status}{kind} {result.message}"
+            f"{status}{kind}{_partial_note(result)} {result.message}"
         )
     if report.resync_error is not None:
         error = report.resync_error
@@ -559,7 +559,31 @@ def _result_dict(result: OrderResult) -> dict[str, object]:
         "position_id": result.position_id,
         "outcome": result.outcome.value,
         "kind": result.error_kind,
+        "filled": result.filled_qty,
+        "shortfall": _shortfall(result),
     }
+
+
+def _shortfall(result: OrderResult) -> float | None:
+    """Unfilled shares against the ticket's ask, or ``None`` when unknown."""
+    if result.filled_qty is None:
+        return None
+    return max(0.0, result.intent.qty - result.filled_qty)
+
+
+def _partial_note(result: OrderResult) -> str:
+    """The filled/short annotation for a partial order, else an empty string.
+
+    A partial entry is not chased (the posture diff compares sides, never sizes),
+    so this shortfall is the only trace that the live position came in under what
+    the sizer asked for. Reported rather than acted on: under-filling errs toward
+    LESS exposure than intended, and silently is the thing to avoid.
+    """
+    short = _shortfall(result)
+    if short is None or short <= 0.0:
+        return ""
+    filled = result.filled_qty or 0.0
+    return f" partial={filled:g}/{result.intent.qty:g} short={short:g}"
 
 
 def _portfolio_dict(portfolio: PortfolioState) -> dict[str, object]:

@@ -273,6 +273,20 @@ def test_already_on_the_target_side_holds(
     assert reconcile((sig(action, qty=5.0),), book, CFG) == ()
 
 
+def test_a_partial_entry_is_not_topped_up() -> None:
+    """Decision (A): a partial entry stands; the sizing target is never chased.
+
+    The posture diff compares SIDES while ``size`` expresses a target weight, so a
+    book holding a fraction of the sizer's ask still matches the target side and
+    HOLDs. Topping up would re-size on every equity/price tick; instead the
+    residual is left alone and the shortfall is reported on the order result.
+    Under-filling errs toward LESS exposure than intended, which is the safe
+    direction for a risk-sized strategy.
+    """
+    book = pf(100_000.0, lot("AAPL", 1.0, 90.0, ActionType.long, pid="L1"))
+    assert reconcile((sig("long", qty=500.0),), book, CFG) == ()
+
+
 def test_empty_owned_closes_nothing() -> None:
     book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
     # Ownership scoped to the empty set: no lot is ours, so nothing closes.

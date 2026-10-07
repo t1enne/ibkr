@@ -48,6 +48,11 @@ class OrderResult:
     #: The ``FeedError.kind`` behind a failed result (``None`` for an ``ok`` one),
     #: so the CLI can render the machine-readable failure alongside the outcome.
     error_kind: str | None = None
+    #: Shares this order actually filled, when the edge knows it (``None`` when it
+    #: does not). Reported as a shortfall against ``intent.qty``: the posture model
+    #: diffs sides, not sizes, so a partial entry is never topped up and the
+    #: shortfall is the only trace of it.
+    filled_qty: float | None = None
 
 
 class LiveBroker(Protocol):
@@ -361,6 +366,7 @@ class SimulatedBroker:
                 ok=False,
                 message=rejected[index],
                 outcome=OrderOutcome.REJECTED,
+                filled_qty=0.0,
             )
         routed = fills[index]
         if intent.action is ActionType.close:
@@ -374,6 +380,7 @@ class SimulatedBroker:
                     ok=False,
                     message=_rejection_message(failure),
                     outcome=OrderOutcome.REJECTED,
+                    filled_qty=0.0,
                 )
             position_id = next_position_id(
                 intent.symbol, ts, open_base + open_rank[index]
@@ -396,6 +403,7 @@ class SimulatedBroker:
             ok=True,
             message=message,
             position_id=position_id,
+            filled_qty=fill.filled_qty,
         )
 
     async def close(self) -> Result[None, FeedError]:

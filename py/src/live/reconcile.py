@@ -10,6 +10,13 @@ side flip) closes a live lot. Sizing is never re-derived here: opens are sized
 through the shared ``sized_signal``/``compute_qty`` layer, and an open that still
 sizes to ``<= 0`` raises rather than placing an accidental order.
 
+A PARTIAL entry stands. The posture diff compares sides, never sizes, so an open
+that filled less than it asked for (a dead DAY order that filled what the venue
+had, a halt) leaves ``cur == tgt`` and is never topped up: the sizing layer's
+target weight is not chased cycle to cycle. Under-filling errs toward LESS
+exposure than intended, and the shortfall is reported on the order result so live
+results diverging from a sized backtest are visible rather than silent.
+
 The book opens are sized against is this cycle's closes settled for real: the
 close intents are priced with the SAME ``execute_signal`` the broker fills with
 and folded through the shared ``apply_fills`` (non-opens-first), so the freed
@@ -145,6 +152,10 @@ def _plan_symbol(
     HOLD (``[], None``) when the target already matches the current side, or
     when the whole book on the symbol is foreign and only a flip would reach the
     target (opening would double gross exposure without closing anything).
+
+    A partially filled lot still counts as the target side, so its residual is
+    never chased here — see the module note on partial entries; the shortfall is
+    reported on the order result instead.
     """
     symbol = sig.symbol
     cur = current_side(portfolio, symbol)

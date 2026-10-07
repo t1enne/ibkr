@@ -160,9 +160,19 @@ class FeedError:
     kind: FeedKind
     message: str
     symbol: str | None = None
+    #: Shares the order actually filled, when the edge knows the number (``None``
+    #: when it does not). A partial fill is a normal outcome rather than a failure
+    #: kind, so it travels here and is reported as a shortfall instead of living
+    #: only inside ``message``.
+    filled_qty: float | None = None
 
 
-def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
+def feed_error(
+    kind: str,
+    message: str,
+    symbol: str | None = None,
+    filled_qty: float | None = None,
+) -> FeedError:
     """Build a typed ``FeedError`` from a client ``ErrorKind`` (a validating identity).
 
     The client's kinds (``auth``/``rate_limit``/``transport``) are a subset of
@@ -176,6 +186,7 @@ def feed_error(kind: str, message: str, symbol: str | None = None) -> FeedError:
         kind=cast("FeedKind", resolved),
         message=message,
         symbol=symbol,
+        filled_qty=filled_qty,
     )
 
 

@@ -1718,8 +1718,47 @@ async def test_deadline_partial_settles_working_not_terminal() -> None:
     (failed,) = cast("tuple[OrderResult, ...]", result.value)
     assert failed.ok is False
     assert failed.outcome not in (OrderOutcome.UNFILLED, OrderOutcome.REJECTED)
+    assert failed.filled_qty == 0.25
     record = intents.load(key)
     assert record is not None and record.state is IntentState.WORKING
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_dead_order_carries_its_partial_fill() -> None:
+    """A terminal partial reports the shares it filled, not just a message.
+
+    A dead DAY order that filled only what the venue had leaves the position under
+    the sizer's target; since the posture diff compares sides and never sizes, the
+    residual is never chased (decision A). ``filled_qty`` on the result is what
+    makes that shortfall visible to an operator and to the report renderer.
+    """
+    intent = _open_intent()
+    intents = FakeIntents()
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "order_status": "Cancelled",
+                "cum_fill": "0.5",
+                "total_size": "1",
+                "average_price": "101.0",
+            },
+        )
+    )
+    _mock_no_working_orders()
+    broker = _broker(intents=intents)
+
+    result = await broker.place_cohort((intent,))
+
+    assert isinstance(result, Ok)
+    (failed,) = cast("tuple[OrderResult, ...]", result.value)
+    assert failed.ok is False
+    assert failed.outcome is OrderOutcome.UNFILLED
+    assert failed.filled_qty == 0.5
 
 
 # --- blocker 1: resync ages an unresolved-no-id record out on its day roll ----

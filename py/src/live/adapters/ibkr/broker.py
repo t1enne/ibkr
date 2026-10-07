@@ -387,7 +387,7 @@ class IbkrBroker:
                 error = cast("FeedError", placed.error)
                 message = f"{error.kind}: {error.message}"
                 self._log(f"order failed {intent.symbol}: {message}")
-                results.append(_failed(intent, message, error.kind))
+                results.append(_failed(intent, message, error.kind, error.filled_qty))
             else:
                 results.append(placed.value)
             if intent.action is ActionType.close and not results[-1].ok:
@@ -1235,6 +1235,7 @@ class IbkrBroker:
                             f"only {fill.qty:g} of {intent.qty:g} filled"
                         ),
                         symbol=intent.symbol,
+                        filled_qty=fill.qty,
                     )
                 ),
             )
@@ -1253,6 +1254,7 @@ class IbkrBroker:
                     ok=True,
                     message=message,
                     position_id=position_id,
+                    filled_qty=fill.qty,
                 )
             ),
         )
@@ -1329,6 +1331,7 @@ class IbkrBroker:
                     kind="timeout",
                     message=message,
                     symbol=intent.symbol,
+                    filled_qty=filled_qty,
                 )
             ),
         )
@@ -1390,7 +1393,12 @@ def _outcome_for_kind(kind: str) -> OrderOutcome:
     }.get(kind, OrderOutcome.UNRESOLVED)
 
 
-def _failed(intent: OrderIntent, message: str, kind: str = "rejected") -> OrderResult:
+def _failed(
+    intent: OrderIntent,
+    message: str,
+    kind: str = "rejected",
+    filled_qty: float | None = None,
+) -> OrderResult:
     """A dropped/refused order as a failed ``OrderResult`` carrying its outcome."""
     return OrderResult(
         intent=intent,
@@ -1399,6 +1407,7 @@ def _failed(intent: OrderIntent, message: str, kind: str = "rejected") -> OrderR
         message=message,
         outcome=_outcome_for_kind(kind),
         error_kind=kind,
+        filled_qty=filled_qty,
     )
 
 
@@ -1419,6 +1428,7 @@ def _adopted_result(record: IntentRecord, found: WorkingOrder) -> OrderResult:
         message=f"adopted {found.order_ref} order_id={found.order_id}",
         position_id=record.key.position_id,
         outcome=OrderOutcome.ADOPTED,
+        filled_qty=found.filled_qty,
     )
 
 

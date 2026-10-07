@@ -335,6 +335,7 @@ def test_render_report_states_a_placement_error() -> None:
         "kind": "transport",
         "message": "cohort refused",
         "symbol": None,
+        "filled_qty": None,
     }
 
 
@@ -375,7 +376,65 @@ def test_render_report_states_a_resync_error() -> None:
         "kind": "transport",
         "message": "open_orders failed",
         "symbol": None,
+        "filled_qty": None,
     }
+
+
+def test_render_report_reports_a_partial_fill_shortfall() -> None:
+    """A partial entry is never topped up, so the shortfall must be visible.
+
+    The posture diff compares sides, not sizes: an open that filled 4 of 10 leaves
+    the position under target forever. That is deliberate (under-filling errs
+    toward less exposure), but it must not be silent — it is the one trace that a
+    live position came in below what the sizer asked for.
+    """
+    intent = replace(_intent(), qty=10.0)
+    partial = OrderResult(
+        intent=intent,
+        fill=None,
+        ok=False,
+        message="unfilled: only 4 of 10 filled",
+        outcome=OrderOutcome.UNFILLED,
+        error_kind="unfilled",
+        filled_qty=4.0,
+    )
+    report = replace(_report(), results=(partial,))
+
+    text = render_report(report, "text")
+    assert "partial=4/10 short=6" in text
+
+    doc = json.loads(render_report(report, "json"))
+    result = doc["results"][0]
+    assert result["filled"] == 4.0
+    assert result["shortfall"] == 6.0
+
+
+def test_render_report_marks_no_shortfall_on_a_whole_fill() -> None:
+    """A complete fill reports a zero shortfall and no partial annotation."""
+    intent = replace(_intent(), qty=10.0)
+    whole = OrderResult(
+        intent=intent,
+        fill=None,
+        ok=True,
+        message="long AAPL qty=10",
+        outcome=OrderOutcome.PLACED,
+        filled_qty=10.0,
+    )
+    report = replace(_report(), results=(whole,))
+
+    text = render_report(report, "text")
+    assert "partial=" not in text
+    assert json.loads(render_report(report, "json"))["results"][0]["shortfall"] == 0.0
+
+
+def test_render_report_leaves_a_shortfall_unknown_when_the_fill_is() -> None:
+    """An unknown fill quantity is reported as ``None``, never as a zero fill."""
+    report = replace(_report(), results=(_unsafe_result(OrderOutcome.UNRESOLVED),))
+
+    doc = json.loads(render_report(report, "json"))
+    assert doc["results"][0]["filled"] is None
+    assert doc["results"][0]["shortfall"] is None
+    assert "partial=" not in render_report(report, "text")
 
 
 # --- exit code (cron must see an unsafe cycle) -------------------------------
