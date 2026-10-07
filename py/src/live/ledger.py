@@ -167,21 +167,18 @@ class LiveSimLot(_Base):
 
 
 class LiveOrderIntent(_Base):
-    """The durable owner of OPEN order state, keyed by ``(scope, token)``.
+    """The durable owner of OPEN order state, keyed by the IDENTITY columns.
 
-    One row per intent key (``symbol``/``action``/``position_id`` split out for
-    the collision check and for readability). ``state`` is an ``IntentState``
-    value, ``attempt`` the re-send counter, ``order_ref`` the minted cOID and
-    ``order_id`` the broker's id (null while unknown). Added to the model set
-    above so the existing ``IF NOT EXISTS`` create path builds it — no ALTER,
-    no rename, nothing existing is touched.
-    """
+    The primary key is ``(scope, symbol, action, position_id)`` — the intent
+    identity itself (``position_id`` is ``''`` for an open) — NOT the crc32
+    ``token``: a crc32 collision can never alias two distinct identities' rows
+    (D7). The ``token`` stays as a plain column, the bar-free cOID prefix."""
 
     scope = TextField()
     token = TextField()
     symbol = TextField()
     action = TextField()
-    position_id = TextField(null=True)
+    position_id = TextField(default="")
     state = TextField()
     attempt = IntegerField()
     order_ref = TextField()
@@ -191,7 +188,7 @@ class LiveOrderIntent(_Base):
 
     class Meta:
         table_name = "live_order_intent"
-        primary_key = CompositeKey("scope", "token")
+        primary_key = CompositeKey("scope", "symbol", "action", "position_id")
 
 
 _MODELS = (
@@ -296,6 +293,65 @@ def _rekey_sim_lots(db: SqliteDatabase) -> None:
         )
 
 
+def _primary_key_columns(db: SqliteDatabase, name: str) -> set[str]:
+    """The primary-key column names of *name* (from ``PRAGMA table_info``)."""
+    return {
+        str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})") if row[5]
+    }
+
+
+_LEGACY_INTENT_TABLE = "live_order_intent_legacy"
+
+
+def _free_intent_legacy_name(db: SqliteDatabase) -> str:
+    """A kept table name for a legacy ``live_order_intent``, never overwriting one."""
+    if not _table_exists(db, _LEGACY_INTENT_TABLE):
+        return _LEGACY_INTENT_TABLE
+    n = 1
+    while _table_exists(db, f"{_LEGACY_INTENT_TABLE}_{n}"):
+        n += 1
+    return f"{_LEGACY_INTENT_TABLE}_{n}"
+
+
+def _rekey_order_intents(db: SqliteDatabase) -> str | None:
+    """Rename a legacy ``(scope, token)`` intent table to a kept copy, or ``None``.
+
+    Also normalises any NULL ``position_id`` to ``''`` in the legacy copy (so it
+    survives reading as an open). No-op when the table is already keyed by the
+    identity columns, or absent. RENAME, never drop.
+    """
+    if not _table_exists(db, "live_order_intent"):
+        return None
+    if _primary_key_columns(db, "live_order_intent") == {
+        "scope",
+        "symbol",
+        "action",
+        "position_id",
+    }:
+        return None
+    legacy = _free_intent_legacy_name(db)
+    db.execute_sql("ALTER TABLE live_order_intent RENAME TO " + legacy)
+    db.execute_sql(f"UPDATE {legacy} SET position_id = '' WHERE position_id IS NULL")
+    return legacy
+
+
+def _restore_intents(db: SqliteDatabase, legacy: str) -> None:
+    """Copy re-keyed legacy intent rows into the fresh identity-keyed table.
+
+    Runs after ``create_tables`` rebuilt ``live_order_intent``. Every legacy row
+    is copied (a rename+copy, never a drop); ``OR IGNORE`` guards the (already
+    handled) token-collision case where two identities would otherwise collide on
+    the identity PK.
+    """
+    db.execute_sql(
+        f"INSERT OR IGNORE INTO live_order_intent "
+        f"(scope, token, symbol, action, position_id, state, attempt, order_ref, "
+        f"order_id, decision_ts, updated_at) "
+        f"SELECT scope, token, symbol, action, COALESCE(position_id, ''), state, "
+        f"attempt, order_ref, order_id, decision_ts, updated_at FROM {legacy}"
+    )
+
+
 def config_hash(config: Mapping[str, object]) -> str:
     """Pure: sha256 of canonical JSON (sorted keys, no whitespace) -> hex.
 
@@ -352,12 +408,15 @@ class SqliteLedger:
         if self._schema_ready:
             return
         with self._database.atomic(lock_type="IMMEDIATE"):
-            self._migrate()
+            legacy_intents = self._migrate()
             self._database.create_tables(_MODELS)
+            if legacy_intents is not None:
+                _restore_intents(self._database, legacy_intents)
         self._schema_ready = True
 
-    def _migrate(self) -> None:
-        """Preserve a pre-4.1 position table, ALTER ``live_strategy`` and re-key sim lots.
+    def _migrate(self) -> str | None:
+        """Preserve a pre-4.1 position table, ALTER ``live_strategy`` and re-key the
+        legacy ``(scope, token)`` intent table to the identity columns.
 
         The old ``live_position`` (PK ``(strategy_id, position_id)``) cannot
         express a ``(scope, conid)`` row, so it is renamed to a kept copy and
@@ -365,6 +424,11 @@ class SqliteLedger:
         the rolling trades window cannot rebuild. ``live_strategy`` gains
         ``scope`` via ALTER so the audit rows survive. ``live_sim_lot`` is
         re-keyed from the config hash to the scope (rows preserved).
+
+        An e362843 ``live_order_intent`` (PK ``(scope, token)``) is RENAMED to a
+        kept copy, never dropped, so a crc32 token collision can no longer alias
+        two identities once the re-keyed table is rebuilt and its rows restored.
+        Returns the legacy table name for the post-create copy.
         """
         db = self._database
         if _table_exists(db, "live_position") and "conid" not in _table_columns(
@@ -378,6 +442,7 @@ class SqliteLedger:
                 "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
             )
         _rekey_sim_lots(db)
+        return _rekey_order_intents(db)
 
     @contextmanager
     def _write(self) -> Iterator[None]:
@@ -623,31 +688,15 @@ class SqliteLedger:
     # the store, which the pure ``IntentKey.token`` forbids.)
 
     def load(self, key: IntentKey) -> IntentRecord | None:
-        """The durable record for *key*, or ``None`` when unwritten/foreign."""
+        """The durable record for *key*, or ``None`` when unwritten."""
         try:
             with self._database.bind_ctx(_MODELS):
-                row = LiveOrderIntent.get_or_none(
-                    (LiveOrderIntent.scope == key.scope)
-                    & (LiveOrderIntent.token == key.token())
-                )
+                row = LiveOrderIntent.get_or_none(self._intent_predicate(key))
         except peewee.OperationalError as exc:
             if not _is_missing_table(exc):
                 raise LedgerReadError(str(exc)) from exc
             return None
-        if row is None:
-            return None
-        if not _row_matches_key(row, key):
-            logger.warning(
-                "live_order_intent token %s under scope %r collides with key "
-                "%s|%s|%s; refusing to adopt a foreign identity",
-                key.token(),
-                key.scope,
-                key.symbol,
-                key.action.value,
-                key.position_id,
-            )
-            return None
-        return _model_to_intent(row)
+        return None if row is None else _model_to_intent(row)
 
     def load_open(self, scope: str) -> tuple[IntentRecord, ...]:
         """Every OPEN record for *scope* (empty if unwritten)."""
@@ -669,25 +718,13 @@ class SqliteLedger:
         return tuple(_model_to_intent(row) for row in rows)
 
     def save(self, record: IntentRecord) -> None:
-        """Upsert *record* keyed ``(scope, token)``; warn on a token collision."""
+        """Upsert *record* keyed on its identity columns.
+
+        The identity columns are the primary key, so a crc32 token collision can
+        never overwrite a foreign identity's row — two colliding keys simply
+        coexist under distinct identities (D7).
+        """
         with self._write():
-            occupied = LiveOrderIntent.get_or_none(
-                (LiveOrderIntent.scope == record.key.scope)
-                & (LiveOrderIntent.token == record.key.token())
-            )
-            if occupied is not None and not _row_matches_key(occupied, record.key):
-                logger.warning(
-                    "live_order_intent token %s under scope %r already belongs to "
-                    "%s|%s|%s; replacing it with %s|%s|%s (crc32 collision)",
-                    record.key.token(),
-                    record.key.scope,
-                    occupied.symbol,
-                    occupied.action,
-                    occupied.position_id,
-                    record.key.symbol,
-                    record.key.action.value,
-                    record.key.position_id,
-                )
             LiveOrderIntent.insert(**_intent_fields(record)).on_conflict(
                 "REPLACE"
             ).execute()
@@ -724,16 +761,27 @@ class SqliteLedger:
         """Stamp *state* (and *order_id* when known) on *key*'s record.
 
         The stored ``order_id`` is only overwritten when a new one is supplied,
-        so an UNRESOLVED transition does not erase a known id.
+        so an UNRESOLVED transition does not erase a known id. Keyed on the
+        identity columns (never the token), so a token collision cannot touch a
+        foreign row.
         """
         fields: dict[str, object] = {"state": state.value, "updated_at": _ms(now)}
         if order_id is not None:
             fields["order_id"] = order_id
         with self._write():
             LiveOrderIntent.update(**fields).where(
-                (LiveOrderIntent.scope == key.scope)
-                & (LiveOrderIntent.token == key.token())
+                self._intent_predicate(key)
             ).execute()
+
+    @staticmethod
+    def _intent_predicate(key: IntentKey):
+        """The peewee WHERE identifying one intent row (identity columns)."""
+        return (
+            (LiveOrderIntent.scope == key.scope)
+            & (LiveOrderIntent.symbol == key.symbol)
+            & (LiveOrderIntent.action == key.action.value)
+            & (LiveOrderIntent.position_id == (key.position_id or ""))
+        )
 
     def prune(self, before: pd.Timestamp) -> int:
         """Delete CLOSED intent rows older than *before*; return the count."""
@@ -765,15 +813,6 @@ def _ts(value: int | None) -> pd.Timestamp | None:
     return cast("pd.Timestamp", pd.Timestamp(value, unit="ms", tz="UTC"))
 
 
-def _row_matches_key(row: LiveOrderIntent, key: IntentKey) -> bool:
-    """Whether a stored intent row names the same trade as *key*."""
-    return (
-        row.symbol == key.symbol
-        and row.action == key.action.value
-        and (row.position_id or None) == key.position_id
-    )
-
-
 def _intent_fields(record: IntentRecord) -> dict[str, object]:
     now = pd.Timestamp.now()
     return {
@@ -781,7 +820,10 @@ def _intent_fields(record: IntentRecord) -> dict[str, object]:
         "token": record.key.token(),
         "symbol": record.key.symbol,
         "action": record.key.action.value,
-        "position_id": record.key.position_id,
+        #: ``''`` (never SQL NULL) is the ``position_id`` stored for an open, so
+        #: the identity primary key stays total (a NULL would defeat its
+        #: uniqueness enforcement on SQLite).
+        "position_id": record.key.position_id or "",
         "state": record.state.value,
         "attempt": record.attempt,
         "order_ref": record.order_ref,
@@ -799,7 +841,9 @@ def _model_to_intent(row: LiveOrderIntent) -> IntentRecord:
             scope=cast("str", row.scope),
             symbol=cast("str", row.symbol),
             action=ActionType(cast("str", row.action)),
-            position_id=cast("str | None", row.position_id),
+            #: ``''`` round-trips to ``None``: an open's row stores ``''`` but the
+            #: in-memory key keeps ``position_id=None`` for equality with callers.
+            position_id=cast("str | None", row.position_id) or None,
         ),
         state=IntentState(cast("str", row.state)),
         attempt=int(cast("int", row.attempt)),

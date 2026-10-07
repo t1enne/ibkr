@@ -50,7 +50,7 @@ from src.bt.state import ActionType, ExecutionParams, FillEvent
 from src.exec.types import Fill, OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.mapping import canonical_order_id, num, opt_str
 from src.live.broker import intent_to_signal, ref_candle
-from src.live.identity import WorkingOrder
+from src.live.identity import WorkingOrder, attempt_of
 from src.live.types import OrderIntent
 
 #: Deterministic timestamp for the synthetic cohort-sizing probes. Only the
@@ -260,13 +260,32 @@ def parse_working_order(entry: object) -> WorkingOrder | None:
     )
 
 
-def match_working(orders: Sequence[WorkingOrder], prefix: str) -> WorkingOrder | None:
-    """The first working order whose ref starts with *prefix* (ours only).
+def match_working(
+    orders: Sequence[WorkingOrder], prefix: str, *, prefer: str | None = None
+) -> WorkingOrder | None:
+    """The one working order whose ref starts with *prefix*, chosen deterministically.
 
     *prefix* is ``scope_tag-token-``: an exact scope+key prefix, never a
     symbol/side match, so a shared account's foreign orders are never adopted.
+    With two of our orders live for one key (a stale attempt plus a newer one),
+    returning the first match could regress the durable attempt; instead the
+    record's stored ``order_ref`` wins when still working, else the HIGHEST
+    attempt does — so adoption never regresses to an older order's ref.
     """
-    return next((o for o in orders if o.order_ref.startswith(prefix)), None)
+    matches = [o for o in orders if o.order_ref.startswith(prefix)]
+    if not matches:
+        return None
+    if prefer is not None:
+        for order in matches:
+            if order.order_ref == prefer:
+                return order
+    return max(matches, key=_attempt_key)
+
+
+def _attempt_key(order: WorkingOrder) -> int:
+    """Sort key ordering a working order by its attempt (unreadable tail lowest)."""
+    attempt = attempt_of(order.order_ref)
+    return attempt if attempt is not None else -1
 
 
 # -- cohort cash scaling (backtest parity) -----------------------------------

@@ -100,6 +100,31 @@ def ref_is_ours(scope: str, coid: str) -> bool:
     return coid.rsplit("-", 2)[0] == scope_tag(scope)
 
 
+def ref_matches_key(scope: str, key: IntentKey, coid: str) -> bool:
+    """Whether *coid* was minted for *key* under *scope* (tag AND token match).
+
+    The ref carries no bar, so this attributes a ref from ANY attempt of *key*
+    to that key — the property the executions sweep relies on to catch a
+    predecessor order whose durable row was lost.
+    """
+    if not ref_is_ours(scope, coid):
+        return False
+    parts = coid.rsplit("-", 2)
+    return len(parts) == 3 and parts[1] == key.token()
+
+
+def attempt_of(order_ref: str) -> int | None:
+    """The attempt counter in *order_ref*'s dashless hex tail, or ``None``.
+
+    ``None`` means the tail is not readable hex, which is distinct from a
+    genuine attempt ``0``.
+    """
+    try:
+        return int(order_ref.rsplit("-", 1)[-1], 16)
+    except ValueError:
+        return None
+
+
 class IntentState(Enum):
     """The lifecycle of one intent's durable record (persisted on every change)."""
 
@@ -206,8 +231,10 @@ __all__ = [
     "PendingIntents",
     "Resolution",
     "WorkingOrder",
+    "attempt_of",
     "intent_key",
     "order_ref",
     "ref_is_ours",
+    "ref_matches_key",
     "ref_prefix",
 ]

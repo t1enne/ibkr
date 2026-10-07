@@ -88,9 +88,9 @@ class LiveSignal:
     signal_ts: pd.Timestamp | None
     price: float  # ref price (last close of the decision bar)
     qty: float  # absolute shares; 0.0 = unsized (size from config)
-    #: The newest data bar this signal was decided on. The DETERMINISTIC anchor
-    #: for an order's cOID: re-running a cycle on the same data re-mints an
-    #: identical ref (IBKR then dedupes), while a new bar mints a new one.
+    #: The newest data bar this signal was decided on. AUDIT ONLY on the live
+    #: path: the order cOID is bar-free (``src.live.identity`` — a scope-token-
+    #: attempt), NOT anchored here, so a new bar never mints a new ref (INV-2).
     bar_ts: pd.Timestamp | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
@@ -112,8 +112,9 @@ class OrderIntent:
     take_profit: float | None = None
     tag: str = ""
     #: The decision bar this intent was derived from (see ``LiveSignal.bar_ts``).
-    #: The broker anchors the cOID on it so a re-run inside the same bar re-mints
-    #: an identical ref instead of a wall-clock-distinct duplicate.
+    #: AUDIT ONLY on the live path — the broker does NOT anchor the cOID on it
+    #: (the cOID is the bar-free ``identity`` ref), so this is recorded for audit
+    #: and for a DAY order's rollover check, never for identity (INV-2).
     decision_ts: pd.Timestamp | None = None
     #: The shared order vocabulary. Phase 3 places MKT only; an LMT intent is
     #: refused by the IBKR adapter until carry-over policy exists (phase 4).

@@ -48,6 +48,10 @@ class CycleReport:
     #: any per-order result existed, so ``results`` may be empty while the orders'
     #: true state is unknown. ``None`` when placement produced per-order results.
     placement_error: FeedError | None = None
+    #: A failed cycle-start ``resync`` (an unreadable open-orders feed). D4: without
+    #: this, a HOLD cycle with no intents reports a clean "0 orders" while every
+    #: OPEN intent was never re-checked. ``None`` when resync succeeded.
+    resync_error: FeedError | None = None
 
 
 #: A closed intent record older than this is housekeeping noise; OPEN records
@@ -111,6 +115,7 @@ def build_report(
     as_of: pd.Timestamp,
     cost: CostProvenance = MODELLED_COST,
     placement_error: FeedError | None = None,
+    resync_error: FeedError | None = None,
 ) -> CycleReport:
     """Pure: assemble the cycle report. No clock, no I/O."""
     return CycleReport(
@@ -121,6 +126,7 @@ def build_report(
         portfolio_before=portfolio,
         cost=cost,
         placement_error=placement_error,
+        resync_error=resync_error,
     )
 
 
@@ -230,7 +236,7 @@ async def run_cycle(
         # Cycle start: reconcile every OPEN intent record BEFORE reading signals,
         # so a prior cycle's working/timed-out order is adopted (not re-minted).
         # Skipped on a dry run: it persists state, which a read-only run must not.
-        resync_results = () if dry_run else await _resync(broker)
+        resync_results, resync_error = ((), None) if dry_run else await _resync(broker)
         # Ownership scoping (plan rev 4.1 §3): the IBKR source's book ALREADY holds
         # only this scope's lots (``trades.reconcile`` filters by our cOID prefix), so
         # every lot in it is closable and no filter is applied (``owned=None``). The
@@ -265,19 +271,24 @@ async def run_cycle(
         now_ts,
         cost=cost,
         placement_error=placement_error,
+        resync_error=resync_error,
     )
 
 
-async def _resync(broker: LiveBroker) -> tuple[OrderResult, ...]:
-    """Adopt/mark OPEN intents at cycle start; a failed read leaves them OPEN.
+async def _resync(
+    broker: LiveBroker,
+) -> tuple[tuple[OrderResult, ...], FeedError | None]:
+    """Adopt/mark OPEN intents at cycle start; a failed read is reported, not swallowed.
 
-    A failure here is not fatal: placement's own pre-flight will fail closed with
-    the same read failure, reported per order.
+    A failure here is non-fatal — placement's own pre-flight fails closed with
+    the same read failure — but it must reach the REPORT (D4): otherwise a HOLD
+    cycle with no intents looks like a clean "0 orders" while no OPEN intent was
+    ever re-checked.
     """
     resynced = await broker.resync()
     if isinstance(resynced, Err):
-        return ()
-    return tuple(resynced.value)
+        return (), cast("FeedError", resynced.error)
+    return tuple(resynced.value), None
 
 
 def _owned_ids(ledger: CycleLedger, scope: str) -> frozenset[str]:

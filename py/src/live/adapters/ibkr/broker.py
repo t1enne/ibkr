@@ -36,7 +36,7 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import cast
 
 import pandas as pd
@@ -46,7 +46,7 @@ from src.bt.state import ActionType, ExecutionParams, FillEvent, PortfolioState
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import search_contracts
 from src.exec.types import Fill, OrderSide, OrderState
-from src.live.adapters.ibkr.mapping import parse_positions
+from src.live.adapters.ibkr.mapping import parse_executions, parse_positions
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     ReplyOutcome,
@@ -66,6 +66,7 @@ from src.live.adapters.ibkr.orders import (
     validate_order,
     whole_quantity,
 )
+from src.live.adapters.ibkr.trades import Execution
 from src.live.broker import OrderResult, position_side_of, trade_signal
 from src.live.identity import (
     OPEN_STATES,
@@ -76,8 +77,10 @@ from src.live.identity import (
     PendingIntents,
     Resolution,
     WorkingOrder,
+    attempt_of,
     intent_key,
     order_ref,
+    ref_matches_key,
     ref_prefix,
 )
 from src.live.result import Err, Ok, Result
@@ -102,16 +105,21 @@ _FLAT_EPS = 1e-9
 #: still trips it.
 _OPEN_CASH_TOLERANCE = 0.02
 
-#: A settle-with-no-terminal maps back to a durable intent state. ``rejected`` and
-#: ``unfilled`` are terminal; anything else (timeout, a transport blip on the
-#: status read) keeps the intent WORKING so the next cycle re-checks it.
-_STATE_FOR_KIND: Mapping[str, IntentState] = {
-    "rejected": IntentState.REJECTED,
-    "unfilled": IntentState.UNFILLED,
-}
-
 ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _WaitOutcome:
+    """A finished fill wait: the durable state it settles, plus what it reports.
+
+    The WAIT BRANCH chooses ``state`` — a terminal status settles FILLED/
+    UNFILLED/REJECTED, a deadline with a partial keeps WORKING — so a live
+    partial is never stamped terminal by a kind-to-state guess.
+    """
+
+    state: IntentState
+    result: Result[OrderResult, FeedError]
 
 
 def _names_the_ticker(candidate: SecdefSearchResponseItem, ticker: str) -> bool:
@@ -149,11 +157,11 @@ async def _default_conid_lookup(ticker: str) -> int:
 
 
 def _attempt_of(order_ref_str: str, existing: IntentRecord | None) -> int:
-    """The attempt encoded in *order_ref_str*'s dashless hex tail (or the prior one)."""
-    try:
-        return int(order_ref_str.rsplit("-", 1)[-1], 16)
-    except ValueError:
-        return existing.attempt if existing is not None else 0
+    """The attempt in *order_ref_str*'s dashless hex tail, else the record's prior one."""
+    parsed = attempt_of(order_ref_str)
+    if parsed is not None:
+        return parsed
+    return existing.attempt if existing is not None else 0
 
 
 def _day_rolled(decision_ts: pd.Timestamp | None, now: pd.Timestamp) -> bool:
@@ -240,7 +248,9 @@ class IbkrBroker:
         now = self._now()
         adopted: list[OrderResult] = []
         for record in records:
-            found = match_working(working, ref_prefix(record.key))
+            found = match_working(
+                working, ref_prefix(record.key), prefer=record.order_ref
+            )
             if found is not None:
                 self._persist_working(record.key, found, record.decision_ts)
                 adopted.append(_adopted_result(record, found))
@@ -298,6 +308,9 @@ class IbkrBroker:
                     "unresolved", f"{intent.symbol}: {decision.reason}", intent.symbol
                 )
             )
+        guarded = await self._guard_lost_predecessor(intent, key)
+        if guarded is not None:
+            return guarded
         return await self._submit_new(account, intent, key, side, conid)
 
     async def place_cohort(
@@ -347,7 +360,7 @@ class IbkrBroker:
                 error = cast("FeedError", placed.error)
                 message = f"{error.kind}: {error.message}"
                 self._log(f"order failed {intent.symbol}: {message}")
-                results.append(_failed(intent, message))
+                results.append(_failed(intent, message, error.kind))
             else:
                 results.append(placed.value)
             if intent.action is ActionType.close and not results[-1].ok:
@@ -361,27 +374,33 @@ class IbkrBroker:
 
     async def wait_filled(
         self, order_id: str, intent: OrderIntent, ticket: Ticket
-    ) -> Result[OrderResult, FeedError]:
+    ) -> _WaitOutcome:
         """Poll the order to a terminal status; map it to a fill or a typed failure.
 
-        Outcomes (all reported, none silently accepted):
+        The ``_WaitOutcome.state`` is chosen by the BRANCH, not the error kind: a
+        terminal status settles FILLED/UNFILLED/REJECTED, a deadline with a
+        partial fill keeps WORKING. Outcomes (all reported, none silently
+        accepted):
 
         - terminal ``Filled`` for the whole size -> ``Ok`` with the fill;
         - a complete fill whose status has not yet flipped (``cum_fill`` reaches
           ``total_size``) -> ``Ok``, because a fill cannot exceed the size;
         - terminal non-filled status (``Cancelled``/``Inactive``) -> ``rejected``;
-        - a partial fill on a dead order, or still working at the deadline ->
-          ``unfilled``, carrying the qty that DID fill;
+        - a partial fill on a DEAD order -> ``unfilled``, carrying the qty that
+          DID fill;
+        - still working at the deadline -> ``timeout`` (a partial is reported in
+          the message), settling WORKING so the next cycle re-checks it;
         - a terminal ``Filled`` whose body omits/garbles ``cum_fill`` ->
-          ``unresolved`` (it filled; its size is unknown) — never "nothing filled";
-        - nothing terminal within the timeout -> ``timeout``.
+          ``unresolved`` (it filled; its size is unknown) — never "nothing filled".
         """
         deadline = self._monotonic() + self._timeout_s
         status: dict[str, object] = {}
         while True:
             fetched = await self._status(order_id)
             if isinstance(fetched, Err):
-                return Err(cast("FeedError", fetched.error))
+                return _WaitOutcome(
+                    IntentState.WORKING, Err(cast("FeedError", fetched.error))
+                )
             status = fetched.value
             if is_terminal(status) or is_fully_filled(
                 status, self._filled_qty(ticket, intent, status)
@@ -553,32 +572,128 @@ class IbkrBroker:
     ) -> Resolution:
         """Decide adopt / submit / skip for *key* given the working-orders index.
 
-        A working order carrying the key's exact prefix is ADOPTED. With none, a
-        record in a terminal state submits a fresh attempt; a record that is OPEN
-        with a known ``order_id`` is SKIPPED (no re-mint — a vanished working
-        order is not proof it is gone); an OPEN record with no id (never
-        confirmed placed) submits, because a clean read showing nothing is proof
-        enough for an order we have no id for.
+        A working order carrying the key's exact prefix is ADOPTED. With none,
+        only a record that PROVES the predecessor was never confirmed placed may
+        submit: a PENDING record (minted, submit not confirmed) or no record at
+        all. An OPEN record in any other state is SKIPPED — ``UNRESOLVED`` means
+        an ambiguous POST left 'whether it is live' unknown, so a clean read that
+        lists nothing is NOT proof it was never placed (``/iserver/account/orders``
+        lists WORKING orders, so absence cannot tell 'never sent' from 'sent and
+        filled'), and a known ``order_id`` with no working order is likewise not
+        proof. A record in a terminal state submits a fresh attempt.
         """
-        found = match_working(tuple(index.values()), ref_prefix(key))
+        existing = self._intents.load(key)
+        found = match_working(
+            tuple(index.values()),
+            ref_prefix(key),
+            prefer=existing.order_ref if existing is not None else None,
+        )
         if found is not None:
             return Resolution(
                 "adopt",
                 found.order_id,
                 f"working order {found.order_id} carries {found.order_ref}",
             )
-        existing = self._intents.load(key)
         if existing is None or existing.state not in OPEN_STATES:
             return Resolution("submit", None, "no open intent for this key")
+        if existing.state is IntentState.PENDING:
+            return Resolution(
+                "submit", None, "pending intent was never confirmed placed"
+            )
         if existing.order_id is None:
             return Resolution(
-                "submit", None, "open intent has no known order id and no working order"
+                "skip",
+                None,
+                f"open intent {existing.state.value} has no known order id and no "
+                f"working order; not re-minting",
             )
         return Resolution(
             "skip",
             existing.order_id,
             f"open intent {existing.state.value} holds order {existing.order_id} "
             f"but no working order carries its prefix; not re-minting",
+        )
+
+    # -- internals: lost-predecessor sweep --------------------------------
+    #
+    # Before minting a NEW attempt the executions window is swept for a fill
+    # attributable to this key. The ref is bar-free, so a fill from ANY attempt
+    # maps to the same key; finding one means a predecessor filled and a submit
+    # would be a duplicate. Swept ONLY when the durable store cannot vouch for
+    # the predecessor (no record, or a PENDING row) — a terminal record already
+    # accounts for its predecessor, so a legitimate re-send (a close re-closed
+    # after a partial) must NOT be blocked. It lives at MINT time, not resync:
+    # only there can a failed executions read block the POST (resync failures
+    # are non-fatal by design, so a resync-time sweep could not be fail-closed,
+    # the INV-1 invariant).
+
+    async def _guard_lost_predecessor(
+        self, intent: OrderIntent, key: IntentKey
+    ) -> Result[OrderResult, FeedError] | None:
+        """Refuse to mint when the executions window proves the key already filled.
+
+        ``None`` means no evidence of a predecessor and the caller may mint; an
+        ``Err`` (a failed executions read) fails closed so no POST follows.
+        """
+        existing = self._intents.load(key)
+        if existing is not None and existing.state is not IntentState.PENDING:
+            return None
+        swept = await self._sweep_key_fill(key)
+        if isinstance(swept, Err):
+            return Err(cast("FeedError", swept.error))
+        execution = swept.value
+        if execution is None:
+            return None
+        self._adopt_execution(key, execution)
+        return Err(
+            feed_error(
+                "unresolved",
+                f"{intent.symbol}: executions window already carries "
+                f"{execution.order_ref} (order {execution.order_id}) for this key "
+                f"— not minting a duplicate; its terminal state is re-checked next "
+                f"cycle",
+                intent.symbol,
+            )
+        )
+
+    async def _sweep_key_fill(
+        self, key: IntentKey
+    ) -> Result[Execution | None, FeedError]:
+        """One execution already attributable to *key*, or ``None`` (fail-closed read)."""
+        try:
+            raw = await self._client.trades()
+        except IbkrError as exc:
+            return Err(feed_error(exc.kind, f"trades: {exc}", key.symbol))
+        executions, _ = parse_executions(raw)
+        return Ok(
+            next(
+                (
+                    e
+                    for e in executions
+                    if ref_matches_key(self._scope, key, e.order_ref)
+                ),
+                None,
+            )
+        )
+
+    def _adopt_execution(self, key: IntentKey, execution: Execution) -> None:
+        """Persist WORKING for *key*, adopting a found execution's order identity.
+
+        Storing the execution's ``order_id`` lets the NEXT cycle's ``resync``
+        settle the true terminal state through ``order_status``; marking it
+        WORKING (not FILLED) avoids asserting a full fill a partial would
+        contradict.
+        """
+        existing = self._intents.load(key)
+        self._intents.save(
+            IntentRecord(
+                key=key,
+                state=IntentState.WORKING,
+                attempt=_attempt_of(execution.order_ref, existing),
+                order_ref=execution.order_ref,
+                order_id=execution.order_id,
+                decision_ts=existing.decision_ts if existing is not None else None,
+            )
         )
 
     # -- internals: submit paths ------------------------------------------
@@ -592,7 +707,12 @@ class IbkrBroker:
         index: Mapping[str, WorkingOrder],
     ) -> Result[OrderResult, FeedError]:
         """Persist WORKING for a found working order and wait on its real status."""
-        found = match_working(tuple(index.values()), ref_prefix(key))
+        existing = self._intents.load(key)
+        found = match_working(
+            tuple(index.values()),
+            ref_prefix(key),
+            prefer=existing.order_ref if existing is not None else None,
+        )
         if found is None:
             self._persist_unresolved(key)
             return Err(
@@ -702,9 +822,12 @@ class IbkrBroker:
             if isinstance(guard, Err):
                 self._persist_unresolved(key)
                 return self._ambiguous_error(
-                    f"confirm {ticket.order_ref}: pre-confirm working-orders read failed"
+                    f"confirm {ticket.order_ref}: pre-confirm working-orders read failed",
+                    read_ok=False,
                 )
-            already = match_working(tuple(guard.value.values()), ref_prefix(key))
+            already = match_working(
+                tuple(guard.value.values()), ref_prefix(key), prefer=ticket.order_ref
+            )
             if already is not None:
                 self._persist_working(key, already, decision_ts)
                 self._log(
@@ -778,23 +901,40 @@ class IbkrBroker:
         index = await self._working_index()
         if isinstance(index, Err):
             self._persist_unresolved(key)
-            return self._ambiguous_error(reason)
-        found = match_working(tuple(index.value.values()), ref_prefix(key))
+            return self._ambiguous_error(reason, read_ok=False)
+        existing = self._intents.load(key)
+        found = match_working(
+            tuple(index.value.values()),
+            ref_prefix(key),
+            prefer=existing.order_ref if existing is not None else None,
+        )
         if found is not None:
             self._persist_working(key, found, None)
             self._log(f"{reason}; adopting working order {found.order_id}")
             return Ok(found.order_id)
         self._persist_unresolved(key)
-        return self._ambiguous_error(reason)
+        return self._ambiguous_error(reason, read_ok=True)
 
-    def _ambiguous_error(self, reason: str) -> Err[str, FeedError]:
-        """The unresolved failure for an order whose submission left state unknown."""
+    def _ambiguous_error(self, reason: str, *, read_ok: bool) -> Err[str, FeedError]:
+        """The unresolved failure for an order whose submission left state unknown.
+
+        The working-orders attestation is only claimed when that read actually
+        SUCCEEDED: ``read_ok=True`` says "no working order carries the key prefix",
+        ``read_ok=False`` (the read FAILED) says "whether a working order exists is
+        unknown" — never positive evidence we do not have (D5).
+        """
+        observation = (
+            "no working order carries the key prefix"
+            if read_ok
+            else "the working-orders read failed, so whether a working order exists "
+            "is unknown"
+        )
         return Err(
             FeedError(
                 kind="unresolved",
                 message=(
-                    f"{reason}; whether it was placed is unknown (no working order "
-                    f"carries the key prefix) — do not assume it was not placed"
+                    f"{reason}; whether it was placed is unknown ({observation}) — "
+                    f"do not assume it was not placed"
                 ),
             )
         )
@@ -802,18 +942,22 @@ class IbkrBroker:
     def _settle_wait(
         self,
         key: IntentKey,
-        result: Result[OrderResult, FeedError],
+        outcome: _WaitOutcome,
         order_id: str | None,
         *,
         adopted: bool,
     ) -> Result[OrderResult, FeedError]:
-        """Persist the durable state a wait settled to, and pass the result through."""
+        """Persist the durable state the wait branch chose, and pass the result on.
+
+        The ORDER (not an error kind) decides state: a terminal status settles
+        FILLED/UNFILLED/REJECTED, a deadline with a partial settles WORKING, so
+        a still-live partial is never marked terminal.
+        """
         now = self._now()
+        result = outcome.result
         if isinstance(result, Err):
-            error = cast("FeedError", result.error)
-            state = _STATE_FOR_KIND.get(error.kind, IntentState.WORKING)
-            self._intents.close(key, state, order_id, now)
-            return Err(error)
+            self._intents.close(key, outcome.state, order_id, now)
+            return Err(cast("FeedError", result.error))
         self._intents.close(key, IntentState.FILLED, order_id, now)
         order = result.value
         return Ok(replace(order, outcome=OrderOutcome.ADOPTED) if adopted else order)
@@ -847,8 +991,19 @@ class IbkrBroker:
             self._intents.close(key, IntentState.UNRESOLVED, None, self._now())
 
     async def _resync_status(self, record: IntentRecord, now: pd.Timestamp) -> None:
-        """Resolve an OPEN record that has no working order but a known order id."""
+        """Resolve an OPEN record that has no working order but a known order id.
+
+        An UNRESOLVED record with NO order id is also resolvable, but only once
+        its DAY order has rolled over: a DAY order that is gone after its day is
+        expired unfilled. Before that rollover, no evidence (no working order, no
+        id) may age it out — whether it was placed-and-just-listed is still
+        unknown (blocker 1).
+        """
         if record.order_id is None:
+            if record.state is IntentState.UNRESOLVED and _day_rolled(
+                record.decision_ts, now
+            ):
+                self._intents.close(record.key, IntentState.UNFILLED, None, now)
             return
         fetched = await self._status(record.order_id)
         if isinstance(fetched, Err):
@@ -920,22 +1075,25 @@ class IbkrBroker:
         intent: OrderIntent,
         ticket: Ticket,
         status: dict[str, object],
-    ) -> Result[OrderResult, FeedError]:
-        """A terminal (or completed) status -> a filled ``OrderResult`` or a typed failure."""
+    ) -> _WaitOutcome:
+        """A terminal (or completed) status -> a fill, or a typed terminal failure."""
         raw = order_status_of(status)
         fill = self._filled(ticket, intent, status)
         if fill is None:
             return self._no_readable_fill(order_id, intent, ticket, raw, status)
         if not is_fully_filled(status, fill.qty):
-            return Err(
-                FeedError(
-                    kind="unfilled",
-                    message=(
-                        f"order {ticket.order_ref} ({order_id}) status {raw} with "
-                        f"only {fill.qty:g} of {intent.qty:g} filled"
-                    ),
-                    symbol=intent.symbol,
-                )
+            return _WaitOutcome(
+                IntentState.UNFILLED,
+                Err(
+                    FeedError(
+                        kind="unfilled",
+                        message=(
+                            f"order {ticket.order_ref} ({order_id}) status {raw} with "
+                            f"only {fill.qty:g} of {intent.qty:g} filled"
+                        ),
+                        symbol=intent.symbol,
+                    )
+                ),
             )
         position_id = intent.position_id or str(ticket.conid)
         message = (
@@ -943,14 +1101,17 @@ class IbkrBroker:
             f"@ {fill.price:.4f} cOID={ticket.order_ref} order_id={order_id}"
         )
         self._log(message)
-        return Ok(
-            OrderResult(
-                intent=intent,
-                fill=self._fill_event(intent, ticket, fill),
-                ok=True,
-                message=message,
-                position_id=position_id,
-            )
+        return _WaitOutcome(
+            IntentState.FILLED,
+            Ok(
+                OrderResult(
+                    intent=intent,
+                    fill=self._fill_event(intent, ticket, fill),
+                    ok=True,
+                    message=message,
+                    position_id=position_id,
+                )
+            ),
         )
 
     def _no_readable_fill(
@@ -960,29 +1121,35 @@ class IbkrBroker:
         ticket: Ticket,
         raw: str,
         status: dict[str, object],
-    ) -> Result[OrderResult, FeedError]:
+    ) -> _WaitOutcome:
         """A terminal body with no readable fill quantity: unknown, not "nothing filled"."""
         if order_state(status) is OrderState.FILLED:
-            return Err(
+            return _WaitOutcome(
+                IntentState.WORKING,
+                Err(
+                    FeedError(
+                        kind="unresolved",
+                        message=(
+                            f"order {ticket.order_ref} ({order_id}) status {raw}: "
+                            f"terminal Filled but cum_fill unreadable — the order "
+                            f"filled; its quantity is unknown"
+                        ),
+                        symbol=intent.symbol,
+                    )
+                ),
+            )
+        return _WaitOutcome(
+            IntentState.REJECTED,
+            Err(
                 FeedError(
-                    kind="unresolved",
+                    kind="rejected",
                     message=(
                         f"order {ticket.order_ref} ({order_id}) status {raw}: "
-                        f"terminal Filled but cum_fill unreadable — the order filled; "
-                        f"its quantity is unknown"
+                        f"nothing filled"
                     ),
                     symbol=intent.symbol,
                 )
-            )
-        return Err(
-            FeedError(
-                kind="rejected",
-                message=(
-                    f"order {ticket.order_ref} ({order_id}) status {raw}: "
-                    f"nothing filled"
-                ),
-                symbol=intent.symbol,
-            )
+            ),
         )
 
     def _unresolved_result(
@@ -991,32 +1158,36 @@ class IbkrBroker:
         intent: OrderIntent,
         ticket: Ticket,
         status: dict[str, object],
-    ) -> Result[OrderResult, FeedError]:
-        """No terminal status inside the deadline: partial -> unfilled, else timeout."""
+    ) -> _WaitOutcome:
+        """No terminal status at the deadline -> a timeout, settling WORKING.
+
+        A partial fill here lives in the MESSAGE, not a terminal state: the order
+        is still working, so stamping it UNFILLED would let the next cycle mint a
+        duplicate while this order is live.
+        """
         raw = order_status_of(status)
         fill = self._filled(ticket, intent, status)
         filled_qty = fill.qty if fill is not None else 0.0
         if filled_qty > 0:
-            return Err(
+            message = (
+                f"order {ticket.order_ref} ({order_id}) still {raw} after "
+                f"{self._timeout_s:g}s with {filled_qty:g} of "
+                f"{intent.qty:g} filled"
+            )
+        else:
+            message = (
+                f"order {ticket.order_ref} ({order_id}) still {raw} after "
+                f"{self._timeout_s:g}s: no terminal status"
+            )
+        return _WaitOutcome(
+            IntentState.WORKING,
+            Err(
                 FeedError(
-                    kind="unfilled",
-                    message=(
-                        f"order {ticket.order_ref} ({order_id}) still {raw} after "
-                        f"{self._timeout_s:g}s with {filled_qty:g} of "
-                        f"{intent.qty:g} filled"
-                    ),
+                    kind="unfilled" if filled_qty > 0 else "timeout",
+                    message=message,
                     symbol=intent.symbol,
                 )
-            )
-        return Err(
-            FeedError(
-                kind="timeout",
-                message=(
-                    f"order {ticket.order_ref} ({order_id}) still {raw} after "
-                    f"{self._timeout_s:g}s: no terminal status"
-                ),
-                symbol=intent.symbol,
-            )
+            ),
         )
 
     def _fill_event(self, intent: OrderIntent, ticket: Ticket, fill: Fill) -> FillEvent:
@@ -1051,14 +1222,29 @@ class IbkrBroker:
         )
 
 
-def _failed(intent: OrderIntent, message: str) -> OrderResult:
-    """A dropped/refused order as a failed ``OrderResult`` (outcome REJECTED)."""
+def _outcome_for_kind(kind: str) -> OrderOutcome:
+    """The ``OrderOutcome`` a placement failure's error kind reports.
+
+    Only rejected flags a genuine refusal; an unresolved POST, a timeout, or an
+    unfilled-but-dead order each carry their own outcome so a duplicate-risk
+    event never renders as a plain "rejected" (INV-3).
+    """
+    return {
+        "unresolved": OrderOutcome.UNRESOLVED,
+        "timeout": OrderOutcome.TIMEOUT,
+        "unfilled": OrderOutcome.UNFILLED,
+    }.get(kind, OrderOutcome.REJECTED)
+
+
+def _failed(intent: OrderIntent, message: str, kind: str = "rejected") -> OrderResult:
+    """A dropped/refused order as a failed ``OrderResult`` carrying its outcome."""
     return OrderResult(
         intent=intent,
         fill=None,
         ok=False,
         message=message,
-        outcome=OrderOutcome.REJECTED,
+        outcome=_outcome_for_kind(kind),
+        error_kind=kind,
     )
 
 

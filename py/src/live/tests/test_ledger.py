@@ -474,31 +474,103 @@ def test_save_overwrites_a_same_key_record(ledger: SqliteLedger) -> None:
     assert record is not None and record.state is IntentState.WORKING
 
 
-def test_load_warns_and_ignores_a_token_owned_by_a_foreign_identity(
-    ledger: SqliteLedger, tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_a_token_collision_cannot_alias_two_distinct_identities(
+    ledger: SqliteLedger, tmp_path: Path
 ) -> None:
-    # Same (scope, token) but a different symbol/action/position_id is a crc32
-    # collision: the foreign row is warned about and read as absent, never adopted.
+    """D7: the identity columns key the table, so a crc32 collision never aliases.
+
+    Two distinct intents whose TOKENS collide (forced here by rewriting one) stay
+    separately addressable — the token is a plain column, not the key — so cycle
+    2 wanting A can never adopt or overwrite B's live order.
+    """
     key = _key("AAPL")
     foreign = replace(key, symbol="MSFT")
+    ledger.save(
+        IntentRecord(
+            key=key,
+            state=IntentState.WORKING,
+            attempt=0,
+            order_ref=order_ref(key, 0),
+            order_id="1",
+            decision_ts=None,
+        )
+    )
     ledger.save(
         IntentRecord(
             key=foreign,
             state=IntentState.WORKING,
             attempt=0,
             order_ref=order_ref(foreign, 0),
-            order_id="1",
+            order_id="2",
             decision_ts=None,
         )
     )
-    with get_connection(tmp_path / "ledger.sqlite") as con:  # force the collision
+    with get_connection(tmp_path / "ledger.sqlite") as con:  # force a collision
         con.execute(
-            "UPDATE live_order_intent SET token=? WHERE token=?",
-            (key.token(), foreign.token()),
+            "UPDATE live_order_intent SET token=? WHERE symbol='AAPL'",
+            (foreign.token(),),
         )
-    with caplog.at_level(logging.WARNING):
-        assert ledger.load(key) is None
-    assert any("collides" in r.message for r in caplog.records)
+    first = ledger.load(key)
+    second = ledger.load(foreign)
+    assert first is not None and second is not None
+    assert (first.order_id, second.order_id) == ("1", "2")  # neither aliased
+    assert ledger.load_open("S1") == (first, second)
+
+
+def test_legacy_token_keyed_intent_table_is_rekeyed_and_preserved(
+    tmp_path: Path,
+) -> None:
+    """D7: an e362843 ``(scope, token)`` intent table is preserved and re-keyed.
+
+    The legacy rows survive under a kept copy AND are restored into the identity-
+    keyed table, never dropped.
+    """
+    path = tmp_path / "ledger.sqlite"
+    with get_connection(path) as con:
+        con.executescript(
+            """
+            CREATE TABLE live_order_intent (
+                scope TEXT NOT NULL, token TEXT NOT NULL, symbol TEXT NOT NULL,
+                action TEXT NOT NULL, position_id TEXT, state TEXT NOT NULL,
+                attempt INTEGER NOT NULL, order_ref TEXT NOT NULL,
+                order_id TEXT, decision_ts INTEGER, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (scope, token)
+            );
+            INSERT INTO live_order_intent VALUES
+              ('S1','t1','AAPL','long',NULL,'working',1,'r1','o1',0,1),
+              ('S1','t2','MSFT','long','265','working',0,'r2','o2',0,1);
+            """
+        )
+    ledger = SqliteLedger(path)
+    # The first WRITE triggers the migration + re-key (reads alone never do).
+    assert ledger.prune(TS) == 0
+    key = _key("AAPL")
+    close_key = _key("MSFT", pid="265")
+    assert ledger.load(key) is not None and ledger.load(close_key) is not None
+    # Both the open (position_id None) and the close survived the re-key.
+    assert {r.key.position_id for r in ledger.load_open("S1")} == {None, "265"}
+    # The legacy table is kept (renamed), never dropped.
+    assert "live_order_intent_legacy" in _tables(path)
+    # Re-keyed: token is NOT part of the primary key anymore.
+    with get_connection(path) as con:
+        info = {
+            r[1] for r in con.execute("PRAGMA table_info(live_order_intent)") if r[5]
+        }
+    assert info == {"scope", "symbol", "action", "position_id"}
 
 
 pytestmark = pytest.mark.db
+
+
+def test_pruned_terminal_record_mints_the_next_attempt_at_zero(
+    ledger: SqliteLedger,
+) -> None:
+    """A pruned CLOSED row is gone, so the next attempt restarts the counter."""
+    key = _key("AAPL")
+    ledger.open_attempt(key, OLD, OLD)
+    ledger.close(key, IntentState.FILLED, "1", OLD)
+    assert ledger.prune(TS) == 1
+    assert ledger.load(key) is None
+    # The counter restarts at 0 once the prior row is pruned (fresh cOID reuse).
+    record = ledger.open_attempt(key, TS, TS)
+    assert record.attempt == 0

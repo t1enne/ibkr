@@ -1,17 +1,23 @@
-"""The single definition of the order-ref scheme, shared by both sides.
+"""The legacy, CYCLE-ANCHORED order-ref scheme — backtest/sim only now.
 
-A ref is ``f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M%S}-{seq:03d}"`` (plan rev 4.1
-§4). ``scope`` is a stable strategy identity that survives a config edit (the
-live config's ``scope`` key, defaulting to the strategy name), and its ``slug``
-prefix is ALSO the attribution key: a strategy recognises its own executions on a
-shared account by that whole-slug prefix (never a slice of a hash).
+These helpers previous defined the ref for BOTH sides and are still exported for
+compat and by ``src.exec.tests.test_refs``, but the LIVE path does not use them:
+``src.live.identity.order_ref`` mints the live ref ``scope_tag-token-attempt``,
+bar-free, so adoption survives bars, days and reruns (INV-2 is the INVERSE of
+what the cycle-anchored scheme here assumes).
 
-``seq`` is keyed on the intent's **stable identity** (symbol + action + lot), not
-its position in the batch. That is the fix for the shifted-batch trap: a close
-filling removes an intent from the next cycle's batch, so a positional seq would
-let the following open inherit the close's already-seen ref and be deduped away.
-Keying on identity mints the same ref for the same intent across runs, and a
-different one for a different intent, regardless of who else is in the batch.
+A ref here is ``f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M%S}-{seq:03d}"`` (plan rev
+4.1 §4). ``scope`` is a stable strategy identity that survives a config edit,
+and its ``slug`` prefix is also the attribution key. ``seq`` is keyed on the
+intent's **stable identity** (symbol + action + lot), not its batch position, so
+no intent inherits another's ref on a shifted batch.
+
+**Upgrade caveat.** Refs minted here (the old scheme) are NOT ``trades.is_ours``
+under the new live ref — the scope segment no longer pins the bar timestamp, and
+``is_ours``/``ref_is_ours`` match the new shape exactly. So pre-upgrade
+``live_order_intent`` refs and pre-upgrade executions still inside the 7-day
+trades window will NOT be attributed (and will not advance the book). A rolling
+fresh cold-start after upgrade is the intended migration.
 """
 
 from __future__ import annotations
@@ -59,12 +65,12 @@ def _seq_of(identity: str) -> int:
 
 
 def assign_seqs(identities: list[str]) -> list[int]:
-    """Seq per identity, collision-broken deterministically within the batch.
+    """BACKTEST/SIM-ONLY: seq per identity, collision-broken deterministically.
 
-    ``_seq_of`` is already stable across runs; on the (rare) collision of two
-    identities mapping to the same seq, the *later* one in sorted identity order
-    is bumped until free — a function of the identity SET, so a re-run of the
-    same set assigns identically.
+    The live path never calls it — ``identity.order_ref`` keys the ref directly
+    on the intent with an attempt counter, no batch seq. ``_seq_of`` is already
+    stable across runs; on the (rare) collision of two identities mapping to the
+    same seq, the *later* one in sorted identity order is bumped until free.
     """
     assigned: dict[str, int] = {}
     taken: set[int] = set()
@@ -82,10 +88,11 @@ def assign_seqs(identities: list[str]) -> list[int]:
 
 
 def order_ref(scope: str, cycle_ts: pd.Timestamp, seq: int) -> str:
-    """Stable order ref: ``<slug(scope)>-<YYYYMMDDTHHMMSS>-<seq:03d>``.
+    """BACKTEST/SIM-ONLY stable order ref: ``<slug>-<YYYYMMDDTHHMMSS>-<seq>``.
 
-    ``cycle_ts`` is second-granular so two different cycles can never share a
-    timestamp; no prices or sizes enter the ref, so a resized order is the same
-    order and a re-sent cycle dedupes at the broker.
+    Bar-anchored, so it is the INV-2 scheme the live path REPLACED with the
+    bar-free ``identity.order_ref``. Left for the simulator/matching seam whose
+    ref is a pure in-process dedupe token (no cross-cycle adoption), and for the
+    test ``test_refs``. A live reader should look at ``src.live.identity``.
     """
     return f"{slug(scope)}-{cycle_ts:%Y%m%dT%H%M%S}-{seq:03d}"

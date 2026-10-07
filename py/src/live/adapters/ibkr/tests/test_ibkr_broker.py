@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -23,12 +24,14 @@ from src.exec.types import FixedCommission, OrderType
 from src.live.adapters.ibkr import broker as broker_mod
 from src.live.adapters.ibkr.broker import MAX_REPLIES, IbkrBroker
 from src.live.broker import OrderResult
+from src.live.ledger import SqliteLedger
 from src.live.identity import (
     OPEN_STATES,
     IntentKey,
     IntentRecord,
     IntentState,
     OrderOutcome,
+    PendingIntents,
     intent_key,
     order_ref,
 )
@@ -49,10 +52,24 @@ STATUS = f"{BASE}iserver/account/order/status/{ORDER_ID}"
 REPLY = f"{BASE}iserver/reply/"
 POSITIONS = f"{BASE}portfolio/{ACCOUNT}/positions/0"
 OPEN_ORDERS = f"{BASE}iserver/account/orders"
+TRADES = f"{BASE}iserver/account/trades"
 
-#: A decision bar distinct from the broker's wall clock, so a test can prove the
-#: cOID is anchored on the BAR, not ``now()``.
+#: An AUDIT decision bar distinct from the broker's wall clock. Under the
+#: bar-free scheme the cOID ignores it (INV-2); it only drives the DAY-order
+#: rollover and the audit field.
 BAR = cast("pd.Timestamp", pd.Timestamp("2024-06-03T20:00:00Z"))
+
+
+@pytest.fixture(autouse=True)
+def _default_empty_executions():
+    """Default: the executions window is empty.
+
+    ``place`` sweeps the executions channel before minting when the durable store
+    cannot vouch for the predecessor; an empty read means no lost predecessor, so
+    most tests proceed to submit. A sweep-specific test overrides this route.
+    """
+    respx.get(TRADES).mock(return_value=httpx.Response(200, json={"trades": []}))
+    yield
 
 
 def _mock_no_working_orders() -> None:
@@ -148,7 +165,7 @@ def _broker(
     monotonic: Callable[[], float] | None = None,
     now: Callable[[], pd.Timestamp] | None = None,
     log: Callable[[str], None] | None = None,
-    intents: FakeIntents | None = None,
+    intents: PendingIntents | None = None,
     params: ExecutionParams | None = None,
 ) -> IbkrBroker:
     return IbkrBroker(
@@ -1453,3 +1470,191 @@ async def test_open_cash_guard_bounds_the_rounded_ticket_quantity() -> None:
     assert error.kind == "rejected"
     assert "exceeds funded cash" in error.message
     assert submit.call_count == 0  # the $1200 order was never sent
+
+
+# --- blocker 1: UNRESOLVED must not re-mint; the executions sweep guards it ---
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_unresolved_without_an_order_id_never_submits() -> None:
+    """Block1: an UNRESOLVED record with no id is NOT proof it was never placed.
+
+    ``/iserver/account/orders`` lists WORKING orders, so absence cannot tell\n    \"never sent\" from \"sent and filled\"; the record must not re-mint a duplicate.\n"""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    intents.records[(key.scope, key.token())] = IntentRecord(
+        key=key,
+        state=IntentState.UNRESOLVED,
+        attempt=0,
+        order_ref=order_ref(key, 0),
+        order_id=None,
+        decision_ts=None,
+    )
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+
+    error = _failure(await _broker(intents=intents).place(intent))
+
+    assert error.kind == "unresolved"
+    assert submit.call_count == 0  # no new attempt while the state is unknown
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_lost_intent_row_does_not_mint_when_the_executions_window_has_the_fill() -> (
+    None
+):
+    """Block1 sweep: the executions channel protects a lost durable row.
+
+    No durable record exists, but the trades window already carries a fill for\n    this key — a submit would be a duplicate, so the broker finds it via the\n    ref (bar-free) and refuses to mint.\n"""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    respx.get(TRADES).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "trades": [
+                    {
+                        "execution_id": "e1",
+                        "order_id": "OLD1",
+                        "order_ref": order_ref(key, 0),
+                        "conid": str(CONID),
+                        "side": "BUY",
+                        "size": "1",
+                        "price": "100",
+                        "trade_time_r": "1717439400000",
+                        "symbol": "AAPL",
+                    }
+                ]
+            },
+        )
+    )
+
+    error = _failure(await _broker().place(intent))
+
+    assert error.kind == "unresolved"
+    assert submit.call_count == 0  # no duplicate minted
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_lost_intent_row_sweep_fails_closed_when_the_executions_read_fails() -> (
+    None
+):
+    """Block1 sweep: a failed executions read blocks the mint (INV-1, fail closed)."""
+    intent = _open_intent()
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    respx.get(TRADES).mock(return_value=httpx.Response(500, json={}))
+
+    error = _failure(await _broker().place(intent))
+
+    assert error.kind in {"transport", "auth", "rate_limit"}
+    assert submit.call_count == 0  # a duplicate is unbounded exposure
+
+
+# --- blocker 2: a deadline partial settles WORKING, never a terminal state ---
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_deadline_partial_settles_working_not_terminal() -> None:
+    """Block2: a partial at the wait deadline keeps the intent WORKING.
+
+    The order is STILL LIVE, so stamping it UNFILLED (terminal) would let the next\n    cycle re-mint a duplicate. The partial is reported in the message; the durable\n    state stays OPEN so resync re-checks it.\n"""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "order_status": "Submitted",
+                "cum_fill": "0.25",
+                "total_size": "1",
+                "average_price": "101.0",
+            },
+        )
+    )
+    _mock_no_working_orders()
+
+    error = _failure(await _broker(intents=intents).place(intent))
+
+    assert error.kind == "unfilled"  # the partial is reported
+    record = intents.load(key)
+    assert record is not None and record.state is IntentState.WORKING
+
+
+# --- blocker 1: resync ages an unresolved-no-id record out on its day roll ----
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_resync_ages_out_an_unresolved_no_id_record_on_its_day_roll() -> None:
+    """Block1: an UNRESOLVED record with no id is aged to UNFILLED on a day roll.
+
+    Before the rollover no evidence may age it out (the order might still be\n    live); once its DAY order's calendar day passes and nothing is working, it has\n    expired unfilled.\n"""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    intents = FakeIntents()
+    decision = cast("pd.Timestamp", pd.Timestamp("2024-06-03T20:00:00Z"))
+    intents.records[(key.scope, key.token())] = IntentRecord(
+        key=key,
+        state=IntentState.UNRESOLVED,
+        attempt=0,
+        order_ref=order_ref(key, 0),
+        order_id=None,
+        decision_ts=decision,
+    )
+    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
+    broker = _broker(
+        intents=intents,
+        now=lambda: cast("pd.Timestamp", pd.Timestamp("2024-06-05T09:00:00Z")),
+    )
+
+    await broker.resync()
+
+    record = intents.load(key)
+    assert record is not None and record.state is IntentState.UNFILLED
+
+
+# --- integration: the broker over the REAL SqliteLedger seam -----------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_broker_places_over_the_real_sqlite_ledger(tmp_path: Path) -> None:
+    """Integration: ``IbkrBroker`` drives the real ``SqliteLedger`` seam end to end.
+
+    This exercises the seam's identity keying and state persistence that\n    ``FakeIntents`` re-implements without (a filled order lands in sqlite and is\n    read back as the broker's FILLED intent).\n"""
+    intent = _open_intent()
+    key = intent_key(SCOPE, intent)
+    ledger = SqliteLedger(tmp_path / "intents.sqlite")
+    respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
+    _mock_no_working_orders()
+
+    placed = _ok(await _broker(intents=ledger).place(intent))
+
+    assert placed.ok
+    # The durable FILLED record is readable back from sqlite by its identity key.
+    record = ledger.load(key)
+    assert record is not None and record.state is IntentState.FILLED
+    assert record.order_id == ORDER_ID
+    assert record.order_ref == order_ref(key, 0)
+    assert ledger.load_open(SCOPE) == ()

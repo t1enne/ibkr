@@ -436,6 +436,7 @@ def _render_json(report: CycleReport) -> str:
         "placement_error": (
             asdict(report.placement_error) if report.placement_error else None
         ),
+        "resync_error": (asdict(report.resync_error) if report.resync_error else None),
         "portfolio_before": _portfolio_dict(report.portfolio_before),
     }
     return json.dumps(doc, default=_json_default, indent=2)
@@ -457,11 +458,14 @@ def _render_text(report: CycleReport) -> str:
             f"qty={intent.qty:g} @ {intent.ref_price:.4f} ({intent.reason})"
         )
     for result in report.results:
-        status = "ok" if result.ok else "rejected"
+        status = result.outcome.value
         lines.append(
             f"order {result.intent.symbol} {result.intent.action.value} "
             f"{status} {result.message}"
         )
+    if report.resync_error is not None:
+        error = report.resync_error
+        lines.append(f"resync_error: {error.kind}: {error.message}")
     if report.placement_error is not None:
         error = report.placement_error
         lines.append(f"placement_error: {error.kind}: {error.message}")
@@ -482,6 +486,8 @@ def _result_dict(result: OrderResult) -> dict[str, object]:
         "qty": result.intent.qty,
         "message": result.message,
         "position_id": result.position_id,
+        "outcome": result.outcome.value,
+        "kind": result.error_kind,
     }
 
 

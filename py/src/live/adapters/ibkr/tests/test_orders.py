@@ -38,7 +38,14 @@ from src.live.adapters.ibkr.orders import (
     whole_quantity,
 )
 from src.live.broker import intent_to_signal, ref_candle
-from src.live.identity import intent_key, order_ref, ref_prefix
+from src.live.identity import (
+    WorkingOrder,
+    intent_key,
+    order_ref,
+    ref_is_ours,
+    ref_matches_key,
+    ref_prefix,
+)
 from src.live.types import OrderIntent
 
 CYCLE_TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T14:30:00Z"))
@@ -548,3 +555,49 @@ def test_live_scale_matches_the_backtest_with_commission_and_friction() -> None:
     assert [i.qty for i in plan.intents] == [
         float(math.floor(f.signal.qty)) for f in scaled
     ]
+
+
+def _working(order_ref: str, order_id: str, filled_qty: float = 0.0) -> WorkingOrder:
+    return WorkingOrder(
+        order_ref=order_ref,
+        order_id=order_id,
+        conid=265598,
+        symbol="AAPL",
+        side="BUY",
+        status="Submitted",
+        filled_qty=filled_qty,
+    )
+
+
+def test_match_working_prefers_the_stored_ref_then_the_highest_attempt() -> None:
+    """D6: with two of our orders live, adoption never regresses to an older attempt.
+
+    Without a stored ref to prefer, the HIGHEST attempt wins (``1`` here, so the
+    durable attempt does not regress one -> zero); with the record's own
+    ``order_ref`` still working, that exact ref wins so the ticket is built from
+    the same order.
+    """
+    key = intent_key(SCOPE, _intent())
+    prefix = ref_prefix(key)
+    stale = _working(order_ref(key, 0), order_id="0")
+    live_new = _working(order_ref(key, 1), order_id="1")
+    by_attempt = match_working((stale, live_new), prefix)
+    assert by_attempt is not None and by_attempt.order_id == "1"
+    by_prefer = match_working((stale, live_new), prefix, prefer=stale.order_ref)
+    assert by_prefer is not None and by_prefer.order_id == "0"
+
+
+def test_ref_is_ours_and_ref_matches_key_attribute_the_bar_free_ref() -> None:
+    """Ownership helpers: the scope segment and the key token, never a bar."""
+    key = intent_key(SCOPE, _intent("AAPL"))
+    ref = order_ref(key, 3)
+    assert ref_is_ours(SCOPE, ref)
+    assert ref_matches_key(SCOPE, key, ref)
+    # A different key (same scope) shares the scope segment but not the token.
+    other = intent_key(SCOPE, _intent("MSFT"))
+    assert ref_is_ours(SCOPE, ref)
+    assert not ref_matches_key(SCOPE, other, ref)
+    # A foreign scope's ref is not ours even with the same token shape.
+    foreign = order_ref(intent_key("other_scope", _intent("AAPL")), 0)
+    assert not ref_is_ours(SCOPE, foreign)
+    assert not ref_matches_key(SCOPE, key, foreign)

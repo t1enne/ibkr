@@ -22,7 +22,7 @@ from src.live.engine import (
 )
 from src.live.ledger import SqliteLedger
 from src.live.lease import CycleInProgressError
-from src.live.result import Err, Ok
+from src.live.result import Err, Ok, Result
 from src.live.types import (
     FeedError,
     LiveConfig,
@@ -109,7 +109,7 @@ class FakeBroker:
     def seed(self, portfolio: PortfolioState) -> None:
         self.seeded = portfolio
 
-    async def resync(self) -> Ok[tuple[OrderResult, ...], FeedError]:
+    async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
         self.resynced += 1
         self.events.append("resync")
         return Ok(())
@@ -146,6 +146,16 @@ class FakeBroker:
 
     async def close(self) -> Ok[None, FeedError]:
         return Ok(None)
+
+
+class ErrResyncBroker(FakeBroker):
+    """A broker whose cycle-start resync returns an ``Err``."""
+
+    async def resync(
+        self,
+    ) -> Err[tuple[OrderResult, ...], FeedError]:
+        self.resynced += 1
+        return Err(FeedError(kind="transport", message="open_orders failed"))
 
 
 class ErrCohortBroker(FakeBroker):
@@ -667,6 +677,31 @@ async def test_run_cycle_cohort_error_is_surfaced_not_silently_empty(
     assert report.placement_error is not None
     assert report.placement_error.kind == "transport"
     assert "cohort refused" in report.placement_error.message
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_surfaces_a_failed_resync(tmp_path: Path) -> None:
+    """D4: a failed resync is carried on the report, not a clean "0 orders"."""
+    db = tmp_path / "c.sqlite"
+    make_candle_db(db, "AAPL", TS)
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+
+    report = await run_cycle(
+        CFG,
+        source=FakeSource(book()),
+        broker=ErrResyncBroker(),
+        ledger=ledger,
+        strategy_id="S1",
+        scope="S1",
+        config_path="x.json",
+        now=TS,
+        db_path=db,
+        signal_source=_source_fn(LONG_10),
+    )
+
+    assert report.resync_error is not None
+    assert report.resync_error.kind == "transport"
+    assert "open_orders failed" in report.resync_error.message
 
 
 @pytest.mark.asyncio

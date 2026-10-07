@@ -34,6 +34,7 @@ from src.live.cli import (
     render_report,
 )
 from src.live.engine import CycleReport, run_cycle
+from src.live.identity import OrderOutcome
 from src.live.ledger import SqliteLedger
 from src.live.result import Ok, Result
 from src.live.types import (
@@ -327,6 +328,46 @@ def test_render_report_states_a_placement_error() -> None:
     assert doc["placement_error"] == {
         "kind": "transport",
         "message": "cohort refused",
+        "symbol": None,
+    }
+
+
+def test_render_report_carries_outcome_and_kind_on_a_failed_result() -> None:
+    """D3: an unresolved (duplicate-risk) order is NOT rendered/typed as "rejected"."""
+    report = replace(
+        _report(),
+        results=(
+            OrderResult(
+                intent=_report().intents[0],
+                fill=None,
+                ok=False,
+                message="unresolved: ambiguous",
+                outcome=OrderOutcome.UNRESOLVED,
+                error_kind="unresolved",
+            ),
+        ),
+    )
+    text = render_report(report, "text")
+    assert "order AAPL long unresolved unresolved: ambiguous" in text
+    assert "rejected" not in text
+    doc = json.loads(render_report(report, "json"))
+    result = doc["results"][0]
+    assert result["outcome"] == "unresolved" and result["kind"] == "unresolved"
+
+
+def test_render_report_states_a_resync_error() -> None:
+    """D4: a failed cycle-start resync is rendered, not a clean "0 orders"."""
+    report = replace(
+        _report(),
+        results=(),
+        resync_error=FeedError(kind="transport", message="open_orders failed"),
+    )
+    text = render_report(report, "text")
+    assert "resync_error: transport: open_orders failed" in text
+    doc = json.loads(render_report(report, "json"))
+    assert doc["resync_error"] == {
+        "kind": "transport",
+        "message": "open_orders failed",
         "symbol": None,
     }
 

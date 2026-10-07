@@ -45,6 +45,9 @@ class OrderResult:
     #: How this order was dispositioned. ``ADOPTED`` = an already-working order
     #: was seen and not re-sent; the rest mirror the outcome vocabulary.
     outcome: OrderOutcome = OrderOutcome.PLACED
+    #: The ``FeedError.kind`` behind a failed result (``None`` for an ``ok`` one),
+    #: so the CLI can render the machine-readable failure alongside the outcome.
+    error_kind: str | None = None
 
 
 class LiveBroker(Protocol):
