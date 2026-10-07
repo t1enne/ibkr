@@ -1,0 +1,226 @@
+# TODO — live IBKR path
+
+Working list of open items for `src/live/` and `src/live/adapters/ibkr/`.
+
+Read `AGENTS.md` (repo rules) and `SKILL.md` (alpha research) before changing
+anything here. Note: `docs/PLAN_LIVE_HEXAGONAL.md` exists but the review pass that
+produced most of this list deliberately did NOT read it, so that findings stood on
+the code alone. Keep it that way when re-verifying — argue from the code.
+
+Contract note: `openapi.spec.json` is **stale** for `/iserver/account/orders` (it
+lists 35 fields with neither `cOID` nor `order_ref`; the live response has 31
+including `order_ref`). The captured fixtures in
+`src/live/adapters/ibkr/tests/fixtures/` are the contract. Never re-introduce a
+hand-built mock for a contract-shaped response.
+
+---
+
+## P0 — open defects
+
+### [ ] D3 — `REJECTED` is excluded from `is_unsafe()`, so a refused CLOSE exits 0
+
+- **Where:** `src/live/engine.py` (`_UNSAFE_OUTCOMES`, `CycleReport.is_unsafe`),
+  `src/live/adapters/ibkr/broker.py` `_close_guard`.
+- **Problem:** excluding `REJECTED` is defensible for an OPEN (nothing taken, book
+  unchanged, re-mints next cycle) but not for:
+  - a **refused close** — `_close_guard` returns `kind="rejected"`, so "our book
+    holds a lot the account does not" or "close qty exceeds the account net"
+    exits **0**. The strategy cannot exit the position while cron reads success,
+    and the open-side equivalent of the same divergence exits 3 (asymmetric).
+  - **structural drops** — `_refuse_opens` / `_apply_scale` go through
+    `_failed(intent, reason)` with the default `kind="rejected"`. A config that
+    can never state a shared cash bound drops **every** open, every cycle, forever,
+    at exit 0.
+- **Fix sketch:** give the close-vs-account mismatch and the structural drops their
+  own kinds (reuse `divergence` for the close-guard mismatch) and add the
+  corresponding outcome(s) to `_UNSAFE_OUTCOMES`.
+- **Test:** a refused close exits non-zero; an all-opens-dropped cohort exits
+  non-zero; a plain refused OPEN still exits 0.
+
+### [ ] D2 — `--allow-unsafe` silently neutralises the exit-code contract
+
+- **Where:** `src/live/cli.py` (`allow_unsafe` flag; the single check at ~`:224`).
+- **Problem:** no stderr note, no guard. One `* * * * * ibkr live run …
+  --allow-unsafe >> log` line makes the exit permanently 0 and every
+  `placement_error` / `resync_error` / `WEDGED` / `TIMEOUT` / `DIVERGENCE`
+  disappears from the cron signal. The help text ("for callers that consume the
+  report themselves") is aspirational — nothing enforces it.
+- **Fix sketch:** when `allow_unsafe and report.is_unsafe()`, write a loud
+  `_stderr_log(...)` naming the suppressed outcomes. Consider rejecting
+  `--allow-unsafe` together with `--format text` (text is a human format, not a
+  machine consumer).
+- **Test:** an unsafe cycle under `--allow-unsafe` exits 0 **and** emits the
+  stderr note.
+
+---
+
+## P1 — smaller correctness / hygiene
+
+### [ ] D6 — fabricated `0.0` on an unreadable `cum_fill`
+
+`_unresolved_result` does `filled_qty = fill.qty if fill is not None else 0.0`,
+but `_filled` → `status_to_fill` returns `None` both for `cum_fill <= 0` **and**
+for an absent/unreadable `cum_fill`. The terminal branch already reports `None`
+(`_no_readable_fill`); the timeout branch asserts `0.0` on the same input. Mirror
+`_no_readable_fill`.
+
+### [ ] D7 — the shortfall denominator is pre-whole-share rounding on IBKR
+
+`_shortfall` diffs against `intent.qty`, but the ticket carries
+`whole_quantity(intent)` (`orders.py`). A sized ask of `10.4` filled as `10`
+reports `short=0.4` — a rounding artifact rendered as a partial. Carry the
+ticket's whole quantity as the denominator.
+
+### [ ] D8 — sim and IBKR disagree on whether a cohort scale is a shortfall
+
+`SimulatedBroker._result` reports the post-scale settled qty against the
+pre-scale `intent.qty`, so a scaled **paper** cohort prints `partial=…`; the IBKR
+path rewrites `intent.qty` before `place` (`scale_open_cohort`), so a scaled
+**live** cohort prints nothing. Pick one. If the scale must be visible live,
+surface it structurally (it is already logged to stderr).
+
+### [ ] D9 — stale docstrings on the exposure guard
+
+`_open_exposure_guard` says "pending/open intent records are read as part of the
+book", but `net_exposure` reads only `live_position`; intent records are never
+consulted. Also confirm `_resolve`'s note that the orders endpoint lists
+filled/cancelled session orders is still accurate (it is, per the captured
+fixture) and that no other comment still describes a superseded mechanism.
+
+### [ ] `''`-for-NULL should be structural, not by convention
+
+`LivePosition`/intent `position_id` is `TextField(default="")` — nullable. Every
+writer currently normalises, but a single future writer storing `None` silently
+reintroduces duplicate-PK rows in SQLite. Make it `null=False, default=""`.
+
+### [ ] `size_mode` is declared twice, the `FeedKind` bug shape
+
+`src/live/types.py` has `size_mode: Literal["equity", "cash", "fixed"]` while
+`src/live/cli.py` has `_SIZE_MODES = frozenset({...})`. Same divergence risk L3
+fixed for `FeedKind` — derive the set from the `Literal` via `get_args`.
+
+### [ ] `owns_book` polarity is inverted at its most consequential use
+
+`IbkrPortfolioSource.owns_book = False` means "the book is already ours, apply no
+scope filter" (`engine.py` passes `owned=None`), and `MockPortfolioSource = True`
+means "scope closes to the sim-owned ids". Rename (e.g. `scope_closes_to_sim_lots`
+/ a `CloseScoping` enum) or document it loudly at the IBKR site — it decides
+whether a close is emitted at all.
+
+### [ ] attempt monotonicity is bounded by the prune window
+
+`prune` deletes terminal rows and the next `open_attempt` restarts at 0, so a
+90-day-old cOID can be re-minted. Safe against IBKR's dedupe windows, but the
+invariant as written ("attempt is monotonic per key") is not what is implemented.
+Either state the bound or keep the counter monotonic independently of retention.
+
+---
+
+## P2 — deferred decisions (need a call, not just code)
+
+### [ ] Partial-open top-up — revisit only on measurement
+
+Decision taken: the posture diff compares **sides**, never sizes, so a partial
+entry stands and the residual is never chased. Rationale: chasing re-sizes on
+every equity/price tick, and under-filling errs toward **less** exposure than
+intended (the safe direction for risk-sized strategies). What shipped instead is
+reporting: `OrderResult.filled_qty` / `FeedError.filled_qty` → `filled` +
+`shortfall` in the JSON and `partial=x/y short=z` in the text line.
+
+**You cannot measure the partial rate today:** `IntentRecord` persists state,
+attempt, `order_ref`, `order_id`, `decision_ts`, `tif`, `stuck_cycles` — but not
+the ask (`total_size`). Add that column (additive, preserve-don't-drop) and count
+terminal partials over N live cycles.
+
+**Trigger to revisit:** if terminal partials are more than a few percent of
+opens, implement the top-up: for an OPEN whose record is terminal and whose held
+qty is short of the freshly sized target by more than a threshold, emit an open
+for the residual under the same key (new attempt). Note the interaction with
+`_open_cash_guard` and the cohort scale before doing it.
+
+### [ ] Cycle lease is unsound on a shared/network filesystem
+
+`lease.py` uses `flock` on `<ledger-db>.cycle.lock`. Right on one host (the kernel
+drops it on `SIGKILL`, a stale file is not a lease, no TTL needed). Unsound when:
+NFS/CIFS with `nolock` (two hosts both "hold" it), an NFS server restart inside
+the lock-grace window, a container on another host, or the lock file deleted and
+re-created (new inode → new lock domain). Either use a distributed lock (a lease
+row with a heartbeat, or `BEGIN EXCLUSIVE` on a lease table) or state
+"single host / local filesystem" in the docstring and enforce nothing.
+
+### [ ] A dry run can read a torn book
+
+`dry_run` deliberately takes no lease (a read must not block live trading), so it
+can read a book another cycle is mid-way through writing. One docstring line,
+or a read-only snapshot.
+
+### [ ] No scheduling artifact, and the exit code is undocumented for cron
+
+There is no cron/systemd unit in the repo (`scripts/` holds `streamline_cycle.py`,
+`login_ibkr.py`, `fetch_macro_fred.py`, `get_ticker_range.py`). Add a documented
+cron example that relies on the exit codes: **0** ok, **1** config/stale/gateway
+(`ClickException`), **2** usage, **3** unsafe cycle. Say plainly that
+`--allow-unsafe` must NOT appear in it.
+
+### [ ] Capture a filled-order fixture
+
+`gateway_trades.json` holds only a pre-upgrade-scheme `order_ref`
+(`511350df-7f3f2b38-20261005T1749-000`). No captured fixture shows a CURRENT
+scheme ref echoed through `/iserver/account/trades` after a real fill, nor the
+filled case in `/iserver/account/orders` (only `PreSubmitted`/`Cancelled`).
+One MKT round trip on Paper closes that gap.
+
+---
+
+## Verification hygiene (learned the hard way)
+
+- **Never build a contract mock by hand.** The `cOID` bug survived three review
+  waves because every test invented a field the gateway does not send. Parse the
+  captured fixtures.
+- **Beware constant mocks in ordering tests.** `test_close_is_sequenced_before_open_in_the_cohort`
+  held a constant account position across a close, which is exactly why D1 (the
+  flip refusal) was invisible. If a mock represents broker state, it must MOVE
+  when our order lands.
+- **A test that passes before and after is a characterisation test, not a
+  regression test.** Say which it is when reporting.
+- **Probe scripts get a target check.** A probe wrote a cancel against every
+  listed order instead of only ref-matching ones, and cancelled a pre-existing GOOG
+  order that was not ours. Filter by our own `order_ref` before acting, and print
+  what will be acted on.
+- **`bt`/live outputs are read whole.** Metrics that matter live in the tail
+  (`AGENTS.md`); state any trim.
+
+---
+
+## Done — do not re-litigate
+
+- **Order identity** is bar-free (`identity.py`): `cOID =
+  scope_tag-token-attempt`, durability in `live_order_intent`, five invariants
+  (no POST after a failed working-orders read; bar-free prefix; ambiguity never
+  reads as "not placed"; the intent table owns OPEN state; adoption by exact
+  scope prefix only). Superseded helpers deleted.
+- **Gateway contract** settled empirically: `/iserver/account/orders` echoes our
+  id as **`order_ref`**; foreign orders carry no `order_ref` at all; the endpoint
+  lists filled/cancelled session orders (so terminal rows are filtered).
+- **Exit code** for unsafe cycles (3) with `--allow-unsafe`; `resync_error`
+  surfaced; outcome vocabulary never defaults to `REJECTED` for an ambiguous POST.
+- **Partial fills** are reported as a shortfall (see P2 for the deferred top-up).
+- **Cohort cash** mirrors the backtest `_scale_opens` (commission reserve,
+  friction price); a failed funding close drops its opens; opens bound their
+  whole-share notional.
+- **Open exposure divergence guard** exists with the in-cycle delta so a flip's
+  own close is excused (`f72d720`) — keep that case covered.
+- **Ledger split** (`ledger.py` → `ledger_base` / `ledger_sim` /
+  `ledger_migration`) verified refactor-only, migrations atomic and
+  rename-never-drop.
+- **Removed:** `ports.Gateway`, `reconcile.size_qty`, the vestigial imports fixed
+  by the `src/timestamps.py` leaf (killed the `src/exec` collection cycle).
+- **Closed finding history** (all fixed): C1, H1, H1b, H3, H4, H5, M1–M8,
+  L1–L10, D1, D4, D5.
+
+## Never reviewed independently
+
+Worth a pass when someone has budget: the `ibkr live abandon` verb and its
+`--yes` gating, `WEDGED_CYCLES = 3` tuning, `_EXPOSURE_TOLERANCE = 1e-6` and
+`_OPEN_CASH_TOLERANCE = 0.02` against real fills, and the pruning/retention
+policy in `ledger_*`.
