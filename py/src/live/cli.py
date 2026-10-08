@@ -429,11 +429,14 @@ def live_pf(
     no_gateway: bool,
     watch_seconds: float | None,
 ) -> None:
-    """Show scopes and their orders/trades, plus the broker side when read.
+    """Show scopes, their P&L and one merged positions table, plus the broker.
 
     With CONFIG_PATH the report covers that config's scope. WITHOUT it, EVERY
     scope the store knows about. Either way each scope renders its own lots,
-    order intents and stored fills (all read from OUR durable store).
+    order intents and stored fills — MERGED into one ``positions`` row per
+    symbol (lot, newest order and the P&L its fills imply), so the same order
+    ref no longer appears in three tables; a ``stats`` table carries the
+    headline P&L (realized / unrealized / total, cost basis, win-loss tally).
 
     ``--adapter`` is a FILTER, not a requirement: given, it selects the broker
     to read (``ibkr`` account-wide, or a config's ``sim`` fixture) and the report

@@ -37,10 +37,12 @@ from src.live.pf import (
     PfReport,
     StoreLot,
     StoreSide,
+    position_rows,
     read_ibkr_broker,
     read_sim_broker,
     read_store,
     render_pf,
+    scope_stats,
 )
 from src.live.types import LiveConfig
 from src.live.result import Ok
@@ -314,39 +316,260 @@ def _report() -> PfReport:
     return PfReport(as_of=TS, stores=(_store(),), broker=_broker())
 
 
+def _fill(
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    commission: float = 1.0,
+) -> ExecutionRecord:
+    """One stored fill with the cash delta its price and commission imply."""
+    cost = qty * price
+    delta = -(cost + commission) if side == "BUY" else cost - commission
+    return ExecutionRecord(
+        scope="S1",
+        execution_id=f"e{side}{qty}",
+        conid=1,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        price=price,
+        commission=commission,
+        cash_delta=delta,
+        ts=TS,
+    )
+
+
+def _side(
+    lots: tuple[StoreLot, ...] = (),
+    trades: tuple[ExecutionRecord, ...] = (),
+    orders: tuple = (),
+    cash: float = 50000.0,
+) -> StoreSide:
+    """A store side built by hand, so the P&L math is exercised without a ledger."""
+    return StoreSide(
+        scope="S1",
+        db_path="/tmp/l.sqlite",
+        strategy_rows=(),
+        cash=cash,
+        initial_capital=50000.0,
+        lots=lots,
+        orders=orders,
+        trades=trades,
+        sim_open_ids=(),
+    )
+
+
+def _lot(side: str = "long", qty: float = 10.0, entry: float = 100.0) -> StoreLot:
+    return StoreLot("AAPL", "AAPL", side, qty, entry, None, None, "", "r1")
+
+
+def _mark(symbol: str, price: float) -> BrokerSide:
+    """A broker side carrying nothing but a last price for *symbol*."""
+    return BrokerSide(
+        adapter="sim",
+        source="pf.json",
+        account="",
+        net_liquidation=None,
+        cash=None,
+        positions=(BrokerLot(symbol, symbol, 10.0, "long", 0.0, price, 0.0, True),),
+        working_orders=(),
+        ours_orders=(),
+        warnings=(),
+    )
+
+
+def test_position_rows_round_trip_realizes_the_pnl() -> None:
+    """Regression: a closed symbol's realized P&L is its sell cash minus its cost."""
+    store = _side(
+        trades=(
+            _fill("AAPL", "BUY", 10.0, 100.0),
+            _fill("AAPL", "SELL", 10.0, 110.0),
+        )
+    )
+    (row,) = position_rows(store)
+    assert (row.status, row.qty) == ("closed", 0.0)
+    assert row.entry == 100.0 and row.last == 110.0  # entry avg, then exit avg
+    assert row.realized == 98.0  # (1100 - 1) - (1000 + 1)
+
+
+def test_open_lot_entry_commission_is_cost_not_loss() -> None:
+    """Regression: an open lot's entry commission must not read as a realized loss."""
+    store = _side(lots=(_lot(),), trades=(_fill("AAPL", "BUY", 10.0, 100.0),))
+    (row,) = position_rows(store)
+    assert row.realized == 0.0
+    assert scope_stats(store).realized_pnl == 0.0
+
+
+def test_open_short_marks_to_market_in_its_own_direction() -> None:
+    """Regression: a short's open basis is cash RECEIVED, so a fall is profit."""
+    store = _side(
+        lots=(StoreLot("TSLA", "TSLA", "short", 10.0, 200.0, None, None, "", "r1"),),
+        trades=(_fill("TSLA", "SELL", 10.0, 200.0),),
+    )
+    (row,) = position_rows(store, _mark("TSLA", 190.0))
+    assert row.side == "short"
+    assert row.realized == 0.0  # the proceeds are not a result yet
+    assert row.unrealized == 100.0  # (190 - 200) * 10, short-signed
+
+
+def test_unrealized_is_none_without_a_mark_never_a_guess() -> None:
+    """A store-only read cannot know a mark: total P&L stays unknown, not partial."""
+    store = _side(lots=(_lot(),), trades=(_fill("AAPL", "BUY", 10.0, 100.0),))
+    (row,) = position_rows(store)
+    assert row.unrealized is None
+    stats = scope_stats(store)
+    assert (stats.unrealized_pnl, stats.total_pnl, stats.total_return) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_stats_tally_wins_and_losses_over_closed_symbols() -> None:
+    """The win/loss tally counts CLOSED symbols only, by the sign of realized."""
+    store = _side(
+        lots=(_lot(),),
+        trades=(
+            _fill("AAPL", "BUY", 10.0, 100.0),
+            _fill("MSFT", "BUY", 5.0, 50.0),
+            _fill("MSFT", "SELL", 5.0, 60.0),
+            _fill("NVDA", "BUY", 2.0, 30.0),
+            _fill("NVDA", "SELL", 2.0, 20.0),
+        ),
+    )
+    stats = scope_stats(store)
+    assert (stats.wins, stats.losses) == (1, 1)
+    assert stats.open_cost == 1000.0
+    assert stats.commission == 5.0
+
+
+def test_stats_totals_realized_when_nothing_is_open() -> None:
+    """With no open lot a store-only read still states a total, from the fills."""
+    store = _side(
+        lots=(),
+        trades=(
+            _fill("AAPL", "BUY", 10.0, 100.0),
+            _fill("AAPL", "SELL", 10.0, 110.0),
+        ),
+    )
+    stats = scope_stats(store)
+    assert (stats.unrealized_pnl, stats.total_pnl) == (0.0, 98.0)
+    assert stats.wins == 1 and stats.losses == 0
+
+
+def test_a_filled_intent_with_no_lot_is_still_a_row() -> None:
+    """The merged view keeps the order trail: a symbol with no lot is not dropped."""
+    key = IntentKey(scope="S1", symbol="AAPL", action=ActionType.long, position_id=None)
+    store = _side(orders=(replace(_record(key), state=IntentState.FILLED),))
+    (row,) = position_rows(store)
+    assert (row.symbol, row.status, row.qty) == ("AAPL", "filled", 0.0)
+    assert row.order_ref == order_ref(key, 0) and row.realized == 0.0
+
+
 def test_render_pf_json_roundtrips() -> None:
     out = render_pf(_report(), "json")
     doc = json.loads(out)  # no unserializable object
     assert doc["broker"]["adapter"] == "sim"
     assert doc["stores"][0]["scope"] == "S1"
+    # The raw per-store arrays stay for machine consumers...
     assert len(doc["stores"][0]["lots"]) == 1
     assert len(doc["stores"][0]["orders"]) == 1
     assert len(doc["stores"][0]["trades"]) == 1
+    # ...alongside the same merged/derived views the text report renders.
+    assert doc["stats"][0]["scope"] == "S1"
+    (position,) = doc["positions"]
+    assert position["symbol"] == "AAPL" and position["unrealized"] == 100.0
     assert doc["divergence"] == ["broker lot TSLA_9 TSLA not in our store"]
 
 
 def test_render_pf_text_names_every_open_lot() -> None:
-    """Characterisation: positions and lots are TABLES, not one line per row."""
+    """The merged view: one positions table, plus scopes and stats tables."""
     text = render_pf(_report(), "text")
-    assert "broker:" in text and "stores:" in text
-    assert "positions:" in text and "lots:" in text
-    assert "orders:" in text and "trades:" in text
-    header = text.partition("positions:\n")[2].partition("\n")[0]
+    assert "broker:" in text and "scopes:" in text and "stats:" in text
+    assert "broker positions:" in text and "positions:" in text
+    for gone in ("lots:", "trades:", "stores:", "\norders:"):
+        assert gone not in text  # the three redundant tables are one table now
+    header = text.partition("\npositions:\n")[2].partition("\n")[0]
     assert header.split() == [
+        "scope",
         "symbol",
-        "id",
         "side",
+        "state",
         "qty",
-        "avg",
+        "entry",
         "last",
-        "mktvalue",
-        "owner",
+        "upnl",
+        "rpnl",
+        "sl",
+        "tp",
+        "order_id",
+        "ref",
+    ]
+    row = text.partition("\npositions:\n")[2].splitlines()[2]
+    assert row.split() == [
+        "S1",
+        "AAPL",
+        "long",
+        "open",
+        "10",
+        "100.0000",
+        "110.0000",
+        "100.00",
+        "0.00",
+        "-",
+        "-",
+        "-",
+        "r1",
     ]
     assert "AAPL_1" in text and "TSLA_9" in text
     assert "ours" in text and "NOT-OURS" in text
-    assert "stores:" in text and "S1" in text
     assert "divergence: broker lot TSLA_9 TSLA not in our store" in text
     assert "store lot" not in text  # AAPL_1 is present at both sides
+
+
+def test_stats_table_carries_the_pnl_figures() -> None:
+    """Regression: the report states P&L, not just counts.
+
+    One lot, 10 @ 100 with a 1.00 commission, marked at 110: realized is 0 (the
+    lot is still open, so its entry commission is cost, not a result) and the
+    unrealized 100.00 comes from the broker's mark, making the total 100.00.
+    """
+    text = render_pf(_report(), "text")
+    header = text.partition("\nstats:\n")[2].partition("\n")[0]
+    assert header.split() == [
+        "scope",
+        "initial",
+        "cash",
+        "open_cost",
+        "realized",
+        "unreal",
+        "total",
+        "ret%",
+        "comm",
+        "lots",
+        "trd",
+        "sim",
+        "win",
+        "loss",
+    ]
+    row = text.partition("\nstats:\n")[2].splitlines()[2]
+    assert row.split() == [
+        "S1",
+        "50000.00",
+        "50000.00",
+        "1000.00",
+        "0.00",
+        "100.00",
+        "100.00",
+        "0.20",
+        "1.00",
+        "1",
+        "1",
+        "1",
+        "0",
+        "0",
+    ]
 
 
 def test_render_pf_text_over_every_scope_has_no_broker_block() -> None:
@@ -355,17 +578,17 @@ def test_render_pf_text_over_every_scope_has_no_broker_block() -> None:
         PfReport(as_of=TS, stores=(_store(), _store("S2")), broker=None), "text"
     )
     assert "broker:" not in text
-    assert "stores:" in text and "S1" in text and "S2" in text
-    assert text.count("lots:") == 1  # one aggregated table over every scope
+    assert "scopes:" in text and "S1" in text and "S2" in text
+    assert text.count("positions:") == 1  # one aggregated table over every scope
     assert "divergence: - (broker not read)" in text
 
 
 def test_render_pf_text_surfaces_a_broker_read_failure() -> None:
-    """A failed broker read degrades to warnings + `positions: none`, never a raise."""
+    """A failed broker read degrades to warnings + an empty book, never a raise."""
     broken = replace(_broker(), positions=(), warnings=("bad_fixture: boom",))
     text = render_pf(PfReport(as_of=TS, stores=(_store(),), broker=broken), "text")
     assert "warning: bad_fixture: boom" in text
-    assert "positions: none" in text
+    assert "broker positions: none" in text
 
 
 def test_render_pf_text_names_a_store_lot_the_broker_lacks() -> None:
@@ -422,7 +645,7 @@ def test_cli_pf_sim_renders_and_writes_no_ddl(
 
     out = CliRunner().invoke(live_group, ["pf", str(target), "--adapter", "sim"])
     assert out.exit_code == 0, out.output
-    assert "broker:" in out.output and "stores:" in out.output
+    assert "broker:" in out.output and "scopes:" in out.output
     assert "NOT-OURS" in out.output
     assert _tables(db) == set()  # a read wrote no DDL
 
@@ -449,7 +672,7 @@ def test_cli_pf_sim_without_fixture_warns_and_stays_store_only(
     )
     out = CliRunner().invoke(live_group, ["pf", str(target), "--adapter", "sim"])
     assert out.exit_code == 0, out.output
-    assert "stores:" in out.output
+    assert "scopes:" in out.output
     assert "no portfolio_path" in out.output
 
 
@@ -512,7 +735,7 @@ def test_cli_pf_without_config_lists_every_scope(
     # With no config a sim read has no fixture: warn and stay store-only.
     scoped = CliRunner().invoke(live_group, ["pf", "--adapter", "sim"])
     assert scoped.exit_code == 0, scoped.output
-    assert "stores:" in scoped.output
+    assert "stats:" in scoped.output
     assert "broker:" in scoped.output and "no portfolio_path" in scoped.output
 
 
@@ -707,13 +930,13 @@ def test_watch_loop_on_a_non_tty_emits_zero_escape_bytes() -> None:
     sleeper = _FakeSleeper(stop_after=2)
     out = io.StringIO()
     watch_pf_loop(
-        lambda: "as_of: 2024-06-03\nstores:\n", 1.0, tty=False, out=out, sleeper=sleeper
+        lambda: "as_of: 2024-06-03\nscopes:\n", 1.0, tty=False, out=out, sleeper=sleeper
     )
 
     text = out.getvalue()
     assert "\x1b" not in text  # not one escape byte into a cron log
     assert text == (
-        "as_of: 2024-06-03\nstores:\n\n" + "-" * 72 + "\nas_of: 2024-06-03\nstores:\n\n"
+        "as_of: 2024-06-03\nscopes:\n\n" + "-" * 72 + "\nas_of: 2024-06-03\nscopes:\n\n"
     )
 
 
@@ -830,7 +1053,7 @@ def test_cli_one_shot_is_unchanged_without_watch(
     out = CliRunner().invoke(live_group, ["pf"])
     assert out.exit_code == 0, out.output
     assert out.output.startswith("as_of: ")
-    assert "stores:" in out.output
+    assert "scopes:" in out.output
     assert "\x1b" not in out.output
     assert not out.output.rstrip().endswith("-" * 72)  # no watch separator
 

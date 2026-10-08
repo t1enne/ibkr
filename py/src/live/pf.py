@@ -8,14 +8,19 @@ the broker shows that our store does not claim) is visible rather than assumed.
 The shapes here are DISPLAY-ONLY: :class:`BrokerSide` for ``ibkr`` carries the
 account summary numbers (net liquidation, cash) purely for the reader — the store
 side is the authority on per-scope cash, and the summary is the whole account's,
-shared by every strategy. Building a report reads; it never writes a ledger row
-or places an order. The only I/O is the async broker read at the edge
-(``read_ibkr_broker``); everything else is pure.
+shared by every strategy. The report's own view of a scope is the MERGED
+:class:`PositionRow` (one row per symbol spanning the open lot, the newest order
+intent and the stored fills) plus the :class:`ScopeStats` headline numbers, so
+the raw lots/orders/trades reads are never rendered as three parallel tables.
+Building a report reads; it never writes a ledger row or places an order. The
+only I/O is the async broker read at the edge (``read_ibkr_broker``); everything
+else is pure.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import cast
 
@@ -293,6 +298,361 @@ def _ibkr_lot(pos: IbkrPosition, owned_conids: frozenset[str]) -> BrokerLot:
     )
 
 
+@dataclass(frozen=True)
+class _LotView:
+    """One symbol's OPEN exposure collapsed from its lots (display-only)."""
+
+    qty: float
+    entry: float
+    side: str
+    stop_loss: float | None
+    take_profit: float | None
+    order_ref: str
+
+
+@dataclass(frozen=True)
+class _Flows:
+    """One symbol's stored fills: net size, the two legs' averages and cash.
+
+    ``cash`` is the summed ``cash_delta`` — every commission already deducted — so
+    the entry commission of a lot that is still OPEN must be added back out of
+    ``realized`` by the proportional share of the entry leg (``buy_comm`` for a
+    long, ``sell_comm`` for a short).
+    """
+
+    net: float
+    buy_qty: float
+    buy_notional: float
+    buy_comm: float
+    sell_qty: float
+    sell_notional: float
+    sell_comm: float
+    cash: float
+
+
+_EMPTY_FLOWS = _Flows(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class PositionRow:
+    """One symbol's whole lifecycle in a scope: its lot, its order and its P&L.
+
+    The merged view that replaces the separate lots/orders/trades tables: the open
+    position (``qty``/``entry``/``stop_loss``/``take_profit``), the newest order
+    intent for the symbol (``status``/``order_id``/``order_ref``) and the P&L the
+    stored fills imply. A symbol that never filled (a rejected or unfilled intent)
+    or whose lot is already gone (closed) is still a row, so nothing is dropped.
+
+    ``unrealized`` is BROKER-MARKED: it is ``None`` when no mark for that symbol
+    was read, never a guess re-derived from our own fills. ``realized`` is the
+    stored cash flow plus the cost basis still open, so it covers everything
+    already round-tripped.
+    """
+
+    scope: str
+    symbol: str
+    side: str
+    status: str
+    qty: float
+    entry: float | None
+    last: float | None
+    unrealized: float | None
+    realized: float
+    stop_loss: float | None
+    take_profit: float | None
+    order_id: str
+    order_ref: str
+
+
+@dataclass(frozen=True)
+class ScopeStats:
+    """A scope's headline numbers: cash, cost basis and realized/unrealized P&L.
+
+    ``realized_pnl`` is the stored cash flows plus the cost basis of what is still
+    open, so it is the P&L of everything already round-tripped. ``unrealized_pnl``
+    is ``None`` unless EVERY open position carries a broker mark (never a partial
+    sum); ``total_pnl`` and ``total_return`` follow it, and a scope with nothing
+    open totals its realized P&L without any broker read.
+    """
+
+    scope: str
+    initial_capital: float
+    cash: float
+    open_cost: float
+    realized_pnl: float
+    unrealized_pnl: float | None
+    total_pnl: float | None
+    total_return: float | None
+    commission: float
+    open_lots: int
+    trades: int
+    sim_lots: int
+    wins: int
+    losses: int
+
+
+def position_rows(
+    store: StoreSide, broker: BrokerSide | None = None
+) -> tuple[PositionRow, ...]:
+    """Every symbol *store* touched, merged into one row (broker marks optional).
+
+    The symbol set is the UNION of the open lots (our book rows plus the sim lots
+    the broker owns), the order intents and the stored fills, so a symbol only one
+    of the three names is not lost. *broker* is read for last prices only.
+    """
+    views, symbols = _open_views(store, broker)
+    intents = _intents_by_symbol(store.orders)
+    flows = _flows(store.trades)
+    marks = _marks(broker)
+    return tuple(
+        _position_row(
+            store.scope,
+            symbol,
+            views.get(symbol),
+            intents.get(symbol),
+            flows.get(symbol, _EMPTY_FLOWS),
+            marks.get(symbol),
+        )
+        for symbol in symbols
+    )
+
+
+def scope_stats(store: StoreSide, broker: BrokerSide | None = None) -> ScopeStats:
+    """The scope's headline numbers, from its own rows plus the broker's marks.
+
+    Every figure is summed from :func:`position_rows`, so the stats table and the
+    positions table can never disagree about what is open or what was made.
+    """
+    rows = position_rows(store, broker)
+    realized = sum(row.realized for row in rows)
+    unrealized = _aggregate_unrealized(rows)
+    total = None if unrealized is None else realized + unrealized
+    closed = tuple(row for row in rows if row.qty == 0.0)
+    return ScopeStats(
+        scope=store.scope,
+        initial_capital=store.initial_capital,
+        cash=store.cash,
+        open_cost=sum(row.qty * (row.entry or 0.0) for row in rows),
+        realized_pnl=realized,
+        unrealized_pnl=unrealized,
+        total_pnl=total,
+        total_return=(
+            total / store.initial_capital
+            if total is not None and store.initial_capital
+            else None
+        ),
+        commission=sum(abs(trade.commission) for trade in store.trades),
+        open_lots=len(store.lots),
+        trades=len(store.trades),
+        sim_lots=len(store.sim_open_ids),
+        wins=sum(1 for row in closed if row.realized > 0.0),
+        losses=sum(1 for row in closed if row.realized < 0.0),
+    )
+
+
+def _open_views(
+    store: StoreSide, broker: BrokerSide | None
+) -> tuple[dict[str, _LotView], list[str]]:
+    """Open exposure per symbol, plus the deterministic list of symbols to show.
+
+    A sim scope persists NO book rows, so its ownership lives in ``sim_open_ids``
+    and only the broker's fixture lot knows the size and the entry: an owned
+    fixture lot becomes a view of its own. A symbol our book already covers is
+    never re-added from the broker (the two adapters key lots differently).
+    """
+    views = {
+        symbol: _lot_view(lots) for symbol, lots in _lots_by_symbol(store.lots).items()
+    }
+    sim_ids = set(store.sim_open_ids)
+    for lot in broker.positions if broker is not None else ():
+        if lot.id in sim_ids and lot.symbol not in views:
+            views[lot.symbol] = _LotView(
+                qty=lot.qty,
+                entry=lot.avg_cost,
+                side=lot.side,
+                stop_loss=None,
+                take_profit=None,
+                order_ref="",
+            )
+    symbols = sorted(
+        set(views)
+        | {trade.symbol or "-" for trade in store.trades}
+        | {record.key.symbol for record in store.orders}
+    )
+    return views, symbols
+
+
+def _lots_by_symbol(lots: tuple[StoreLot, ...]) -> dict[str, tuple[StoreLot, ...]]:
+    """Group our open book rows by symbol (one symbol may hold several lots)."""
+    grouped: dict[str, list[StoreLot]] = {}
+    for lot in lots:
+        grouped.setdefault(lot.symbol, []).append(lot)
+    return {symbol: tuple(rows) for symbol, rows in grouped.items()}
+
+
+def _lot_view(lots: tuple[StoreLot, ...]) -> _LotView:
+    """One symbol's lots collapsed: summed size, weighted entry, first stops set."""
+    qty = sum(lot.qty for lot in lots)
+    cost = sum(lot.qty * lot.entry_price for lot in lots)
+    return _LotView(
+        qty=qty,
+        entry=cost / qty if qty else lots[0].entry_price,
+        side=lots[0].side,
+        stop_loss=_first(lot.stop_loss for lot in lots),
+        take_profit=_first(lot.take_profit for lot in lots),
+        order_ref=_first(lot.order_ref or None for lot in lots) or "",
+    )
+
+
+def _first[T](values: Iterable[T | None]) -> T | None:
+    """The first value that is not ``None`` (stops, refs — never a guess)."""
+    return next((value for value in values if value is not None), None)
+
+
+def _intents_by_symbol(orders: tuple[IntentRecord, ...]) -> dict[str, IntentRecord]:
+    """The NEWEST intent per symbol (``intents_of`` already returns newest first)."""
+    newest: dict[str, IntentRecord] = {}
+    for record in orders:
+        newest.setdefault(record.key.symbol, record)
+    return newest
+
+
+def _flows(trades: tuple[ExecutionRecord, ...]) -> dict[str, _Flows]:
+    """Aggregate one scope's stored fills by symbol, buys and sells kept apart."""
+    flows: dict[str, _Flows] = {}
+    for trade in trades:
+        symbol = trade.symbol or "-"
+        prev = flows.get(symbol, _EMPTY_FLOWS)
+        buy = trade.side.upper().startswith("B")
+        flows[symbol] = _Flows(
+            net=prev.net + (trade.qty if buy else -trade.qty),
+            buy_qty=prev.buy_qty + (trade.qty if buy else 0.0),
+            buy_notional=prev.buy_notional + (trade.qty * trade.price if buy else 0.0),
+            buy_comm=prev.buy_comm + (abs(trade.commission) if buy else 0.0),
+            sell_qty=prev.sell_qty + (0.0 if buy else trade.qty),
+            sell_notional=prev.sell_notional
+            + (0.0 if buy else trade.qty * trade.price),
+            sell_comm=prev.sell_comm + (0.0 if buy else abs(trade.commission)),
+            cash=prev.cash + trade.cash_delta,
+        )
+    return flows
+
+
+def _marks(broker: BrokerSide | None) -> dict[str, float]:
+    """The broker's last price per symbol (empty without a broker read)."""
+    if broker is None:
+        return {}
+    return {lot.symbol: lot.last_price for lot in broker.positions if lot.last_price}
+
+
+def _position_row(
+    scope: str,
+    symbol: str,
+    view: _LotView | None,
+    intent: IntentRecord | None,
+    flow: _Flows,
+    mark: float | None,
+) -> PositionRow:
+    """One merged row: the lot view when open, else the fill/order trail."""
+    qty = view.qty if view is not None else abs(flow.net)
+    side = _side(view, flow)
+    entry = view.entry if view is not None else _avg_entry(flow)
+    return PositionRow(
+        scope=scope,
+        symbol=symbol,
+        side=side,
+        status="open" if view is not None else _status(intent, flow),
+        qty=qty,
+        entry=entry,
+        last=mark if mark is not None else (None if qty else _avg_exit(flow)),
+        unrealized=_unrealized(view, mark),
+        realized=_realized(flow, side, qty, entry),
+        stop_loss=view.stop_loss if view is not None else None,
+        take_profit=view.take_profit if view is not None else None,
+        order_id=(intent.order_id or "") if intent is not None else "",
+        order_ref=_order_ref(view, intent),
+    )
+
+
+def _realized(flow: _Flows, side: str, qty: float, entry: float | None) -> float:
+    """The P&L the fills already round-tripped, closed size only.
+
+    ``flow.cash`` holds every cash delta (commissions included), so the cost basis
+    of what is still OPEN and that entry commission's proportional share are added
+    back: the open lot's entry is not a result yet. The basis is SIGNED by the
+    side — a long's basis is cash already spent, a short's is cash already taken —
+    so an open short does not read as profit.
+    """
+    if qty == 0.0 or entry is None:
+        return flow.cash
+    long_side = side == _LONG
+    entry_qty = flow.buy_qty if long_side else flow.sell_qty
+    entry_comm = flow.buy_comm if long_side else flow.sell_comm
+    share = qty / entry_qty if entry_qty else 0.0
+    direction = 1.0 if long_side else -1.0
+    return flow.cash + direction * qty * entry + entry_comm * share
+
+
+def _order_ref(view: _LotView | None, intent: IntentRecord | None) -> str:
+    """The lot's ENTRY ref when we hold one, else the newest intent's ref."""
+    if view is not None and view.order_ref:
+        return view.order_ref
+    return intent.order_ref if intent is not None else ""
+
+
+def _side(view: _LotView | None, flow: _Flows) -> str:
+    """``long``/``short``: the open lot's own side, else the fills' direction."""
+    if view is not None:
+        return view.side
+    if flow.net != 0.0:
+        return _LONG if flow.net > 0 else _SHORT
+    return _LONG if flow.buy_qty else _SHORT
+
+
+def _status(intent: IntentRecord | None, flow: _Flows) -> str:
+    """A row with no lot: the newest intent's state, else open/closed on the fills.
+
+    A ``closed`` row means our fills net to zero and the book holds no lot; a
+    ``filled`` row with a non-zero ``qty`` is an open position our book lost — the
+    state names the ORDER, the ``qty`` column names the exposure.
+    """
+    if intent is not None:
+        return intent.state.value
+    return "closed" if flow.net == 0.0 else "open"
+
+
+def _avg_entry(flow: _Flows) -> float | None:
+    """The entry leg's average fill price (the buys, else the sells' average)."""
+    qty = flow.buy_qty or flow.sell_qty
+    notional = flow.buy_notional or flow.sell_notional
+    return notional / qty if qty else None
+
+
+def _avg_exit(flow: _Flows) -> float | None:
+    """The closing leg's average fill price (``None`` when nothing was closed)."""
+    if flow.buy_qty and flow.sell_qty:
+        return flow.sell_notional / flow.sell_qty
+    return None
+
+
+def _unrealized(view: _LotView | None, mark: float | None) -> float | None:
+    """Mark-to-market of the open lot, or ``None`` without a broker mark."""
+    if view is None or mark is None:
+        return None
+    direction = 1.0 if view.side == _LONG else -1.0
+    return (mark - view.entry) * view.qty * direction
+
+
+def _aggregate_unrealized(rows: tuple[PositionRow, ...]) -> float | None:
+    """Sum the open rows' marks; ``None`` when ANY open row lacks one (no partial)."""
+    open_rows = tuple(row for row in rows if row.qty != 0.0)
+    if not open_rows:
+        return 0.0
+    if any(row.unrealized is None for row in open_rows):
+        return None
+    return sum(cast("float", row.unrealized) for row in open_rows)
+
+
 def render_pf(report: PfReport, fmt: str) -> str:
     """Deterministic text tables (default) or a JSON document for one pf read."""
     if fmt == "json":
@@ -300,7 +660,7 @@ def render_pf(report: PfReport, fmt: str) -> str:
     return _render_text(report)
 
 
-_POSITION_COLS = (
+_BROKER_POSITION_COLS = (
     Col("symbol"),
     Col("id"),
     Col("side"),
@@ -319,62 +679,65 @@ _ORDER_COLS = (
     Col("ref"),
     Col("owner"),
 )
-_STORE_COLS = (
+_SCOPE_COLS = (
     Col("scope"),
-    Col("cash", ">"),
-    Col("initial", ">"),
-    Col("pos", ">"),
-    Col("ord", ">"),
-    Col("trd", ">"),
-    Col("sim", ">"),
+    Col("mode"),
     Col("rev", ">"),
     Col("id"),
     Col("name"),
-    Col("mode"),
     Col("created"),
     Col("last_cycle"),
 )
-_LOT_COLS = (
+_STATS_COLS = (
+    Col("scope"),
+    Col("initial", ">"),
+    Col("cash", ">"),
+    Col("open_cost", ">"),
+    Col("realized", ">"),
+    Col("unreal", ">"),
+    Col("total", ">"),
+    Col("ret%", ">"),
+    Col("comm", ">"),
+    Col("lots", ">"),
+    Col("trd", ">"),
+    Col("sim", ">"),
+    Col("win", ">"),
+    Col("loss", ">"),
+)
+_POSITION_COLS = (
     Col("scope"),
     Col("symbol"),
-    Col("id"),
     Col("side"),
+    Col("state"),
     Col("qty", ">"),
     Col("entry", ">"),
+    Col("last", ">"),
+    Col("upnl", ">"),
+    Col("rpnl", ">"),
     Col("sl", ">"),
     Col("tp", ">"),
-    Col("tag"),
-    Col("ref"),
-)
-_INTENT_COLS = (
-    Col("scope"),
-    Col("symbol"),
-    Col("action"),
-    Col("state"),
-    Col("attempt", ">"),
     Col("order_id"),
     Col("ref"),
-    Col("stuck", ">"),
-)
-_TRADE_COLS = (
-    Col("scope"),
-    Col("ts"),
-    Col("symbol"),
-    Col("conid"),
-    Col("side"),
-    Col("qty", ">"),
-    Col("price", ">"),
-    Col("comm", ">"),
-    Col("cash", ">"),
 )
 
 
 def _render_json(report: PfReport) -> str:
-    """JSON at the edge — reuse the shared encoder for Timestamps/Enums."""
+    """JSON at the edge — reuse the shared encoder for Timestamps/Enums.
+
+    The per-store ``lots``/``orders``/``trades`` arrays stay RAW (a machine
+    consumer wants the rows, not the merge), while ``stats`` and ``positions``
+    carry the same derived numbers the text view renders.
+    """
     doc = {
         "as_of": report.as_of,
         "broker": asdict(report.broker) if report.broker is not None else None,
         "stores": [_store_dict(store) for store in report.stores],
+        "stats": [asdict(scope_stats(store, report.broker)) for store in report.stores],
+        "positions": [
+            asdict(row)
+            for store in report.stores
+            for row in position_rows(store, report.broker)
+        ],
         "divergence": list(_divergence(report)),
     }
     return json.dumps(doc, default=_json_default, indent=2)
@@ -414,19 +777,28 @@ def _intent_dict(record: IntentRecord) -> dict[str, object]:
 def _render_text(report: PfReport) -> str:
     """Every side as one aggregated table (``src.bt.table``), no scalar run-on lines.
 
-    All scopes fold into a SINGLE stores table and SINGLE lots / orders / trades
-    tables (each row carries its ``scope``), so a report over every scope stays
-    the same height as one over a single config. The broker side, when read, is
-    its own table block.
+    All scopes fold into a SINGLE scopes / stats / positions table (each row
+    carries its ``scope``), so a report over every scope stays the same height as
+    one over a single config. ``positions`` is the ONE table the operator reads —
+    each row is a symbol's lot, the newest order for it and the P&L its fills
+    imply, so the old lots/orders/trades trio (which repeated the same order ref
+    three times) is gone. The broker side, when read, is its own table block.
     """
     blocks: list[list[str]] = [[f"as_of: {report.as_of}"]]
     if report.stores:
-        blocks.append(_store_block(report.stores))
+        blocks.append(_table("scopes", _SCOPE_COLS, _scope_rows(report.stores)))
+        blocks.append(
+            _table("stats", _STATS_COLS, _stats_rows(report.stores, report.broker))
+        )
+    blocks.append(
+        _table(
+            "positions",
+            _POSITION_COLS,
+            _position_text_rows(report.stores, report.broker),
+        )
+    )
     if report.broker is not None:
         blocks.append(_broker_lines(report.broker))
-    blocks.append(_table("lots", _LOT_COLS, _lot_rows(report.stores)))
-    blocks.append(_table("orders", _INTENT_COLS, _intent_rows(report.stores)))
-    blocks.append(_table("trades", _TRADE_COLS, _trade_rows(report.stores)))
     divergence = _divergence(report)
     if report.broker is None:
         blocks.append(["divergence: - (broker not read)"])
@@ -447,7 +819,12 @@ def _table(
 
 
 def _broker_lines(broker: BrokerSide) -> list[str]:
-    """The broker block: one scalar line, then the positions and orders tables."""
+    """The broker block: one scalar line, then the account's positions and orders.
+
+    The account's book is shown whole (foreign lots included) because the account
+    is shared: a position another scope or a human opened is exactly the thing this
+    block exists to reveal, so it is never folded into our merged ``positions``.
+    """
     scalars = [f"adapter={broker.adapter}", f"source={broker.source or '-'}"]
     if broker.account:
         scalars.append(f"account={broker.account}")
@@ -458,8 +835,8 @@ def _broker_lines(broker: BrokerSide) -> list[str]:
     lines = ["broker: " + "  ".join(scalars)]
     lines.extend(
         _table(
-            "positions",
-            _POSITION_COLS,
+            "broker positions",
+            _BROKER_POSITION_COLS,
             tuple(
                 (
                     lot.symbol,
@@ -497,42 +874,85 @@ def _broker_lines(broker: BrokerSide) -> list[str]:
     return lines
 
 
-def _store_block(stores: tuple[StoreSide, ...]) -> list[str]:
-    """One ``stores`` table over every scope, plus the single shared ``db`` line.
+def _scope_rows(stores: tuple[StoreSide, ...]) -> tuple[tuple[str, ...], ...]:
+    """One row per scope: identity and audit only (cash and P&L live in ``stats``).
 
-    The audit, cash and ownership scalars are columns, not a run-on ``key=value``
-    header, so scopes line up and the report adds a row — never a paragraph — per
-    scope. ``id`` is the config hash truncated for display; ``rev`` is the audit
-    row count, so the truncated id still reads as the latest revision.
+    The counts that used to sit here (lots/orders/trades/sim) are gone: every one
+    of them is now visible as rows in ``positions``, so repeating them as scalars
+    was the redundancy this report was rebuilt to drop.
     """
-    lines = ["stores:"]
-    lines.extend(render(Table(columns=_STORE_COLS, rows=_store_rows(stores))))
-    return lines
+    return tuple(_scope_row(store) for store in stores)
 
 
-def _store_rows(stores: tuple[StoreSide, ...]) -> tuple[tuple[str, ...], ...]:
-    """One row per scope: the latest audit revision's identity + the store's counts."""
-    return tuple(_store_row(store) for store in stores)
-
-
-def _store_row(store: StoreSide) -> tuple[str, ...]:
-    """One scope's row — the latest revision read once, then its derived cells."""
+def _scope_row(store: StoreSide) -> tuple[str, ...]:
+    """One scope's identity — the latest revision read once, then its cells."""
     latest = _latest(store)
     return (
         store.scope,
-        f"{store.cash:.2f}",
-        f"{store.initial_capital:.2f}",
-        str(len(store.lots)),
-        str(len(store.orders)),
-        str(len(store.trades)),
-        str(len(store.sim_open_ids)),
+        latest.mode if latest else "-",
         str(len(store.strategy_rows)),
         latest.strategy_id[:12] if latest else "-",
         latest.name if latest else "-",
-        latest.mode if latest else "-",
         _ts(latest.created_at if latest else None),
         _ts(latest.last_cycle_at if latest else None),
     )
+
+
+def _stats_rows(
+    stores: tuple[StoreSide, ...], broker: BrokerSide | None
+) -> tuple[tuple[str, ...], ...]:
+    """One P&L row per scope, derived from the store plus the broker's marks."""
+    return tuple(_stats_row(scope_stats(store, broker)) for store in stores)
+
+
+def _stats_row(stats: ScopeStats) -> tuple[str, ...]:
+    """One scope's headline cells; a number we cannot honestly state renders ``-``."""
+    return (
+        stats.scope,
+        f"{stats.initial_capital:.2f}",
+        f"{stats.cash:.2f}",
+        f"{stats.open_cost:.2f}",
+        f"{stats.realized_pnl:.2f}",
+        _money(stats.unrealized_pnl),
+        _money(stats.total_pnl),
+        "-" if stats.total_return is None else f"{stats.total_return * 100:.2f}",
+        f"{stats.commission:.2f}",
+        str(stats.open_lots),
+        str(stats.trades),
+        str(stats.sim_lots),
+        str(stats.wins),
+        str(stats.losses),
+    )
+
+
+def _position_text_rows(
+    stores: tuple[StoreSide, ...], broker: BrokerSide | None
+) -> tuple[tuple[str, ...], ...]:
+    """Every scope's merged position rows in one table, each tagged with its scope."""
+    return tuple(
+        (
+            row.scope,
+            row.symbol,
+            row.side,
+            row.status,
+            f"{row.qty:g}",
+            _opt(row.entry),
+            _opt(row.last),
+            _money(row.unrealized),
+            f"{row.realized:.2f}",
+            _opt(row.stop_loss),
+            _opt(row.take_profit),
+            row.order_id or "-",
+            row.order_ref or "-",
+        )
+        for store in stores
+        for row in position_rows(store, broker)
+    )
+
+
+def _money(value: float | None) -> str:
+    """A cash cell at two decimals, or ``-`` when the number is unknown."""
+    return "-" if value is None else f"{value:.2f}"
 
 
 def _latest(store: StoreSide) -> StrategyAudit | None:
@@ -543,63 +963,6 @@ def _latest(store: StoreSide) -> StrategyAudit | None:
 def _ts(value: pd.Timestamp | None) -> str:
     """A UTC timestamp at second precision (``-`` for an unwritten column)."""
     return "-" if value is None else value.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _lot_rows(stores: tuple[StoreSide, ...]) -> tuple[tuple[str, ...], ...]:
-    """Every scope's open lots in one table, each row tagged with its scope."""
-    return tuple(
-        (
-            store.scope,
-            lot.symbol,
-            lot.id,
-            lot.side,
-            f"{lot.qty:g}",
-            f"{lot.entry_price:.4f}",
-            _opt(lot.stop_loss),
-            _opt(lot.take_profit),
-            lot.tag or "-",
-            lot.order_ref or "-",
-        )
-        for store in stores
-        for lot in store.lots
-    )
-
-
-def _intent_rows(stores: tuple[StoreSide, ...]) -> tuple[tuple[str, ...], ...]:
-    """Every scope's order intents in one table, newest first."""
-    return tuple(
-        (
-            store.scope,
-            record.key.symbol,
-            record.key.action.value,
-            record.state.value,
-            str(record.attempt),
-            record.order_id or "-",
-            record.order_ref,
-            str(record.stuck_cycles),
-        )
-        for store in stores
-        for record in store.orders
-    )
-
-
-def _trade_rows(stores: tuple[StoreSide, ...]) -> tuple[tuple[str, ...], ...]:
-    """Every scope's stored fills in one table, oldest first."""
-    return tuple(
-        (
-            store.scope,
-            _ts(trade.ts),
-            trade.symbol or "-",
-            str(trade.conid),
-            trade.side,
-            f"{trade.qty:g}",
-            f"{trade.price:.4f}",
-            f"{trade.commission:.2f}",
-            f"{trade.cash_delta:.2f}",
-        )
-        for store in stores
-        for trade in store.trades
-    )
 
 
 def _opt(value: float | None) -> str:
@@ -649,8 +1012,12 @@ __all__ = [
     "BrokerLot",
     "BrokerSide",
     "PfReport",
+    "PositionRow",
+    "ScopeStats",
     "StoreLot",
     "StoreSide",
+    "position_rows",
+    "scope_stats",
     "read_ibkr_broker",
     "read_sim_broker",
     "read_store",
