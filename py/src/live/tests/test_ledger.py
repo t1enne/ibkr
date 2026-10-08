@@ -29,7 +29,7 @@ from src.live.ledger import (
     execution_cash_delta,
 )
 from src.live.lease import CycleInProgressError
-from src.live.ledger_sim import SimLot
+from src.live.ledger import SimLot
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
 OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
@@ -232,6 +232,40 @@ def test_net_exposure_on_an_unwritten_db_is_flat(tmp_path: Path) -> None:
     assert SqliteLedger(tmp_path / "l.sqlite").net_exposure(1) == 0.0
 
 
+def test_net_exposure_ignores_the_sim_account_role(ledger: SqliteLedger) -> None:
+    """The IBKR exposure cross-check reads conids, never the sim lot ids.
+
+    One book table holds both roles, so the cross-check must not let a sim lot
+    contribute to a conid's booked net. A sim lot id is never numeric in practice;
+    the point is that an executions row IS, and only it counts.
+    """
+    ex = _exec("e1", conid=7, side=OrderSide.BUY, qty=10.0, scope="alpha")
+    book, _ = reconcile("alpha", (ex,), StrategyBook())
+    ledger.save_book("alpha", book, (ex,), 1000.0)
+    ledger.record_sim_lot(
+        "sim_a_1",
+        SimLot(position_id="7", symbol="AAPL", side="long", qty=5.0, entry_price=1.0),
+    )
+    assert ledger.net_exposure(7) == 10.0  # the executions role only
+
+
+def test_the_executions_book_refuses_a_non_conid_row(ledger: SqliteLedger) -> None:
+    """A sim lot in the IBKR book is a LOUD failure, never a silently-missing lot.
+
+    An account-role row read as a book row would read downstream as "flat" and
+    re-open the position, so the projection raises rather than skips it.
+    """
+    ledger.ensure_cash("S1", 1000.0)  # first write builds the schema
+    with get_connection(ledger.db_path) as con:
+        con.execute(
+            "INSERT INTO live_position (scope, position_id, symbol, side, qty, "
+            "entry_price, tag, order_ref, source) VALUES "
+            "('S1', 'AAPL_1', 'AAPL', 'long', 1.0, 1.0, '', '', 'executions')"
+        )
+    with pytest.raises(LedgerReadError):
+        ledger.load_book("S1")
+
+
 def test_two_ledgers_on_two_paths_do_not_retarget_each_other(tmp_path: Path) -> None:
     # peewee binds a model at CLASS level, so a single module-global database let a
     # second SqliteLedger silently retarget the first's connection (writes landing
@@ -379,9 +413,15 @@ def test_migration_check_and_action_are_one_atomic_unit(
     assert kept == [("AAPL",)]  # no row lost to a failed migration
 
 
-def test_migration_rekeys_legacy_sim_lots_to_scope(tmp_path: Path) -> None:
-    # Pre-4.1 sim ownership was keyed by the config hash (strategy_id); re-key to
-    # the stable scope, preserving the rows (never dropped).
+def test_migration_folds_legacy_sim_lots_into_the_one_book(tmp_path: Path) -> None:
+    """Pre-fold sim lots move into ``live_position source='account'``, preserved.
+
+    ``live_sim_lot`` was the sim path's own book keyed by the config hash
+    (``strategy_id``); it is folded into the ONE book table, re-keyed to the stable
+    scope, and kept verbatim under a legacy copy. The behaviour under test: every
+    lot is still readable through the sim API, the identity moved, and the legacy
+    rows read back as OWNERSHIP-ONLY ones (no invented size or entry).
+    """
     db = tmp_path / "legacy.sqlite"
     with get_connection(db) as con:
         con.execute(
@@ -400,16 +440,44 @@ def test_migration_rekeys_legacy_sim_lots_to_scope(tmp_path: Path) -> None:
         )
     ledger = SqliteLedger(db)
     ledger.record_sim_open("momentum", "lot-3")  # first write triggers migration
+
+    # Every legacy lot survived AND the new one landed in the same (re-keyed) book:
+    # the legacy scope's alias is followed, so the operator's config still names it.
     assert ledger.sim_open_ids("momentum") == frozenset({"lot-1", "lot-3"})
-    with get_connection(db) as con:
-        cols = {r[1] for r in con.execute("PRAGMA table_info(live_sim_lot)")}
-    assert "scope" in cols and "strategy_id" not in cols
-    # The fill-detail columns are added to the migrated table, and the legacy rows
-    # read back as OWNERSHIP-ONLY ones (no invented size or entry).
-    assert {"symbol", "side", "qty", "entry_price", "opened_at"} <= cols
+    assert ledger.sim_open_ids("ibkr_momentum_legacy") == frozenset({"lot-1", "lot-3"})
     migrated = {lot.position_id: lot for lot in ledger.sim_open_lots("momentum")}
-    assert migrated["lot-3"].has_detail is False
-    assert migrated["lot-3"].qty is None
+    assert migrated["lot-1"].has_detail is False  # no invented size or entry
+    assert migrated["lot-1"].qty is None
+    # The old table is KEPT, closed out (lot-2 was closed), never dropped.
+    with get_connection(db) as con:
+        kept = con.execute("SELECT COUNT(*) FROM live_sim_lot_legacy").fetchone()
+    assert kept == (2,)
+
+
+def test_folded_sim_lots_are_the_account_role_of_the_one_book(tmp_path: Path) -> None:
+    """The fold lands in ``live_position`` and reads back with ``source='account'``.
+
+    The IBKR reconcile book (``load_book``) is the ``executions`` role of the SAME
+    table, so the two never double-count: a sim scope's lots must NOT appear as
+    IBKR book rows.
+    """
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.record_sim_lot(
+        "sim_a_1",
+        SimLot(
+            position_id="AAPL_1",
+            symbol="AAPL",
+            side="long",
+            qty=3.0,
+            entry_price=10.0,
+            opened_at=TS,
+        ),
+    )
+    with get_connection(tmp_path / "l.sqlite") as con:
+        rows = con.execute("SELECT position_id, source FROM live_position").fetchall()
+    assert rows == [("AAPL_1", "account")]
+    assert ledger.sim_open_ids("sim_a_1") == frozenset({"AAPL_1"})
+    assert ledger.load_book("sim_a_1").rows == ()  # not the executions role
 
 
 def test_sim_lot_detail_round_trips_and_survives_a_bare_reopen(

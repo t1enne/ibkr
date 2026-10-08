@@ -69,7 +69,7 @@ from src.live.adapters.ibkr.orders import (
     whole_quantity,
 )
 from src.live.adapters.ibkr.trades import Execution
-from src.live.broker import OrderResult, position_side_of, trade_signal
+from src.live.pure import OrderResult, position_side_of, trade_signal
 from src.live.identity import (
     DEFAULT_TIF,
     OPEN_STATES,
@@ -121,6 +121,13 @@ _EXPOSURE_TOLERANCE = 1e-6
 
 ConidLookup = Callable[[str], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
+
+#: The kind on an OPEN the cohort's STRUCTURAL rules dropped (``_refuse_opens``/
+#: ``_apply_scale``): the cohort cannot state a shared cash bound, or a scaled qty
+#: floors to 0 shares. Deliberately NOT ``rejected``: a structural drop recurs
+#: every cycle forever, so it must read as unsafe (D3). A genuine cash-exhaustion
+#: refusal never reaches here — it arrives from placement as ``rejected``.
+_STRUCTURAL_KIND = "unfunded"
 
 
 @dataclass(frozen=True)
@@ -431,7 +438,7 @@ class IbkrBroker:
             drop = dropped.get(ident)
             if drop is not None:
                 self._log(drop.reason)
-                results.append(_failed(intent, drop.reason))
+                results.append(_failed(intent, drop.reason, kind=_STRUCTURAL_KIND))
                 continue
             if intent.action is not ActionType.close and close_failed:
                 message = (
@@ -695,18 +702,26 @@ class IbkrBroker:
         net fails closed; the flat check keeps the old fail-closed behaviour for
         a genuinely empty book. ``_FLAT_EPS`` absorbs float noise and a fractional
         net that shrank slightly between cycles.
+
+        Every refusal here is a **book divergence** (``kind="divergence"``), not
+        a broker ``rejected``: our book holds a lot the account does not, or the
+        close qty exceeds the account net. ``rejected`` is excluded from the
+        unsafe set (a genuine refused open is re-minted next cycle), so reporting
+        it here would let a strategy that CANNOT EXIT exit 0 — the open-side
+        equivalent of this same disagreement exits 3. The reducing side must be
+        symmetric, so it surfaces as ``DIVERGENCE``.
         """
         net = await self._account_net(conid)
         if net is None:
             return feed_error(
-                "rejected",
+                "divergence",
                 f"refused close {intent.symbol} (conid {conid}): account net "
                 f"unreadable, cannot prove there is anything to reduce",
                 intent.symbol,
             )
         if abs(net) <= _FLAT_EPS:
             return feed_error(
-                "rejected",
+                "divergence",
                 f"refused close {intent.symbol} (conid {conid}): account is "
                 f"flat, nothing to reduce",
                 intent.symbol,
@@ -714,7 +729,7 @@ class IbkrBroker:
         reducing = net > 0 if side is OrderSide.SELL else net < 0
         if not reducing:
             return feed_error(
-                "rejected",
+                "divergence",
                 f"refused close {intent.symbol} (conid {conid}): account net "
                 f"{net:g} is on the opposite side to the {side.value} close, which "
                 f"would open a position",
@@ -723,7 +738,7 @@ class IbkrBroker:
         whole = whole_quantity(intent)
         if whole > abs(net) + _FLAT_EPS:
             return feed_error(
-                "rejected",
+                "divergence",
                 f"refused close {intent.symbol} (conid {conid}): close qty {whole:g} "
                 f"exceeds the account net {abs(net):g}, which would open a position",
                 intent.symbol,
@@ -1472,8 +1487,13 @@ def _outcome_for_kind(kind: str) -> OrderOutcome:
         "auth": OrderOutcome.UNRESOLVED,
         "rate_limit": OrderOutcome.UNRESOLVED,
         # A deliberate refusal on an unexplained account net — its own outcome, so
-        # it is neither a broker rejection nor an unresolved order.
+        # it is neither a broker rejection nor an unresolved order. The close
+        # guard reports this kind from the reducing side too (D3).
         "divergence": OrderOutcome.DIVERGENCE,
+        # A STRUCTURAL drop (no shared cash bound / scaled to 0 shares): distinct
+        # from a genuine cash-exhaustion ``rejected``, which is re-minted next
+        # cycle and stays safe.
+        "unfunded": OrderOutcome.UNFUNDED,
     }.get(kind, OrderOutcome.UNRESOLVED)
 
 

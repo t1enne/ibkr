@@ -49,7 +49,7 @@ from src.bt.portfolio.pure import ScaleRecord, estimate_open_commission
 from src.bt.state import ActionType, ExecutionParams, FillEvent
 from src.exec.types import Fill, OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.mapping import canonical_order_id, num, opt_str
-from src.live.broker import intent_to_signal, ref_candle
+from src.live.pure import intent_to_signal, ref_candle
 from src.live.identity import WorkingOrder, attempt_of
 from src.live.types import OrderIntent
 

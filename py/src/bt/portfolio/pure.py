@@ -280,8 +280,8 @@ def next_position_id(symbol: str, ts: pd.Timestamp, seq: int) -> str:
     cohort): a timestamp-only id collides and the second lot becomes unreachable
     by ``position_id`` in ``_close_position``/``_rebalance_position``.
 
-    Kept here (a pure function in ``src/bt/portfolio``) so the live
-    ``SimulatedBroker`` can import the same shape later.
+    Kept here (a pure function in ``src/bt/portfolio``) so the live sim
+    execution path can import the same shape.
     """
     return f"{symbol}_{ts.timestamp()}_{seq}"
 

@@ -1,13 +1,12 @@
 """Live ports not already defined beside their concrete types.
 
-Most live seams live with the code that owns them: ``PortfolioSource``
-(``src/live/portfolio_source.py``), ``LiveBroker`` (``src/live/broker.py``),
-``PendingIntents`` (``src/live/identity.py``), ``SignalSource``
-(``src/live/engine.py``). The one seam with no natural home is the **account
-exposure oracle**: the IBKR broker must compare the account net against what the
-ledger can account for before it opens, but the broker is an adapter and must not
-import the sqlite ledger. So the Protocol lives here, at the port layer, and the
-ledger stays behind it.
+Most live seams live with the code that owns them: the ``LiveAdapter`` Protocol
+(``src/live/adapter.py``), ``PendingIntents`` (``src/live/identity.py``),
+``SignalSource`` (``src/live/engine.py``). The one seam with no natural home is
+the **account exposure oracle**: the IBKR broker must compare the account net
+against what the ledger can account for before it opens, but the broker is an
+adapter and must not import the sqlite ledger. So the Protocol lives here, at the
+port layer, and the ledger stays behind it.
 
 Deliberately this ONE port only — moving the other seams here would duplicate
 definitions that already sit beside their implementations.

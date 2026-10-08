@@ -10,7 +10,7 @@ depends only on the minimal :class:`PortfolioView` Protocol that
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, cast, get_args
+from typing import TYPE_CHECKING, Literal, cast, get_args
 
 import pandas as pd
 
@@ -18,6 +18,12 @@ from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
 from src.bt.state.factories import build_commission_model, create_execution_params
 from src.exec.types import OrderType
+
+if TYPE_CHECKING:
+    # Type-only: ``scope`` imports ``LiveConfig`` from here, so a runtime import
+    # would be a cycle. ``AdapterName`` is the ONE definition of the adapter
+    # vocabulary (never redefined in this module).
+    from src.live.scope import AdapterName
 
 #: Actions the screen can emit that require a live decision. ``flat`` is never
 #: produced: absence of a signal is HOLD downstream.
@@ -148,8 +154,14 @@ FeedKind = Literal[
     "unresolved",
     #: The account net and the ledger's booked exposure on a conid disagree: a
     #: fill we cannot see may be live (or our book is ahead of the account). An
-    #: OPEN is refused rather than placed on top of an unexplained position.
+    #: OPEN is refused rather than placed on top of an unexplained position. The
+    #: same kind carries a refused CLOSE (the account net cannot absorb the
+    #: reducing order), so the reducing side surfaces symmetrically.
     "divergence",
+    #: An OPEN dropped by a STRUCTURAL cohort rule (no provable shared cash bound,
+    #: or a scaled qty flooring to 0 shares) — distinct from a broker ``rejected``,
+    #: which is genuine cash exhaustion for this bar and re-mints next cycle.
+    "unfunded",
 ]
 
 #: Every ``FeedError.kind`` a value may carry, derived from the Literal above.
@@ -215,15 +227,18 @@ class LiveConfig:
     size_mode: Literal["equity", "cash", "fixed"] = "equity"
     size: float = 0.0
     max_symbol_allocation: float = 1.0
-    portfolio_path: str = ""  # MockPortfolioSource fixture path
     mode: Literal["paper", "live"] = "paper"
-    # Which broker this config trades through. Mirrors ``StrategyConfig.broker``
-    # (phase 1.5) and is the field ``ibkr live run`` resolves its adapter from
-    # when no ``--adapter`` flag is given.
+    # The resolved backend this config trades through (plan §2.2). The CLI
+    # overrides it with ``--adapter`` when that flag is passed explicitly; absent
+    # a flag this is what ``resolve_adapter_name`` resolves, falling back to the
+    # back-compat ``broker`` key below.
+    adapter: AdapterName = "sim"
+    # Which broker this config TRADES through, kept as the back-compat source for
+    # adapter resolution (``resolve_broker``) and as a description of the config.
+    # A run's actual backend is ``adapter`` — this no longer selects it.
     broker: Literal["sim", "ibkr"] = "sim"
-    #: Stable strategy identity (plan rev 4.1 §4). Defaults to the strategy name;
-    #: the per-scope sqlite book key and the cOID prefix for fill attribution.
-    scope: str = ""
+    #: The config's ``name`` — the ``<config_name>`` scope segment.
+    config_name: str = ""
 
 
 def exec_params_of(config: LiveConfig) -> ExecutionParams:

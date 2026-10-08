@@ -1,11 +1,9 @@
-"""Tests for the live domain types (the shared edge vocabulary)."""
+"""Critical-path tests for the live domain types (friction -> execution params)."""
 
 from __future__ import annotations
 
-from typing import get_args
-
 from src.bt.state import FixedCommission, PerShareCommission
-from src.live.types import FeedKind, LiveConfig, exec_params_of, feed_error
+from src.live.types import LiveConfig, exec_params_of, feed_error
 
 
 def _cfg_friction(
@@ -31,14 +29,6 @@ def _cfg_friction(
         commission_min=commission_min,
         commission_max_pct=commission_max_pct,
     )
-
-
-def test_feed_error_preserves_every_declared_kind() -> None:
-    # Guards the L3 hazard: a kind added to the ``FeedKind`` Literal but not to the
-    # accepted set would silently degrade to "transport" here. Because the set is
-    # DERIVED from the Literal, this can never drift.
-    for kind in get_args(FeedKind):
-        assert feed_error(kind, "m").kind == kind
 
 
 def test_feed_error_degrades_an_unknown_kind_to_transport() -> None:

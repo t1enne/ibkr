@@ -213,7 +213,26 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 ```
 
 - `--allow-live` is required to read a `live` account; a `paper` config pointed
-  at a live account is refused. The adapter defaults to the config's `broker`.
+  at a live account is refused.
+- **Adapter resolution:** CLI `--adapter` (unset by default) > config `adapter` >
+  legacy config `broker` > `ibkr`. Both adapters (`ibkr`, `sim`) are STATELESS —
+  the fetched book travels in as a parameter and the settled results come back
+  out; the durable book lives in sqlite (`live_position`), never on the adapter.
+- **Scope grammar:** `scope = <adapter>_<config_name>_<config_hash>`, where
+  `<config_hash>` is a short digest of the **strategy-intent fields only**
+  (strategy type, symbols, params, bars, warm-up, sizing — `src/live/scope.py`).
+  Friction/capital/broker/bookkeeping edits do NOT re-mint it. **Operator risk:**
+  a strategy-intent edit while exposed re-mints the scope, and the OLD scope's
+  book is no longer reconciled by the new one → the new scope can enter the same
+  position again, doubling exposure. Edit strategy intent while FLAT.
+- **One book table:** `live_position`, keyed `(scope, position_id)`, with
+  `source ∈ {account, executions}`. `account` is the human/broker-editable exposure
+  surface (sim lots); `executions` is the engine-owned fold of our own fills, used
+  as the divergence oracle. A human edit surfaces as `DIVERGENCE` (exit 3) — never
+  a silent re-size onto the account's number.
+- **Per-scope lease:** `<db>.<scope_tag>.cycle.lock` (an OS advisory `flock`, held
+  for the cycle). Per scope, not per DB, so two adapters (or two configs) run
+  CONCURRENTLY while the same scope cannot overlap.
 - **Exit codes are the machine contract:** `0` clean, `1` config/stale/gateway
   (`ClickException`), `2` usage, `3` **unsafe cycle**. Alert on non-zero.
   `--allow-unsafe` is for report-consuming callers only — never put it in a
@@ -272,13 +291,49 @@ wrong field name and hid the bug through several review passes.
 - A test that passes both before and after your change is a characterisation
   test, not a regression test. Say which one you wrote.
 
+#### `src/live` tests: critical paths only
+
+A `src/live` test earns its place only when it pins one of these behaviours:
+
+1. **Order-safety invariants** (see §Live trading): never POST after a failed
+   working-orders read; the order ref is bar-free; ambiguity is reported
+   `unresolved`, never as "not placed"; an OPEN intent is never re-minted;
+   adoption matches our own `order_ref` by exact `scope_tag` prefix.
+2. **Exit-code contract**: clean cycle `0`, config/stale/gateway `1`, usage `2`,
+   unsafe `3`; `--allow-unsafe` exits `0` AND names the suppressed outcomes on
+   stderr.
+3. **Money/book accounting**: a fill advances the scope's book and cash through
+   the ledger; sim and ibkr settle through the same shared cohort-scale rule.
+4. **Divergence**: the fill-derived book vs the account book — agreement is
+   silent, disagreement is `DIVERGENCE` and unsafe.
+5. **Identity/scope**: `config_hash` covers strategy-intent fields only; two
+   adapters never share a scope.
+6. **Durability**: migrations preserve rows and never drop; `--dry-run` writes
+   nothing and takes no lease; two cycles on one scope cannot overlap.
+7. **Reconcile posture**: flat→long, add, reduce, close, invert.
+
+**Not eligible — delete on sight:** rendering/formatting assertions (table
+layout, padding, text wording, column ordering); shape assertions (dataclass
+field lists, dict keys, schema columns, reprs); mock-only wiring tests that fail
+only if a call disappears (no behaviour branch); direct tests of private helpers
+already covered through a public entry point; anything that would still pass if
+the behaviour it claims to protect were broken.
+
+**Mocks:** only at the true edges — HTTP (`respx` over the captured fixtures in
+`src/live/adapters/ibkr/tests/fixtures/`) and the clock. A mock standing for
+broker state must move when our order lands. For everything else run against a
+temp sqlite via `IBKR_DB_PATH`.
+
 ### Where state lives
 
 One sqlite file (the same `../data/db.sqlite` the candles use, overridable via
-`db_path`): `live_strategy`, `live_cash`, `live_position`, `live_execution`,
-`live_sim_lot`, `live_order_intent`, plus `*_legacy` tables preserved by past
-migrations. The cycle lease is an OS advisory lock on `<db>.cycle.lock` — sound
-on a single host with a local filesystem only.
+`db_path`): `live_strategy`, `live_cash`, `live_position` (the ONE book table —
+both roles, told apart by `source`), `live_execution`, `live_order_intent`,
+`live_scope_alias` (a re-keyed legacy scope reads as its new name), plus the
+`*_legacy` copies past migrations preserve (e.g. `live_position_legacy`,
+`live_sim_lot_legacy`) rather than drop. The cycle lease is an OS advisory lock
+on `<db>.<scope_tag>.cycle.lock` — sound on a single host with a local filesystem
+only.
 
 ## Language & Toolchain
 

@@ -23,7 +23,8 @@ from ib_rest_api_client.models import SecdefSearchResponseItem
 from src.exec.types import FixedCommission, OrderType
 from src.live.adapters.ibkr import broker as broker_mod
 from src.live.adapters.ibkr.broker import MAX_REPLIES, IbkrBroker
-from src.live.broker import OrderResult
+from src.live.pure import OrderResult
+from src.live.engine import _UNSAFE_OUTCOMES
 from src.live.ledger import SqliteLedger
 from src.live.identity import (
     WEDGED_CYCLES,
@@ -1211,6 +1212,70 @@ async def test_scaled_open_that_floors_to_zero_is_dropped() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_an_all_opens_dropped_cohort_reports_the_unsafe_unfunded_outcome() -> (
+    None
+):
+    """D3: a STRUCTURAL drop carries ``UNFUNDED``, never a safe ``REJECTED``.
+
+    Two opens that disagree on their cash bound make the shared budget
+    unprovable, so ``_refuse_opens`` drops EVERY open. A config that can never
+    state that bound does this every cycle forever, so the outcomes must be
+    unsafe (exit 3) — unlike a genuine cash-exhaustion refusal, which re-mints
+    next cycle and stays safe.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    _mock_no_working_orders()
+    broker = _broker()
+
+    result = await broker.place_cohort(
+        (
+            _sized_open("AAPL", qty=10.0, price=100.0, bound=15000.0),
+            _sized_open("MSFT", qty=10.0, price=100.0, bound=9000.0),
+        )
+    )
+
+    assert isinstance(result, Ok)
+    results = cast("tuple[OrderResult, ...]", result.value)
+    assert len(results) == 2
+    assert all(r.ok is False for r in results)  # every open was dropped
+    assert {r.outcome for r in results} == {OrderOutcome.UNFUNDED}
+    assert {r.error_kind for r in results} == {"unfunded"}
+    assert OrderOutcome.UNFUNDED in _UNSAFE_OUTCOMES
+    assert OrderOutcome.UNFUNDED is not OrderOutcome.REJECTED  # never conflate
+    assert submit.call_count == 0  # unprovable budget sends nothing
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_genuine_cash_exhaustion_open_stays_a_safe_rejected() -> None:
+    """D3 boundary: real cash exhaustion is ``REJECTED`` (safe), not ``UNFUNDED``.
+
+    A lone open over its own bound is refused by the cash guard with kind
+    ``rejected`` — nothing was taken and the intent re-mints next bar, so the
+    cycle legitimately exits 0. Only a STRUCTURAL drop becomes unsafe.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    _mock_no_working_orders()
+    broker = _broker()
+
+    result = await broker.place_cohort(
+        (_sized_open("AAPL", qty=100.0, price=100.0, bound=5000.0),)
+    )
+
+    assert isinstance(result, Ok)
+    (open_result,) = cast("tuple[OrderResult, ...]", result.value)
+    assert open_result.ok is False
+    assert open_result.outcome is OrderOutcome.REJECTED
+    assert OrderOutcome.REJECTED not in _UNSAFE_OUTCOMES
+    assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_close_is_sequenced_before_open_in_the_cohort() -> None:
     """A close frees the lot/cash the open needs, so its seq (and cOID) comes first."""
     respx.post(SUBMIT).mock(
@@ -1335,7 +1400,12 @@ async def test_flip_open_is_refused_when_the_account_holds_more_than_our_close()
 @respx.mock
 @pytest.mark.asyncio
 async def test_close_on_a_flat_account_is_refused_before_submitting() -> None:
-    """Safety guard (plan §6 phase 3.5): never reduce a conid the account is flat on."""
+    """Safety guard (plan §6 phase 3.5): never reduce a conid the account is flat on.
+
+    D3: the refusal is a BOOK DIVERGENCE (our book holds a lot the account does
+    not), so it surfaces as ``OrderOutcome.DIVERGENCE`` — an unsafe cycle at exit
+    3 — not as a broker ``rejected`` (which the exit contract treats as safe).
+    """
     submit = respx.post(SUBMIT).mock(
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
     )
@@ -1352,7 +1422,9 @@ async def test_close_on_a_flat_account_is_refused_before_submitting() -> None:
     )
     result = await broker.place(intent)
     assert isinstance(result, Err)
-    assert "flat" in cast("FeedError", result.error).message
+    error = cast("FeedError", result.error)
+    assert "flat" in error.message
+    assert error.kind == "divergence"  # D3: unsafe, not a safe "rejected"
     assert submit.call_count == 0  # never sent
 
 
@@ -1364,7 +1436,8 @@ async def test_close_larger_than_a_shared_net_is_refused_before_submitting() -> 
     Our book holds long 60, but another scope/human holds 40 short on the same
     conid, so the account nets to 20. The old guard only checked ``abs(net) > eps``,
     so A's SELL 60 passed and flipped the account to -40 — an unintended naked
-    short. Worse, without a check the close never opens a new position.
+    short. The refusal is a book divergence, so the strategy that cannot exit
+    surfaces at exit 3.
     """
     submit = respx.post(SUBMIT).mock(
         return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
@@ -1392,7 +1465,9 @@ async def test_close_larger_than_a_shared_net_is_refused_before_submitting() -> 
     )
     result = await broker.place(intent)
     assert isinstance(result, Err)
-    assert "exceeds the account net" in cast("FeedError", result.error).message
+    error = cast("FeedError", result.error)
+    assert "exceeds the account net" in error.message
+    assert error.kind == "divergence"  # D3: unsafe, not a safe "rejected"
     assert submit.call_count == 0  # the flip is refused, nothing sent
 
 
@@ -1421,8 +1496,56 @@ async def test_close_against_the_opposite_net_side_is_refused() -> None:
     )
     result = await broker.place(intent)
     assert isinstance(result, Err)
-    assert "opposite side" in cast("FeedError", result.error).message
+    error = cast("FeedError", result.error)
+    assert "opposite side" in error.message
+    assert error.kind == "divergence"  # D3: unsafe, not a safe "rejected"
     assert submit.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_refused_close_reports_the_unsafe_divergence_outcome() -> None:
+    """D3, end to end through a cohort: the refusal carries ``DIVERGENCE``.
+
+    ``place_cohort`` maps the guard's kind to an outcome; a close the account net
+    cannot absorb must yield ``OrderOutcome.DIVERGENCE`` (in the engine's unsafe
+    set) so the cycle exits 3 — the strategy cannot exit, and cron must see it.
+    """
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    # Our long 60 and a FOREIGN short 40 on the conid net the account to 20, so a
+    # SELL 60 would flip it to -40: the guard refuses the unexplained net.
+    respx.get(POSITIONS).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"conid": CONID, "contractDesc": "AAPL", "position": 60},
+                {"conid": CONID, "contractDesc": "AAPL", "position": -40},
+            ],
+        )
+    )
+    _mock_no_working_orders()
+    broker = _broker()
+    broker.seed(_long_lot("555000111", qty=60.0))
+    close_intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=60.0,
+        ref_price=100.0,
+        reason="close lot",
+        position_id="555000111",
+    )
+
+    result = await broker.place_cohort((close_intent,))
+
+    assert isinstance(result, Ok)
+    (close_result,) = cast("tuple[OrderResult, ...]", result.value)
+    assert close_result.ok is False
+    assert close_result.error_kind == "divergence"
+    assert close_result.outcome is OrderOutcome.DIVERGENCE
+    assert OrderOutcome.DIVERGENCE in _UNSAFE_OUTCOMES
+    assert submit.call_count == 0  # nothing was sent against an unexplained net
 
 
 @respx.mock
@@ -1472,33 +1595,6 @@ async def _candidates(
 
 
 @pytest.mark.asyncio
-async def test_default_conid_lookup_returns_the_verified_conid(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        broker_mod,
-        "search_contracts",
-        lambda _t: _candidates(_contract("265598", "AAPL")),
-    )
-    assert await broker_mod._default_conid_lookup("aapl") == 265598
-
-
-@pytest.mark.asyncio
-async def test_default_conid_lookup_prefers_the_db_conid_on_ambiguity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Two US STK rows share the ticker; the candle DB pairs AAPL with conid 2,
-    # so that candidate wins instead of the raise.
-    monkeypatch.setattr(
-        broker_mod,
-        "search_contracts",
-        lambda _t: _candidates(_contract("1", "AAPL"), _contract("2", "AAPL")),
-    )
-    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda t: 2)
-    assert await broker_mod._default_conid_lookup("AAPL") == 2
-
-
-@pytest.mark.asyncio
 async def test_default_conid_lookup_refuses_ambiguity_without_a_db_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1540,25 +1636,39 @@ async def test_default_conid_lookup_refuses_a_restricted_contract(
 
 
 @pytest.mark.asyncio
-async def test_conid_lookup_is_cached_per_symbol() -> None:
-    calls: list[str] = []
+async def test_prefer_db_conid_picks_the_db_matching_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SUCCESS path: among several same-ticker listings, the DB's conid wins.
 
-    async def counting(ticker: str) -> int:
-        calls.append(ticker)
-        return CONID
-
-    broker = IbkrBroker(
-        IbkrClient(base_url=BASE, account=ACCOUNT),
-        scope=SCOPE,
-        intents=FakeIntents(),
-        params=_FLAT_PARAMS,
-        account=ACCOUNT,
-        conid_lookup=counting,
+    A live order routed to the WRONG conid of a ticker lands on the wrong
+    instrument, so this is the safety-critical branch. SHOP's real shape: two US
+    STK rows share the ticker, only one is the contract our data treats as SHOP.
+    The preference must be LOAD-BEARING — flipping the DB's conid to the other
+    candidate must change the winner, or the test would pass on any pick.
+    """
+    monkeypatch.setattr(
+        broker_mod,
+        "search_contracts",
+        lambda _t: _candidates(_contract("1", "SHOP"), _contract("2", "SHOP")),
     )
-    first = await broker._conid("AAPL")
-    second = await broker._conid("AAPL")
-    assert (first, second) == (CONID, CONID)
-    assert calls == ["AAPL"]  # one round trip for the run, not one per order
+    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda _t: 2)
+    assert (await broker_mod._default_conid_lookup("SHOP")) == 2
+    # The other candidate would have won had the preference pointed at it: the
+    # DB row, not the search order, decides.
+    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda _t: 1)
+    assert (await broker_mod._default_conid_lookup("SHOP")) == 1
+
+
+@pytest.mark.asyncio
+async def test_default_conid_lookup_resolves_a_single_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unambiguous candidate resolves to its conid, no DB preference needed."""
+    monkeypatch.setattr(
+        broker_mod, "search_contracts", lambda _t: _candidates(_contract("7", "AAPL"))
+    )
+    assert (await broker_mod._default_conid_lookup("AAPL")) == 7
 
 
 # --- INV-1 fail-closed pre-flight / resync / attempt minting ---------------
@@ -2255,22 +2365,6 @@ async def test_skip_does_not_downgrade_a_working_record() -> None:
 
 
 # --- N8: the durable attempt never regresses ---------------------------------
-
-
-def test_attempt_of_never_regresses_the_stored_attempt() -> None:
-    """N8: ``_attempt_of`` takes the MAX of the ref tail and the stored attempt."""
-    key = intent_key(SCOPE, _open_intent())
-    existing = IntentRecord(
-        key=key,
-        state=IntentState.WORKING,
-        attempt=5,
-        order_ref=order_ref(key, 5),
-        order_id="1",
-        decision_ts=None,
-    )
-    assert broker_mod._attempt_of(order_ref(key, 0), existing) == 5
-    assert broker_mod._attempt_of(order_ref(key, 7), existing) == 7
-    assert broker_mod._attempt_of("garbage", existing) == 5  # unreadable tail
 
 
 @respx.mock

@@ -213,6 +213,11 @@ class OrderOutcome(Enum):
     #: see may be live, or our book is ahead of the account. Distinct from a
     #: broker ``rejected`` and from an order ``unresolved``.
     DIVERGENCE = "divergence"
+    #: An OPEN dropped by a STRUCTURAL rule (``_refuse_opens``/``_apply_scale``):
+    #: the cohort cannot state a shared cash bound, or a scaled qty floors to 0.
+    #: Unlike a ``REJECTED`` open — genuine cash exhaustion for THIS bar, re-minted
+    #: next cycle at exit 0 — this recurs every cycle forever, so it is UNSAFE.
+    UNFUNDED = "unfunded"
 
 
 #: Consecutive resyncs an OPEN record may stay unresolved before it is called

@@ -17,40 +17,30 @@ hand-built mock for a contract-shaped response.
 
 ## P0 — open defects
 
-### [ ] D3 — `REJECTED` is excluded from `is_unsafe()`, so a refused CLOSE exits 0
+### [ ] D20 — an unsized-open config loses the whole cycle's opens (recon, NOT fixed)
 
-- **Where:** `src/live/engine.py` (`_UNSAFE_OUTCOMES`, `CycleReport.is_unsafe`),
-  `src/live/adapters/ibkr/broker.py` `_close_guard`.
-- **Problem:** excluding `REJECTED` is defensible for an OPEN (nothing taken, book
-  unchanged, re-mints next cycle) but not for:
-  - a **refused close** — `_close_guard` returns `kind="rejected"`, so "our book
-    holds a lot the account does not" or "close qty exceeds the account net"
-    exits **0**. The strategy cannot exit the position while cron reads success,
-    and the open-side equivalent of the same divergence exits 3 (asymmetric).
-  - **structural drops** — `_refuse_opens` / `_apply_scale` go through
-    `_failed(intent, reason)` with the default `kind="rejected"`. A config that
-    can never state a shared cash bound drops **every** open, every cycle, forever,
-    at exit 0.
-- **Fix sketch:** give the close-vs-account mismatch and the structural drops their
-  own kinds (reuse `divergence` for the close-guard mismatch) and add the
-  corresponding outcome(s) to `_UNSAFE_OUTCOMES`.
-- **Test:** a refused close exits non-zero; an all-opens-dropped cohort exits
-  non-zero; a plain refused OPEN still exits 0.
-
-### [ ] D2 — `--allow-unsafe` silently neutralises the exit-code contract
-
-- **Where:** `src/live/cli.py` (`allow_unsafe` flag; the single check at ~`:224`).
-- **Problem:** no stderr note, no guard. One `* * * * * ibkr live run …
-  --allow-unsafe >> log` line makes the exit permanently 0 and every
-  `placement_error` / `resync_error` / `WEDGED` / `TIMEOUT` / `DIVERGENCE`
-  disappears from the cron signal. The help text ("for callers that consume the
-  report themselves") is aspirational — nothing enforces it.
-- **Fix sketch:** when `allow_unsafe and report.is_unsafe()`, write a loud
-  `_stderr_log(...)` naming the suppressed outcomes. Consider rejecting
-  `--allow-unsafe` together with `--format text` (text is a human format, not a
-  machine consumer).
-- **Test:** an unsafe cycle under `--allow-unsafe` exits 0 **and** emits the
-  stderr note.
+- **Where:** `src/live/reconcile.py:300-303` (`_open_intent` raises
+  `ValueError("unsized open ...")` when the sizer yields `qty <= 0`);
+  `src/live/cli.py:217-220` (the `except ValueError` that turns it into a
+  `ClickException`).
+- **Repro:** a strategy whose sizing lives ONLY in `strategy_params` (no
+  top-level `size`, no per-trade `ctx.long(..., size=)`) emitting a bare
+  `ctx.long(sym)` (signal `qty=0`) — `SizingParams.size` defaults `0.0`
+  (`src/bt/size/pure.py:50`), `_size_based_qty` returns `0.0`
+  (`src/bt/size/pure.py:129-131`), so `sized.qty == 0` and `_open_intent` raises.
+  Reproduced with a `cup_handle_dsl` config stripped of `size`:
+  `ValueError: unsized open AAPL: signal qty=0.0, sized qty=0.0
+  (size_mode='equity', size=0.0)`.
+- **Effect:** the cycle's ENTIRE open set is lost — no intent is emitted for any
+  opening symbol, and the CLI reports `Error: unsized open ...` at exit **1**
+  (the task brief said exit 0 with an empty-`intents` report; the reproduction
+  shows exit 1 with a bare `ClickException`, which cron also sees as failure —
+  but the opens are still silently absent from the report body, so a config with
+  one unsized symbol starves every symbol that cycle). Out of scope for the
+  adapter rewrite — record, do not fix.
+- **Fix sketch (later):** surface the unsized open as a typed cycle/placement
+  error naming the symbol, or fail config validation when a qty=0-emitting
+  strategy has no resolvable `size`.
 
 ### [ ] D10 — per-symbol staleness is ungated: one fresh symbol masks a dead one
 
@@ -359,6 +349,23 @@ One MKT round trip on Paper closes that gap.
 ---
 
 ## Done — do not re-litigate
+
+- **D3 CLOSED — a refused CLOSE is a book divergence, so it exits 3, not 0.** The
+  close-vs-account mismatch reports `kind="divergence"`/`OrderOutcome.DIVERGENCE`
+  (`_close_guard`, `src/live/adapters/ibkr/broker.py`) and the structural cohort
+  drops (`_refuse_opens`/`_apply_scale`) report the distinct `unfunded` outcome,
+  both added to `_UNSAFE_OUTCOMES`. Pinned by `test_a_refused_close_exits_three`,
+  `test_an_all_opens_dropped_cohort_exits_three`,
+  `test_a_plain_refused_open_still_exits_zero` (`src/live/tests/test_cli.py`) and
+  `test_a_refused_close_reports_the_unsafe_divergence_outcome` and
+  `test_an_all_opens_dropped_cohort_reports_the_unsafe_unfunded_outcome`
+  (`src/live/adapters/ibkr/tests/test_ibkr_broker.py`).
+- **D2 CLOSED — `--allow-unsafe` names what it suppressed.** An unsafe cycle under
+  `--allow-unsafe` now exits 0 AND writes a stderr note naming the suppressed
+  outcomes, derived from the report (never a fixed string). Pinned by
+  `test_allow_unsafe_suppresses_the_nonzero_exit` and
+  `test_allow_unsafe_emits_a_note_naming_the_suppressed_outcome`
+  (`src/live/tests/test_cli.py`).
 
 - **Order identity** is bar-free (`identity.py`): `cOID =
   scope_tag-token-attempt`, durability in `live_order_intent`, five invariants

@@ -5,14 +5,20 @@ Pure sqlite3 wrappers. No ORM dependency at this layer.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-_DEFAULT_DB_PATH = (
-    Path(__file__).resolve().parent.parent.parent.parent / "data" / "db.sqlite"
+#: Overrides the default DB file. Lets a test (or a second book) point at its own
+#: sqlite without changing every call site that relies on the default path.
+_DB_PATH_ENV = "IBKR_DB_PATH"
+
+_DEFAULT_DB_PATH = Path(
+    os.environ.get(_DB_PATH_ENV)
+    or Path(__file__).resolve().parent.parent.parent.parent / "data" / "db.sqlite"
 )
 
 

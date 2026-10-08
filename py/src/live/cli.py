@@ -2,7 +2,7 @@
 
 The caller (cron) drives cadence; this runs exactly ONE cycle. ``--dry-run``
 reconciles and reports without placing anything. Everything the cycle reads
-(config, mock book) is resolved here; the engine owns the pure core.
+(config, adapter) is resolved here; the engine owns the pure core.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Literal, TextIO, cast
 
@@ -26,19 +26,18 @@ from src.bt.cmds._shared import _json_default
 from src.shared.style import COLOR, PLAIN, Styler
 from src.bt.table import Col, Table, render as render_table
 from src.bt.state import ActionType, PortfolioState
-from src.bt.state.factories import create_initial_portfolio
 from src.bt.types import StrategyConfig
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.gateway import IbkrGateway
+from src.live.adapter import LiveAdapter, resolve_adapter, resolve_adapter_name
 from src.live.adapters.ibkr.authz import authorize
-from src.live.adapters.ibkr.broker import IbkrBroker
-from src.live.adapters.ibkr.portfolio_source import IbkrPortfolioSource
-from src.live.broker import LiveBroker, OrderResult, SimulatedBroker
+from src.live.pure import OrderResult
 from src.live.engine import (
     CycleReport,
     PortfolioFetchError,
     StaleDataError,
     run_cycle,
+    unsafe_outcomes,
 )
 from src.live.lease import CycleInProgressError
 from src.live.identity import OPEN_STATES, IntentKey, IntentState
@@ -52,19 +51,20 @@ from src.live.pf import (
     read_store,
     render_pf,
 )
-from src.live.portfolio_source import (
-    MockPortfolioSource,
-    PortfolioSource,
-    fixture_is_managed,
-    write_mock_portfolio,
-)
 from src.live.result import Err
+from src.live.scope import (
+    AdapterName,
+    ScopeParts,
+    config_name_of,
+    config_hash as config_scope_hash,
+    scope_of,
+)
+from src.live.divergence import Divergence
 from src.live.types import (
     CostProvenance,
     FeedError,
     LiveConfig,
     cost_provenance,
-    exec_params_of,
 )
 
 #: Sizing modes the shared ``SizingParams`` layer accepts.
@@ -84,50 +84,6 @@ SleepFn = Callable[[float], None]
 #: ``2`` (UsageError), so cron can tell "the broker may be holding something we
 #: cannot see" apart from "the run could not start".
 _UNSAFE_EXIT_CODE = 3
-
-
-@dataclass(frozen=True)
-class _SimBook:
-    """The sim broker's book: its fixture path, and whether we may write it back."""
-
-    path: str
-    managed: bool
-
-
-def _sim_book(cfg: LiveConfig, name: str) -> _SimBook:
-    """Resolve the sim mock book: the config's own fixture, else one we mint.
-
-    ``--adapter sim`` must not require a live-only ``portfolio_path`` in a
-    strategy JSON. Absent one, a FLAT fixture seeded with the config's
-    ``initial_capital`` is written to the system temp dir as
-    ``pf_sim_<name>.json`` and marked as OURS. A managed fixture is the sim
-    broker's record of the cycle: the CLI reads the book from it and writes the
-    settled book back after each real cycle, so a mock book persists across
-    cycles. A hand-authored fixture (no marker) is left read-only.
-    """
-    if cfg.portfolio_path:
-        return _SimBook(cfg.portfolio_path, fixture_is_managed(cfg.portfolio_path))
-    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
-    path = Path(tempfile.gettempdir()) / f"pf_sim_{safe}.json"
-    if not path.exists():
-        write_mock_portfolio(
-            path, create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now())
-        )
-        _stderr_log(f"sim: no portfolio_path in config; minted mock fixture {path}")
-    return _SimBook(str(path), True)
-
-
-def _strategy_name(raw: Mapping[str, object] | None, cfg: LiveConfig) -> str:
-    """The label for a minted sim fixture: the config's ``name``, else its scope."""
-    named = None if raw is None else raw.get("name")
-    return named if isinstance(named, str) and named else cfg.scope
-
-
-def _sim_config(cfg: LiveConfig, raw: Mapping[str, object] | None) -> LiveConfig:
-    """*cfg* with a fixture path resolved: its own, else a minted ``pf_sim_*.json``."""
-    if cfg.portfolio_path:
-        return cfg
-    return replace(cfg, portfolio_path=_sim_book(cfg, _strategy_name(raw, cfg)).path)
 
 
 def _stderr_log(message: str) -> None:
@@ -163,11 +119,9 @@ def live_group() -> None:
 @click.option(
     "--adapter",
     type=click.Choice(_ADAPTERS),
-    default="ibkr",
-    show_default=True,
-    help="Broker adapter to run through. Defaults to `ibkr`, so the flag is the "
-    "ONE namesake: a config's `broker` key no longer selects it (it still "
-    "describes the config for readers, and `live pf` still honours it).",
+    default=None,
+    help="Broker adapter to run through. Unset, the config decides (its `adapter` "
+    "key, then the back-compat `broker` key), defaulting to `ibkr`.",
 )
 @click.option(
     "--allow-live",
@@ -183,9 +137,10 @@ def live_group() -> None:
     "--allow-unsafe",
     is_flag=True,
     help=(
-        "Exit 0 even when the cycle is unsafe (placement/resync error, or an "
-        "unresolved/wedged/timed-out order). For callers that consume the "
-        "report themselves; the default exits non-zero so cron can see it."
+        "Exit 0 even when the cycle is unsafe (placement/resync error, a book "
+        "divergence, or an unresolved/wedged/timed-out order). For callers that "
+        "consume the report themselves; the default exits non-zero so cron can "
+        "see it."
     ),
 )
 def live_run(
@@ -193,7 +148,7 @@ def live_run(
     dry_run: bool,
     max_age: int,
     fmt: str,
-    adapter: str,
+    adapter: str | None,
     allow_live: bool,
     no_gateway: bool,
     allow_unsafe: bool,
@@ -201,52 +156,31 @@ def live_run(
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
-    resolved = adapter
-    # Scope key derives from the ORIGINAL raw config, never the temp projection
-    # (the strategy-only file lives at a random path and must not change scope).
+    try:
+        resolved = resolve_adapter_name(adapter, raw, cfg.strategy_params)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    # Audit key vs ownership key (plan §1.4): the config hash identifies the
+    # revision that wrote the scope; the scope keys the book, the cOID prefix and
+    # the lease. The scope is minted ONCE here from the ORIGINAL raw config, never
+    # the strategy-only temp projection (a random path must not change identity).
     strategy_id = config_hash(raw)
+    scope = scope_of(ScopeParts(resolved, config_name_of(cfg), config_scope_hash(cfg)))
     strategy = _strategy_config(config_path, raw)
-    scope = cfg.scope or strategy.name
     ledger = SqliteLedger()
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
         ledger.ensure_strategy(strategy_id, scope, strategy.name, cfg.mode)
         ledger.ensure_cash(scope, cfg.initial_capital)
     gateway: IbkrGateway | None = None
-    broker: LiveBroker
-    # A managed sim fixture is the sim broker's record: the settled book is
-    # written back below, so the mock book persists across cycles (an
-    # unmanaged/hand-authored fixture stays read-only).
-    sim_book: _SimBook | None = None
-    sim_broker: SimulatedBroker | None = None
+    client: IbkrClient | None = None
     if resolved == "ibkr":
         gateway = IbkrGateway(IbkrClient())
-        source: PortfolioSource = IbkrPortfolioSource(
-            gateway.client,
-            scope=scope,
-            ledger=ledger,
-            initial_capital=cfg.initial_capital,
-            dry_run=dry_run,
-        )
-        # The real routing edge. ``dry_run`` is passed through as defence in
-        # depth: even if the guard below were skipped, this broker places nothing.
-        broker = IbkrBroker(
-            gateway.client,
-            scope=scope,
-            intents=ledger,
-            params=exec_params_of(cfg),
-            exposure=ledger,
-            dry_run=dry_run,
-            log=_stderr_log,
-        )
-    else:
-        sim_book = _sim_book(cfg, strategy.name)
-        source = MockPortfolioSource(sim_book.path)
-        sim_broker = SimulatedBroker(
-            create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
-            exec_params_of(cfg),
-            _stderr_log,
-        )
-        broker = sim_broker
+        client = gateway.client
+    # The adapter is built from the resolved name only: no branch on the
+    # backend's internals survives here, so a third adapter needs no edit.
+    backend = resolve_adapter(
+        cfg, resolved, scope, ledger, dry_run, _stderr_log, client=client
+    )
     # Plan §7.3: label which source produced this run's costs. A resolved IBKR run
     # books the broker's exact per-execution commission but still SIZES on the sim
     # model — the report states both, so the mix is never ambiguous.
@@ -261,8 +195,7 @@ def live_run(
             report = asyncio.run(
                 _run_cycle(
                     cfg,
-                    source=source,
-                    broker=broker,
+                    adapter=backend,
                     ledger=ledger,
                     strategy_id=strategy_id,
                     scope=scope,
@@ -275,13 +208,6 @@ def live_run(
                     cost=cost,
                 )
             )
-            if sim_book is not None and sim_broker is not None and sim_book.managed:
-                # The sim book is durable WHERE the fixture is, not in the ledger:
-                # the broker settled this cycle's cohort into its held book, so
-                # THAT book is what the next cycle must read. A dry run placed
-                # nothing, so there is no new book to persist.
-                if not dry_run:
-                    write_mock_portfolio(sim_book.path, sim_broker.portfolio())
     except (
         StaleDataError,
         PortfolioFetchError,
@@ -293,22 +219,30 @@ def live_run(
         # ValueError: an unsized open raises by default policy — a traceback is
         # not a CLI contract.
         raise click.ClickException(str(exc)) from exc
-    click.echo(render_report(report, fmt))
+    click.echo(render_report(report, fmt, scope))
     _housekeeping(ledger, dry_run)
     # The report already prints placement_error/resync_error/the unsafe outcomes,
     # so the exit code is the machine-readable signal — never a duplicated message.
     # stdout stays the parseable contract (a JSON document for ``--format json``);
     # the exit code is out-of-band. Checked AFTER the housekeeping so a prune
     # failure cannot change the verdict.
-    if not allow_unsafe and report.is_unsafe():
-        raise click.exceptions.Exit(_UNSAFE_EXIT_CODE)
+    if report.is_unsafe():
+        if not allow_unsafe:
+            raise click.exceptions.Exit(_UNSAFE_EXIT_CODE)
+        # D2: ``--allow-unsafe`` forces exit 0, so the ONLY trace of an unsafe
+        # cycle is this note. It must name what it suppressed and be derived from
+        # the report (never a fixed string), or one cron line silently neutralises
+        # every placement/resync/wedge/timeout/divergence alert.
+        _stderr_log(
+            f"--allow-unsafe: exit 0 forced for an UNSAFE cycle; suppressed "
+            f"outcomes: {', '.join(unsafe_outcomes(report))}"
+        )
 
 
 async def _run_cycle(
     cfg: LiveConfig,
     *,
-    source: PortfolioSource,
-    broker: LiveBroker,
+    adapter: LiveAdapter,
     ledger: SqliteLedger,
     strategy_id: str,
     scope: str,
@@ -354,8 +288,7 @@ async def _run_cycle(
     try:
         return await run_cycle(
             cfg,
-            source=source,
-            broker=broker,
+            adapter,
             ledger=ledger,
             strategy_id=strategy_id,
             scope=scope,
@@ -499,10 +432,10 @@ def live_pf(
     headline P&L (realized / unrealized / total, cost basis, win-loss tally).
 
     ``--adapter`` is a FILTER, not a requirement: given, it selects the broker
-    to read (``ibkr`` account-wide, or a config's ``sim`` fixture) and the report
-    includes the broker block + divergence; absent, the report is store-only and
-    no broker is touched — so a bare strategy config reads without a
-    ``portfolio_path``. Without a config, a live account needs ``--allow-live``.
+    to read (``ibkr`` account-wide, or the ``sim`` book straight from the store)
+    and the report includes the broker block + divergence; absent, the report is
+    store-only and no broker is touched. Without a config, a live account needs
+    ``--allow-live``.
 
     ``--watch SECONDS`` turns the one-shot report into a polling view: the store
     and broker are re-read and re-rendered every SECONDS until Ctrl-C (exit 0).
@@ -544,7 +477,7 @@ def _all_scopes_report(
     """Every scope in the store, plus a broker read when ``--adapter`` names one."""
     scopes = ledger.scopes_of_store()
     stores = tuple(read_store(ledger, scope) for scope in scopes)
-    broker = _pf_broker(adapter, None, None, stores, allow_live, no_gateway)
+    broker = _pf_broker(ledger, adapter, None, None, stores, allow_live, no_gateway)
     return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker)
 
 
@@ -558,12 +491,26 @@ def _config_report(
     """The config's scope, plus a broker read when one is resolved."""
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
-    store = read_store(ledger, cfg.scope, initial_capital=cfg.initial_capital)
-    broker = _pf_broker(adapter, raw, cfg, (store,), allow_live, no_gateway)
+    store = read_store(ledger, _config_scope(cfg), initial_capital=cfg.initial_capital)
+    broker = _pf_broker(ledger, adapter, raw, cfg, (store,), allow_live, no_gateway)
     return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=(store,), broker=broker)
 
 
+def _config_scope(cfg: LiveConfig) -> str:
+    """The scope a config addresses: ``<adapter>_<config_name>_<config_hash>``.
+
+    The SAME mint ``live run`` uses, so ``pf``/``status`` read the scope a cycle
+    writes. A config's own ``adapter`` key decides the segment (``sim`` when it
+    never named one), matching ``resolve_adapter_name``'s precedence minus the
+    CLI flag — a diagnostic read is not a run.
+    """
+    return scope_of(
+        ScopeParts(cfg.adapter, config_name_of(cfg), config_scope_hash(cfg))
+    )
+
+
 def _pf_broker(
+    ledger: SqliteLedger,
     adapter: str | None,
     raw: Mapping[str, object] | None,
     cfg: LiveConfig | None,
@@ -575,11 +522,10 @@ def _pf_broker(
 
     ``--adapter`` wins; otherwise a config's EXPLICITLY-named ``broker`` key; a
     config that never named one reads NO broker (store-only), so ``live pf
-    <strategy.json>`` works without a ``portfolio_path``. A ``sim`` read resolves
-    its mock book the way ``live run`` does: the config's own ``portfolio_path``
-    if named, else a minted ``pf_sim_<name>.json``. Only a sim read with NO
-    config at all (no name to mint from) degrades to a warning. Without a config
-    the mode is ``live`` when ``--allow-live`` and ``paper`` otherwise.
+    <strategy.json>`` works with no configuration beyond the strategy. A ``sim``
+    read is the store's own account book (``read_sim_broker``) — no fixture, no
+    gateway. Without a config the mode is ``live`` when ``--allow-live`` and
+    ``paper`` otherwise.
     """
     resolved = adapter
     if resolved is None and raw is not None and cfg is not None:
@@ -588,17 +534,7 @@ def _pf_broker(
     if resolved is None:
         return None
     if resolved == "sim":
-        if cfg is None:
-            return _skipped_broker(
-                "sim", "no portfolio_path and no config (broker read skipped)"
-            )
-        cfg = _sim_config(cfg, raw)
-        owned = frozenset(
-            i
-            for store in stores
-            for i in (*(lot.id for lot in store.lots), *store.sim_open_ids)
-        )
-        return asyncio.run(read_sim_broker(cfg, owned))
+        return read_sim_broker(ledger, stores[0].scope if stores else "")
     mode: Literal["paper", "live"] = (
         cfg.mode if cfg is not None else ("live" if allow_live else "paper")
     )
@@ -611,21 +547,6 @@ def _pf_broker(
             allow_live,
             no_gateway,
         )
-    )
-
-
-def _skipped_broker(adapter: str, reason: str) -> BrokerSide:
-    """A broker block that carries only a warning — no positions, no orders."""
-    return BrokerSide(
-        adapter=adapter,
-        source="",
-        account="",
-        net_liquidation=None,
-        cash=None,
-        positions=(),
-        working_orders=(),
-        ours_orders=(),
-        warnings=(reason,),
     )
 
 
@@ -764,7 +685,7 @@ def _open_watch_session(
     An ``ibkr`` read (with or without a config) opens ONE gateway on ONE
     persistent event loop — the client is authenticated here and only its book is
     re-read per tick, so the connection pool is never rebound to a fresh loop. A
-    store-only or ``sim`` read needs no session at all (the fixture is re-read per
+    store-only or ``sim`` read needs no session at all (the store is re-read per
     tick). No lease is taken and no DDL runs: the frame calls the same read
     helpers the one-shot path uses.
     """
@@ -792,7 +713,7 @@ def _open_watch_session(
         )
     return _ibkr_watch_session(
         ledger,
-        lambda: (cfg.scope,),
+        lambda: (_config_scope(cfg),),
         cfg.initial_capital,
         cfg.mode,
         allow_live,
@@ -876,26 +797,21 @@ def _store_and_broker(
     adapter: str | None,
     raw: Mapping[str, object] | None = None,
 ) -> tuple[tuple[StoreSide, ...], BrokerSide | None]:
-    """Re-read the store side and (for ``sim``) the fixture, per tick.
+    """Re-read the store side and (for ``sim``) the store's account book, per tick.
 
-    Only the store and the sim fixture are re-read here — a non-sim broker would
-    need a live session, which the watch holds open itself. Mirrors
-    ``_all_scopes_report``/``_config_report`` for the store half, including the
-    minted-fixture fallback a sim config with no ``portfolio_path`` gets.
+    Only the store is re-read here — a non-sim broker would need a live session,
+    which the watch holds open itself. Mirrors ``_all_scopes_report``/
+    ``_config_report`` for the store half; a sim read is the same store read
+    (``read_sim_broker``), so a watch never touches a fixture.
     """
     if cfg is None:
         stores = tuple(read_store(ledger, scope) for scope in ledger.scopes_of_store())
     else:
-        stores = (read_store(ledger, cfg.scope, initial_capital=cfg.initial_capital),)
-    if adapter != "sim" or cfg is None:
+        scope = _config_scope(cfg)
+        stores = (read_store(ledger, scope, initial_capital=cfg.initial_capital),)
+    if adapter != "sim":
         return stores, None
-    cfg = _sim_config(cfg, raw)
-    owned = frozenset(
-        i
-        for store in stores
-        for i in (*(lot.id for lot in store.lots), *store.sim_open_ids)
-    )
-    return stores, asyncio.run(read_sim_broker(cfg, owned))
+    return stores, read_sim_broker(ledger, stores[0].scope if stores else "")
 
 
 def watch_pf_loop(
@@ -963,8 +879,8 @@ def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
 
     ``load_strategy`` validates through ``StrategyConfig(**data)`` and rejects
     unknown top-level keys, so the screen bridge must see ONLY the keys
-    ``StrategyConfig`` defines. Live-only keys (``portfolio_path``, ``mode``,
-    sizing) never reach the temp file.
+    ``StrategyConfig`` defines. Live-only keys (``mode``, sizing) never reach the
+    temp file.
     """
     path = Path(tmp) / "strategy.json"
     path.write_text(json.dumps(asdict(strategy), default=_json_default))
@@ -994,10 +910,10 @@ def load_live_config(path: str) -> LiveConfig:
     """Parse + validate the live JSON -> ``LiveConfig`` (strategy + sizing).
 
     Strategy fields are validated through ``StrategyConfig`` (via
-    ``load_strategy`` for a pure file); live-only keys — ``portfolio_path``,
-    ``mode``, sizing — are read from the raw dict. Sizing accepts a nested
-    ``"sizing"`` object OR flat keys (top-level, then ``strategy_params``, where
-    real ``strats/*.json`` keep sizing); flat wins when both are given.
+    ``load_strategy`` for a pure file); live-only keys — ``mode``, sizing — are
+    read from the raw dict. Sizing accepts a nested ``"sizing"`` object OR flat
+    keys (top-level, then ``strategy_params``, where real ``strats/*.json`` keep
+    sizing); flat wins when both are given.
     """
     raw = _read_json(path)
     strategy = _strategy_config(path, raw)
@@ -1007,7 +923,6 @@ def load_live_config(path: str) -> LiveConfig:
     if raw_mode not in ("paper", "live"):
         raise ValueError(f"mode must be 'paper' or 'live', got {raw_mode!r}")
     raw_broker, _ = resolve_broker(raw, params)
-    portfolio_path = _pick((raw, params), ("portfolio_path",), "")
     commission = _float_or((raw, params), "commission", strategy.commission)
     spread_bps = _float_or((raw, params), "spread_bps", strategy.spread_bps)
     slippage_bps = _float_or((raw, params), "slippage_bps", strategy.slippage_bps)
@@ -1034,40 +949,41 @@ def load_live_config(path: str) -> LiveConfig:
         size_mode=size_mode,
         size=size,
         max_symbol_allocation=alloc,
-        portfolio_path=portfolio_path if isinstance(portfolio_path, str) else "",
         mode=cast("Literal['paper', 'live']", raw_mode),
+        adapter=cast("AdapterName", _resolve_adapter_key(raw, params)),
         broker=cast("Literal['sim', 'ibkr']", raw_broker),
-        scope=_scope(raw, params, strategy),
     )
 
 
-def _scope(
-    raw: Mapping[str, object],
-    params: Mapping[str, object],
-    strategy: StrategyConfig,
+def _resolve_adapter_key(
+    raw: Mapping[str, object], params: Mapping[str, object]
 ) -> str:
-    """The ownership scope: the config's ``scope`` key, else the strategy name.
+    """The config's own adapter, by the shared precedence (CLI flag excluded).
 
-    A stable strategy identity that survives a config edit (plan §4) — the
-    per-scope book key and the cOID attribution prefix on a shared account.
+    Delegates to :func:`resolve_adapter_name` with no flag, so a config's
+    ``adapter`` key, then the back-compat ``broker`` key, then ``ibkr`` are read
+    in ONE place — the CLI flag only overrides it at the call site.
     """
-    value = _pick((raw, params), ("scope",), None)
-    return (
-        value if isinstance(value, str) and value else (strategy.scope or strategy.name)
-    )
+    return resolve_adapter_name(None, raw, params)
 
 
-def render_report(report: CycleReport, fmt: str) -> str:
-    """Deterministic text table (default) or JSON document for one cycle."""
+def render_report(report: CycleReport, fmt: str, scope: str = "") -> str:
+    """Deterministic text table (default) or JSON document for one cycle.
+
+    *scope* is the resolved ownership key, printed in the header so the operator
+    sees WHICH book this cycle touched (``<adapter>_<name>_<hash>``) without
+    re-deriving it from the config.
+    """
     if fmt == "json":
-        return _render_json(report)
-    return _render_text(report)
+        return _render_json(report, scope)
+    return _render_text(report, scope)
 
 
-def _render_json(report: CycleReport) -> str:
+def _render_json(report: CycleReport, scope: str = "") -> str:
     """JSON at the edge — reuse the shared encoder for Timestamps/Enums."""
     doc = {
         "as_of": report.as_of,
+        "scope": scope,
         "costs": asdict(report.cost),
         "signals": [asdict(s) for s in report.signals],
         "intents": [asdict(i) for i in report.intents],
@@ -1105,7 +1021,21 @@ _RESULT_COLS = (
 )
 
 
-def _render_text(report: CycleReport) -> str:
+def _divergence_lines(divergences: tuple[Divergence, ...]) -> list[str]:
+    """One line per book disagreement, naming the side that is short.
+
+    The operator's next step is a manual reconciliation, so the line states both
+    quantities: "ours" is the fill fold (engine-owned), "account" is what the
+    broker reported or the operator edited.
+    """
+    return [
+        f"divergence: {d.symbol} {d.position_id or '-'} {d.kind} "
+        f"ours={d.ours_qty:g} account={d.account_qty:g}"
+        for d in divergences
+    ]
+
+
+def _render_text(report: CycleReport, scope: str = "") -> str:
     """The cycle as block-aligned tables (``src.bt.table``), not run-on rows.
 
     Scalars stay lines; every list — signals, intents, order results — is one
@@ -1113,7 +1043,9 @@ def _render_text(report: CycleReport) -> str:
     fighting a ``key=value`` header. The last column of the results table is the
     message, which is allowed to grow; the rest stay tight.
     """
-    blocks: list[list[str]] = [[f"as_of: {report.as_of}"]]
+    blocks: list[list[str]] = [[f"scope: {scope}", f"as_of: {report.as_of}"]]
+    if report.divergences:
+        blocks.append(_divergence_lines(report.divergences))
     blocks.append(
         [f"costs: bookkeeping={report.cost.bookkeeping} sizing={report.cost.sizing}"]
     )

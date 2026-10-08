@@ -1,8 +1,12 @@
 """Per-scope sqlite book — the durable, per-strategy position store (plan §3).
 
 The 7-day ``/iserver/account/trades`` window is a *confirmation channel*: it
-advances the book. The book itself lives here, one row per ``(scope, conid)``,
-plus one row per applied ``execution_id`` so re-applying the window is a no-op.
+advances the book. The book itself lives here, ONE table (``live_position``), one
+row per ``(scope, position_id)``, plus one row per applied ``execution_id`` so
+re-applying the window is a no-op. The table carries both book ROLES, told apart
+by ``source``: ``executions`` rows are the immutable fold of our own fills (the
+IBKR reconcile book, keyed ``str(conid)``), ``account`` rows are the
+human/broker-editable exposure surface (the sim lot book).
 Live-only: the backtest persists nothing. Tables live in the SAME candle DB
 (``src.data.db``), created idempotently on first WRITE — a read (and therefore a
 ``--dry-run``) writes no DDL.
@@ -20,7 +24,7 @@ already-present matching tables). DDL stays lazy: ``create_tables`` runs only
 inside a WRITE path, never at import, never for a read/``--dry-run``.
 
 ``SqliteLedger`` is the seam implementing the live Protocols; its per-domain
-methods live in their own mixins (``ledger_sim``, and the stores below) so each
+methods live in their own mixins (``SimLotStore`` and the stores below) so each
 class stays small. Shared plumbing (the template binding, the base model, the
 epoch codec) is in ``ledger_base``; the lossless migrations are in
 ``ledger_migration``. Every public method keeps its name and signature.
@@ -33,7 +37,7 @@ import json
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -50,6 +54,7 @@ from peewee import (
 
 from src.bt.state import ActionType
 from src.data.db import _DEFAULT_DB_PATH
+from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import (
     BookRow,
@@ -57,6 +62,7 @@ from src.live.adapters.ibkr.trades import (
     StrategyBook,
     is_ours,
 )
+from src.live.pure import OrderResult
 from src.live.identity import (
     OPEN_STATES,
     IntentKey,
@@ -73,15 +79,41 @@ from src.live.ledger_base import (
     _ts,
     LedgerReadError,
 )
-from src.live.ledger_migration import _restore_intents, migrate
-from src.live.ledger_sim import LiveSimLot, SimLot, SimLotBook
+from src.live.ledger_migration import _restore_intents, _restore_positions, migrate
 
 logger = logging.getLogger(__name__)
+
+#: ``live_position.source`` for the sim lot book (the human/broker-editable surface).
+SOURCE_ACCOUNT = "account"
+#: ``live_position.source`` for the fill fold (the engine-owned, append-only truth).
+SOURCE_EXECUTIONS = "executions"
+
+
+def _alias_scope(db: peewee.SqliteDatabase, scope: str) -> str:
+    """Follow a migration scope alias: a re-keyed legacy scope reads as the new one.
+
+    ``migrate`` re-keys a bare legacy scope ``X`` to ``ibkr_X_legacy`` in every
+    live table. Without this lookup the operator's still-config'd ``X`` would
+    address an EMPTY book, so the strategy would read itself flat and re-open on
+    top of live positions. An absent table (fresh db) or no row for *scope* means
+    "not a legacy scope", so the scope is returned unchanged.
+    """
+    try:
+        row = db.execute_sql(
+            "SELECT new_scope FROM live_scope_alias WHERE legacy_scope=?", (scope,)
+        ).fetchone()
+    except peewee.OperationalError:
+        return scope
+    return scope if row is None else str(row[0])
 
 
 class LiveStrategy(_Base):
     strategy_id = TextField(primary_key=True)
     scope = TextField(null=False, default="")
+    #: Scope segments (plan §4.1), additive: which adapter/config wrote this scope.
+    adapter = TextField(null=False, default="")
+    config_name = TextField(null=False, default="")
+    instance = TextField(null=False, default="")
     name = TextField()
     mode = TextField()
     created_at = IntegerField()
@@ -92,29 +124,43 @@ class LiveStrategy(_Base):
 
 
 class LivePosition(_Base):
+    """The ONE book table: both roles, told apart by ``source``.
+
+    ``position_id`` is TEXT because the two roles name lots differently: an IBKR
+    lot is ``str(conid)`` (what the IBKR portfolio source mints, so the re-key
+    keeps every existing row's identity), a sim lot the broker's synthetic
+    ``SYM_<ts>_<seq>`` id.
+    """
+
     scope = TextField()
-    conid = IntegerField()
+    position_id = TextField()
     symbol = TextField()
     side = TextField()
     qty = FloatField()
     entry_price = FloatField()
-    opened_at = IntegerField(null=True)
-    closed_at = IntegerField(null=True)
     stop_loss = FloatField(null=True)
     take_profit = FloatField(null=True)
     tag = TextField(default="")
     order_ref = TextField(default="")
+    opened_at = IntegerField(null=True)
+    closed_at = IntegerField(null=True)
+    #: The entry/exit legs' fees (sim fill detail; NULL when unknown).
+    entry_commission = FloatField(null=True)
+    exit_price = FloatField(null=True)
+    exit_commission = FloatField(null=True)
+    source = TextField(null=False, default=SOURCE_ACCOUNT)
 
     class Meta:
         table_name = "live_position"
-        primary_key = CompositeKey("scope", "conid")
+        primary_key = CompositeKey("scope", "position_id")
         indexes = ((("scope", "closed_at"), False),)
 
 
 class LiveExecution(_Base):
     scope = TextField()
     execution_id = TextField()
-    conid = IntegerField()
+    #: The lot this fill belongs to (``str(conid)`` for IBKR; a sim lot's id).
+    position_id = TextField(default="")
     side = TextField()
     qty = FloatField()
     price = FloatField()
@@ -134,6 +180,21 @@ class LiveCash(_Base):
 
     class Meta:
         table_name = "live_cash"
+
+
+class LiveScopeAlias(_Base):
+    """Migration audit: the scope a legacy book moved to (plan §4.4 step 4).
+
+    Written once per re-keyed scope so a read can follow a bare legacy scope to
+    the charged one; the rows themselves are re-keyed in every live table, never
+    dropped.
+    """
+
+    legacy_scope = TextField(primary_key=True)
+    new_scope = TextField()
+
+    class Meta:
+        table_name = "live_scope_alias"
 
 
 class LiveOrderIntent(_Base):
@@ -170,7 +231,7 @@ _MODELS = (
     LivePosition,
     LiveExecution,
     LiveCash,
-    LiveSimLot,
+    LiveScopeAlias,
     LiveOrderIntent,
 )
 
@@ -196,14 +257,15 @@ class StrategyAudit:
 class ExecutionRecord:
     """One stored fill (``live_execution``) projected for the report.
 
-    ``live_execution`` stores ``conid`` but no symbol, so ``symbol`` is resolved
-    from the scope's book rows (the conid's symbol, ``""`` when no row remains).
-    ``ts`` is the fill's UTC instant.
+    ``live_execution`` stores ``position_id`` but no symbol, so ``symbol`` is
+    resolved from the scope's book rows (the lot's symbol, ``""`` when no row
+    remains). ``ts`` is the fill's UTC instant.
     """
 
     scope: str
     execution_id: str
-    #: ``None`` for a sim fill: a sim lot has no conid, so nothing to key on.
+    #: ``None`` for a sim fill (a sim lot has no conid). IBKR rows derive it from
+    #: the stored ``position_id``.
     conid: int | None
     symbol: str
     side: str
@@ -212,6 +274,49 @@ class ExecutionRecord:
     commission: float
     cash_delta: float
     ts: pd.Timestamp | None
+    #: The lot this fill belongs to, in the BOOK's id space: ``str(conid)`` for an
+    #: IBKR row, the sim lot's own minted id for a sim row. This is the fold key
+    #: ``book_from_executions`` groups on; ``conid`` cannot serve (it is ``None``
+    #: for every sim fill, which would merge a symbol's whole sim book into one lot).
+    #: Last and defaulted so an existing caller that only knows the conid still
+    #: constructs.
+    position_id: str = ""
+
+
+@dataclass(frozen=True)
+class SimLot:
+    """One sim lot: the minted ``position_id``, its entry, and its exit (when closed).
+
+    The detail is optional because a row may predate it (an ownership-only
+    record): ``symbol``/``side``/``qty``/``entry_price`` are ``None`` then, so a
+    caller can always tell "we own it" from "we know what it is" rather than
+    reading an invented size as a real one. ``exit_price``/``exit_commission``
+    are set only by a close, which is what makes the row a completed round trip.
+    """
+
+    position_id: str
+    symbol: str | None = None
+    side: str | None = None
+    qty: float | None = None
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    tag: str | None = None
+    opened_at: pd.Timestamp | None = None
+    entry_commission: float | None = None
+    exit_price: float | None = None
+    exit_commission: float | None = None
+    closed_at: pd.Timestamp | None = None
+
+    @property
+    def has_detail(self) -> bool:
+        """Whether this row carries the lot's own size and entry."""
+        return bool(self.symbol) and self.qty is not None
+
+    @property
+    def is_open(self) -> bool:
+        """Whether the lot is still held (no exit recorded)."""
+        return self.closed_at is None
 
 
 #: The terminal (closed) intent states ``prune`` is allowed to delete.
@@ -241,7 +346,6 @@ class MetadataStore(_SqliteOps):
                 LivePosition,
                 LiveExecution,
                 LiveOrderIntent,
-                LiveSimLot,
             ):
                 try:
                     rows = model.select(model.scope).distinct().execute()
@@ -267,6 +371,7 @@ class MetadataStore(_SqliteOps):
         wedge every config edit. Give the other config its own ``scope``.
         """
         with self._write():
+            scope = _alias_scope(self._database, scope)
             others = (
                 LiveStrategy.select(LiveStrategy.strategy_id)
                 .where(
@@ -295,6 +400,7 @@ class MetadataStore(_SqliteOps):
     def ensure_cash(self, scope: str, initial_capital: float) -> None:
         """Record the scope's ``initial_capital`` once; a later cycle never resets it."""
         with self._write():
+            scope = _alias_scope(self._database, scope)
             LiveCash.insert(
                 scope=scope,
                 initial_capital=initial_capital,
@@ -315,6 +421,7 @@ class MetadataStore(_SqliteOps):
         like the book reads; any OTHER ``OperationalError`` is a genuine read
         failure and raises :class:`LedgerReadError` rather than reporting nothing.
         """
+        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
@@ -331,25 +438,36 @@ class MetadataStore(_SqliteOps):
 
 
 class BookStore(_SqliteOps):
-    """Ledger mixin: the conid-keyed book, its executions and its cash seed."""
+    """Ledger mixin: the IBKR reconcile book, its executions and its cash seed.
+
+    This mixin owns the ``source='executions'`` ROLE of ``live_position`` — the
+    fold of our own fills that ``trades.reconcile`` advances. The sim's
+    ``source='account'`` role is :class:`SimLotStore`; keeping the roles on
+    distinct ``source`` values is what stops one adapter's rows from
+    double-counting as the other's (the two never share a scope either).
+    """
 
     def sim_lots(self, scope: str) -> tuple[SimLot, ...]:
-        """Every sim lot for *scope*: provided by :class:`SimLotBook`.
+        """Every sim lot for *scope*: provided by :class:`SimLotStore`.
 
-        Declared here so this mixin's cash/execution reads can compose the sim
-        book with the conid book; the concrete ledger inherits ``SimLotBook``
+        Declared here so this mixin's execution/cash reads can compose the sim
+        book with the fill fold; the concrete ledger inherits ``SimLotStore``
         FIRST, so this stub is never the one that runs.
         """
         raise NotImplementedError
 
     def load_book(self, scope: str) -> StrategyBook:
         """The durable rows + applied execution ids for *scope* (empty if unaware)."""
+        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
                     LivePosition.select()
-                    .where(LivePosition.scope == scope)
-                    .order_by(LivePosition.conid)
+                    .where(
+                        (LivePosition.scope == scope)
+                        & (LivePosition.source == SOURCE_EXECUTIONS)
+                    )
+                    .order_by(LivePosition.position_id)
                     .execute()
                 )
                 applied = {
@@ -380,13 +498,14 @@ class BookStore(_SqliteOps):
         the cash ledger accumulates each fill exactly once even across re-runs.
         """
         with self._write():
+            scope = _alias_scope(self._database, scope)
             LiveCash.insert(
                 scope=scope,
                 initial_capital=initial_capital,
                 updated_at=_ms(pd.Timestamp.now()),
             ).on_conflict("IGNORE").execute()
             for row in book.rows:
-                LivePosition.insert(**_book_fields(row)).on_conflict(
+                LivePosition.insert(**_book_fields(scope, row)).on_conflict(
                     "REPLACE"
                 ).execute()
             for execution in executions:
@@ -397,7 +516,7 @@ class BookStore(_SqliteOps):
                 LiveExecution.insert(
                     scope=scope,
                     execution_id=execution.execution_id,
-                    conid=execution.conid,
+                    position_id=str(execution.conid),
                     side=execution.side.value,
                     qty=execution.qty,
                     price=execution.price,
@@ -410,17 +529,18 @@ class BookStore(_SqliteOps):
         """Stored fill history for *scope*, oldest first (empty if unwritten).
 
         One :class:`ExecutionRecord` per applied fill, `ts` ascending, with
-        `symbol` resolved from the conid's book row (`""` when none remains). A
+        `symbol` resolved from the lot's book row (`""` when none remains). A
         missing table (a never-written scope) reads as empty; a genuine read
         failure raises :class:`LedgerReadError`.
         """
+        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 symbols = {
-                    int(row.conid): cast("str", row.symbol)
+                    cast("str", row.position_id): cast("str", row.symbol)
                     for row in LivePosition.select(
-                        LivePosition.conid, LivePosition.symbol
-                    )
+                        LivePosition.position_id, LivePosition.symbol
+                    ).where(LivePosition.scope == scope)
                 }
                 rows = (
                     LiveExecution.select()
@@ -435,7 +555,7 @@ class BookStore(_SqliteOps):
         return tuple(_model_to_execution(row, symbols) for row in rows)
 
     def sim_executions(self, scope: str) -> tuple[ExecutionRecord, ...]:
-        """The sim path's fill history for *scope*, oldest first (empty if none).
+        """The sim path's fills for *scope* that no stored execution row already holds.
 
         The sim has no execution stream to replay, so its OWN lot book is the
         record: each lot contributes an entry fill and, once closed, an exit
@@ -443,14 +563,18 @@ class BookStore(_SqliteOps):
         ``_flows``/commission/realized math the IBKR fills feed — instead of a
         book with no fills at all (which reads an open lot's cost as profit).
 
-        ``conid`` is ``None``: a sim lot has no conid, so the symbol is carried
-        directly, and the ``execution_id`` is the minted ``position_id`` plus the
-        leg it names.
+        A fill :meth:`record_results` already persisted is SKIPPED (both paths
+        mint the same ``<pid>:open``/``:close`` id), so a recorded fill counts ONCE
+        — the derived view and the stored rows are two views of one book, never
+        two books. ``conid`` is ``None``: a sim lot has no conid, so the symbol is
+        carried directly.
         """
+        stored = {record.execution_id for record in self.executions_of(scope)}
         return tuple(
             record
             for lot in self.sim_lots(scope)
             for record in _sim_fill_records(scope, lot)
+            if record.execution_id not in stored
         )
 
     def sim_cash_delta(self, scope: str) -> float:
@@ -463,9 +587,10 @@ class BookStore(_SqliteOps):
         The stored ``initial_capital`` (first cycle's config value) wins; a scope
         with no stored row falls back to *default_initial*. Never reads the
         account summary: N strategies share one account's cash. Both books
-        contribute: the conid book's stored fills AND the sim lot book, so a sim
-        scope's cash tracks its own fills exactly as a real one's does.
+        contribute: the stored fills AND the sim lot book, so a sim scope's cash
+        tracks its own fills exactly as a real one's does.
         """
+        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 cash = LiveCash.get_or_none(LiveCash.scope == scope)
@@ -486,6 +611,7 @@ class BookStore(_SqliteOps):
         return initial + float(sunk) + self.sim_cash_delta(scope)
 
     def initial_capital_of(self, scope: str) -> float:
+        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 cash = LiveCash.get_or_none(LiveCash.scope == scope)
@@ -514,16 +640,22 @@ class BookStore(_SqliteOps):
         """Signed net quantity the book holds on *conid*, summed over ALL scopes.
 
         Long rows add, short rows subtract, so the result is the net a broker
-        account would show if every booked fill were the whole story. A missing
-        table reads as a flat (0.0) book — the dry-run case; a genuine read
-        failure still raises (:class:`LedgerReadError`), never a silent zero.
+        account would show if every booked fill were the whole story. Only the
+        ``executions`` ROLE counts: the id space is a conid's, and an ``account``
+        role row (a sim lot, keyed by a minted id) is not a conid at all —
+        including it would inflate the net this guard reconciles against the
+        broker, which is what gates a close refusal. A missing table reads as a
+        flat (0.0) book — the dry-run case; a genuine read failure still raises
+        (:class:`LedgerReadError`), never a silent zero.
         """
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
                     LivePosition.select(LivePosition.side, LivePosition.qty)
                     .where(
-                        (LivePosition.conid == conid) & LivePosition.closed_at.is_null()
+                        (LivePosition.position_id == str(conid))
+                        & (LivePosition.source == SOURCE_EXECUTIONS)
+                        & LivePosition.closed_at.is_null()
                     )
                     .execute()
                 )
@@ -534,6 +666,235 @@ class BookStore(_SqliteOps):
         return sum(
             float(row.qty) if row.side == "long" else -float(row.qty) for row in rows
         )
+
+
+class SimLotStore(_SqliteOps):
+    """Ledger mixin: the sim/mock lot book, in ``live_position source='account'``.
+
+    The sim/mock broker mints its own ``position_id`` (``SYM_{ts}_{seq}``) and the
+    mock fixture may hold lots the strategy never opened, so the sim path needs
+    its own durable record of what it holds. It shares the ONE book table with the
+    IBKR reconcile book; ``source`` keeps the two roles apart (and the scope
+    embeds the adapter, so they never share a scope either).
+
+    Ownership (an OPEN row) also scopes a sim close: only a lot the strategy
+    OPENED is closable, so an exogenous fixture lot is left alone. Keyed by
+    ``scope`` — a STABLE identity — so a config edit does not orphan open lots.
+    """
+
+    def record_sim_lot(self, scope: str, lot: SimLot) -> None:
+        """Record a sim lot the strategy just opened (resurrects a closed one)."""
+        with self._write():
+            scope = _alias_scope(self._database, scope)
+            LivePosition.insert(
+                scope=scope,
+                position_id=lot.position_id,
+                symbol=lot.symbol or "",
+                side=lot.side or "",
+                qty=0.0 if lot.qty is None else lot.qty,
+                entry_price=0.0 if lot.entry_price is None else lot.entry_price,
+                stop_loss=lot.stop_loss,
+                take_profit=lot.take_profit,
+                tag=lot.tag or "",
+                opened_at=None if lot.opened_at is None else _ms(lot.opened_at),
+                closed_at=None if lot.closed_at is None else _ms(lot.closed_at),
+                entry_commission=lot.entry_commission,
+                exit_price=lot.exit_price,
+                exit_commission=lot.exit_commission,
+                source=SOURCE_ACCOUNT,
+            ).on_conflict("REPLACE").execute()
+
+    def record_sim_open(self, scope: str, position_id: str) -> None:
+        """Record an ownership-only sim lot (no fill detail), never clobbering one.
+
+        A row that already carries detail is only re-opened, so a caller that
+        knows less than the store never erases what it holds.
+        """
+        with self._write():
+            scope = _alias_scope(self._database, scope)
+            reopened = (
+                LivePosition.update(closed_at=None)
+                .where(
+                    (LivePosition.scope == scope)
+                    & (LivePosition.position_id == position_id)
+                    & (LivePosition.source == SOURCE_ACCOUNT)
+                )
+                .execute()
+            )
+            if not reopened:
+                LivePosition.insert(
+                    scope=scope,
+                    position_id=position_id,
+                    symbol="",
+                    side="",
+                    qty=0.0,
+                    entry_price=0.0,
+                    tag="",
+                    closed_at=None,
+                    source=SOURCE_ACCOUNT,
+                ).execute()
+
+    def mark_sim_closed(
+        self,
+        scope: str,
+        position_id: str,
+        closed_at: pd.Timestamp,
+        exit_price: float | None = None,
+        commission: float | None = None,
+    ) -> None:
+        """Stamp a sim lot closed, with the exit leg when the edge reported one.
+
+        An unknown id is a no-op. Re-marking an already-closed lot is
+        IDEMPOTENT: a close that does not say what it exited at never erases an
+        exit already recorded.
+        """
+        with self._write():
+            scope = _alias_scope(self._database, scope)
+            fields: dict[str, object] = {"closed_at": _ms(closed_at)}
+            if exit_price is not None:
+                fields["exit_price"] = exit_price
+            if commission is not None:
+                fields["exit_commission"] = commission
+            LivePosition.update(**fields).where(
+                (LivePosition.scope == scope)
+                & (LivePosition.position_id == position_id)
+                & (LivePosition.source == SOURCE_ACCOUNT)
+            ).execute()
+
+    def sim_lots(self, scope: str) -> tuple[SimLot, ...]:
+        """Every sim lot this scope ever opened, oldest first (empty if unwritten)."""
+        scope = _alias_scope(self._database, scope)
+        try:
+            with self._database.bind_ctx(_MODELS):
+                rows = (
+                    LivePosition.select()
+                    .where(
+                        (LivePosition.scope == scope)
+                        & (LivePosition.source == SOURCE_ACCOUNT)
+                    )
+                    .order_by(LivePosition.opened_at, LivePosition.position_id)
+                    .execute()
+                )
+        except peewee.OperationalError as exc:
+            if not _is_missing_table(exc):
+                raise LedgerReadError(str(exc)) from exc
+            return ()
+        return tuple(_sim_lot(row) for row in rows)
+
+    def sim_open_lots(self, scope: str) -> tuple[SimLot, ...]:
+        """The OPEN sim lots this scope owns, oldest first (empty if unwritten)."""
+        return tuple(lot for lot in self.sim_lots(scope) if lot.is_open)
+
+    def sim_open_ids(self, scope: str) -> frozenset[str]:
+        """The sim lot ids this scope currently owns (empty if unwritten)."""
+        return frozenset(lot.position_id for lot in self.sim_open_lots(scope))
+
+    def record_results(
+        self,
+        scope: str,
+        results: tuple[OrderResult, ...],
+        now: pd.Timestamp,
+    ) -> None:
+        """Record a cycle's placement results into the book — the ONE write point.
+
+        The engine hands over what the adapter RETURNED (adapters hold no book),
+        so this mirrors the pre-seam ``_record_owned`` semantics: a failed or
+        rejected result records nothing, an OPEN upserts the account lot with the
+        fill's detail (an unnamed open can never be targeted by a close, so it
+        records nothing), and a CLOSE marks the targeted lot closed without
+        erasing an exit already recorded.
+
+        Each touched lot's implied fills are ALSO persisted into
+        ``live_execution``, so the ledger holds the same fill rows a real broker
+        would replay while :meth:`sim_executions` skips what is already stored.
+        """
+        for result in results:
+            if not result.ok:
+                continue
+            intent = result.intent
+            if intent.action is ActionType.close:
+                if not intent.position_id:
+                    continue
+                self.mark_sim_closed(
+                    scope,
+                    intent.position_id,
+                    now,
+                    exit_price=result.fill.executed_price if result.fill else None,
+                    commission=result.fill.commission if result.fill else None,
+                )
+                pid = intent.position_id
+            else:
+                if not result.position_id:
+                    continue
+                self.record_sim_lot(scope, _result_lot(result))
+                pid = result.position_id
+            for record in self._fills_of(scope, pid):
+                self._insert_execution(record)
+
+    def _fills_of(self, scope: str, position_id: str) -> tuple[ExecutionRecord, ...]:
+        """The fills the stored lot with *position_id* now implies (empty if none)."""
+        for lot in self.sim_lots(scope):
+            if lot.position_id == position_id:
+                return _sim_fill_records(scope, lot)
+        return ()
+
+    def _insert_execution(self, record: ExecutionRecord) -> None:
+        """Persist one already-derived fill row, keyed so a re-run is a no-op."""
+        with self._write():
+            LiveExecution.insert(
+                scope=record.scope,
+                execution_id=record.execution_id,
+                position_id=record.position_id,
+                side=record.side,
+                qty=record.qty,
+                price=record.price,
+                commission=record.commission,
+                cash_delta=record.cash_delta,
+                ts=0 if record.ts is None else _ms(record.ts),
+            ).on_conflict("IGNORE").execute()
+
+
+def _result_lot(result: OrderResult) -> SimLot:
+    """The lot an OPEN fill created, from the fill and the intent behind it.
+
+    A result with no fill still records the lot (ownership is never lost to
+    missing detail): size and entry simply stay unknown, and the row reads as an
+    ownership-only one rather than inventing a position.
+    """
+    fill = result.fill
+    return SimLot(
+        position_id=cast("str", result.position_id),
+        symbol=result.intent.symbol,
+        side=result.intent.action.value,
+        qty=fill.filled_qty if fill is not None else None,
+        entry_price=fill.executed_price if fill is not None else None,
+        stop_loss=result.intent.stop_loss,
+        take_profit=result.intent.take_profit,
+        tag=result.intent.tag or None,
+        opened_at=fill.timestamp if fill is not None else None,
+        entry_commission=fill.commission if fill is not None else None,
+    )
+
+
+def _sim_lot(row: LivePosition) -> SimLot:
+    """Project one stored lot row. An ownership-only row (no symbol) reads bare."""
+    symbol = cast("str", row.symbol)
+    detail = bool(symbol)
+    return SimLot(
+        position_id=cast("str", row.position_id),
+        symbol=symbol if detail else None,
+        side=cast("str", row.side) if detail else None,
+        qty=cast("float", row.qty) if detail else None,
+        entry_price=cast("float", row.entry_price) if detail else None,
+        stop_loss=cast("float | None", row.stop_loss),
+        take_profit=cast("float | None", row.take_profit),
+        tag=cast("str | None", row.tag) or None,
+        opened_at=_ts(cast("int | None", row.opened_at)),
+        entry_commission=cast("float | None", row.entry_commission),
+        exit_price=cast("float | None", row.exit_price),
+        exit_commission=cast("float | None", row.exit_commission),
+        closed_at=_ts(cast("int | None", row.closed_at)),
+    )
 
 
 class IntentStore(_SqliteOps):
@@ -549,6 +910,7 @@ class IntentStore(_SqliteOps):
 
     def load(self, key: IntentKey) -> IntentRecord | None:
         """The durable record for *key*, or ``None`` when unwritten."""
+        key = self._key(key)
         try:
             with self._database.bind_ctx(_MODELS):
                 row = LiveOrderIntent.get_or_none(self._intent_predicate(key))
@@ -560,6 +922,7 @@ class IntentStore(_SqliteOps):
 
     def load_open(self, scope: str) -> tuple[IntentRecord, ...]:
         """Every OPEN record for *scope* (empty if unwritten)."""
+        scope = _alias_scope(self._database, scope)
         states = [s.value for s in OPEN_STATES]
         try:
             with self._database.bind_ctx(_MODELS):
@@ -584,6 +947,7 @@ class IntentStore(_SqliteOps):
         trail (filled / unfilled / rejected included) is what the report shows.
         A missing table reads as empty; a genuine read failure raises.
         """
+        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
@@ -606,6 +970,7 @@ class IntentStore(_SqliteOps):
         coexist under distinct identities (D7).
         """
         with self._write():
+            record = self._record(record)
             LiveOrderIntent.insert(**_intent_fields(record)).on_conflict(
                 "REPLACE"
             ).execute()
@@ -650,9 +1015,20 @@ class IntentStore(_SqliteOps):
         if order_id is not None:
             fields["order_id"] = order_id
         with self._write():
+            key = self._key(key)
             LiveOrderIntent.update(**fields).where(
                 self._intent_predicate(key)
             ).execute()
+
+    def _key(self, key: IntentKey) -> IntentKey:
+        """*key* re-pointed at its scope's alias-resolved name (migration re-key)."""
+        scope = _alias_scope(self._database, key.scope)
+        return key if scope == key.scope else replace(key, scope=scope)
+
+    def _record(self, record: IntentRecord) -> IntentRecord:
+        """*record* re-pointed at its scope's alias-resolved name."""
+        key = self._key(record.key)
+        return record if key == record.key else replace(record, key=key)
 
     @staticmethod
     def _intent_predicate(key: IntentKey):
@@ -677,7 +1053,7 @@ class IntentStore(_SqliteOps):
             )
 
 
-class SqliteLedger(MetadataStore, SimLotBook, BookStore, IntentStore):
+class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
     """peewee-backed per-scope book. One database per ledger, bound on init.
 
     Construction writes NOTHING (no DDL): a ``--dry-run`` that only reads must
@@ -716,10 +1092,11 @@ class SqliteLedger(MetadataStore, SimLotBook, BookStore, IntentStore):
         if self._schema_ready:
             return
         with self._database.atomic(lock_type="IMMEDIATE"):
-            legacy_intents = migrate(self._database)
+            legacy = migrate(self._database)
             self._database.create_tables(_MODELS)
-            if legacy_intents is not None:
-                _restore_intents(self._database, legacy_intents)
+            _restore_positions(self._database, legacy)
+            if legacy.intents is not None:
+                _restore_intents(self._database, legacy.intents)
         self._schema_ready = True
 
     @contextmanager
@@ -730,16 +1107,20 @@ class SqliteLedger(MetadataStore, SimLotBook, BookStore, IntentStore):
             with self._database.atomic():
                 yield
 
-    def cycle_lease(self) -> AbstractContextManager[None]:
-        """Exclusive cross-process lease on this ledger's DB for a full cycle.
+    def cycle_lease(self, scope: str = "") -> AbstractContextManager[None]:
+        """Exclusive cross-process lease for ONE scope's cycle on this DB.
 
         Held for the cycle's duration so a cron overlap or a racing human run
         REFUSES to start rather than both placing off the same pre-order book.
-        The kernel drops the flock on process exit, so a crashed run never
-        wedges live trading; there is no TTL.
+        The lock is PER SCOPE (``<db>.<scope_tag>.cycle.lock``), so two adapters
+        — or two configs — run CONCURRENTLY without blocking each other, while
+        two cycles on the SAME scope still serialize. The kernel drops the flock
+        on process exit, so a crashed run never wedges live trading; there is no
+        TTL. Single host / local filesystem only (the caveat ``lease`` documents).
         """
         path = self._db_path if self._db_path is not None else _DEFAULT_DB_PATH
-        return file_lease(f"{path}.cycle.lock")
+        tag = scope_tag(scope) if scope else "global"
+        return file_lease(str(path), tag)
 
 
 def config_hash(config: Mapping[str, object]) -> str:
@@ -818,6 +1199,7 @@ def _sim_fill(
         scope=scope,
         execution_id=execution_id,
         conid=None,
+        position_id=lot.position_id,
         symbol=lot.symbol or "",
         side=side.value,
         qty=qty,
@@ -887,10 +1269,16 @@ def _model_to_intent(row: LiveOrderIntent) -> IntentRecord:
     )
 
 
-def _book_fields(row: BookRow) -> dict[str, object]:
+def _book_fields(scope: str, row: BookRow) -> dict[str, object]:
+    """One reconciled ``BookRow`` as ``live_position`` fields (the executions role).
+
+    ``scope`` comes from the caller, not ``row``: ``reconcile`` stamps the row's
+    ``scope`` but the ledger's alias-resolved scope is the authority (a legacy
+    scope re-keyed at migration must be written under its new name).
+    """
     return {
-        "scope": row.scope,
-        "conid": row.conid,
+        "scope": scope,
+        "position_id": str(row.conid),
         "symbol": row.symbol,
         "side": row.side,
         "qty": row.qty,
@@ -901,19 +1289,21 @@ def _book_fields(row: BookRow) -> dict[str, object]:
         "take_profit": row.take_profit,
         "tag": row.tag,
         "order_ref": row.order_ref,
+        "source": SOURCE_EXECUTIONS,
     }
 
 
 def _model_to_execution(
-    row: LiveExecution, symbols: Mapping[int, str]
+    row: LiveExecution, symbols: Mapping[str, str]
 ) -> ExecutionRecord:
-    """Project a stored execution, resolving its symbol from *symbols* (conid space)."""
-    conid = int(cast("int", row.conid))
+    """Project a stored execution, resolving its symbol from *symbols* (lot id)."""
+    position_id = cast("str", row.position_id)
     return ExecutionRecord(
         scope=cast("str", row.scope),
         execution_id=cast("str", row.execution_id),
-        conid=conid,
-        symbol=symbols.get(conid, ""),
+        conid=_conid_of(position_id),
+        position_id=position_id,
+        symbol=symbols.get(position_id, ""),
         side=cast("str", row.side),
         qty=float(cast("float", row.qty)),
         price=float(cast("float", row.price)),
@@ -923,10 +1313,27 @@ def _model_to_execution(
     )
 
 
+def _conid_of(position_id: str) -> int | None:
+    """The conid a lot id names, or ``None`` when it is not an IBKR conid.
+
+    ``live_position.position_id`` is TEXT and carries either ``str(conid)`` (the
+    IBKR executions role) or a sim lot id, so a non-numeric id is a legitimate
+    sim row rather than an error.
+    """
+    return int(position_id) if position_id.isdigit() else None
+
+
 def _model_to_book(row: LivePosition) -> BookRow:
+    conid = _conid_of(cast("str", row.position_id))
+    if conid is None:
+        raise LedgerReadError(
+            f"live_position row {cast('str', row.position_id)!r} in scope "
+            f"{cast('str', row.scope)!r} is not an IBKR conid; the executions "
+            "book cannot read it"
+        )
     return BookRow(
         scope=cast("str", row.scope),
-        conid=int(cast("int", row.conid)),
+        conid=conid,
         symbol=cast("str", row.symbol),
         side=cast("str", row.side),
         qty=float(cast("float", row.qty)),

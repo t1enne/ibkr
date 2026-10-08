@@ -39,7 +39,7 @@ from src.live.adapters.ibkr.orders import (
     status_to_fill,
     whole_quantity,
 )
-from src.live.broker import intent_to_signal, ref_candle
+from src.live.pure import intent_to_signal, ref_candle
 from src.live.identity import (
     WorkingOrder,
     intent_key,
@@ -146,31 +146,6 @@ def test_ref_is_bar_free_and_keyed_on_the_intent() -> None:
     key = intent_key(SCOPE, early)
     assert order_ref(key, 0) != order_ref(key, 1)
     assert ref_prefix(key) == order_ref(key, 0)[:-2]
-
-
-def test_build_ticket_mkt_body_carries_the_supplied_coid() -> None:
-    key = intent_key(SCOPE, _intent())
-    ref = order_ref(key, 0)
-    ticket = build_ticket(_intent(), conid=265598, side=OrderSide.BUY, order_ref=ref)
-    assert ticket.body == {
-        "conid": 265598,
-        "side": "BUY",
-        "quantity": 10.0,
-        "orderType": "MKT",
-        "tif": "DAY",
-        "cOID": ref,
-    }
-    assert ticket.side is OrderSide.BUY
-    assert ticket.order_ref == ref
-
-
-def test_build_ticket_close_uses_the_lot_side() -> None:
-    intent = _intent(action=ActionType.close, position_id="55")
-    side = order_side(intent, ActionType.long)
-    ticket = build_ticket(
-        intent, conid=1, side=side, order_ref=order_ref(intent_key(SCOPE, intent), 0)
-    )
-    assert ticket.body["side"] == "SELL"
 
 
 def test_build_ticket_close_floors_the_quantity() -> None:

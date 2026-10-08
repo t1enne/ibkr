@@ -27,7 +27,6 @@ from typing import cast
 import pandas as pd
 
 from src.bt.cmds._shared import _json_default
-from src.bt.state import PortfolioState, Position
 from src.shared.style import PLAIN, Role, Styler
 from src.bt.table import Col, Table, render
 from src.data.ibkr.client import IbkrClient
@@ -36,10 +35,7 @@ from src.live.adapters.ibkr.mapping import IbkrPosition, parse_positions, parse_
 from src.live.adapters.ibkr.orders import parse_working_order
 from src.live.identity import IntentRecord, WorkingOrder
 from src.live.ledger import ExecutionRecord, SqliteLedger, StrategyAudit
-from src.live.ledger_sim import SimLot
-from src.live.portfolio_source import MockPortfolioSource
-from src.live.result import Err
-from src.live.types import FeedError, LiveConfig
+from src.live.ledger import SimLot
 
 #: The side label a signed quantity reduces to; the broker side and the store
 #: side both use it so a long/short lot compares directly.
@@ -203,60 +199,40 @@ def _sim_store_lot(lot: SimLot) -> StoreLot:
     )
 
 
-async def read_sim_broker(cfg: LiveConfig, owned_ids: frozenset[str]) -> BrokerSide:
-    """Read the sim/mock fixture as the broker side (no network).
+def read_sim_broker(ledger: SqliteLedger, scope: str) -> BrokerSide:
+    """Read the sim ACCOUNT book from the store itself (no fixture, no network).
 
-    The fixture is the mock book, so a lot's ``id`` is its ``position_id`` and its
-    side lives on ``Position.type`` (a fixture lot the strategy never opened is
-    marked ``owned=False``, not ours). A fixture read failure is carried as a
-    warning, never raised — the store side still renders.
+    ``source='account'`` rows are the human-editable side of the sim book; the
+    scope's own account rows are all ours (the scope embeds the adapter, so no
+    foreign strategy shares it), so every lot is ``owned=True``. A row with no
+    detail names a lot we own but cannot describe — it is skipped, exactly as the
+    adapter's account-book read skips it. ``source`` names the STORE, not a path:
+    the sim book is sqlite now.
     """
-    source = MockPortfolioSource(cfg.portfolio_path)
-    fetched = await source.fetch()
-    if isinstance(fetched, Err):
-        error = cast("FeedError", fetched.error)
-        return BrokerSide(
-            adapter="sim",
-            source=cfg.portfolio_path,
-            account="",
-            net_liquidation=None,
-            cash=None,
-            positions=(),
-            working_orders=(),
-            ours_orders=(),
-            warnings=(error.message,),
-        )
-    portfolio = fetched.value.portfolio
     lots = tuple(
         BrokerLot(
-            symbol=pos.symbol,
-            id=pos.position_id,
-            qty=pos.qty,
-            side=pos.type.value,
-            avg_cost=pos.entry_price,
-            last_price=pos.last_price,
-            market_value=pos.qty * pos.last_price,
-            owned=pos.position_id in owned_ids,
+            symbol=lot.symbol or "",
+            id=lot.position_id,
+            qty=lot.qty or 0.0,
+            side=lot.side or "",
+            avg_cost=lot.entry_price or 0.0,
+            last_price=lot.entry_price or 0.0,
+            market_value=(lot.qty or 0.0) * (lot.entry_price or 0.0),
+            owned=True,
         )
-        for pos in _sim_positions(portfolio)
+        for lot in ledger.sim_open_lots(scope)
+        if lot.has_detail
     )
     return BrokerSide(
         adapter="sim",
-        source=cfg.portfolio_path,
+        source=ledger.db_path,
         account="",
         net_liquidation=None,
-        cash=portfolio.cash,
+        cash=ledger.cash_of(scope),
         positions=lots,
         working_orders=(),
         ours_orders=(),
         warnings=(),
-    )
-
-
-def _sim_positions(portfolio: PortfolioState) -> tuple[Position, ...]:
-    """Flatten a ``PortfolioState``'s per-symbol lot tuples in symbol order."""
-    return tuple(
-        pos for sym in sorted(portfolio.positions) for pos in portfolio.positions[sym]
     )
 
 

@@ -1,6 +1,6 @@
 """Shared plumbing for the sqlite ledger and its mixins.
 
-The ledger's models and behaviour are split across modules (``ledger_sim``,
+The ledger's models and behaviour are split across modules (``ledger`` and
 ``ledger_migration``) so each class stays under the repo's size budget. This
 module owns the pieces ALL of them need and that have no natural home: the peewee
 template binding, the base model, the read-failure type, the raw ``sqlite_master``
@@ -33,8 +33,8 @@ class _Base(Model):
 class _SqliteOps:
     """The per-instance seam the ledger mixins build on: a bound db + write txn.
 
-    Declared here so the model-group mixins (``ledger_sim``, and the book/intent
-    mixins in ``ledger``) can call ``self._write()`` without importing the
+    Declared here so the model-group mixins (the book/intent mixins in
+    ``ledger``) can call ``self._write()`` without importing the
     concrete ``SqliteLedger`` (which would be circular). The concrete ledger
     supplies both; the stubs are never reached.
     """

@@ -1,9 +1,14 @@
-"""Live cycle orchestration — one batch pass: fetch pf → screen → reconcile → place → record.
+"""Live cycle orchestration — one batch pass: read book → screen → reconcile → place → record.
 
 Not a loop. The caller (CLI / cron) drives cadence. All I/O sits at the edges
-(``PortfolioSource``, ``LiveBroker``, the screen bridge); ``reconcile`` and
-``build_report`` are pure. A cycle fails loudly on a stale feed or an
-unfetchable portfolio rather than trading yesterday's intent.
+(the ``LiveAdapter`` seam, the screen bridge); ``reconcile`` and ``build_report``
+are pure. A cycle fails loudly on a stale feed or an unreadable book rather than
+trading yesterday's intent.
+
+The engine depends on ONE backend seam (:class:`src.live.adapter.LiveAdapter`) and
+one ledger capability set (:class:`CycleLedger`); the book travels INTO the
+adapter as a parameter and the results come back OUT, so no adapter holds state
+between cycles and the ledger stays the single durable book.
 """
 
 from __future__ import annotations
@@ -15,12 +20,13 @@ from typing import Protocol, cast
 
 import pandas as pd
 
-from src.bt.state import ActionType, PortfolioState
+from src.bt.state import PortfolioState
 from src.data.db import get_connection
-from src.live.broker import LiveBroker, OrderResult
+from src.live.adapter import LiveAdapter
+from src.live.pure import OrderResult
+from src.live.divergence import Divergence, book_from_executions, guard_divergence
 from src.live.identity import OrderOutcome
-from src.live.ledger_sim import SimLot
-from src.live.portfolio_source import PortfolioSource
+from src.live.ledger import ExecutionRecord
 from src.live.reconcile import reconcile
 from src.live.result import Err, Ok, Result
 from src.live.signals import live_signals
@@ -31,6 +37,7 @@ from src.live.types import (
     LiveConfig,
     LiveSignal,
     OrderIntent,
+    PortfolioSnapshot,
 )
 
 
@@ -54,27 +61,41 @@ class CycleReport:
     #: this, a HOLD cycle with no intents reports a clean "0 orders" while every
     #: OPEN intent was never re-checked. ``None`` when resync succeeded.
     resync_error: FeedError | None = None
+    #: Every lot our fill fold and the account book disagree on (plan §4.3). Our
+    #: book is ``book_from_executions`` (append-only, engine-owned); the account's
+    #: is what the adapter READ. A manual edit, an untracked entry or a lot we
+    #: booked that the account lacks lands here — the operator resolves it, the
+    #: engine never silently re-sizes onto the account's number.
+    divergences: tuple[Divergence, ...] = ()
 
     def is_unsafe(self) -> bool:
         """Whether this cycle failed to safely do its job (the exit-code predicate).
 
         The ONE definition of "unsafe", so the CLI's exit code cannot drift from
         the report it prints. A cycle is unsafe when placement or resync reported
-        a cohort-level error, or when any order result is in a state that leaves
-        the order's true disposition unknown or stuck:
+        a cohort-level error, when the two books disagree on any lot, or when any
+        order result is in a state that leaves the order's true disposition
+        unknown or stuck:
 
         - ``UNRESOLVED`` — a submit/confirm left "is it live?" unknown;
         - ``WEDGED`` — an OPEN record nothing could settle across ``WEDGED_CYCLES``
           resyncs, which needs an operator;
         - ``TIMEOUT`` — still working at the deadline; not proven terminal;
-        - ``DIVERGENCE`` — an OPEN refused because the account net and our book
-          disagree on a conid; the account is in a state we cannot explain, so an
-          operator must look even though nothing was placed.
+        - ``DIVERGENCE`` — an OPEN (or a CLOSE the account net cannot absorb —
+          the same book disagreement seen from the reducing side) refused; the
+          account is in a state we cannot explain, so an operator must look even
+          though nothing was placed;
+        - ``UNFUNDED`` — a STRUCTURAL drop: a cohort that cannot state a shared
+          cash bound refuses EVERY open, and a scaled qty that floors to 0 shares
+          drops one. Unlike a ``REJECTED`` open (genuine cash exhaustion for this
+          bar, re-minted next cycle) this recurs every cycle forever.
 
         A clean cycle (``REJECTED``/``UNFILLED`` are terminal and honest, a
         ``PLACED``/``ADOPTED`` fill is settled) is safe.
         """
         if self.placement_error is not None or self.resync_error is not None:
+            return True
+        if self.divergences:
             return True
         return any(result.outcome in _UNSAFE_OUTCOMES for result in self.results)
 
@@ -86,8 +107,30 @@ _UNSAFE_OUTCOMES: frozenset[OrderOutcome] = frozenset(
         OrderOutcome.WEDGED,
         OrderOutcome.TIMEOUT,
         OrderOutcome.DIVERGENCE,
+        OrderOutcome.UNFUNDED,
     }
 )
+
+
+def unsafe_outcomes(report: CycleReport) -> tuple[str, ...]:
+    """What made *report* unsafe, in report order — the operator's suppression note.
+
+    Derived from the report, never a fixed list, so the D2 stderr note cannot
+    claim something the cycle did not do: the cohort-level ``placement_error``/
+    ``resync_error`` kinds first (each prefixed so a kind cannot be mistaken for
+    an order outcome), then every distinct unsafe order outcome present (a
+    refused close and a structural open drop both surface here as their kind's
+    outcome). Empty exactly when :meth:`CycleReport.is_unsafe` is False.
+    """
+    named: list[str] = []
+    if report.placement_error is not None:
+        named.append(f"placement_error:{report.placement_error.kind}")
+    if report.resync_error is not None:
+        named.append(f"resync_error:{report.resync_error.kind}")
+    for result in report.results:
+        if result.outcome in _UNSAFE_OUTCOMES and result.outcome.value not in named:
+            named.append(result.outcome.value)
+    return tuple(named)
 
 
 #: A closed intent record older than this is housekeeping noise; OPEN records
@@ -120,30 +163,26 @@ class SignalSource(Protocol):
 
 
 class CycleLedger(Protocol):
-    """The ledger capabilities ``run_cycle`` needs: cycle stamp (audit) + sim lots.
+    """The ledger capabilities ``run_cycle`` needs: the lease, the book, the stamp.
 
-    ``sim_open_ids`` / ``record_sim_lot`` / ``mark_sim_closed`` back the sim
-    path's own book: the lots it owns (a close may only target a lot the
-    strategy opened) plus the fill detail a report needs to show them, keyed by
-    the stable ``scope``. ``cycle_lease`` is the concurrency guard. The IBKR path
-    never calls the sim methods: its book is ours by construction.
+    ``cycle_lease(scope)`` is the PER-SCOPE concurrency guard (two adapters run
+    concurrently; two cycles on one scope do not). ``executions_of`` is our
+    fill-derived book, the divergence guard's "ours" side. ``sim_open_ids`` scopes
+    a close to the lots the scope is recorded as owning. ``record_results`` is the
+    ONE write point for placement outcomes, and ``touch_cycle``/``prune`` are the
+    audit + housekeeping writes.
     """
 
-    def cycle_lease(self) -> AbstractContextManager[None]: ...
+    def cycle_lease(self, scope: str = "") -> AbstractContextManager[None]: ...
 
     def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None: ...
 
     def sim_open_ids(self, scope: str) -> frozenset[str]: ...
 
-    def record_sim_lot(self, scope: str, lot: SimLot) -> None: ...
+    def executions_of(self, scope: str) -> tuple[ExecutionRecord, ...]: ...
 
-    def mark_sim_closed(
-        self,
-        scope: str,
-        position_id: str,
-        closed_at: pd.Timestamp,
-        exit_price: float | None = None,
-        commission: float | None = None,
+    def record_results(
+        self, scope: str, results: tuple[OrderResult, ...], now: pd.Timestamp
     ) -> None: ...
 
     def prune(self, before: pd.Timestamp) -> int: ...
@@ -158,6 +197,7 @@ def build_report(
     cost: CostProvenance = MODELLED_COST,
     placement_error: FeedError | None = None,
     resync_error: FeedError | None = None,
+    divergences: tuple[Divergence, ...] = (),
 ) -> CycleReport:
     """Pure: assemble the cycle report. No clock, no I/O."""
     return CycleReport(
@@ -169,6 +209,7 @@ def build_report(
         cost=cost,
         placement_error=placement_error,
         resync_error=resync_error,
+        divergences=divergences,
     )
 
 
@@ -231,9 +272,8 @@ def _newest_ms(symbols: tuple[str, ...], db_path: str | Path | None) -> int | No
 
 async def run_cycle(
     config: LiveConfig,
+    adapter: LiveAdapter,
     *,
-    source: PortfolioSource,
-    broker: LiveBroker,
     ledger: CycleLedger,
     strategy_id: str,
     scope: str,
@@ -247,161 +287,186 @@ async def run_cycle(
 ) -> CycleReport:
     """One full batch pass. Not a loop; the caller drives cadence.
 
-    A non-dry run holds *ledger*'s exclusive cycle lease for its whole duration:
-    an overlapping cron/human cycle refuses to start (``CycleInProgressError``)
-    instead of both placing off the same pre-order book.
+    A non-dry run holds the SCOPE's exclusive cycle lease for the whole pass, so
+    an overlapping cycle on the same scope refuses to start
+    (``CycleInProgressError``) instead of both placing off the same pre-order
+    book; another scope's lease is unaffected, so two adapters run concurrently.
 
     ``strategy_id`` is the config-hash AUDIT key (``touch_cycle``); ``scope`` is
-    the stable OWNERSHIP key the sim lots are keyed by, so a config edit does
-    not orphan every open lot.
-
-    ``dry_run=True`` computes signals + intents but places NOTHING and writes
-    NOTHING: the broker loop is skipped, ``results`` is empty, no ``touch_cycle``
-    write happens, and no lease is taken (a read-only run must not block a live
-    cycle). Nothing is recorded, so the next cycle recomputes the same intents.
+    the stable OWNERSHIP key the book is keyed by and the lease is taken for.
+    ``dry_run=True`` takes no lease and writes nothing at all, so the next cycle
+    recomputes the same intents (see :func:`_lease`/:func:`_persist`).
     """
     now_ts = now if now is not None else pd.Timestamp.now(tz="UTC")
-    lease = nullcontext() if dry_run else ledger.cycle_lease()
-    with lease:
-        fetched = await source.fetch()
-        if isinstance(fetched, Err):
-            raise PortfolioFetchError(cast("FeedError", fetched.error))
-        snapshot = fetched.value
+    with _lease(ledger, scope, dry_run):
+        snapshot = await _read_book(adapter)
         assert_data_fresh(config.symbols, max_age_days, now_ts, db_path)
         assert config_path is not None, (
             "run_cycle requires config_path for the screen bridge"
         )
         signals = signal_source(config_path, max_age_days)
-        # Align the simulated book with the fetched read so the SAME book is both
-        # reconciled and settled (the LiveBroker Protocol has no seed — adaptation).
-        broker.seed(snapshot.portfolio)
-        # Cycle start: reconcile every OPEN intent record BEFORE reading signals,
-        # so a prior cycle's working/timed-out order is adopted (not re-minted).
-        # Skipped on a dry run: it persists state, which a read-only run must not.
-        resync_results, resync_error = ((), None) if dry_run else await _resync(broker)
-        # Ownership scoping (plan rev 4.1 §3): the IBKR source's book ALREADY holds
-        # only this scope's lots (``trades.reconcile`` filters by our cOID prefix), so
-        # every lot in it is closable and no filter is applied (``owned=None``). The
-        # sim/mock book may hold exogenous fixture lots, so its closes are scoped to
-        # the lots the scope is recorded as owning (``sim_open_ids``).
-        owns_book = getattr(source, "owns_book", True)
-        owned = _owned_ids(ledger, scope) if owns_book else None
-        intents = reconcile(signals, snapshot.portfolio, config, owned)
-        results: tuple[OrderResult, ...] = ()
-        placement_error: FeedError | None = None
+        resync_results, resync_error = await _resync(adapter, dry_run)
+        divergences = _divergences(ledger, scope, snapshot.portfolio)
+        placed = await _place(
+            adapter, snapshot.portfolio, signals, config, ledger, scope, dry_run
+        )
+        results, placement_error = _merge(resync_results, placed.results)
         if not dry_run:
-            placed = await _place_all(broker, intents)
-            if isinstance(placed, Err):
-                placement_error = cast("FeedError", placed.error)
-                results = resync_results
-            else:
-                placed_results = tuple(placed.value)
-                results = resync_results + placed_results
-                if owns_book:
-                    _record_owned(ledger, scope, placed_results, now_ts)
-            ledger.touch_cycle(strategy_id, now_ts)
-            cutoff = cast(
-                "pd.Timestamp", now_ts - pd.Timedelta(days=_INTENT_RETENTION_DAYS)
-            )
-            ledger.prune(cutoff)
-        await broker.close()
+            _persist(ledger, adapter, scope, placed, strategy_id, now_ts)
+        await adapter.close()
     return build_report(
         snapshot.portfolio,
         signals,
-        intents,
+        placed.intents,
         results,
         now_ts,
         cost=cost,
         placement_error=placement_error,
         resync_error=resync_error,
+        divergences=divergences,
     )
 
 
+def _persist(
+    ledger: CycleLedger,
+    adapter: LiveAdapter,
+    scope: str,
+    placed: _Placement,
+    strategy_id: str,
+    now_ts: pd.Timestamp,
+) -> None:
+    """The cycle's durable writes, in order: book, audit stamp, housekeeping.
+
+    Skipped entirely on a dry run (the caller never reaches here), so a read-only
+    cycle leaves the store byte-identical.
+    """
+    _record(ledger, adapter, scope, placed, now_ts)
+    ledger.touch_cycle(strategy_id, now_ts)
+    ledger.prune(
+        cast("pd.Timestamp", now_ts - pd.Timedelta(days=_INTENT_RETENTION_DAYS))
+    )
+
+
+def _lease(
+    ledger: CycleLedger, scope: str, dry_run: bool
+) -> AbstractContextManager[None]:
+    """The cycle's concurrency guard: the scope's lease, or nothing on a dry run.
+
+    A read-only run takes NO lease, so a diagnostic ``--dry-run`` can never block
+    a live cycle (and two dry runs never block each other).
+    """
+    return nullcontext() if dry_run else ledger.cycle_lease(scope)
+
+
+async def _read_book(adapter: LiveAdapter) -> PortfolioSnapshot:
+    """The adapter's book read; an ``Err`` is fatal (no book, no reconcile)."""
+    fetched = await adapter.read_book()
+    if isinstance(fetched, Err):
+        raise PortfolioFetchError(cast("FeedError", fetched.error))
+    return fetched.value
+
+
 async def _resync(
-    broker: LiveBroker,
+    adapter: LiveAdapter, dry_run: bool
 ) -> tuple[tuple[OrderResult, ...], FeedError | None]:
     """Adopt/mark OPEN intents at cycle start; a failed read is reported, not swallowed.
 
-    A failure here is non-fatal — placement's own pre-flight fails closed with
-    the same read failure — but it must reach the REPORT (D4): otherwise a HOLD
-    cycle with no intents looks like a clean "0 orders" while no OPEN intent was
-    ever re-checked.
+    A failure here is non-fatal — placement's own pre-flight fails closed with the
+    same read failure — but it must reach the REPORT (D4): otherwise a HOLD cycle
+    with no intents looks like a clean "0 orders" while no OPEN intent was ever
+    re-checked. Skipped on a dry run, which must not persist anything.
     """
-    resynced = await broker.resync()
+    if dry_run:
+        return (), None
+    resynced = await adapter.resync()
     if isinstance(resynced, Err):
         return (), cast("FeedError", resynced.error)
     return tuple(resynced.value), None
 
 
-def _owned_ids(ledger: CycleLedger, scope: str) -> frozenset[str]:
-    """Broker lot ids the scope currently owns (scopes sim close intents)."""
-    return ledger.sim_open_ids(scope)
+def _owned_ids(
+    ledger: CycleLedger, adapter: LiveAdapter, scope: str
+) -> frozenset[str] | None:
+    """The lot ids a close may target, or ``None`` when every lot is closable.
+
+    A book the adapter does not own (IBKR's replayed book: already only our lots)
+    needs no filter, so ``owned=None`` — and the ledger must not blank it out. A
+    book that may hold lots we never opened (the sim account book, a human-edited
+    ``live_position``) is scoped to the lots the scope is recorded as owning.
+    """
+    return ledger.sim_open_ids(scope) if adapter.owns_book else None
 
 
-def _record_owned(
+def _divergences(
+    ledger: CycleLedger, scope: str, account: PortfolioState
+) -> tuple[Divergence, ...]:
+    """Our fill-derived book vs the account book, compared by the shared oracle."""
+    return guard_divergence(book_from_executions(ledger.executions_of(scope)), account)
+
+
+@dataclass(frozen=True)
+class _Placement:
+    """One cycle's placement: the intents it decided on and the cohort's outcome."""
+
+    intents: tuple[OrderIntent, ...]
+    results: Result[tuple[OrderResult, ...], FeedError]
+
+
+async def _place(
+    adapter: LiveAdapter,
+    book: PortfolioState,
+    signals: tuple[LiveSignal, ...],
+    config: LiveConfig,
     ledger: CycleLedger,
     scope: str,
-    results: tuple[OrderResult, ...],
-    now_ts: pd.Timestamp,
-) -> None:
-    """Record the sim book's write points. A failed/rejected result records nothing.
+    dry_run: bool,
+) -> _Placement:
+    """Reconcile the signals into intents, then place them as ONE cohort.
 
-    Only the sim path calls this (the IBKR book advances from its own execution
-    stream, never from a placement result). An OPEN records the lot AND the fill
-    detail that opened it — the sim's own durable row, so a report shows the lot
-    even after the fixture stops carrying it. A lot the broker did not name can
-    never be targeted by a close, so an unnamed open records nothing.
+    The book is NOT written here: the adapter returns the results and the engine
+    records them (:func:`_record`), or the next cycle's read advances the book
+    from the broker's own executions. A cohort ``Err`` is returned AS-IS (never
+    silently turned into "no orders"): the report carries it so an operator sees
+    the failure rather than "0 orders". A dry run places nothing at all.
     """
-    for result in results:
-        if not result.ok:
-            continue
-        intent = result.intent
-        if intent.action is ActionType.close:
-            if intent.position_id:
-                ledger.mark_sim_closed(
-                    scope,
-                    intent.position_id,
-                    now_ts,
-                    exit_price=result.fill.executed_price if result.fill else None,
-                    commission=result.fill.commission if result.fill else None,
-                )
-        elif result.position_id:
-            ledger.record_sim_lot(scope, _sim_lot(result))
-
-
-def _sim_lot(result: OrderResult) -> SimLot:
-    """The sim lot an OPEN fill created, from the fill and the intent behind it.
-
-    A result with no fill still records the lot (ownership is never lost to
-    missing detail): size and entry simply stay unknown, and the row reads as an
-    ownership-only one rather than inventing a position.
-    """
-    fill = result.fill
-    return SimLot(
-        position_id=cast("str", result.position_id),
-        symbol=result.intent.symbol,
-        side=result.intent.action.value,
-        qty=fill.filled_qty if fill is not None else None,
-        entry_price=fill.executed_price if fill is not None else None,
-        stop_loss=result.intent.stop_loss,
-        take_profit=result.intent.take_profit,
-        tag=result.intent.tag or None,
-        opened_at=fill.timestamp if fill is not None else None,
-        entry_commission=fill.commission if fill is not None else None,
+    intents = reconcile(signals, book, config, _owned_ids(ledger, adapter, scope))
+    if dry_run or not intents:
+        return _Placement(intents=intents, results=Ok(()))
+    return _Placement(
+        intents=intents, results=await adapter.place_cohort(book, intents)
     )
 
 
-async def _place_all(
-    broker: LiveBroker,
-    intents: tuple[OrderIntent, ...],
-) -> Result[tuple[OrderResult, ...], FeedError]:
-    """Place the cycle's intents as ONE cohort; a cohort-level ``Err`` is surfaced.
+def _record(
+    ledger: CycleLedger,
+    adapter: LiveAdapter,
+    scope: str,
+    placed: _Placement,
+    now_ts: pd.Timestamp,
+) -> None:
+    """Record this cycle's placement results — only when the scope owns the book.
 
-    The book is NOT written from the placement result: it is advanced from the
-    broker's own execution stream by the next cycle's ``reconcile`` (plan §3).
-    A cohort ``Err`` is returned AS-IS (never silently turned into "no orders"):
-    the report carries it so an operator sees the failure rather than "0 orders".
+    An IBKR scope's book advances from the broker's own execution stream (the
+    broker persists it), so recording placement results there would double-book;
+    the sim account book has no such stream, so its results ARE the book's next
+    state. A cohort-level ``Err`` records nothing: the orders' true state is
+    unknown, and a recorded row would read as settled.
     """
-    if not intents:
-        return Ok(())
-    return await broker.place_cohort(tuple(intents))
+    if not adapter.owns_book or isinstance(placed.results, Err):
+        return
+    ledger.record_results(scope, tuple(placed.results.value), now_ts)
+
+
+def _merge(
+    resync_results: tuple[OrderResult, ...],
+    placed: Result[tuple[OrderResult, ...], FeedError],
+) -> tuple[tuple[OrderResult, ...], FeedError | None]:
+    """Cycle results: adopted/marked OPEN intents first, then this cycle's placements.
+
+    A cohort-level placement ``Err`` yields the resync results alone plus the
+    error: the orders' true state is unknown, so inventing per-order rows would
+    read as settled.
+    """
+    if isinstance(placed, Err):
+        return resync_results, cast("FeedError", placed.error)
+    return resync_results + tuple(placed.value), None
