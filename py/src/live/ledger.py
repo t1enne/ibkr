@@ -74,7 +74,7 @@ from src.live.ledger_base import (
     LedgerReadError,
 )
 from src.live.ledger_migration import _restore_intents, migrate
-from src.live.ledger_sim import LiveSimLot, SimLotBook
+from src.live.ledger_sim import LiveSimLot, SimLot, SimLotBook
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +203,8 @@ class ExecutionRecord:
 
     scope: str
     execution_id: str
-    conid: int
+    #: ``None`` for a sim fill: a sim lot has no conid, so nothing to key on.
+    conid: int | None
     symbol: str
     side: str
     qty: float
@@ -332,6 +333,15 @@ class MetadataStore(_SqliteOps):
 class BookStore(_SqliteOps):
     """Ledger mixin: the conid-keyed book, its executions and its cash seed."""
 
+    def sim_lots(self, scope: str) -> tuple[SimLot, ...]:
+        """Every sim lot for *scope*: provided by :class:`SimLotBook`.
+
+        Declared here so this mixin's cash/execution reads can compose the sim
+        book with the conid book; the concrete ledger inherits ``SimLotBook``
+        FIRST, so this stub is never the one that runs.
+        """
+        raise NotImplementedError
+
     def load_book(self, scope: str) -> StrategyBook:
         """The durable rows + applied execution ids for *scope* (empty if unaware)."""
         try:
@@ -424,12 +434,37 @@ class BookStore(_SqliteOps):
             return ()
         return tuple(_model_to_execution(row, symbols) for row in rows)
 
+    def sim_executions(self, scope: str) -> tuple[ExecutionRecord, ...]:
+        """The sim path's fill history for *scope*, oldest first (empty if none).
+
+        The sim has no execution stream to replay, so its OWN lot book is the
+        record: each lot contributes an entry fill and, once closed, an exit
+        fill. This is what lets a sim scope read like a real one — the same
+        ``_flows``/commission/realized math the IBKR fills feed — instead of a
+        book with no fills at all (which reads an open lot's cost as profit).
+
+        ``conid`` is ``None``: a sim lot has no conid, so the symbol is carried
+        directly, and the ``execution_id`` is the minted ``position_id`` plus the
+        leg it names.
+        """
+        return tuple(
+            record
+            for lot in self.sim_lots(scope)
+            for record in _sim_fill_records(scope, lot)
+        )
+
+    def sim_cash_delta(self, scope: str) -> float:
+        """Signed cash the sim lots already moved (entry debits, exits credits)."""
+        return sum(record.cash_delta for record in self.sim_executions(scope))
+
     def cash_of(self, scope: str, default_initial: float = 0.0) -> float:
         """Per-scope cash: ``initial_capital`` advanced by the scope's own fills.
 
         The stored ``initial_capital`` (first cycle's config value) wins; a scope
         with no stored row falls back to *default_initial*. Never reads the
-        account summary: N strategies share one account's cash.
+        account summary: N strategies share one account's cash. Both books
+        contribute: the conid book's stored fills AND the sim lot book, so a sim
+        scope's cash tracks its own fills exactly as a real one's does.
         """
         try:
             with self._database.bind_ctx(_MODELS):
@@ -448,7 +483,7 @@ class BookStore(_SqliteOps):
             if not _is_missing_table(exc):
                 raise LedgerReadError(str(exc)) from exc
             return default_initial
-        return initial + float(sunk)
+        return initial + float(sunk) + self.sim_cash_delta(scope)
 
     def initial_capital_of(self, scope: str) -> float:
         try:
@@ -642,7 +677,7 @@ class IntentStore(_SqliteOps):
             )
 
 
-class SqliteLedger(MetadataStore, BookStore, IntentStore, SimLotBook):
+class SqliteLedger(MetadataStore, SimLotBook, BookStore, IntentStore):
     """peewee-backed per-scope book. One database per ledger, bound on init.
 
     Construction writes NOTHING (no DDL): a ``--dry-run`` that only reads must
@@ -723,6 +758,74 @@ def _cash_delta(execution: Execution) -> float:
     if execution.side is OrderSide.SELL:
         return gross - execution.commission
     return -(gross + execution.commission)
+
+
+def _sim_fill_records(scope: str, lot: SimLot) -> tuple[ExecutionRecord, ...]:
+    """The fills one sim lot implies: its entry, plus its exit when it has one.
+
+    A lot without detail (an ownership-only row) implies nothing — there is no
+    size or price to book, and inventing one would put a phantom fill in the
+    scope's history. An open long DEBITS cash on the entry and will CREDIT it on
+    the exit; a short is the mirror, so the side of each leg follows the lot.
+    """
+    if not lot.has_detail:
+        return ()
+    qty = cast("float", lot.qty)
+    entry = cast("float", lot.entry_price)
+    short = lot.side == "short"
+    records = [
+        _sim_fill(
+            scope,
+            f"{lot.position_id}:open",
+            lot,
+            OrderSide.SELL if short else OrderSide.BUY,
+            qty,
+            entry,
+            lot.entry_commission,
+            lot.opened_at,
+        )
+    ]
+    if lot.exit_price is not None:
+        records.append(
+            _sim_fill(
+                scope,
+                f"{lot.position_id}:close",
+                lot,
+                OrderSide.BUY if short else OrderSide.SELL,
+                qty,
+                lot.exit_price,
+                lot.exit_commission,
+                lot.closed_at,
+            )
+        )
+    return tuple(records)
+
+
+def _sim_fill(
+    scope: str,
+    execution_id: str,
+    lot: SimLot,
+    side: OrderSide,
+    qty: float,
+    price: float,
+    commission: float | None,
+    ts: pd.Timestamp | None,
+) -> ExecutionRecord:
+    """One sim leg as the same record shape a replayed IBKR fill produces."""
+    fee = commission or 0.0
+    gross = qty * price
+    return ExecutionRecord(
+        scope=scope,
+        execution_id=execution_id,
+        conid=None,
+        symbol=lot.symbol or "",
+        side=side.value,
+        qty=qty,
+        price=price,
+        commission=fee,
+        cash_delta=(gross - fee) if side is OrderSide.SELL else -(gross + fee),
+        ts=ts,
+    )
 
 
 #: Public name for the cash-flow helper (used by the IBKR portfolio source).

@@ -1,8 +1,13 @@
 """Portfolio sources — normalise a broker read into the shared ``PortfolioState``.
 
-Only the edges touch I/O. ``load_mock_portfolio`` is pure (fixture dict ->
-snapshot); ``MockPortfolioSource`` is the async wrapper that reads a JSON file.
-No network for v1.
+Only the edges touch I/O. ``load_mock_portfolio``/``write_mock_portfolio`` are
+pure (fixture dict <-> book); ``MockPortfolioSource`` is the async wrapper that
+reads a JSON file. No network for v1.
+
+A managed fixture (one WE minted, marked ``MANAGED_KEY``) is the sim broker's
+record of the cycle: the cycle reads its book from the file and writes the
+settled book back, so a mock book persists across cycles instead of resetting
+flat. A hand-authored fixture carries no marker and stays read-only.
 """
 
 from __future__ import annotations
@@ -51,8 +56,9 @@ def load_mock_portfolio(
                         "tag": str, "last_price": float, "entry_time": str|null}]}
 
     ``qty`` is stored positive; the side lives on ``Position.type``. Lots are
-    grouped per symbol into tuples in input order. Raises ``ValueError`` on
-    malformed input (bad cash/symbol/type/qty/timestamp).
+    grouped per symbol into tuples in input order. An unknown key (e.g. the
+    :data:`MANAGED_KEY` marker ``write_mock_portfolio`` emits) is ignored.
+    Raises ``ValueError`` on malformed input (bad cash/symbol/type/qty/timestamp).
     """
     cash = _number(raw.get("cash"), "cash")
     if cash < 0:
@@ -73,6 +79,54 @@ def load_mock_portfolio(
         initial_capital=initial_capital,
     )
     return PortfolioSnapshot(portfolio=portfolio, as_of=as_of)
+
+
+#: Fixture key marking a file as OURS (minted by the sim path, writable).
+MANAGED_KEY = "managed"
+
+
+def fixture_is_managed(path: str | Path) -> bool:
+    """Whether *path* is a fixture we minted and may write the book back into.
+
+    Unreadable or malformed files read as NOT ours (fail closed: never overwrite
+    a file we cannot prove we own).
+    """
+    try:
+        raw = json.loads(Path(path).read_text())
+    except OSError, ValueError:
+        return False
+    return isinstance(raw, Mapping) and raw.get(MANAGED_KEY) is True
+
+
+def write_mock_portfolio(path: str | Path, portfolio: PortfolioState) -> None:
+    """Persist a settled book into a mock fixture — the inverse of ``load``.
+
+    Emits :data:`MANAGED_KEY`, so the file this writes is one a later cycle may
+    write again. Lots keep their ``position_id``, so the ledger's sim ownership
+    (``live_sim_lot``) still names them on the next read.
+    """
+    doc: dict[str, object] = {
+        MANAGED_KEY: True,
+        "cash": float(portfolio.cash),
+        "initial_capital": float(portfolio.initial_capital),
+        "positions": [
+            {
+                "symbol": pos.symbol,
+                "qty": float(pos.qty),
+                "type": pos.type.value,
+                "entry_price": float(pos.entry_price),
+                "position_id": pos.position_id,
+                "stop_loss": pos.stop_loss,
+                "take_profit": pos.take_profit,
+                "tag": pos.tag,
+                "last_price": float(pos.last_price),
+                "entry_time": pos.entry_time.isoformat(),
+            }
+            for symbol in sorted(portfolio.positions)
+            for pos in portfolio.positions[symbol]
+        ],
+    }
+    Path(path).write_text(json.dumps(doc, indent=2))
 
 
 def _position_entries(value: object) -> list[Mapping[str, object]]:

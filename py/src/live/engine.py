@@ -19,6 +19,7 @@ from src.bt.state import ActionType, PortfolioState
 from src.data.db import get_connection
 from src.live.broker import LiveBroker, OrderResult
 from src.live.identity import OrderOutcome
+from src.live.ledger_sim import SimLot
 from src.live.portfolio_source import PortfolioSource
 from src.live.reconcile import reconcile
 from src.live.result import Err, Ok, Result
@@ -121,10 +122,11 @@ class SignalSource(Protocol):
 class CycleLedger(Protocol):
     """The ledger capabilities ``run_cycle`` needs: cycle stamp (audit) + sim lots.
 
-    ``sim_open_ids`` / ``record_sim_open`` / ``mark_sim_closed`` back the sim
-    path's ownership scoping (a close may only target a lot the strategy opened),
-    keyed by the stable ``scope``. ``cycle_lease`` is the concurrency guard.
-    The IBKR path never calls the sim methods: its book is ours by construction.
+    ``sim_open_ids`` / ``record_sim_lot`` / ``mark_sim_closed`` back the sim
+    path's own book: the lots it owns (a close may only target a lot the
+    strategy opened) plus the fill detail a report needs to show them, keyed by
+    the stable ``scope``. ``cycle_lease`` is the concurrency guard. The IBKR path
+    never calls the sim methods: its book is ours by construction.
     """
 
     def cycle_lease(self) -> AbstractContextManager[None]: ...
@@ -133,10 +135,15 @@ class CycleLedger(Protocol):
 
     def sim_open_ids(self, scope: str) -> frozenset[str]: ...
 
-    def record_sim_open(self, scope: str, position_id: str) -> None: ...
+    def record_sim_lot(self, scope: str, lot: SimLot) -> None: ...
 
     def mark_sim_closed(
-        self, scope: str, position_id: str, closed_at: pd.Timestamp
+        self,
+        scope: str,
+        position_id: str,
+        closed_at: pd.Timestamp,
+        exit_price: float | None = None,
+        commission: float | None = None,
     ) -> None: ...
 
     def prune(self, before: pd.Timestamp) -> int: ...
@@ -337,10 +344,12 @@ def _record_owned(
     results: tuple[OrderResult, ...],
     now_ts: pd.Timestamp,
 ) -> None:
-    """Record the sim ownership write points. A failed/rejected result records nothing.
+    """Record the sim book's write points. A failed/rejected result records nothing.
 
     Only the sim path calls this (the IBKR book advances from its own execution
-    stream, never from a placement result). A lot the broker did not name can
+    stream, never from a placement result). An OPEN records the lot AND the fill
+    detail that opened it — the sim's own durable row, so a report shows the lot
+    even after the fixture stops carrying it. A lot the broker did not name can
     never be targeted by a close, so an unnamed open records nothing.
     """
     for result in results:
@@ -349,9 +358,37 @@ def _record_owned(
         intent = result.intent
         if intent.action is ActionType.close:
             if intent.position_id:
-                ledger.mark_sim_closed(scope, intent.position_id, now_ts)
+                ledger.mark_sim_closed(
+                    scope,
+                    intent.position_id,
+                    now_ts,
+                    exit_price=result.fill.executed_price if result.fill else None,
+                    commission=result.fill.commission if result.fill else None,
+                )
         elif result.position_id:
-            ledger.record_sim_open(scope, result.position_id)
+            ledger.record_sim_lot(scope, _sim_lot(result))
+
+
+def _sim_lot(result: OrderResult) -> SimLot:
+    """The sim lot an OPEN fill created, from the fill and the intent behind it.
+
+    A result with no fill still records the lot (ownership is never lost to
+    missing detail): size and entry simply stay unknown, and the row reads as an
+    ownership-only one rather than inventing a position.
+    """
+    fill = result.fill
+    return SimLot(
+        position_id=cast("str", result.position_id),
+        symbol=result.intent.symbol,
+        side=result.intent.action.value,
+        qty=fill.filled_qty if fill is not None else None,
+        entry_price=fill.executed_price if fill is not None else None,
+        stop_loss=result.intent.stop_loss,
+        take_profit=result.intent.take_profit,
+        tag=result.intent.tag or None,
+        opened_at=fill.timestamp if fill is not None else None,
+        entry_commission=fill.commission if fill is not None else None,
+    )
 
 
 async def _place_all(

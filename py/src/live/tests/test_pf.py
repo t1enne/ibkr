@@ -29,7 +29,12 @@ from src.data.ibkr.client import IbkrClient
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
 from src.exec.refs import scope_tag
-from src.live.cli import live_group, load_live_config, watch_pf_loop
+from src.live.cli import (
+    _store_and_broker,
+    live_group,
+    load_live_config,
+    watch_pf_loop,
+)
 from src.live.identity import IntentKey, IntentState, order_ref
 from src.live.ledger import ExecutionRecord, SqliteLedger
 from src.live.pf import (
@@ -46,6 +51,8 @@ from src.live.pf import (
     scope_stats,
 )
 from src.live.types import LiveConfig
+from src.live.ledger_sim import SimLot
+from src.live.portfolio_source import fixture_is_managed
 from src.live.result import Ok
 
 TS: pd.Timestamp = cast(pd.Timestamp, pd.Timestamp("2024-06-03T15:00:00Z"))
@@ -218,6 +225,57 @@ def test_read_store_on_a_fresh_ledger_falls_back_to_config(tmp_path: Path) -> No
     assert store.strategy_rows == ()
 
 
+def test_a_sim_scope_reports_its_fills_cash_and_realized(tmp_path: Path) -> None:
+    """A sim scope reads like a real one: fills, cash and P&L all present.
+
+    Regression: the sim wrote no fills, so an open lot's own cost read as
+    REALIZED profit and the scope's cash never moved below its seed.
+    """
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.ensure_cash("S1", 50000.0)
+    ledger.record_sim_lot(
+        "S1",
+        SimLot(
+            position_id="AAPL_1",
+            symbol="AAPL",
+            side="long",
+            qty=10.0,
+            entry_price=100.0,
+            opened_at=TS,
+            entry_commission=0.05,
+        ),
+    )
+
+    store = read_store(ledger, "S1", initial_capital=50000.0)
+    assert store.cash == 50000.0 - 1000.0 - 0.05
+    assert [t.execution_id for t in store.trades] == ["AAPL_1:open"]
+    (trade,) = store.trades
+    assert (trade.symbol, trade.side, trade.conid) == ("AAPL", "BUY", None)
+    assert trade.cash_delta == -1000.05
+    # The open lot is not a result: the entry's own cost must not read as profit.
+    assert scope_stats(store).realized_pnl == pytest.approx(0.0)
+    assert scope_stats(store).commission == pytest.approx(0.05)
+
+    ledger.mark_sim_closed("S1", "AAPL_1", TS, exit_price=110.0, commission=0.05)
+    store = read_store(ledger, "S1", initial_capital=50000.0)
+    assert store.cash == pytest.approx(50099.9)
+    stats = scope_stats(store)
+    assert stats.realized_pnl == pytest.approx(99.9)
+    assert stats.trades == 2
+    assert stats.wins == 1 and stats.losses == 0
+
+
+def test_an_ownership_only_sim_lot_implies_no_fill(tmp_path: Path) -> None:
+    """A row with no detail books NOTHING: an invented fill would be phantom P&L."""
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger.ensure_cash("S1", 500.0)
+    ledger.record_sim_open("S1", "L1")
+    store = read_store(ledger, "S1", initial_capital=500.0)
+    assert store.trades == ()
+    assert store.cash == 500.0
+    assert scope_stats(store).realized_pnl == pytest.approx(0.0)
+
+
 # --- (c) read_sim_broker ownership -------------------------------------------
 
 
@@ -271,7 +329,7 @@ def _broker() -> BrokerSide:
         source="pf.json",
         account="",
         net_liquidation=None,
-        cash=40000.0,
+        cash=50000.0,
         positions=(
             BrokerLot("AAPL", "AAPL_1", 10.0, "long", 100.0, 110.0, 1100.0, True),
             BrokerLot("TSLA", "TSLA_9", 5.0, "short", 200.0, 190.0, 950.0, False),
@@ -601,6 +659,78 @@ def test_render_pf_text_names_a_store_lot_the_broker_lacks() -> None:
     assert "divergence: store lot AAPL_1 AAPL not at the broker" in text
 
 
+def test_a_sim_lot_dropped_from_the_fixture_is_named_and_still_shown() -> None:
+    """The sim's OWN book is the store side, so a lot the fixture lost is visible.
+
+    Regression: the sim store side used to be projected FROM the fixture, so a lot
+    dropped from the file (or a wiped ledger) vanished instead of diverging.
+    """
+    lot = StoreLot(
+        id="AAPL_1",
+        symbol="AAPL",
+        side="long",
+        qty=10.0,
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=None,
+        tag="",
+        order_ref="",
+    )
+    store = replace(_store(), lots=(), sim_open_ids=("AAPL_1",), sim_lots=(lot,))
+    text = render_pf(
+        PfReport(as_of=TS, stores=(store,), broker=replace(_broker(), positions=())),
+        "text",
+    )
+    assert "divergence: store lot AAPL_1 AAPL not at the broker" in text
+    row = next(
+        line for line in text.splitlines() if line.startswith("S1") and "AAPL" in line
+    )
+    assert "open" in row and "10" in row
+
+
+def test_ownership_only_sim_lot_still_diverges_by_id() -> None:
+    """A sim row with no fill detail diverges by id, so a legacy row is not lost."""
+    store = replace(_store(), lots=(), sim_open_ids=("LEGACY_1",), sim_lots=())
+    text = render_pf(
+        PfReport(as_of=TS, stores=(store,), broker=replace(_broker(), positions=())),
+        "text",
+    )
+    assert "divergence: store lot LEGACY_1 - not at the broker" in text
+
+
+def test_an_edited_fixture_cash_is_reported_as_a_divergence() -> None:
+    """The sim broker's cash IS this scope's cash, so a mismatch is a divergence.
+
+    Editing the fixture's ``cash`` is otherwise invisible: it moves sizing but
+    would not show anywhere in the report.
+    """
+    text = render_pf(
+        PfReport(
+            as_of=TS,
+            stores=(_store(),),
+            broker=replace(_broker(), positions=(), cash=49000.0),
+        ),
+        "text",
+    )
+    assert "divergence: cash: broker 49000.00 vs store 50000.00 for S1" in text
+
+
+def test_an_ibkr_scope_never_reports_a_cash_divergence() -> None:
+    """The account's cash is shared by every strategy, so it is not comparable."""
+    broker = _broker()
+    text = render_pf(
+        PfReport(
+            as_of=TS,
+            stores=(_store(),),
+            broker=replace(
+                broker, adapter="ibkr", positions=broker.positions[:1], cash=123.0
+            ),
+        ),
+        "text",
+    )
+    assert "divergence: none" in text
+
+
 def test_render_pf_text_reports_no_divergence() -> None:
     broker = _broker()
     text = render_pf(
@@ -657,12 +787,13 @@ def test_cli_pf_sim_renders_and_writes_no_ddl(
     assert json.loads(as_json.output)["broker"]["adapter"] == "sim"
 
 
-def test_cli_pf_sim_without_fixture_warns_and_stays_store_only(
+def test_cli_pf_sim_without_fixture_mints_one_like_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A sim read with no portfolio_path degrades to a warning, not a usage error.
+    """A sim read with no portfolio_path mints ``pf_sim_<name>.json``, like ``run``.
 
-    The scope still renders from OUR store; only the broker block is skipped.
+    Regression: ``live pf`` used to warn and skip the broker block, so the same
+    config rendered a broker for ``run`` but none for ``pf``.
     """
     target = tmp_path / "cfg.json"
     target.write_text(
@@ -671,10 +802,57 @@ def test_cli_pf_sim_without_fixture_warns_and_stays_store_only(
     monkeypatch.setattr(
         "src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(tmp_path / "l.sqlite")
     )
+    monkeypatch.setattr("src.live.cli.tempfile.gettempdir", lambda: str(tmp_path))
     out = CliRunner().invoke(live_group, ["pf", str(target), "--adapter", "sim"])
     assert out.exit_code == 0, out.output
     assert "scopes:" in out.output
-    assert "no portfolio_path" in out.output
+    assert "broker read skipped" not in out.output
+    assert "broker:" in out.output
+    fixture = tmp_path / "pf_sim_pf_test.json"
+    assert fixture_is_managed(fixture)
+    assert json.loads(fixture.read_text())["cash"] == 50000.0
+
+
+def test_store_and_broker_mints_the_watch_frame_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``--watch`` frame mints the same fixture, so a refresh reads a book."""
+    monkeypatch.setattr("src.live.cli.tempfile.gettempdir", lambda: str(tmp_path))
+    cfg = _cfg(tmp_path, portfolio_path="", mode="paper")
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    stores, broker = _store_and_broker(ledger, cfg, "sim", BASE_CONFIG)
+    assert len(stores) == 1
+    assert broker is not None
+    assert (broker.adapter, broker.cash) == ("sim", 50000.0)
+    assert (tmp_path / "pf_sim_pf_test.json").exists()
+
+
+def test_store_and_broker_without_a_config_stays_store_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No config, no name to mint from: the watch frame reads no broker."""
+    monkeypatch.setattr(
+        "src.live.cli.tempfile",
+        type("T", (), {"gettempdir": staticmethod(lambda: str(tmp_path))}),
+    )
+    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    stores, broker = _store_and_broker(ledger, None, "sim")
+    assert stores == ()
+    assert broker is None
+
+
+def test_cli_pf_sim_with_no_config_at_all_warns_and_stays_store_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no config there is no name to mint from: warn, stay store-only."""
+    db = tmp_path / "ledger.sqlite"
+    ledger = SqliteLedger(db)
+    ledger.ensure_strategy("hash-a", "S1", "S1", "paper")
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(db))
+    out = CliRunner().invoke(live_group, ["pf", "--adapter", "sim"])
+    assert out.exit_code == 0, out.output
+    assert "stats:" in out.output
+    assert "broker:" in out.output and "no portfolio_path" in out.output
 
 
 def test_cli_pf_ibkr_refuses_a_paper_config_on_a_live_account(

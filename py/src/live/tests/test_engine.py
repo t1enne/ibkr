@@ -388,6 +388,11 @@ async def test_sim_cycle_records_an_opened_lot_as_owned(tmp_path: Path) -> None:
     )
 
     assert ledger.sim_open_ids("S1") == frozenset({"AAPL_1"})
+    # The lot's fill detail is recorded too: the sim's own book row, so a report
+    # can show the lot even after the mock fixture stops carrying it.
+    (recorded,) = ledger.sim_open_lots("S1")
+    assert (recorded.symbol, recorded.side, recorded.qty) == ("AAPL", "long", 10.0)
+    assert recorded.entry_price is not None and recorded.entry_price > 0.0
 
 
 @pytest.mark.asyncio

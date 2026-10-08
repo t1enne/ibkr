@@ -175,14 +175,42 @@ def _restore_intents(db: peewee.SqliteDatabase, legacy: str) -> None:
     )
 
 
+def _add_sim_lot_columns(db: peewee.SqliteDatabase) -> None:
+    """Add the sim lot's fill-detail columns to an EXISTING ``live_sim_lot``.
+
+    Additive only (``ALTER ... ADD COLUMN``), never a drop: a pre-existing
+    ownership row keeps its scope/id and simply reads back as ownership-only
+    (NULL detail), which is exactly what it is. No-op when the table is absent.
+    """
+    if not _table_exists(db, "live_sim_lot"):
+        return
+    columns = _table_columns(db, "live_sim_lot")
+    for name, sql_type in (
+        ("symbol", "TEXT"),
+        ("side", "TEXT"),
+        ("qty", "REAL"),
+        ("entry_price", "REAL"),
+        ("stop_loss", "REAL"),
+        ("take_profit", "REAL"),
+        ("tag", "TEXT"),
+        ("opened_at", "INTEGER"),
+        ("entry_commission", "REAL"),
+        ("exit_price", "REAL"),
+        ("exit_commission", "REAL"),
+    ):
+        if name not in columns:
+            db.execute_sql(f"ALTER TABLE live_sim_lot ADD COLUMN {name} {sql_type}")
+
+
 def migrate(db: peewee.SqliteDatabase) -> str | None:
     """Preserve/alter/re-key every legacy shape; return the legacy intent table.
 
     Preserve a pre-4.1 position table, ALTER ``live_strategy`` for ``scope``,
-    re-key ``live_sim_lot`` from the config hash to the scope, and rename a legacy
-    ``(scope, token)`` intent table to the identity columns. Returns the legacy
-    table name for the post-create row copy (:func:`restore_intents`), or ``None``.
-    All additive or renames — never a drop.
+    re-key ``live_sim_lot`` from the config hash to the scope (and add its
+    fill-detail columns), and rename a legacy ``(scope, token)`` intent table to
+    the identity columns. Returns the legacy table name for the post-create row
+    copy (:func:`restore_intents`), or ``None``. All additive or renames — never
+    a drop.
     """
     if _table_exists(db, "live_position") and "conid" not in _table_columns(
         db, "live_position"
@@ -195,6 +223,7 @@ def migrate(db: peewee.SqliteDatabase) -> str | None:
             "ALTER TABLE live_strategy ADD COLUMN scope TEXT NOT NULL DEFAULT ''"
         )
     _rekey_sim_lots(db)
+    _add_sim_lot_columns(db)
     legacy = _rekey_order_intents(db)
     _add_intent_columns(db)
     return legacy

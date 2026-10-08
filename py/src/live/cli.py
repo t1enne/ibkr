@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal, TextIO, cast
 
@@ -52,7 +52,12 @@ from src.live.pf import (
     read_store,
     render_pf,
 )
-from src.live.portfolio_source import MockPortfolioSource, PortfolioSource
+from src.live.portfolio_source import (
+    MockPortfolioSource,
+    PortfolioSource,
+    fixture_is_managed,
+    write_mock_portfolio,
+)
 from src.live.result import Err
 from src.live.types import (
     CostProvenance,
@@ -79,6 +84,50 @@ SleepFn = Callable[[float], None]
 #: ``2`` (UsageError), so cron can tell "the broker may be holding something we
 #: cannot see" apart from "the run could not start".
 _UNSAFE_EXIT_CODE = 3
+
+
+@dataclass(frozen=True)
+class _SimBook:
+    """The sim broker's book: its fixture path, and whether we may write it back."""
+
+    path: str
+    managed: bool
+
+
+def _sim_book(cfg: LiveConfig, name: str) -> _SimBook:
+    """Resolve the sim mock book: the config's own fixture, else one we mint.
+
+    ``--adapter sim`` must not require a live-only ``portfolio_path`` in a
+    strategy JSON. Absent one, a FLAT fixture seeded with the config's
+    ``initial_capital`` is written to the system temp dir as
+    ``pf_sim_<name>.json`` and marked as OURS. A managed fixture is the sim
+    broker's record of the cycle: the CLI reads the book from it and writes the
+    settled book back after each real cycle, so a mock book persists across
+    cycles. A hand-authored fixture (no marker) is left read-only.
+    """
+    if cfg.portfolio_path:
+        return _SimBook(cfg.portfolio_path, fixture_is_managed(cfg.portfolio_path))
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
+    path = Path(tempfile.gettempdir()) / f"pf_sim_{safe}.json"
+    if not path.exists():
+        write_mock_portfolio(
+            path, create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now())
+        )
+        _stderr_log(f"sim: no portfolio_path in config; minted mock fixture {path}")
+    return _SimBook(str(path), True)
+
+
+def _strategy_name(raw: Mapping[str, object] | None, cfg: LiveConfig) -> str:
+    """The label for a minted sim fixture: the config's ``name``, else its scope."""
+    named = None if raw is None else raw.get("name")
+    return named if isinstance(named, str) and named else cfg.scope
+
+
+def _sim_config(cfg: LiveConfig, raw: Mapping[str, object] | None) -> LiveConfig:
+    """*cfg* with a fixture path resolved: its own, else a minted ``pf_sim_*.json``."""
+    if cfg.portfolio_path:
+        return cfg
+    return replace(cfg, portfolio_path=_sim_book(cfg, _strategy_name(raw, cfg)).path)
 
 
 def _stderr_log(message: str) -> None:
@@ -164,6 +213,11 @@ def live_run(
         ledger.ensure_cash(scope, cfg.initial_capital)
     gateway: IbkrGateway | None = None
     broker: LiveBroker
+    # A managed sim fixture is the sim broker's record: the settled book is
+    # written back below, so the mock book persists across cycles (an
+    # unmanaged/hand-authored fixture stays read-only).
+    sim_book: _SimBook | None = None
+    sim_broker: SimulatedBroker | None = None
     if resolved == "ibkr":
         gateway = IbkrGateway(IbkrClient())
         source: PortfolioSource = IbkrPortfolioSource(
@@ -185,16 +239,14 @@ def live_run(
             log=_stderr_log,
         )
     else:
-        if not cfg.portfolio_path:
-            raise click.UsageError(
-                "config requires portfolio_path (mock portfolio fixture)"
-            )
-        source = MockPortfolioSource(cfg.portfolio_path)
-        broker = SimulatedBroker(
+        sim_book = _sim_book(cfg, strategy.name)
+        source = MockPortfolioSource(sim_book.path)
+        sim_broker = SimulatedBroker(
             create_initial_portfolio(cfg.initial_capital, pd.Timestamp.now()),
             exec_params_of(cfg),
             _stderr_log,
         )
+        broker = sim_broker
     # Plan §7.3: label which source produced this run's costs. A resolved IBKR run
     # books the broker's exact per-execution commission but still SIZES on the sim
     # model — the report states both, so the mix is never ambiguous.
@@ -223,6 +275,13 @@ def live_run(
                     cost=cost,
                 )
             )
+            if sim_book is not None and sim_broker is not None and sim_book.managed:
+                # The sim book is durable WHERE the fixture is, not in the ledger:
+                # the broker settled this cycle's cohort into its held book, so
+                # THAT book is what the next cycle must read. A dry run placed
+                # nothing, so there is no new book to persist.
+                if not dry_run:
+                    write_mock_portfolio(sim_book.path, sim_broker.portfolio())
     except (
         StaleDataError,
         PortfolioFetchError,
@@ -516,9 +575,11 @@ def _pf_broker(
 
     ``--adapter`` wins; otherwise a config's EXPLICITLY-named ``broker`` key; a
     config that never named one reads NO broker (store-only), so ``live pf
-    <strategy.json>`` works without a ``portfolio_path``. A ``sim`` read without
-    a ``portfolio_path`` degrades to a warning, never a usage error. Without a
-    config the mode is ``live`` when ``--allow-live`` and ``paper`` otherwise.
+    <strategy.json>`` works without a ``portfolio_path``. A ``sim`` read resolves
+    its mock book the way ``live run`` does: the config's own ``portfolio_path``
+    if named, else a minted ``pf_sim_<name>.json``. Only a sim read with NO
+    config at all (no name to mint from) degrades to a warning. Without a config
+    the mode is ``live`` when ``--allow-live`` and ``paper`` otherwise.
     """
     resolved = adapter
     if resolved is None and raw is not None and cfg is not None:
@@ -527,10 +588,11 @@ def _pf_broker(
     if resolved is None:
         return None
     if resolved == "sim":
-        if cfg is None or not cfg.portfolio_path:
+        if cfg is None:
             return _skipped_broker(
-                "sim", "no portfolio_path in config (broker read skipped)"
+                "sim", "no portfolio_path and no config (broker read skipped)"
             )
+        cfg = _sim_config(cfg, raw)
         owned = frozenset(
             i
             for store in stores
@@ -725,7 +787,7 @@ def _open_watch_session(
         name = resolved if named else None
     if name != "ibkr":
         return _WatchSession(
-            _store_frame(ledger, cfg if name is not None else None, name, style),
+            _store_frame(ledger, cfg if name is not None else None, name, style, raw),
             _noop,
         )
     return _ibkr_watch_session(
@@ -793,11 +855,12 @@ def _store_frame(
     cfg: LiveConfig | None,
     adapter: str | None,
     style: Styler = PLAIN,
+    raw: Mapping[str, object] | None = None,
 ) -> Callable[[], str]:
     """A store (+ sim broker) frame builder for the scopes a watch covers."""
 
     def frame() -> str:
-        stores, broker = _store_and_broker(ledger, cfg, adapter)
+        stores, broker = _store_and_broker(ledger, cfg, adapter, raw)
         return render_pf(
             PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
             "text",
@@ -808,13 +871,17 @@ def _store_frame(
 
 
 def _store_and_broker(
-    ledger: SqliteLedger, cfg: LiveConfig | None, adapter: str | None
+    ledger: SqliteLedger,
+    cfg: LiveConfig | None,
+    adapter: str | None,
+    raw: Mapping[str, object] | None = None,
 ) -> tuple[tuple[StoreSide, ...], BrokerSide | None]:
     """Re-read the store side and (for ``sim``) the fixture, per tick.
 
     Only the store and the sim fixture are re-read here — a non-sim broker would
     need a live session, which the watch holds open itself. Mirrors
-    ``_all_scopes_report``/``_config_report`` for the store half.
+    ``_all_scopes_report``/``_config_report`` for the store half, including the
+    minted-fixture fallback a sim config with no ``portfolio_path`` gets.
     """
     if cfg is None:
         stores = tuple(read_store(ledger, scope) for scope in ledger.scopes_of_store())
@@ -822,10 +889,7 @@ def _store_and_broker(
         stores = (read_store(ledger, cfg.scope, initial_capital=cfg.initial_capital),)
     if adapter != "sim" or cfg is None:
         return stores, None
-    if not cfg.portfolio_path:
-        return stores, _skipped_broker(
-            "sim", "no portfolio_path in config (broker read skipped)"
-        )
+    cfg = _sim_config(cfg, raw)
     owned = frozenset(
         i
         for store in stores

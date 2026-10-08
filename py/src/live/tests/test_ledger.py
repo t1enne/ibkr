@@ -29,6 +29,7 @@ from src.live.ledger import (
     execution_cash_delta,
 )
 from src.live.lease import CycleInProgressError
+from src.live.ledger_sim import SimLot
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
 OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
@@ -403,6 +404,48 @@ def test_migration_rekeys_legacy_sim_lots_to_scope(tmp_path: Path) -> None:
     with get_connection(db) as con:
         cols = {r[1] for r in con.execute("PRAGMA table_info(live_sim_lot)")}
     assert "scope" in cols and "strategy_id" not in cols
+    # The fill-detail columns are added to the migrated table, and the legacy rows
+    # read back as OWNERSHIP-ONLY ones (no invented size or entry).
+    assert {"symbol", "side", "qty", "entry_price", "opened_at"} <= cols
+    migrated = {lot.position_id: lot for lot in ledger.sim_open_lots("momentum")}
+    assert migrated["lot-3"].has_detail is False
+    assert migrated["lot-3"].qty is None
+
+
+def test_sim_lot_detail_round_trips_and_survives_a_bare_reopen(
+    ledger: SqliteLedger,
+) -> None:
+    """A recorded lot keeps its fill detail; a bared ownership write never erases it."""
+    opened = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
+    ledger.record_sim_lot(
+        "S1",
+        SimLot(
+            position_id="AAPL_7",
+            symbol="AAPL",
+            side="long",
+            qty=3.0,
+            entry_price=10.0,
+            stop_loss=9.0,
+            take_profit=12.0,
+            tag="v",
+            opened_at=opened,
+        ),
+    )
+    ledger.record_sim_open("S1", "AAPL_7")  # re-open, less detail
+    (lot,) = ledger.sim_open_lots("S1")
+    assert (lot.symbol, lot.side, lot.qty, lot.entry_price) == (
+        "AAPL",
+        "long",
+        3.0,
+        10.0,
+    )
+    assert (lot.stop_loss, lot.take_profit, lot.tag) == (9.0, 12.0, "v")
+    assert lot.opened_at == opened
+    assert lot.has_detail is True
+
+    ledger.mark_sim_closed("S1", "AAPL_7", opened)
+    assert ledger.sim_open_ids("S1") == frozenset()
+    assert ledger.sim_open_lots("S1") == ()
 
 
 # --- pending order intents (PendingIntents) ---------------------------------

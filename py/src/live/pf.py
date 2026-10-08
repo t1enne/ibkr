@@ -36,6 +36,7 @@ from src.live.adapters.ibkr.mapping import IbkrPosition, parse_positions, parse_
 from src.live.adapters.ibkr.orders import parse_working_order
 from src.live.identity import IntentRecord, WorkingOrder
 from src.live.ledger import ExecutionRecord, SqliteLedger, StrategyAudit
+from src.live.ledger_sim import SimLot
 from src.live.portfolio_source import MockPortfolioSource
 from src.live.result import Err
 from src.live.types import FeedError, LiveConfig
@@ -110,9 +111,11 @@ class StoreSide:
     ``db_path`` is the resolved sqlite file; ``strategy_rows`` is the audit trail
     (oldest first) so the report can name the latest revision and its cycle.
     ``orders`` is EVERY order intent for the scope (open and closed, newest
-    first); ``trades`` is every stored fill (oldest first). ``sim_open_ids`` is
-    the sim lot ownership set — the sim path persists NO book rows, so for a sim
-    scope this set (not ``lots``) is what proves ownership.
+    first); ``trades`` is every stored fill (oldest first) — the conid book's
+    replayed fills AND the sim path's own lot legs, so a sim scope reports the
+    same way a real one does. ``sim_lots`` are the sim path's own book rows (the
+    conid-keyed ``lots`` stay empty for a sim scope): the sim broker mints a
+    synthetic ``position_id``, never a conid.
     """
 
     scope: str
@@ -124,6 +127,7 @@ class StoreSide:
     orders: tuple[IntentRecord, ...]
     trades: tuple[ExecutionRecord, ...]
     sim_open_ids: tuple[str, ...]
+    sim_lots: tuple[StoreLot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -147,13 +151,14 @@ def read_store(
     """Read our durable store for *scope* through the ledger's PUBLIC reads only.
 
     Every figure comes from a public read method (``cash_of``,
-    ``initial_capital_of``, ``load_book``, ``load_open``, ``sim_open_ids``,
+    ``initial_capital_of``, ``load_book``, ``load_open``, ``sim_open_lots``,
     ``strategies_of``); this never writes and never touches a model directly. The
     stored ``initial_capital`` wins for cash's seed; a scope that has never
     written falls back to *initial_capital* (``0.0`` without a config, so a
     scope read outside its own config invents no number).
     """
     book = ledger.load_book(scope)
+    sim_lots = ledger.sim_open_lots(scope)
     open_lots = tuple(
         StoreLot(
             id=str(row.conid),
@@ -177,8 +182,24 @@ def read_store(
         initial_capital=ledger.initial_capital_of(scope) or initial_capital,
         lots=open_lots,
         orders=ledger.intents_of(scope),
-        trades=ledger.executions_of(scope),
-        sim_open_ids=tuple(sorted(ledger.sim_open_ids(scope))),
+        trades=ledger.executions_of(scope) + ledger.sim_executions(scope),
+        sim_open_ids=tuple(sorted(lot.position_id for lot in sim_lots)),
+        sim_lots=tuple(_sim_store_lot(lot) for lot in sim_lots),
+    )
+
+
+def _sim_store_lot(lot: SimLot) -> StoreLot:
+    """One sim lot as a store row. An ownership-only row carries no symbol/size."""
+    return StoreLot(
+        id=lot.position_id,
+        symbol=lot.symbol or "",
+        side=lot.side or "",
+        qty=lot.qty or 0.0,
+        entry_price=lot.entry_price or 0.0,
+        stop_loss=lot.stop_loss,
+        take_profit=lot.take_profit,
+        tag=lot.tag or "",
+        order_ref="",
     )
 
 
@@ -456,31 +477,84 @@ def _open_views(
 ) -> tuple[dict[str, _LotView], list[str]]:
     """Open exposure per symbol, plus the deterministic list of symbols to show.
 
-    A sim scope persists NO book rows, so its ownership lives in ``sim_open_ids``
-    and only the broker's fixture lot knows the size and the entry: an owned
-    fixture lot becomes a view of its own. A symbol our book already covers is
-    never re-added from the broker (the two adapters key lots differently).
+    Our book rows and the sim lots we own BOTH become views. A sim lot that
+    carries its fill detail is a view of its own, so a lot the fixture no longer
+    holds still shows the size we own (that missing counterpart is exactly what
+    the divergence line reports). An ownership-only row has no detail, so the
+    broker's fixture lot with the same id supplies it, when one is there. A
+    symbol our book already covers is never re-added from the broker (the two
+    adapters key lots differently).
     """
     views = {
         symbol: _lot_view(lots) for symbol, lots in _lots_by_symbol(store.lots).items()
     }
-    sim_ids = set(store.sim_open_ids)
-    for lot in broker.positions if broker is not None else ():
-        if lot.id in sim_ids and lot.symbol not in views:
-            views[lot.symbol] = _LotView(
-                qty=lot.qty,
-                entry=lot.avg_cost,
-                side=lot.side,
-                stop_loss=None,
-                take_profit=None,
-                order_ref="",
-            )
+    for symbol, view in _sim_lot_views(store, broker).items():
+        views.setdefault(symbol, view)
     symbols = sorted(
         set(views)
         | {trade.symbol or "-" for trade in store.trades}
         | {record.key.symbol for record in store.orders}
     )
     return views, symbols
+
+
+def _sim_lot_views(store: StoreSide, broker: BrokerSide | None) -> dict[str, _LotView]:
+    """One view per sim lot we own: its own detail, else the fixture's.
+
+    Rows that carry detail collapse per symbol the way a conid book with several
+    lots does (summed size, weighted entry). An ownership-only row has no detail,
+    so the fixture's lot with the same id supplies it — and never overwrites a
+    symbol a detailed row already described.
+    """
+    detailed = tuple(lot for lot in store.sim_lots if lot.symbol)
+    out = {
+        symbol: _lot_view(lots) for symbol, lots in _lots_by_symbol(detailed).items()
+    }
+    marks = {lot.id: lot for lot in (broker.positions if broker is not None else ())}
+    for lot in store.sim_lots:
+        if lot.symbol:
+            continue
+        mark = marks.get(lot.id)
+        if mark is not None:
+            out.setdefault(
+                mark.symbol,
+                _LotView(
+                    qty=mark.qty,
+                    entry=mark.avg_cost,
+                    side=mark.side,
+                    stop_loss=None,
+                    take_profit=None,
+                    order_ref="",
+                ),
+            )
+    return out
+
+
+def _owned_lots(store: StoreSide) -> tuple[StoreLot, ...]:
+    """The lots we own: our book rows plus the sim lots (id-only ones included).
+
+    An id named by more than one of the three sources is listed ONCE — the two
+    adapters key their lots differently, so a conid and a ``position_id`` can
+    collide as strings without being the same lot.
+    """
+    rows = store.lots + store.sim_lots
+    seen = {lot.id for lot in rows}
+    extra = tuple(
+        StoreLot(
+            id=i,
+            symbol="",
+            side="",
+            qty=0.0,
+            entry_price=0.0,
+            stop_loss=None,
+            take_profit=None,
+            tag="",
+            order_ref="",
+        )
+        for i in store.sim_open_ids
+        if i not in seen
+    )
+    return rows + extra
 
 
 def _lots_by_symbol(lots: tuple[StoreLot, ...]) -> dict[str, tuple[StoreLot, ...]]:
@@ -1013,41 +1087,60 @@ def _opt(value: float | None) -> str:
 
 
 def _divergence(report: PfReport) -> tuple[str, ...]:
-    """Broker lots our store does not own, and store lots the broker does not show.
+    """Where the broker and our store disagree: lots both ways, and sim cash.
 
-    The two mismatches a human acts on: a broker lot we do not record (a position
-    our store does not claim) and a store lot the broker does not show (a book row
-    with no matching broker position). Ownership is the UNION of the scope's book
-    rows (conid space) and its sim lots (``position_id`` space) — the two adapters
-    key their lots differently, and a sim scope has NO book rows at all.
+    The mismatches a human acts on: a broker lot we do not record, a store lot
+    the broker does not show, and — for ``sim``, whose broker cash IS this
+    scope's cash — a cash figure that moved on one side only. Ownership is the
+    union of the scope's book rows (conid space) and its sim lots
+    (``position_id`` space): the two adapters key their lots differently.
 
-    Compares the broker against the UNION of every scope in ``report.stores``:
-    with no config the report covers them all, and a broker side is only ever
-    built alongside those stores. Ownership is the union of each scope's book
-    rows (conid space) and its sim lots (``position_id`` space) — the two
-    adapters key their lots differently, and a sim scope has NO book rows at all.
-    Without a broker read there is nothing to compare against and the list is
-    empty.
+    Cash is only compared for ``sim``: an IBKR account's cash is shared by every
+    strategy on it (and the store's own cash is the authority), so a difference
+    there says nothing about this scope. Without a broker read there is nothing
+    to compare against and the list is empty.
     """
     broker = report.broker
     if broker is None or not report.stores:
         return ()
     broker_ids = {lot.id for lot in broker.positions}
-    store_ids = {lot.id for store in report.stores for lot in store.lots} | {
-        i for store in report.stores for i in store.sim_open_ids
-    }
+    store_ids = {lot.id for store in report.stores for lot in _owned_lots(store)}
     ours_unmatched = tuple(
         f"broker lot {lot.id} {lot.symbol} not in our store"
         for lot in broker.positions
         if lot.id not in store_ids
     )
+    # Keyed by id so a scope list that names the same lot twice reports it once;
+    # the first sighting wins, which is the one carrying the symbol when any does.
+    store_lots: dict[str, StoreLot] = {}
+    for store in report.stores:
+        for lot in _owned_lots(store):
+            store_lots.setdefault(lot.id, lot)
     store_unmatched = tuple(
-        f"store lot {lot.id} {lot.symbol} not at the broker"
-        for store in report.stores
-        for lot in store.lots
+        f"store lot {lot.id} {lot.symbol or '-'} not at the broker"
+        for lot in store_lots.values()
         if lot.id not in broker_ids
     )
-    return ours_unmatched + store_unmatched
+    cash = _cash_divergence(broker, report.stores) if broker.adapter == "sim" else ()
+    return ours_unmatched + store_unmatched + cash
+
+
+#: Cash differences below this are rounding, not a divergence worth a line.
+_CASH_TOLERANCE = 0.01
+
+
+def _cash_divergence(
+    broker: BrokerSide, stores: tuple[StoreSide, ...]
+) -> tuple[str, ...]:
+    """Cash the sim broker's book and our store disagree on, per scope."""
+    if broker.cash is None:
+        return ()
+    return tuple(
+        f"cash: broker {broker.cash:.2f} vs store {store.cash:.2f} for "
+        f"{store.scope} (edited fixture, or a cycle that did not settle)"
+        for store in stores
+        if abs(broker.cash - store.cash) > _CASH_TOLERANCE
+    )
 
 
 __all__ = [

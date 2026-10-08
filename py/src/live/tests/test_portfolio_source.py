@@ -8,8 +8,13 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.state import ActionType, PortfolioState
-from src.live.portfolio_source import MockPortfolioSource, load_mock_portfolio
+from src.bt.state import ActionType, PortfolioState, Position
+from src.live.portfolio_source import (
+    MockPortfolioSource,
+    fixture_is_managed,
+    load_mock_portfolio,
+    write_mock_portfolio,
+)
 from src.live.result import Err, Ok
 from src.live.types import FeedError, PortfolioSnapshot
 
@@ -163,3 +168,56 @@ async def test_mock_source_reads_fixture(tmp_path) -> None:
     snapshot = cast(PortfolioSnapshot, result.value)
     assert snapshot.portfolio.cash == 5.0
     assert snapshot.portfolio.positions["AAPL"][0].qty == 2.0
+
+
+def test_write_then_load_round_trips_a_book(tmp_path) -> None:
+    """A written fixture reads back as the same book, and is marked as OURS.
+
+    Regression: the sim book used to have no writer at all, so the fixture it read
+    could never carry a cycle's result forward.
+    """
+    path = tmp_path / "pf_sim.json"
+    portfolio = PortfolioState(
+        cash=1234.5,
+        positions={
+            "AAPL": (
+                Position(
+                    symbol="AAPL",
+                    qty=3.0,
+                    entry_price=10.0,
+                    entry_time=AS_OF,
+                    stop_loss=9.0,
+                    take_profit=12.0,
+                    last_price=11.0,
+                    type=ActionType.short,
+                    position_id="AAPL_7",
+                    tag="v",
+                ),
+            )
+        },
+        trades=(),
+        equity_curve=(),
+        initial_capital=2000.0,
+    )
+
+    write_mock_portfolio(path, portfolio)
+    assert fixture_is_managed(path)
+
+    snapshot = load_mock_portfolio(json.loads(path.read_text()), AS_OF)
+    assert snapshot.portfolio.cash == 1234.5
+    assert snapshot.portfolio.initial_capital == 2000.0
+    lot = snapshot.portfolio.positions["AAPL"][0]
+    assert (lot.qty, lot.type, lot.position_id) == (3.0, ActionType.short, "AAPL_7")
+    assert (lot.stop_loss, lot.take_profit, lot.tag) == (9.0, 12.0, "v")
+    assert lot.entry_time == AS_OF
+
+
+def test_fixture_is_managed_fails_closed(tmp_path) -> None:
+    """Only a readable file carrying the marker is ours; anything else is not."""
+    unmarked = tmp_path / "hand.json"
+    unmarked.write_text(json.dumps({"cash": 1.0, "positions": []}))
+    assert fixture_is_managed(unmarked) is False
+    assert fixture_is_managed(tmp_path / "missing.json") is False
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    assert fixture_is_managed(broken) is False

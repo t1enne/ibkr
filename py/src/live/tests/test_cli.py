@@ -24,7 +24,9 @@ from src.bt.state import ActionType, ExecutionParams, PortfolioState, Position
 from src.live.broker import OrderResult
 from src.live.cli import (
     _STRATEGY_FIELDS,
+    _SimBook,
     _housekeeping,
+    _sim_book,
     _stderr_log,
     _strategy_config,
     _write_strategy_config,
@@ -41,6 +43,7 @@ from src.live.identity import (
     order_ref,
 )
 from src.live.ledger import SqliteLedger
+from src.live.ledger_sim import SimLot
 from src.live.result import Ok, Result
 from src.live.types import (
     FeedError,
@@ -151,18 +154,118 @@ def test_live_run_missing_file_fails(tmp_path: Path) -> None:
     assert out.exit_code != 0
 
 
-def test_live_run_empty_portfolio_path_usage_error(
+def test_live_run_empty_portfolio_path_mints_a_sim_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """No ``portfolio_path`` + ``--adapter sim`` mints a temp fixture, not an error.
+
+    Regression: this used to be a ``UsageError``, which forced a live-only key
+    into every strategy JSON just to run the sim adapter.
+    """
+    seen: list[str] = []
+
     class FakeLedger:
         def ensure_strategy(self, *args: object, **kwargs: object) -> None: ...
         def ensure_cash(self, *args: object, **kwargs: object) -> None: ...
+        def prune_closed(self, *args: object, **kwargs: object) -> int:
+            return 0
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        return _report()
 
     monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr(
+        "src.live.cli.MockPortfolioSource", lambda p: seen.append(p) or object()
+    )
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    monkeypatch.setattr("src.live.cli.tempfile.gettempdir", lambda: str(tmp_path))
+    path = write_config(tmp_path, portfolio_path="", mode="paper")
+    out = CliRunner().invoke(live_group, ["run", path, "--dry-run", "--adapter", "sim"])
+    assert out.exit_code == 0, out.output
+    fixture = tmp_path / "pf_sim_cli_test.json"
+    assert seen == [str(fixture)]
+    # A dry run places nothing, so the minted seed book is left as it was.
+    assert json.loads(fixture.read_text()) == {
+        "managed": True,
+        "cash": 50000,
+        "initial_capital": 50000,
+        "positions": [],
+    }
+
+
+def test_sim_book_prefers_the_config_and_marks_only_what_we_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit path wins; a minted fixture is marked, re-seeded never clobbered."""
+    monkeypatch.setattr("src.live.cli.tempfile.gettempdir", lambda: str(tmp_path))
+    explicit = write_config(tmp_path, portfolio_path="pf.json")
+    cfg = load_live_config(explicit)
+    strategy = _strategy_config(explicit, json.loads(Path(explicit).read_text()))
+    mine = _sim_book(cfg, strategy.name)
+    assert (mine.path, mine.managed) == ("pf.json", False)
+
+    flat = load_live_config(write_config(tmp_path, portfolio_path=""))
+    book = _sim_book(flat, strategy.name)
+    assert book == _SimBook(str(tmp_path / "pf_sim_cli_test.json"), True)
+    # A managed fixture is the book: an edited one is reused, never overwritten.
+    book_on_disk = tmp_path / "pf_sim_cli_test.json"
+    book_on_disk.write_text(json.dumps({"managed": True, "cash": 1.0, "positions": []}))
+    assert _sim_book(flat, strategy.name) == book
+    assert json.loads(book_on_disk.read_text())["cash"] == 1.0
+
+
+def test_sim_run_writes_the_settled_book_back_into_a_managed_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-dry-run sim cycle persists the broker's settled book into the fixture.
+
+    Regression: the book used to reset flat every cycle while the ledger
+    accumulated ownership rows, so ``live pf`` diverged forever.
+    """
+    monkeypatch.setattr("src.live.cli.tempfile.gettempdir", lambda: str(tmp_path))
+
+    class FakeLedger:
+        def ensure_strategy(self, *args: object, **kwargs: object) -> None: ...
+        def ensure_cash(self, *args: object, **kwargs: object) -> None: ...
+        def prune_closed(self, *args: object, **kwargs: object) -> int:
+            return 0
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
     path = write_config(tmp_path, portfolio_path="", mode="paper")
     out = CliRunner().invoke(live_group, ["run", path, "--adapter", "sim"])
-    assert out.exit_code != 0
-    assert "portfolio_path" in out.output
+    assert out.exit_code == 0, out.output
+    # The stubbed cycle never seeds the broker, so the persisted book is the
+    # broker's own starting book: cash seeded, no lots.
+    doc = json.loads((tmp_path / "pf_sim_cli_test.json").read_text())
+    assert (doc["managed"], doc["cash"], doc["positions"]) == (True, 50000.0, [])
+
+
+def test_a_hand_authored_fixture_is_never_written_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unmarked fixture is read-only: a cycle must not clobber an operator's file."""
+
+    class FakeLedger:
+        def ensure_strategy(self, *args: object, **kwargs: object) -> None: ...
+        def ensure_cash(self, *args: object, **kwargs: object) -> None: ...
+        def prune_closed(self, *args: object, **kwargs: object) -> int:
+            return 0
+
+    async def fake_cycle(*a: object, **k: object) -> CycleReport:
+        return _report()
+
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    hand_authored = tmp_path / "my_book.json"
+    hand_authored.write_text(json.dumps({"cash": 123.0, "positions": []}))
+    path = write_config(tmp_path, portfolio_path=str(hand_authored), mode="paper")
+    out = CliRunner().invoke(live_group, ["run", path, "--adapter", "sim"])
+    assert out.exit_code == 0, out.output
+    assert json.loads(hand_authored.read_text()) == {"cash": 123.0, "positions": []}
 
 
 # --- load_live_config -------------------------------------------------------
@@ -602,7 +705,7 @@ def test_is_unsafe_predicate_covers_errors_and_outcomes() -> None:
 class _RecordingLedger:
     def __init__(self) -> None:
         self.touched = 0
-        self.opens: list[object] = []
+        self.opens: list[SimLot] = []
         self.closed: list[str] = []
 
     def ensure_strategy(self, *a: object, **k: object) -> None: ...
@@ -622,13 +725,18 @@ class _RecordingLedger:
         return nullcontext()
 
     def sim_open_ids(self, scope: str) -> frozenset[str]:
-        return frozenset(cast("str", p) for p in self.opens)
+        return frozenset(lot.position_id for lot in self.opens)
 
-    def record_sim_open(self, scope: str, position_id: str) -> None:
-        self.opens.append(position_id)
+    def record_sim_lot(self, scope: str, lot: SimLot) -> None:
+        self.opens.append(lot)
 
     def mark_sim_closed(
-        self, scope: str, position_id: str, closed_at: pd.Timestamp
+        self,
+        scope: str,
+        position_id: str,
+        closed_at: pd.Timestamp,
+        exit_price: float | None = None,
+        commission: float | None = None,
     ) -> None:
         self.closed.append(position_id)
 
