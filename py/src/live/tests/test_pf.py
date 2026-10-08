@@ -18,7 +18,7 @@ import pytest
 
 from src.bt.state import ActionType
 from src.data.db import get_connection
-from src.data.ibkr.client import IbkrClient
+from src.data.ibkr.client import IbkrClient, IbkrError
 from src.exec.refs import scope_tag
 from src.live.cli import load_live_config
 from src.live.identity import IntentKey, IntentRecord, IntentState, order_ref
@@ -600,6 +600,9 @@ class _StubClient:
     async def positions_all(self, account: str) -> list[dict[str, object]]:
         return self.positions
 
+    async def positions_invalidate(self, account: str) -> None:
+        return None
+
     async def open_orders(self) -> list[dict[str, object]]:
         return self.orders
 
@@ -623,6 +626,23 @@ def test_read_ibkr_broker_marks_owned_and_splits_orders() -> None:
     assert owned == {"265598": True, "4815": False}
     assert [o.order_ref for o in side.ours_orders] == [f"{scope_tag('S1')}-deadbeef-00"]
     assert len(side.working_orders) == 2  # the no-ref row is dropped, not shown
+
+
+def test_read_ibkr_broker_warns_when_the_refresh_fails() -> None:
+    """A failed cache discard is a warning — the cached book still beats no book."""
+
+    class _Refusing(_StubClient):
+        async def positions_invalidate(self, account: str) -> None:
+            raise IbkrError("rate_limit", "positions/invalidate: 503", "positions")
+
+    async def go() -> BrokerSide:
+        return await read_ibkr_broker(
+            cast("IbkrClient", _Refusing()), "DU1", ("S1",), frozenset()
+        )
+
+    side = asyncio.run(go())
+    assert side.positions
+    assert any("positions refresh" in warning for warning in side.warnings)
 
 
 # --- (f) sim broker side reads the store's own account rows -------------------

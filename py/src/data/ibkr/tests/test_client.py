@@ -129,6 +129,33 @@ async def test_portfolio_call_without_account_is_auth_error() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_positions_invalidate_posts_to_the_account_path() -> None:
+    """The cache discard is a POST on the account's own positions path.
+
+    The gateway serves positions from a snapshot that goes stale, so the discard is
+    what makes the following read fresh; a wrong verb/path would silently leave
+    every mark frozen (the pf ``--watch`` symptom).
+    """
+    route = respx.post(f"{BASE}portfolio/DU1234567/positions/invalidate").mock(
+        return_value=httpx.Response(200, json={"message": "success"})
+    )
+    await _client().positions_invalidate()
+    assert route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_positions_invalidate_failure_is_typed() -> None:
+    respx.post(f"{BASE}portfolio/DU1234567/positions/invalidate").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    with pytest.raises(IbkrError) as excinfo:
+        await _client().positions_invalidate()
+    assert excinfo.value.kind == "transport"
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_resolve_account_uses_first_when_unset() -> None:
     respx.get(f"{BASE}iserver/accounts").mock(
         return_value=httpx.Response(200, json={"accounts": ["DU9", "U1"]})

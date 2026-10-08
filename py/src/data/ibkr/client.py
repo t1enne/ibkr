@@ -279,6 +279,17 @@ class IbkrClient:
                 break
         return out
 
+    async def positions_invalidate(self, account: str | None = None) -> None:
+        """``/portfolio/{acct}/positions/invalidate`` — discard the cached book.
+
+        The positions endpoint serves a SNAPSHOT the gateway regenerates on its own
+        cadence, so ``mktPrice`` sits frozen while the market moves. This asks IB to
+        drop it, so the next ``positions`` read is freshly obtained. It discards a
+        cache only — no order and no account state is touched.
+        """
+        account = self._require_account(account)
+        await self._post(f"portfolio/{account}/positions/invalidate")
+
     async def trades(self) -> list[dict[str, Any]]:
         """``/iserver/account/trades`` — per-execution trade history (7d window)."""
         body = await self._get("iserver/account/trades")

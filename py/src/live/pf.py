@@ -29,7 +29,7 @@ import pandas as pd
 from src.bt.cmds._shared import _json_default
 from src.shared.style import PLAIN, Role, Styler
 from src.bt.table import Col, Table, render
-from src.data.ibkr.client import IbkrClient
+from src.data.ibkr.client import IbkrClient, IbkrError
 from src.live.identity import ref_is_ours
 from src.live.adapters.ibkr.mapping import IbkrPosition, parse_positions, parse_summary
 from src.live.adapters.ibkr.orders import parse_working_order
@@ -250,10 +250,18 @@ async def read_ibkr_broker(
     must not blank the report. ``ours_orders`` is the working orders minted by
     ANY of *scopes* (``identity.ref_is_ours``, the same predicate the cycle's
     adoption uses); ``working_orders`` holds only the rows that carry a ref.
+
+    The gateway serves positions from a snapshot it regenerates on its own
+    cadence, which leaves ``mktPrice`` frozen however often this is called — so
+    the cache is discarded FIRST (``positions_invalidate``) and the read that
+    follows is freshly obtained. The discard never places, amends or cancels
+    anything; when it fails the read still proceeds, cached, and says so in
+    ``warnings``.
     """
     summary, summary_warnings = parse_summary(
         await client.portfolio_summary(account), account
     )
+    refresh_warnings = await _discard_position_cache(client, account)
     positions, position_warnings = parse_positions(await client.positions_all(account))
     working = _working_orders(await client.open_orders())
     return BrokerSide(
@@ -267,8 +275,17 @@ async def read_ibkr_broker(
         ours_orders=tuple(
             o for o in working if any(ref_is_ours(s, o.order_ref) for s in scopes)
         ),
-        warnings=summary_warnings + position_warnings,
+        warnings=summary_warnings + refresh_warnings + position_warnings,
     )
+
+
+async def _discard_position_cache(client: IbkrClient, account: str) -> tuple[str, ...]:
+    """Force a fresh positions snapshot; a failure is a warning, not a blank report."""
+    try:
+        await client.positions_invalidate(account)
+    except IbkrError as exc:
+        return (f"positions refresh: {exc}; marks may be cached",)
+    return ()
 
 
 def _working_orders(entries: list[dict[str, object]]) -> tuple[WorkingOrder, ...]:
