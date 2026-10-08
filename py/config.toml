@@ -1,0 +1,8 @@
+# Operator settings — non-secret defaults a CLI cannot guess.
+# Secrets stay in `.env` (IBKR_USERNAME / IBKR_PASSWORD).
+# `IBKR_CONFIG_PATH` points elsewhere (tests do).
+
+[live]
+# The adapter a live run/`live pf` uses when neither `--adapter` nor the
+# strategy config names one. One of "ibkr" | "sim".
+adapter = "ibkr"

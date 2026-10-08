@@ -7,8 +7,8 @@ A live scope has two halves that must not drift apart:
 - the **strategy intent hash** (``config_hash``) — the capital-at-risk identity of
   the strategy *itself*.
 
-Friction and bookkeeping fields (fees, mode, capital, paths) are deliberately
-excluded from the hash: re-running the same strategy with a different commission
+Friction and bookkeeping fields (fees, capital, paths) are deliberately excluded
+from the hash: re-running the same strategy with a different commission
 assumption is the same strategy, and changing those must not fork its identity.
 """
 
@@ -84,7 +84,7 @@ def strategy_intent_payload(cfg: LiveConfig) -> dict[str, object]:
     """The fields that define the strategy's intent — the hash's whole input.
 
     Only what the strategy *does*: type, universe, params, bars, warm-up and
-    sizing. Friction and bookkeeping (fees, spread/slippage, mode, broker, scope,
+    sizing. Friction and bookkeeping (fees, spread/slippage, broker, scope,
     capital, portfolio path, config name) are excluded by construction, so editing
     them leaves the identity unchanged.
     """

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal, TextIO, cast
 
@@ -27,10 +27,10 @@ from src.shared.style import COLOR, PLAIN, Styler
 from src.bt.table import Col, Table, render as render_table
 from src.bt.state import ActionType, PortfolioState
 from src.bt.types import StrategyConfig
+from src.config import live_adapter
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.gateway import IbkrGateway
 from src.live.adapter import LiveAdapter, resolve_adapter, resolve_adapter_name
-from src.live.adapters.ibkr.authz import authorize
 from src.live.pure import OrderResult
 from src.live.engine import (
     CycleReport,
@@ -51,7 +51,6 @@ from src.live.pf import (
     read_store,
     render_pf,
 )
-from src.live.result import Err
 from src.live.scope import (
     AdapterName,
     ScopeParts,
@@ -61,7 +60,6 @@ from src.live.scope import (
 )
 from src.live.divergence import Divergence
 from src.live.types import (
-    CostProvenance,
     FeedError,
     LiveConfig,
     cost_provenance,
@@ -157,7 +155,7 @@ def live_run(
     strategy = _strategy_config(config_path, raw)
     ledger = SqliteLedger()
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
-        ledger.ensure_strategy(strategy_id, scope, strategy.name, cfg.mode)
+        ledger.ensure_strategy(strategy_id, scope, strategy.name)
         ledger.ensure_cash(scope, cfg.initial_capital)
     gateway: IbkrGateway | None = None
     client: IbkrClient | None = None
@@ -180,24 +178,25 @@ def live_run(
         # on exit.
         with tempfile.TemporaryDirectory(prefix="ibkr-live-") as tmp:
             normalized_path = _write_strategy_config(strategy, tmp)
-            report = asyncio.run(
-                _run_cycle(
-                    cfg,
-                    adapter=backend,
-                    ledger=ledger,
-                    strategy_id=strategy_id,
-                    scope=scope,
-                    config_path=normalized_path,
-                    max_age_days=max_age,
-                    dry_run=dry_run,
-                    gateway=gateway,
-                    cost=cost,
-                )
+            report = replace(
+                asyncio.run(
+                    _run_cycle(
+                        cfg,
+                        adapter=backend,
+                        ledger=ledger,
+                        strategy_id=strategy_id,
+                        scope=scope,
+                        config_path=normalized_path,
+                        max_age_days=max_age,
+                        dry_run=dry_run,
+                        gateway=gateway,
+                    )
+                ),
+                cost=cost,
             )
     except (
         StaleDataError,
         PortfolioFetchError,
-        SessionNotReady,
         CycleInProgressError,
         LedgerReadError,
         ValueError,
@@ -236,27 +235,13 @@ async def _run_cycle(
     max_age_days: int,
     dry_run: bool,
     gateway: IbkrGateway | None,
-    cost: CostProvenance,
 ) -> CycleReport:
-    """Resolve the account + authz, then run the cycle.
+    """Run the cycle, closing the gateway client when it is done.
 
-    The gateway adapter is what this adds over the sim path, and it runs BEFORE
-    ``run_cycle``: a cycle that cannot reach a broker session, or that is not
-    permitted to trade the account it found, must fail without ever touching the
-    screen or the book. Keeping a session *fresh* is ``ibkr gw``'s job — this
-    only proves a usable one exists.
+    Reachability, login and session freshness are ``ibkr gw``'s job: this only
+    owns the client's lifetime (the portfolio source shares it, so it outlives
+    the read and is released here rather than leaked).
     """
-    if gateway is not None:
-        try:
-            account = await gateway.client.resolve_account()
-        except IbkrError as exc:
-            raise SessionNotReady(FeedError(kind="auth", message=str(exc))) from exc
-        decision = authorize(
-            mode=cfg.mode,
-            account=account,
-        )
-        if isinstance(decision, Err):
-            raise SessionNotReady(cast("FeedError", decision.error))
     try:
         return await run_cycle(
             cfg,
@@ -267,7 +252,6 @@ async def _run_cycle(
             config_path=config_path,
             max_age_days=max_age_days,
             dry_run=dry_run,
-            cost=cost,
         )
     finally:
         # The client is shared with the portfolio source and outlives the read;
@@ -284,8 +268,9 @@ def resolve_broker(
     ``StrategyConfig.broker``, ``LiveConfig.broker`` and ``live pf``'s probe
     previously resolved the key in three places and disagreed when it lived in
     ``strategy_params``. They now all go through this: flat/top-level wins, then
-    ``strategy_params``, then the ``sim`` default. The explicit-named flag comes
-    from the same scan, so it can never contradict the resolved name.
+    ``strategy_params``, then ``config.toml``'s ``[live] adapter``. The
+    explicit-named flag comes from the same scan, so it can never contradict the
+    resolved name.
 
     ``live run`` no longer consults this for adapter SELECTION (its ``--adapter``
     always carries a value, ``ibkr`` by default); it is the description of the
@@ -299,7 +284,7 @@ def resolve_broker(
                     f"broker must be one of {sorted(_ADAPTERS)}, got {value!r}"
                 )
             return cast("str", value), True
-    return "sim", False
+    return live_adapter(), False
 
 
 live_group.add_command(live_run)
@@ -536,10 +521,9 @@ async def _read_ibkr_pf(
     """
     gateway, account = await _open_ibkr_session()
     try:
-        try:
-            return await read_ibkr_broker(gateway.client, account, scopes, owned)
-        except IbkrError as exc:
-            raise SessionNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
+        return await read_ibkr_broker(gateway.client, account, scopes, owned)
+    except IbkrError as exc:
+        raise SessionNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
     finally:
         await gateway.aclose()
 
@@ -647,7 +631,7 @@ def _ibkr_watch_session(
     initial_capital: float,
     style: Styler = PLAIN,
 ) -> _WatchSession:
-    """Gate ONE ibkr session on a persistent loop, then read only the book.
+    """Hold ONE ibkr session open on a persistent loop, then read only the book.
 
     The loop is held for the whole watch: an ``httpx.AsyncClient`` binds to the
     loop that first runs it, so a fresh ``asyncio.run`` per tick would rebind the
@@ -791,8 +775,8 @@ def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
 
     ``load_strategy`` validates through ``StrategyConfig(**data)`` and rejects
     unknown top-level keys, so the screen bridge must see ONLY the keys
-    ``StrategyConfig`` defines. Live-only keys (``mode``, sizing) never reach the
-    temp file.
+    ``StrategyConfig`` defines. Live-only keys (sizing) never reach the temp
+    file.
     """
     path = Path(tmp) / "strategy.json"
     path.write_text(json.dumps(asdict(strategy), default=_json_default))
@@ -810,30 +794,28 @@ def _housekeeping(ledger: SqliteLedger, dry_run: bool) -> None:
     try:
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=90)
         ledger.prune_closed(cast("pd.Timestamp", cutoff))
-    except peewee.OperationalError:  # housekeeping is non-fatal
+    except peewee.OperationalError as exc:  # housekeeping is non-fatal
         # peewee wraps sqlite3 errors (a lock, a busy DB) as peewee.OperationalError
         # — NOT a sqlite3.Error — so this is the type a prune failure actually
         # raises. The ledger's own reads catch the same type. LedgerReadError is
         # not caught: prune_closed takes the WRITE path and never raises it.
-        pass
+        _stderr_log(f"housekeeping: prune skipped ({exc})")
 
 
 def load_live_config(path: str) -> LiveConfig:
     """Parse + validate the live JSON -> ``LiveConfig`` (strategy + sizing).
 
     Strategy fields are validated through ``StrategyConfig`` (via
-    ``load_strategy`` for a pure file); live-only keys — ``mode``, sizing — are
-    read from the raw dict. Sizing accepts a nested ``"sizing"`` object OR flat
-    keys (top-level, then ``strategy_params``, where real ``strats/*.json`` keep
-    sizing); flat wins when both are given.
+    ``load_strategy`` for a pure file); the live-only sizing keys are read from
+    the raw dict (and a key neither knows, such as a stale ``mode``, is ignored).
+    Sizing accepts a nested ``"sizing"`` object OR flat keys (top-level, then
+    ``strategy_params``, where real ``strats/*.json`` keep sizing); flat wins when
+    both are given.
     """
     raw = _read_json(path)
     strategy = _strategy_config(path, raw)
     params = strategy.strategy_params
     size_mode, size, alloc = _sizing(raw, params)
-    raw_mode = _pick((raw, params), ("mode",), "paper")
-    if raw_mode not in ("paper", "live"):
-        raise ValueError(f"mode must be 'paper' or 'live', got {raw_mode!r}")
     raw_broker, _ = resolve_broker(raw, params)
     commission = _float_or((raw, params), "commission", strategy.commission)
     spread_bps = _float_or((raw, params), "spread_bps", strategy.spread_bps)
@@ -861,7 +843,6 @@ def load_live_config(path: str) -> LiveConfig:
         size_mode=size_mode,
         size=size,
         max_symbol_allocation=alloc,
-        mode=cast("Literal['paper', 'live']", raw_mode),
         adapter=cast("AdapterName", _resolve_adapter_key(raw, params)),
         broker=cast("Literal['sim', 'ibkr']", raw_broker),
         config_name=strategy.name,

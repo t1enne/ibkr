@@ -42,7 +42,7 @@ agent burning a session rebuilding machinery the toolkit already has.
    or evaluation starts there. Skipping it causes rules 2–5.
 2. **Never test a strategy.** Strategies, `strats/*.json`, research and sweeps
    are exempt from `AGENTS.md`'s test rule — no `test_<strategy>.py`, no
-   fixtures. Tests cover *engine* code only. Validate strategies by **running** them.
+   fixtures. Tests cover _engine_ code only. Validate strategies by **running** them.
 3. **Use `bt run` / `bt sweep` / `bt split` / `bt optimize` — no throwaway
    harnesses.** A bespoke candle-load + grid-loop + `run()` script is forbidden;
    that is `bt sweep` (`bt optimize` if folds must also validate OOS). Custom
@@ -136,9 +136,9 @@ iteration) truncates rows beyond the cursor. Fast-path methods (`latest`,
 #### `candle.interval` — which bar is this?
 
 `ctx.candle.interval` is `"1h"` for base bars, `"4h"` for HTF bars, etc. The
-engine fires the strategy only on base-interval candles, so ``ctx.candle.interval``
+engine fires the strategy only on base-interval candles, so `ctx.candle.interval`
 is the signal interval at every call. Multi-interval strategies that also read
-HTF structure reach the accumulated store via ``ctx.state.candles`` (cursor-
+HTF structure reach the accumulated store via `ctx.state.candles` (cursor-
 truncated):
 
 ```python
@@ -155,11 +155,11 @@ def on_candle(ctx):
 
 The engine has already accumulated every symbol up to the current timestamp
 when the strategy runs (fires on the last symbol), so cross-sectional reads are
-complete. Read any symbol from ``ctx.state.candles``, then emit signals per
-target symbol with ``ctx.long/close``. Returned signals are bucketed by
-``signal.symbol`` — the engine drains each symbol's queue when its candle
-iteration reaches the execution stage. Prefer a typed ``Params`` dataclass
-(fields reachable as attributes on ``ctx.params``; see ``StrategyParams``):
+complete. Read any symbol from `ctx.state.candles`, then emit signals per
+target symbol with `ctx.long/close`. Returned signals are bucketed by
+`signal.symbol` — the engine drains each symbol's queue when its candle
+iteration reaches the execution stage. Prefer a typed `Params` dataclass
+(fields reachable as attributes on `ctx.params`; see `StrategyParams`):
 
 ```python
 from dataclasses import dataclass
@@ -246,12 +246,12 @@ One command, two transports: candles come from the IBKR Gateway (bounded by
 directly from SEC (no Gateway, payloads cached on disk) as sparse fiscal rows,
 reported in a `fundamentals:` recap block. The symbol list is resolved once for
 both, and the SEC pass always runs. `--fundamentals-from`/`--fundamentals-to`
-bound the *filing* date, `--refresh-fundamentals` bypasses the SEC payload
+bound the _filing_ date, `--refresh-fundamentals` bypasses the SEC payload
 cache, `--fundamentals-cache` sets its directory. The candle window is
 deliberately not applied to filings.
 
 `--from` sets the history floor — earlier = deeper backfill plus the trailing
-tail in one call. Its `0 fetch gaps`/`up to date` tail is *post-download* output
+tail in one call. Its `0 fetch gaps`/`up to date` tail is _post-download_ output
 and can print even on a successful fill; always confirm with:
 
 ```bash
@@ -355,7 +355,7 @@ combos/folds wastes nothing.
 #### When to use `--workers`
 
 `--workers` is a throughput knob, not a correctness one — every count returns
-**identical** results. The question is only whether a process pool is *faster*.
+**identical** results. The question is only whether a process pool is _faster_.
 There is a **fixed cost of ~2s per pooled run** (spawning a `forkserver` + worker
 processes on Python 3.14), so the pool wins only when the units it parallelizes
 are cheap by comparison. Roughly: if total compute is under a few seconds, keep
@@ -409,18 +409,19 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 ```
 
 `--adapter sim` settles a paper book locally from a JSON fixture; `--adapter ibkr`
-places real orders (and is the default). A config with `"mode": "paper"` pointed
-at a live account is **refused**: switch the config to `"mode": "live"` or point
-it at a paper account.
+places real orders (and is the default). Precedence is `--adapter` > the config's
+`adapter` key > the legacy `broker` key > `[live] adapter` in `config.toml` —
+that file is the one place the default lives, so change it there rather than at a
+call site.
 
 The gateway lifecycle lives in `ibkr gw`: `gw start` (the default subcommand)
 brings the compose stack up detached, logs the session in via Playwright when
 it is unauthenticated (`--mode paper|live`, default `$TRADING_MODE`), then
 supervises the gateway in the foreground — a `/tickle` keepalive and a daily
 container bounce for the fresh IBKR session. `gw stop` tears the stack down.
-A cycle does not probe readiness — keeping the session fresh is `ibkr gw`'s job;
-`live run` only resolves the account and checks its mode may trade it. See
-`ibkr gw start --help` for the rest.
+A cycle does not probe readiness — keeping the session fresh, logging in, and
+deciding `paper` vs `live` are all `ibkr gw`'s job; `live run` just trades through
+the session it finds. See `ibkr gw start --help` for the rest.
 
 ### The cycle
 
@@ -472,12 +473,12 @@ same book, while two different scopes still run concurrently.
 
 ### Exit codes
 
-| code | meaning |
-| ---- | ------- |
-| `0` | clean cycle |
-| `1` | config / stale data / gateway failure |
-| `2` | usage error |
-| `3` | **unsafe cycle** — placement or resync error, or an order left unresolved, wedged, timed out or diverged |
+| code | meaning                                                                                                  |
+| ---- | -------------------------------------------------------------------------------------------------------- |
+| `0`  | clean cycle                                                                                              |
+| `1`  | config / stale data / gateway failure                                                                    |
+| `2`  | usage error                                                                                              |
+| `3`  | **unsafe cycle** — placement or resync error, or an order left unresolved, wedged, timed out or diverged |
 
 Cron should alert on anything non-zero. `--allow-unsafe` forces `0` for callers
 that consume the report themselves; it does not belong in a scheduled run.

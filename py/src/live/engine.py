@@ -188,31 +188,6 @@ class CycleLedger(Protocol):
     def prune(self, before: pd.Timestamp) -> int: ...
 
 
-def build_report(
-    portfolio: PortfolioState,
-    signals: tuple[LiveSignal, ...],
-    intents: tuple[OrderIntent, ...],
-    results: tuple[OrderResult, ...],
-    as_of: pd.Timestamp,
-    cost: CostProvenance = MODELLED_COST,
-    placement_error: FeedError | None = None,
-    resync_error: FeedError | None = None,
-    divergences: tuple[Divergence, ...] = (),
-) -> CycleReport:
-    """Pure: assemble the cycle report. No clock, no I/O."""
-    return CycleReport(
-        as_of=as_of,
-        signals=signals,
-        intents=intents,
-        results=results,
-        portfolio_before=portfolio,
-        cost=cost,
-        placement_error=placement_error,
-        resync_error=resync_error,
-        divergences=divergences,
-    )
-
-
 def assert_data_fresh(
     symbols: tuple[str, ...],
     max_age_days: int,
@@ -283,7 +258,6 @@ async def run_cycle(
     db_path: str | Path | None = None,
     now: pd.Timestamp | None = None,
     signal_source: SignalSource = live_signals,
-    cost: CostProvenance = MODELLED_COST,
 ) -> CycleReport:
     """One full batch pass. Not a loop; the caller drives cadence.
 
@@ -314,13 +288,12 @@ async def run_cycle(
         if not dry_run:
             _persist(ledger, adapter, scope, placed, strategy_id, now_ts)
         await adapter.close()
-    return build_report(
-        snapshot.portfolio,
-        signals,
-        placed.intents,
-        results,
-        now_ts,
-        cost=cost,
+    return CycleReport(
+        as_of=now_ts,
+        signals=signals,
+        intents=placed.intents,
+        results=results,
+        portfolio_before=snapshot.portfolio,
         placement_error=placement_error,
         resync_error=resync_error,
         divergences=divergences,
@@ -384,19 +357,6 @@ async def _resync(
     return tuple(resynced.value), None
 
 
-def _owned_ids(
-    ledger: CycleLedger, adapter: LiveAdapter, scope: str
-) -> frozenset[str] | None:
-    """The lot ids a close may target, or ``None`` when every lot is closable.
-
-    A book the adapter does not own (IBKR's replayed book: already only our lots)
-    needs no filter, so ``owned=None`` — and the ledger must not blank it out. A
-    book that may hold lots we never opened (the sim account book, a human-edited
-    ``live_position``) is scoped to the lots the scope is recorded as owning.
-    """
-    return ledger.sim_open_ids(scope) if adapter.owns_book else None
-
-
 def _divergences(
     ledger: CycleLedger, scope: str, account: PortfolioState
 ) -> tuple[Divergence, ...]:
@@ -429,7 +389,11 @@ async def _place(
     silently turned into "no orders"): the report carries it so an operator sees
     the failure rather than "0 orders". A dry run places nothing at all.
     """
-    intents = reconcile(signals, book, config, _owned_ids(ledger, adapter, scope))
+    # An adapter that OWNS its book (IBKR's replay is already only our lots) needs
+    # no ownership filter (``None``); one that may hold lots we never opened (the
+    # sim account book, a human-edited ``live_position``) is scoped to ours.
+    owned = ledger.sim_open_ids(scope) if adapter.owns_book else None
+    intents = reconcile(signals, book, config, owned)
     if dry_run or not intents:
         return _Placement(intents=intents, results=Ok(()))
     return _Placement(

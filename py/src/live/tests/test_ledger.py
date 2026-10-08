@@ -77,9 +77,9 @@ def test_reusing_a_scope_with_a_different_strategy_warns(
 ) -> None:
     # Two configs sharing a name share one scope (book + cash + cOID prefix); a
     # different strategy_id on an existing scope must be loud, not silent (L7).
-    ledger.ensure_strategy("hash-a", "momentum", "momentum", "paper")
+    ledger.ensure_strategy("hash-a", "momentum", "momentum")
     with caplog.at_level(logging.WARNING, logger="src.live.ledger"):
-        ledger.ensure_strategy("hash-b", "momentum", "momentum", "paper")
+        ledger.ensure_strategy("hash-b", "momentum", "momentum")
     assert any("momentum" in record.getMessage() for record in caplog.records)
 
 
@@ -87,9 +87,9 @@ def test_same_scope_same_strategy_does_not_warn(
     ledger: SqliteLedger, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The ordinary re-run (same config hash) must stay quiet.
-    ledger.ensure_strategy("hash-a", "momentum", "momentum", "paper")
+    ledger.ensure_strategy("hash-a", "momentum", "momentum")
     with caplog.at_level(logging.WARNING, logger="src.live.ledger"):
-        ledger.ensure_strategy("hash-a", "momentum", "momentum", "paper")
+        ledger.ensure_strategy("hash-a", "momentum", "momentum")
     assert not [
         record
         for record in caplog.records
@@ -323,7 +323,7 @@ def test_migration_check_and_action_are_one_atomic_unit(
 
     monkeypatch.setattr(ledger._database, "create_tables", explode)
     with pytest.raises(RuntimeError, match="mid-transaction"):
-        ledger.ensure_strategy("h1", "momentum", "phase", "paper")
+        ledger.ensure_strategy("h1", "momentum", "phase")
     monkeypatch.undo()
 
     with get_connection(db) as con:

@@ -772,7 +772,6 @@ _ORDER_COLS = (
 )
 _SCOPE_COLS = (
     Col("scope"),
-    Col("mode"),
     Col("rev", ">"),
     Col("id"),
     Col("name"),
@@ -998,7 +997,6 @@ def _scope_row(store: StoreSide) -> tuple[str, ...]:
     latest = _latest(store)
     return (
         store.scope,
-        latest.mode if latest else "-",
         str(len(store.strategy_rows)),
         latest.strategy_id[:12] if latest else "-",
         latest.name if latest else "-",

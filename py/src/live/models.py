@@ -40,7 +40,6 @@ class LiveStrategy(_Base):
     config_name = TextField(null=False, default="")
     instance = TextField(null=False, default="")
     name = TextField()
-    mode = TextField()
     created_at = IntegerField()
     last_cycle_at = IntegerField(null=True)
 

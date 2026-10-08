@@ -470,7 +470,7 @@ def test_cli_pf_sim_marks_a_recorded_lot_ours(
     from src.live.cli import live_group
 
     db = tmp_path / "ledger.sqlite"
-    scope = _config_scope(_cfg(tmp_path, mode="paper"))
+    scope = _config_scope(_cfg(tmp_path))
     ledger = SqliteLedger(db)
     ledger.record_sim_lot(
         scope,
@@ -483,7 +483,7 @@ def test_cli_pf_sim_marks_a_recorded_lot_ours(
         ),
     )
     target = tmp_path / "cfg.json"
-    target.write_text(json.dumps({**BASE_CONFIG, "mode": "paper"}))
+    target.write_text(json.dumps(BASE_CONFIG))
     monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(db))
 
     out = CliRunner().invoke(live_group, ["pf", str(target), "--adapter", "sim"])

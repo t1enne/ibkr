@@ -195,7 +195,6 @@ def test_pf_and_run_resolve_the_same_scope_for_one_config(tmp_path: Path) -> Non
 def test_load_live_config_maps_every_field(tmp_path: Path) -> None:
     path = write_config(
         tmp_path,
-        mode="live",
         size_mode="cash",
         size=0.25,
         max_symbol_allocation=0.5,
@@ -207,7 +206,6 @@ def test_load_live_config_maps_every_field(tmp_path: Path) -> None:
     assert cfg.initial_capital == 50000
     assert cfg.strategy_params == {"vwatr_period": 14}
     assert (cfg.size_mode, cfg.size, cfg.max_symbol_allocation) == ("cash", 0.25, 0.5)
-    assert cfg.mode == "live"
 
 
 def test_load_live_config_flat_overrides_nested(tmp_path: Path) -> None:
@@ -223,18 +221,13 @@ def test_load_live_config_flat_overrides_nested(tmp_path: Path) -> None:
     assert cfg.max_symbol_allocation == 0.9  # no flat key -> nested kept
 
 
-def test_load_live_config_bad_mode_raises(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="mode must be"):
-        load_live_config(write_config(tmp_path, mode="bogus"))
-
-
 def test_load_live_config_bad_size_mode_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="size_mode must be"):
         load_live_config(write_config(tmp_path, size_mode="bogus"))
 
 
 def test_write_strategy_config_is_load_strategy_able(tmp_path: Path) -> None:
-    path = write_config(tmp_path, portfolio_path="pf.json", mode="live", size=0.25)
+    path = write_config(tmp_path, portfolio_path="pf.json", size=0.25)
     raw = json.loads(Path(path).read_text())
     strategy = _strategy_config(path, raw)
     with tempfile.TemporaryDirectory() as tmp:
@@ -614,7 +607,7 @@ def test_ibkr_dry_run_adapter_still_refuses_to_place(
         return _report()
 
     monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
-    path = write_config(tmp_path, broker="ibkr", mode="paper")
+    path = write_config(tmp_path, broker="ibkr")
     out = CliRunner().invoke(
         live_group, ["run", path, "--dry-run", "--adapter", "ibkr"]
     )

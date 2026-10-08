@@ -254,13 +254,15 @@ uv run ibkr live run strats/pass/<cfg>.json --adapter ibkr
 uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 ```
 
-- A `paper` config pointed at a live account is refused; the config's `mode` is
-  the only switch for reading a live account.
-- **No gateway lifecycle in `live`.** `ibkr gw` starts/stops the stack and keeps
-  the session fresh (`/tickle` + daily bounce). A cycle resolves the account and
-  checks its mode, nothing more — it never probes gateway readiness.
+- **No gateway lifecycle in `live`.** `ibkr gw` starts/stops the stack, logs in,
+  keeps the session fresh (`/tickle` + daily bounce) and decides `paper` vs
+  `live`. A cycle only uses the gateway client to read/place — it never probes
+  readiness, resolves the account or mentions a session mode.
 - **Adapter resolution:** CLI `--adapter` (unset by default) > config `adapter` >
-  legacy config `broker` > `ibkr`. Both adapters (`ibkr`, `sim`) are STATELESS —
+  legacy config `broker` > `[live] adapter` in `py/config.toml` (read by
+  `src/config.py`, overridable with `IBKR_CONFIG_PATH`; a typo raises, never a
+  silent fallback). That file is the ONE place a default adapter literal lives.
+  Both adapters (`ibkr`, `sim`) are STATELESS —
   the fetched book travels in as a parameter and the settled results come back
   out; the durable book lives in sqlite (`live_position`), never on the adapter.
 - **Scope grammar:** `scope = <adapter>_<config_name>_<config_hash>`, where
@@ -307,7 +309,10 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 5. **Adoption matches our own `order_ref` by exact `scope_tag` prefix.** Never
    symbol+side — the account is shared with other scopes and with a human.
 
-Also: migrations **rename, never drop**, and re-keys preserve rows; the close and
+Also: migrations **rename, never drop**, and re-keys preserve rows — the one
+carve-out is a DEAD COLUMN nobody reads (`live_strategy.mode`: dropped from the
+model, so `live_0001`'s model-driven DDL no longer creates it, plus a one-off
+`ALTER TABLE ... DROP COLUMN` on an already-migrated file). The close and
 open guards fail **closed** on every unknown, and the open guard may be excused
 only by our own already-confirmed reducing fills (a same-cycle flip) — do not
 widen that; stop-loss/take-profit and LMT are **refused**, never silently sent

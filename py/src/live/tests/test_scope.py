@@ -54,7 +54,6 @@ def test_friction_and_bookkeeping_edits_do_not_move_the_hash() -> None:
         ("commission", 9.99),
         ("initial_capital", 1_000_000.0),
         ("broker", "ibkr"),
-        ("mode", "live"),
         ("adapter", "sim"),
         ("config_name", "renamed"),
     ):

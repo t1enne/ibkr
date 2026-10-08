@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from typing import Protocol, cast
 
 from src.bt.state import PortfolioState
+from src.config import live_adapter
 from src.data.ibkr.client import IbkrClient
 from src.live.adapters.ibkr.adapter import build_ibkr_adapter
 from src.live.adapters.sim.adapter import build_sim_adapter
@@ -78,15 +79,16 @@ def resolve_adapter_name(
 
     CLI ``--adapter`` (an explicitly passed flag) wins, then the config's
     ``adapter`` key, then the back-compat ``broker`` key — each scanned
-    top-level first, then ``strategy_params`` — then the ``"ibkr"`` default.
-    An unknown winner is a config error (``ValueError``), never a silent
-    fallback to the default: a typo'd adapter must not trade on the wrong side.
+    top-level first, then ``strategy_params`` — then ``config.toml``'s
+    ``[live] adapter`` (see :func:`src.config.live_adapter`). An unknown winner
+    is a config error (``ValueError``), never a silent fallback to the default:
+    a typo'd adapter must not trade on the wrong side.
     """
     winner: object = cli_flag
     if winner is None:
         winner = _first_named(raw, params, ("adapter", "broker"))
     if winner is None:
-        return "ibkr"
+        return cast("AdapterName", live_adapter())
     if winner not in _ADAPTER_NAMES:
         raise ValueError(
             f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got {winner!r}"

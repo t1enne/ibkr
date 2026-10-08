@@ -35,11 +35,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pandas as pd
 import peewee
@@ -91,6 +91,25 @@ logger = logging.getLogger(__name__)
 #: on two paths share these classes — see :mod:`src.live.models`.
 _MODELS = LIVE_MODELS
 
+_T = TypeVar("_T")
+
+
+def _read(db: SqliteDatabase, query: Callable[[], _T], default: _T) -> _T:
+    """Run *query* under the live model binding; an absent table yields *default*.
+
+    An absent table is the never-written (or dry-run) store, whose reads are
+    empty rather than an error. Any OTHER ``OperationalError`` — a lock, a
+    corrupt file, a shape drift — raises :class:`LedgerReadError`, so an
+    unreadable book can never read as a flat one.
+    """
+    try:
+        with db.bind_ctx(_MODELS):
+            return query()
+    except peewee.OperationalError as exc:
+        if not _is_missing_table(exc):
+            raise LedgerReadError(str(exc)) from exc
+        return default
+
 
 @dataclass(frozen=True)
 class StrategyAudit:
@@ -104,7 +123,6 @@ class StrategyAudit:
     strategy_id: str
     scope: str
     name: str
-    mode: str
     created_at: pd.Timestamp | None
     last_cycle_at: pd.Timestamp | None
 
@@ -195,26 +213,22 @@ class MetadataStore(_SqliteOps):
         read failure raises ``LedgerReadError``.
         """
         found: set[str] = set()
-        with self._database.bind_ctx(_MODELS):
-            for model in (
-                LiveStrategy,
-                LiveCash,
-                LivePosition,
-                LiveExecution,
-                LiveOrderIntent,
-            ):
-                try:
-                    rows = model.select(model.scope).distinct().execute()
-                except peewee.OperationalError as exc:
-                    if not _is_missing_table(exc):
-                        raise LedgerReadError(str(exc)) from exc
-                    continue
-                found.update(str(row.scope) for row in rows)
+        for model in (
+            LiveStrategy,
+            LiveCash,
+            LivePosition,
+            LiveExecution,
+            LiveOrderIntent,
+        ):
+            rows = _read(
+                self._database,
+                lambda m=model: m.select(m.scope).distinct().execute(),
+                (),
+            )
+            found.update(str(row.scope) for row in rows)
         return tuple(sorted(found))
 
-    def ensure_strategy(
-        self, strategy_id: str, scope: str, name: str, mode: str
-    ) -> None:
+    def ensure_strategy(self, strategy_id: str, scope: str, name: str) -> None:
         """Record the strategy audit row; warn when a run reuses another's scope.
 
         Ownership is the ``scope`` (one book, one cash seed, one cOID prefix), but
@@ -248,7 +262,6 @@ class MetadataStore(_SqliteOps):
                 strategy_id=strategy_id,
                 scope=scope,
                 name=name,
-                mode=mode,
                 created_at=_ms(pd.Timestamp.now()),
             ).on_conflict("IGNORE").execute()
 
@@ -275,18 +288,16 @@ class MetadataStore(_SqliteOps):
         like the book reads; any OTHER ``OperationalError`` is a genuine read
         failure and raises :class:`LedgerReadError` rather than reporting nothing.
         """
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
-                    LiveStrategy.select()
-                    .where(LiveStrategy.scope == scope)
-                    .order_by(LiveStrategy.created_at, LiveStrategy.strategy_id)
-                    .execute()
-                )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return ()
+        rows = _read(
+            self._database,
+            lambda: (
+                LiveStrategy.select()
+                .where(LiveStrategy.scope == scope)
+                .order_by(LiveStrategy.created_at, LiveStrategy.strategy_id)
+                .execute()
+            ),
+            (),
+        )
         return tuple(_audit_of(row) for row in rows)
 
 
@@ -311,9 +322,11 @@ class BookStore(_SqliteOps):
 
     def load_book(self, scope: str) -> StrategyBook:
         """The durable rows + applied execution ids for *scope* (empty if unaware)."""
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
+
+        def query() -> tuple[tuple[LivePosition, ...], frozenset[str]]:
+            """The execution-role rows plus the ids of the executions already applied."""
+            return (
+                tuple(
                     LivePosition.select()
                     .where(
                         (LivePosition.scope == scope)
@@ -321,20 +334,19 @@ class BookStore(_SqliteOps):
                     )
                     .order_by(LivePosition.position_id)
                     .execute()
-                )
-                applied = {
+                ),
+                frozenset(
                     e.execution_id
                     for e in LiveExecution.select(LiveExecution.execution_id).where(
                         LiveExecution.scope == scope
                     )
-                }
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return StrategyBook()
+                ),
+            )
+
+        rows, applied = _read(self._database, query, ((), frozenset()))
         return StrategyBook(
             rows=tuple(_model_to_book(row) for row in rows),
-            applied=frozenset(applied),
+            applied=applied,
         )
 
     def save_book(
@@ -384,24 +396,24 @@ class BookStore(_SqliteOps):
         missing table (a never-written scope) reads as empty; a genuine read
         failure raises :class:`LedgerReadError`.
         """
-        try:
-            with self._database.bind_ctx(_MODELS):
-                symbols = {
-                    cast("str", row.position_id): cast("str", row.symbol)
-                    for row in LivePosition.select(
-                        LivePosition.position_id, LivePosition.symbol
-                    ).where(LivePosition.scope == scope)
-                }
-                rows = (
-                    LiveExecution.select()
-                    .where(LiveExecution.scope == scope)
-                    .order_by(LiveExecution.ts)
-                    .execute()
-                )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return ()
+
+        def query() -> tuple[dict[str, str], list[LiveExecution]]:
+            """The scope's symbol-per-position_id map and its execution rows."""
+            symbols = {
+                cast("str", row.position_id): cast("str", row.symbol)
+                for row in LivePosition.select(
+                    LivePosition.position_id, LivePosition.symbol
+                ).where(LivePosition.scope == scope)
+            }
+            rows = (
+                LiveExecution.select()
+                .where(LiveExecution.scope == scope)
+                .order_by(LiveExecution.ts)
+                .execute()
+            )
+            return symbols, list(rows)
+
+        symbols, rows = _read(self._database, query, ({}, []))
         return tuple(_model_to_execution(row, symbols) for row in rows)
 
     def sim_executions(self, scope: str) -> tuple[ExecutionRecord, ...]:
@@ -440,33 +452,29 @@ class BookStore(_SqliteOps):
         contribute: the stored fills AND the sim lot book, so a sim scope's cash
         tracks its own fills exactly as a real one's does.
         """
-        try:
-            with self._database.bind_ctx(_MODELS):
-                cash = LiveCash.get_or_none(LiveCash.scope == scope)
-                initial = (
-                    float(cash.initial_capital) if cash is not None else default_initial
-                )
-                sunk = (
-                    LiveExecution.select(
-                        fn.COALESCE(fn.SUM(LiveExecution.cash_delta), 0.0)
-                    )
-                    .where(LiveExecution.scope == scope)
-                    .scalar()
-                )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return default_initial
-        return initial + float(sunk) + self.sim_cash_delta(scope)
+
+        def query() -> tuple[float, float]:
+            """The stored (or default) initial capital and the fills' summed cash."""
+            cash = LiveCash.get_or_none(LiveCash.scope == scope)
+            initial = (
+                float(cash.initial_capital) if cash is not None else default_initial
+            )
+            sunk = (
+                LiveExecution.select(fn.COALESCE(fn.SUM(LiveExecution.cash_delta), 0.0))
+                .where(LiveExecution.scope == scope)
+                .scalar()
+            )
+            return initial, float(sunk)
+
+        initial, sunk = _read(self._database, query, (default_initial, 0.0))
+        return initial + sunk + self.sim_cash_delta(scope)
 
     def initial_capital_of(self, scope: str) -> float:
-        try:
-            with self._database.bind_ctx(_MODELS):
-                cash = LiveCash.get_or_none(LiveCash.scope == scope)
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return 0.0
+        cash = _read(
+            self._database,
+            lambda: LiveCash.get_or_none(LiveCash.scope == scope),
+            None,
+        )
         return float(cash.initial_capital) if cash is not None else 0.0
 
     def prune_closed(self, before: pd.Timestamp) -> int:
@@ -496,21 +504,19 @@ class BookStore(_SqliteOps):
         flat (0.0) book — the dry-run case; a genuine read failure still raises
         (:class:`LedgerReadError`), never a silent zero.
         """
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
-                    LivePosition.select(LivePosition.side, LivePosition.qty)
-                    .where(
-                        (LivePosition.position_id == str(conid))
-                        & (LivePosition.source == SOURCE_EXECUTIONS)
-                        & LivePosition.closed_at.is_null()
-                    )
-                    .execute()
+        rows = _read(
+            self._database,
+            lambda: (
+                LivePosition.select(LivePosition.side, LivePosition.qty)
+                .where(
+                    (LivePosition.position_id == str(conid))
+                    & (LivePosition.source == SOURCE_EXECUTIONS)
+                    & LivePosition.closed_at.is_null()
                 )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return 0.0
+                .execute()
+            ),
+            (),
+        )
         return sum(
             float(row.qty) if row.side == "long" else -float(row.qty) for row in rows
         )
@@ -608,21 +614,19 @@ class SimLotStore(_SqliteOps):
 
     def sim_lots(self, scope: str) -> tuple[SimLot, ...]:
         """Every sim lot this scope ever opened, oldest first (empty if unwritten)."""
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
-                    LivePosition.select()
-                    .where(
-                        (LivePosition.scope == scope)
-                        & (LivePosition.source == SOURCE_ACCOUNT)
-                    )
-                    .order_by(LivePosition.opened_at, LivePosition.position_id)
-                    .execute()
+        rows = _read(
+            self._database,
+            lambda: (
+                LivePosition.select()
+                .where(
+                    (LivePosition.scope == scope)
+                    & (LivePosition.source == SOURCE_ACCOUNT)
                 )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return ()
+                .order_by(LivePosition.opened_at, LivePosition.position_id)
+                .execute()
+            ),
+            (),
+        )
         return tuple(_sim_lot(row) for row in rows)
 
     def sim_open_lots(self, scope: str) -> tuple[SimLot, ...]:
@@ -754,32 +758,27 @@ class IntentStore(_SqliteOps):
 
     def load(self, key: IntentKey) -> IntentRecord | None:
         """The durable record for *key*, or ``None`` when unwritten."""
-        try:
-            with self._database.bind_ctx(_MODELS):
-                row = LiveOrderIntent.get_or_none(self._intent_predicate(key))
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return None
+        row = _read(
+            self._database,
+            lambda: LiveOrderIntent.get_or_none(self._intent_predicate(key)),
+            None,
+        )
         return None if row is None else _model_to_intent(row)
 
     def load_open(self, scope: str) -> tuple[IntentRecord, ...]:
         """Every OPEN record for *scope* (empty if unwritten)."""
         states = [s.value for s in OPEN_STATES]
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
-                    LiveOrderIntent.select()
-                    .where(
-                        (LiveOrderIntent.scope == scope)
-                        & (LiveOrderIntent.state << states)
-                    )
-                    .execute()
+        rows = _read(
+            self._database,
+            lambda: (
+                LiveOrderIntent.select()
+                .where(
+                    (LiveOrderIntent.scope == scope) & (LiveOrderIntent.state << states)
                 )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return ()
+                .execute()
+            ),
+            (),
+        )
         return tuple(_model_to_intent(row) for row in rows)
 
     def intents_of(self, scope: str) -> tuple[IntentRecord, ...]:
@@ -789,18 +788,16 @@ class IntentStore(_SqliteOps):
         trail (filled / unfilled / rejected included) is what the report shows.
         A missing table reads as empty; a genuine read failure raises.
         """
-        try:
-            with self._database.bind_ctx(_MODELS):
-                rows = (
-                    LiveOrderIntent.select()
-                    .where(LiveOrderIntent.scope == scope)
-                    .order_by(LiveOrderIntent.updated_at.desc())
-                    .execute()
-                )
-        except peewee.OperationalError as exc:
-            if not _is_missing_table(exc):
-                raise LedgerReadError(str(exc)) from exc
-            return ()
+        rows = _read(
+            self._database,
+            lambda: (
+                LiveOrderIntent.select()
+                .where(LiveOrderIntent.scope == scope)
+                .order_by(LiveOrderIntent.updated_at.desc())
+                .execute()
+            ),
+            (),
+        )
         return tuple(_model_to_intent(row) for row in rows)
 
     def save(self, record: IntentRecord) -> None:
@@ -1080,7 +1077,6 @@ def _audit_of(row: LiveStrategy) -> StrategyAudit:
         strategy_id=cast("str", row.strategy_id),
         scope=cast("str", row.scope),
         name=cast("str", row.name),
-        mode=cast("str", row.mode),
         created_at=_ts(cast("int | None", row.created_at)),
         last_cycle_at=_ts(cast("int | None", row.last_cycle_at)),
     )

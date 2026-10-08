@@ -1,4 +1,4 @@
-"""Tests for the live cycle engine: freshness gate, run_cycle, build_report."""
+"""Tests for the live cycle engine: freshness gate, run_cycle."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from src.live.engine import (
     PortfolioFetchError,
     StaleDataError,
     assert_data_fresh,
-    build_report,
     run_cycle,
 )
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
@@ -279,7 +278,7 @@ async def test_run_cycle_places_an_open_without_touching_a_self_owned_book(
     make_candle_db(db, "AAPL", TS)
     ledger_path = tmp_path / "l.sqlite"
     ledger = SqliteLedger(ledger_path)
-    ledger.ensure_strategy("S1", "aapl", "momentum", "paper")
+    ledger.ensure_strategy("S1", "aapl", "momentum")
 
     report = await run_cycle(
         CFG,
@@ -745,22 +744,6 @@ async def test_dry_run_never_resyncs(tmp_path: Path) -> None:
     )
 
     assert adapter.resynced == 0
-
-
-def test_build_report_is_pure() -> None:
-    args = (book(), (signal("long", 10.0),), (), ())
-    first = build_report(*args, as_of=TS)
-    second = build_report(*args, as_of=TS)
-    assert first == second
-    assert first.as_of == TS
-    assert first.portfolio_before == book()
-
-
-def test_build_report_carries_a_placement_error() -> None:
-    error = FeedError(kind="transport", message="cohort refused")
-    report = build_report(book(), (), (), (), as_of=TS, placement_error=error)
-    assert report.placement_error == error
-    assert report.results == ()
 
 
 # --- the real sim adapter through the cycle (the seam, end to end) ----------

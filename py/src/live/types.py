@@ -17,6 +17,7 @@ import pandas as pd
 from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
 from src.bt.state.factories import build_commission_model, create_execution_params
+from src.config import live_adapter
 from src.exec.types import OrderType
 
 if TYPE_CHECKING:
@@ -227,16 +228,15 @@ class LiveConfig:
     size_mode: Literal["equity", "cash", "fixed"] = "equity"
     size: float = 0.0
     max_symbol_allocation: float = 1.0
-    mode: Literal["paper", "live"] = "paper"
     # The resolved backend this config trades through (plan §2.2). The CLI
     # overrides it with ``--adapter`` when that flag is passed explicitly; absent
     # a flag this is what ``resolve_adapter_name`` resolves, falling back to the
-    # back-compat ``broker`` key below.
-    adapter: AdapterName = "sim"
+    # back-compat ``broker`` key below, then ``config.toml``'s ``[live] adapter``.
+    adapter: AdapterName = cast("AdapterName", live_adapter())
     # Which broker this config TRADES through, kept as the back-compat source for
     # adapter resolution (``resolve_broker``) and as a description of the config.
     # A run's actual backend is ``adapter`` — this no longer selects it.
-    broker: Literal["sim", "ibkr"] = "sim"
+    broker: Literal["sim", "ibkr"] = cast("Literal['sim', 'ibkr']", live_adapter())
     #: The config's ``name`` — the ``<config_name>`` scope segment.
     config_name: str = ""
 
