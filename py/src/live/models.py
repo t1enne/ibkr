@@ -111,21 +111,6 @@ class LiveCash(_Base):
         table_name = "live_cash"
 
 
-class LiveScopeAlias(_Base):
-    """Migration audit: the scope a legacy book moved to (plan §4.4 step 4).
-
-    Written once per re-keyed scope so a read can follow a bare legacy scope to
-    the charged one; the rows themselves are re-keyed in every live table, never
-    dropped.
-    """
-
-    legacy_scope = TextField(primary_key=True)
-    new_scope = TextField()
-
-    class Meta:
-        table_name = "live_scope_alias"
-
-
 class LiveOrderIntent(_Base):
     """The durable owner of OPEN order state, keyed by the IDENTITY columns.
 
@@ -167,7 +152,6 @@ LIVE_MODELS: tuple[type[_Base], ...] = (
     LivePosition,
     LiveExecution,
     LiveCash,
-    LiveScopeAlias,
     LiveOrderIntent,
 )
 
@@ -183,6 +167,5 @@ __all__ = [
     "LiveExecution",
     "LiveOrderIntent",
     "LivePosition",
-    "LiveScopeAlias",
     "LiveStrategy",
 ]

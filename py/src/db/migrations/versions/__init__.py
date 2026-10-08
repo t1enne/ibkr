@@ -22,12 +22,18 @@ from src.db.migrations.versions import (
     data_0001_baseline,
     data_0002_drop_migrated_live_tables,
     live_0001_baseline,
+    live_0002_drop_legacy_artifacts,
 )
 
 #: The live book's history, oldest first. ``down`` is omitted where no safe
 #: inverse exists (see each module's docstring).
 LIVE_MIGRATIONS: Registry = (
     Migration(name=live_0001_baseline.NAME, up=live_0001_baseline.up, down=None),
+    Migration(
+        name=live_0002_drop_legacy_artifacts.NAME,
+        up=live_0002_drop_legacy_artifacts.up,
+        down=None,
+    ),
 )
 
 #: The candle/research file's history, oldest first.

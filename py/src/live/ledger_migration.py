@@ -298,14 +298,18 @@ def _is_legacy_scope(scope: str) -> bool:
 
 
 def _rekey_scopes(db: peewee.SqliteDatabase) -> int:
-    """Re-key every bare legacy scope and record the mapping; return the count.
+    """Re-key every bare legacy scope; return the count.
 
     A legacy bare scope ``X`` becomes ``ibkr_X_legacy`` (the adapter that ever
     placed real orders; the original config hash is unknowable from a bare scope,
-    so the literal instance ``legacy`` is used) in EVERY live table, and a
-    ``live_scope_alias(X, 'ibkr_X_legacy')`` row is written so a read can follow
-    the move. ``live_strategy`` additionally gets the parsed segments, so the
-    re-keyed scope is immediately groupable by adapter.
+    so the literal instance ``legacy`` is used) in EVERY live table.
+    ``live_strategy`` additionally gets the parsed segments, so the re-keyed scope
+    is immediately groupable by adapter.
+
+    No alias is recorded: the charged grammar makes a bare scope unmintable, so
+    nothing but a hand-typed ``--scope X`` can still name one. A config file
+    mints its own ``<adapter>_<name>_<hash>`` scope and is unaffected — see
+    ``live_0002_drop_legacy_artifacts`` for why the alias table is gone.
     """
     from src.live.scope import ScopeParts, parse_scope, scope_of, slug_segment
 
@@ -334,16 +338,12 @@ def _rekey_scopes(db: peewee.SqliteDatabase) -> int:
             )
         if not parse_scope(new_scope):  # pragma: no cover - scope_of is total
             raise RuntimeError(f"minted an unparseable scope {new_scope!r}")
-        db.execute_sql(
-            "INSERT OR REPLACE INTO live_scope_alias (legacy_scope, new_scope) "
-            "VALUES (?, ?)",
-            (legacy, new_scope),
-        )
         logger.warning(
             "re-keyed legacy scope %r to %r (plan §4.4 step 4): the book is "
-            "unchanged, but the scope string moved — a config still naming %r "
-            "resolves to it through live_scope_alias",
+            "unchanged, but the scope string moved — a run must address %r, never "
+            "the bare %r",
             legacy,
+            new_scope,
             new_scope,
             legacy,
         )
@@ -499,28 +499,15 @@ def _copy_legacy_rows(
     db.execute_sql(sql)
 
 
-def _ensure_alias_table(db: peewee.SqliteDatabase) -> None:
-    """Create ``live_scope_alias`` if absent (``create_tables`` then skips it).
-
-    The scope re-key runs inside ``migrate``, BEFORE the caller's
-    ``create_tables``, so the alias table it writes to must exist by then. The
-    shape mirrors the model exactly, so the later ``create_tables`` is a no-op.
-    """
-    db.execute_sql(
-        "CREATE TABLE IF NOT EXISTS live_scope_alias ("
-        "legacy_scope TEXT NOT NULL PRIMARY KEY, new_scope TEXT NOT NULL)"
-    )
-
-
 def migrate(db: peewee.SqliteDatabase) -> Legacy:
     """Preserve/alter/re-key every legacy shape; return the kept copies.
 
     Preserve a pre-conid position table, ALTER ``live_strategy`` for ``scope`` and
-    its segments, re-key every bare legacy scope (writing ``live_scope_alias``),
-    re-key/fold ``live_sim_lot``, re-key ``live_position`` from ``conid`` to
-    ``position_id``, backfill ``live_execution.position_id`` from its ``conid``, and
-    rename a legacy ``(scope, token)`` intent table to the identity columns. All
-    additive or renames — never a drop.
+    its segments, re-key every bare legacy scope, re-key/fold ``live_sim_lot``,
+    re-key ``live_position`` from ``conid`` to ``position_id``, backfill
+    ``live_execution.position_id`` from its ``conid``, and rename a legacy
+    ``(scope, token)`` intent table to the identity columns. All additive or
+    renames — never a drop.
 
     ORDER matters: the scope re-key runs FIRST, while every table still carries a
     ``scope`` column, so no table is left holding a bare scope; only then are the
@@ -534,7 +521,6 @@ def migrate(db: peewee.SqliteDatabase) -> Legacy:
     if columns is not None and not {"conid", "source"} & columns:
         _preserve_legacy_positions(db)
     _add_strategy_columns(db)
-    _ensure_alias_table(db)
     _rekey_scopes(db)
     sim_lots = _rekey_sim_lots(db)
     _rekey_executions(db)

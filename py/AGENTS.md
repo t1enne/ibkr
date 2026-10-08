@@ -373,11 +373,12 @@ The live book has its **OWN sqlite file**, `../data/live.db` (overridable via
 `src/db/path.py::resolve_live_db_path`. It is split from the candle file because
 the book is durable state no download can rebuild (todo D18). Tables:
 `live_strategy`, `live_cash`, `live_position` (the ONE book table — both roles,
-told apart by `source`), `live_execution`, `live_order_intent`, `live_scope_alias`
-(a re-keyed legacy scope reads as its new name), plus the `*_legacy` copies past
-migrations preserve (e.g. `live_position_legacy`, `live_sim_lot_legacy`) rather
-than drop. The cycle lease is an OS advisory lock on `<db>.<scope_tag>.cycle.lock`
-— sound on a single host with a local filesystem only.
+told apart by `source`), `live_execution`, `live_order_intent`. The `*_legacy`
+copies past migrations preserve, and the pre-grammar `live_scope_alias` mapping,
+are retired by `live_0002_drop_legacy_artifacts` once every row they hold is
+accounted for in the live tables. The cycle lease is an OS advisory lock on
+`<db>.<scope_tag>.cycle.lock` — sound on a single host with a local filesystem
+only.
 
 **The split was a one-off, already performed.** The book lives in `data/live.db`
 and was populated by a verified row-for-row copy whose tooling

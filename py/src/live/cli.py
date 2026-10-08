@@ -952,6 +952,7 @@ def load_live_config(path: str) -> LiveConfig:
         mode=cast("Literal['paper', 'live']", raw_mode),
         adapter=cast("AdapterName", _resolve_adapter_key(raw, params)),
         broker=cast("Literal['sim', 'ibkr']", raw_broker),
+        config_name=strategy.name,
     )
 
 

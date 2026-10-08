@@ -37,7 +37,7 @@ import json
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -90,24 +90,6 @@ logger = logging.getLogger(__name__)
 #: Rebound here (not globally) because peewee binds at CLASS level and two ledgers
 #: on two paths share these classes — see :mod:`src.live.models`.
 _MODELS = LIVE_MODELS
-
-
-def _alias_scope(db: peewee.SqliteDatabase, scope: str) -> str:
-    """Follow a migration scope alias: a re-keyed legacy scope reads as the new one.
-
-    ``migrate`` re-keys a bare legacy scope ``X`` to ``ibkr_X_legacy`` in every
-    live table. Without this lookup the operator's still-config'd ``X`` would
-    address an EMPTY book, so the strategy would read itself flat and re-open on
-    top of live positions. An absent table (fresh db) or no row for *scope* means
-    "not a legacy scope", so the scope is returned unchanged.
-    """
-    try:
-        row = db.execute_sql(
-            "SELECT new_scope FROM live_scope_alias WHERE legacy_scope=?", (scope,)
-        ).fetchone()
-    except peewee.OperationalError:
-        return scope
-    return scope if row is None else str(row[0])
 
 
 @dataclass(frozen=True)
@@ -245,7 +227,6 @@ class MetadataStore(_SqliteOps):
         wedge every config edit. Give the other config its own ``scope``.
         """
         with self._write():
-            scope = _alias_scope(self._database, scope)
             others = (
                 LiveStrategy.select(LiveStrategy.strategy_id)
                 .where(
@@ -274,7 +255,6 @@ class MetadataStore(_SqliteOps):
     def ensure_cash(self, scope: str, initial_capital: float) -> None:
         """Record the scope's ``initial_capital`` once; a later cycle never resets it."""
         with self._write():
-            scope = _alias_scope(self._database, scope)
             LiveCash.insert(
                 scope=scope,
                 initial_capital=initial_capital,
@@ -295,7 +275,6 @@ class MetadataStore(_SqliteOps):
         like the book reads; any OTHER ``OperationalError`` is a genuine read
         failure and raises :class:`LedgerReadError` rather than reporting nothing.
         """
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
@@ -332,7 +311,6 @@ class BookStore(_SqliteOps):
 
     def load_book(self, scope: str) -> StrategyBook:
         """The durable rows + applied execution ids for *scope* (empty if unaware)."""
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
@@ -372,7 +350,6 @@ class BookStore(_SqliteOps):
         the cash ledger accumulates each fill exactly once even across re-runs.
         """
         with self._write():
-            scope = _alias_scope(self._database, scope)
             LiveCash.insert(
                 scope=scope,
                 initial_capital=initial_capital,
@@ -407,7 +384,6 @@ class BookStore(_SqliteOps):
         missing table (a never-written scope) reads as empty; a genuine read
         failure raises :class:`LedgerReadError`.
         """
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 symbols = {
@@ -464,7 +440,6 @@ class BookStore(_SqliteOps):
         contribute: the stored fills AND the sim lot book, so a sim scope's cash
         tracks its own fills exactly as a real one's does.
         """
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 cash = LiveCash.get_or_none(LiveCash.scope == scope)
@@ -485,7 +460,6 @@ class BookStore(_SqliteOps):
         return initial + float(sunk) + self.sim_cash_delta(scope)
 
     def initial_capital_of(self, scope: str) -> float:
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 cash = LiveCash.get_or_none(LiveCash.scope == scope)
@@ -559,7 +533,6 @@ class SimLotStore(_SqliteOps):
     def record_sim_lot(self, scope: str, lot: SimLot) -> None:
         """Record a sim lot the strategy just opened (resurrects a closed one)."""
         with self._write():
-            scope = _alias_scope(self._database, scope)
             LivePosition.insert(
                 scope=scope,
                 position_id=lot.position_id,
@@ -585,7 +558,6 @@ class SimLotStore(_SqliteOps):
         knows less than the store never erases what it holds.
         """
         with self._write():
-            scope = _alias_scope(self._database, scope)
             reopened = (
                 LivePosition.update(closed_at=None)
                 .where(
@@ -623,7 +595,6 @@ class SimLotStore(_SqliteOps):
         exit already recorded.
         """
         with self._write():
-            scope = _alias_scope(self._database, scope)
             fields: dict[str, object] = {"closed_at": _ms(closed_at)}
             if exit_price is not None:
                 fields["exit_price"] = exit_price
@@ -637,7 +608,6 @@ class SimLotStore(_SqliteOps):
 
     def sim_lots(self, scope: str) -> tuple[SimLot, ...]:
         """Every sim lot this scope ever opened, oldest first (empty if unwritten)."""
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
@@ -784,7 +754,6 @@ class IntentStore(_SqliteOps):
 
     def load(self, key: IntentKey) -> IntentRecord | None:
         """The durable record for *key*, or ``None`` when unwritten."""
-        key = self._key(key)
         try:
             with self._database.bind_ctx(_MODELS):
                 row = LiveOrderIntent.get_or_none(self._intent_predicate(key))
@@ -796,7 +765,6 @@ class IntentStore(_SqliteOps):
 
     def load_open(self, scope: str) -> tuple[IntentRecord, ...]:
         """Every OPEN record for *scope* (empty if unwritten)."""
-        scope = _alias_scope(self._database, scope)
         states = [s.value for s in OPEN_STATES]
         try:
             with self._database.bind_ctx(_MODELS):
@@ -821,7 +789,6 @@ class IntentStore(_SqliteOps):
         trail (filled / unfilled / rejected included) is what the report shows.
         A missing table reads as empty; a genuine read failure raises.
         """
-        scope = _alias_scope(self._database, scope)
         try:
             with self._database.bind_ctx(_MODELS):
                 rows = (
@@ -844,7 +811,6 @@ class IntentStore(_SqliteOps):
         coexist under distinct identities (D7).
         """
         with self._write():
-            record = self._record(record)
             LiveOrderIntent.insert(**_intent_fields(record)).on_conflict(
                 "REPLACE"
             ).execute()
@@ -889,20 +855,9 @@ class IntentStore(_SqliteOps):
         if order_id is not None:
             fields["order_id"] = order_id
         with self._write():
-            key = self._key(key)
             LiveOrderIntent.update(**fields).where(
                 self._intent_predicate(key)
             ).execute()
-
-    def _key(self, key: IntentKey) -> IntentKey:
-        """*key* re-pointed at its scope's alias-resolved name (migration re-key)."""
-        scope = _alias_scope(self._database, key.scope)
-        return key if scope == key.scope else replace(key, scope=scope)
-
-    def _record(self, record: IntentRecord) -> IntentRecord:
-        """*record* re-pointed at its scope's alias-resolved name."""
-        key = self._key(record.key)
-        return record if key == record.key else replace(record, key=key)
 
     @staticmethod
     def _intent_predicate(key: IntentKey):
@@ -1155,8 +1110,8 @@ def _book_fields(scope: str, row: BookRow) -> dict[str, object]:
     """One reconciled ``BookRow`` as ``live_position`` fields (the executions role).
 
     ``scope`` comes from the caller, not ``row``: ``reconcile`` stamps the row's
-    ``scope`` but the ledger's alias-resolved scope is the authority (a legacy
-    scope re-keyed at migration must be written under its new name).
+    ``scope`` but the ledger's scope is the authority (a caller may be addressing a
+    book it read under another name).
     """
     return {
         "scope": scope,

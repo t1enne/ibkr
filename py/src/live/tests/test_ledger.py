@@ -294,85 +294,6 @@ def test_prune_closed_deletes_only_old_closed(ledger: SqliteLedger) -> None:
     assert ledger.load_book("S1").rows == ()
 
 
-def test_migration_preserves_incompatible_legacy_position_table(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # A pre-conid live_position cannot be read into the conid-keyed book, but its
-    # durable open rows must NOT be dropped: they are preserved under a kept copy
-    # and named loudly, since the rolling trades window cannot rebuild them.
-    db = tmp_path / "legacy.sqlite"
-    with get_connection(db) as con:
-        con.execute(
-            "CREATE TABLE live_position (strategy_id TEXT, position_id TEXT, "
-            "symbol TEXT, side TEXT, qty REAL, status TEXT, "
-            "PRIMARY KEY (strategy_id, position_id))"
-        )
-        con.execute(
-            "INSERT INTO live_position VALUES "
-            "('h1', 'lot-1', 'AAPL', 'long', 10.0, 'open')"
-        )
-        con.execute(
-            "CREATE TABLE live_strategy (strategy_id TEXT PRIMARY KEY, name TEXT, "
-            "mode TEXT, created_at INTEGER, last_cycle_at INTEGER)"
-        )
-    ledger = SqliteLedger(db)
-    with caplog.at_level("WARNING", logger="src.live.ledger"):
-        ledger.ensure_strategy("h1", "momentum", "phase", "paper")
-
-    tables = _tables(db)
-    assert "live_position_legacy" in tables  # preserved, not dropped
-    assert {"live_position", "live_execution", "live_cash"} <= tables
-    with get_connection(db) as con:
-        kept = con.execute(
-            "SELECT symbol, side, qty FROM live_position_legacy"
-        ).fetchall()
-        fresh = con.execute("SELECT * FROM live_position").fetchall()
-    assert kept == [("AAPL", "long", 10.0)]
-    assert fresh == []  # the new conid-keyed book starts empty, not erased
-    assert any("AAPL" in r.message and "double" in r.message for r in caplog.records)
-    # The migration is one-time: a second write neither re-warns nor loses rows.
-    ledger.touch_cycle("h1", TS)
-    assert "live_position_legacy" in _tables(db)
-
-
-def test_migration_keeps_every_legacy_copy_never_dropping_rows(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # D7(b): a legacy-shaped live_position re-created WITH rows beside an already
-    # kept copy must be preserved, not dropped. The old branch warned about the
-    # open rows and then DROPped the table, losing them.
-    db = tmp_path / "legacy.sqlite"
-    legacy_schema = (
-        "CREATE TABLE %s (strategy_id TEXT, position_id TEXT, symbol TEXT, "
-        "side TEXT, qty REAL, status TEXT, PRIMARY KEY (strategy_id, position_id))"
-    )
-    with get_connection(db) as con:
-        con.execute(legacy_schema % "live_position")
-        con.execute(
-            "INSERT INTO live_position VALUES ('h1','lot-1','AAPL','long',10.0,'open')"
-        )
-        con.execute(legacy_schema % "live_position_legacy")
-        con.execute(
-            "INSERT INTO live_position_legacy VALUES "
-            "('h0','lot-0','MSFT','long',5.0,'open')"
-        )
-    ledger = SqliteLedger(db)
-    with caplog.at_level("WARNING", logger="src.live.ledger"):
-        ledger.ensure_strategy("h1", "momentum", "phase", "paper")
-
-    tables = _tables(db)
-    assert "live_position" in tables  # fresh conid-keyed book created
-    assert "live_position_legacy" in tables  # the pre-existing copy kept
-    assert "live_position_legacy_1" in tables  # the re-created one kept, not dropped
-    with get_connection(db) as con:
-        kept = con.execute("SELECT symbol FROM live_position_legacy").fetchall()
-        recreated = con.execute("SELECT symbol FROM live_position_legacy_1").fetchall()
-        fresh = con.execute("SELECT * FROM live_position").fetchall()
-    assert kept == [("MSFT",)]
-    assert recreated == [("AAPL",)]  # no row lost
-    assert fresh == []  # the new book starts empty, not erased
-
-
 def test_migration_check_and_action_are_one_atomic_unit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -405,53 +326,9 @@ def test_migration_check_and_action_are_one_atomic_unit(
         ledger.ensure_strategy("h1", "momentum", "phase", "paper")
     monkeypatch.undo()
 
-    tables = _tables(db)
-    assert "live_position" in tables  # the rename was rolled back
-    assert "live_position_legacy" not in tables
     with get_connection(db) as con:
         kept = con.execute("SELECT symbol FROM live_position").fetchall()
     assert kept == [("AAPL",)]  # no row lost to a failed migration
-
-
-def test_migration_folds_legacy_sim_lots_into_the_one_book(tmp_path: Path) -> None:
-    """Pre-fold sim lots move into ``live_position source='account'``, preserved.
-
-    ``live_sim_lot`` was the sim path's own book keyed by the config hash
-    (``strategy_id``); it is folded into the ONE book table, re-keyed to the stable
-    scope, and kept verbatim under a legacy copy. The behaviour under test: every
-    lot is still readable through the sim API, the identity moved, and the legacy
-    rows read back as OWNERSHIP-ONLY ones (no invented size or entry).
-    """
-    db = tmp_path / "legacy.sqlite"
-    with get_connection(db) as con:
-        con.execute(
-            "CREATE TABLE live_sim_lot (strategy_id TEXT, position_id TEXT, "
-            "closed_at INTEGER, PRIMARY KEY (strategy_id, position_id))"
-        )
-        con.execute("INSERT INTO live_sim_lot VALUES ('hash1','lot-1',NULL)")
-        con.execute("INSERT INTO live_sim_lot VALUES ('hash1','lot-2',123)")
-        con.execute(
-            "CREATE TABLE live_strategy (strategy_id TEXT PRIMARY KEY, "
-            "scope TEXT NOT NULL DEFAULT '', name TEXT, mode TEXT, "
-            "created_at INTEGER, last_cycle_at INTEGER)"
-        )
-        con.execute(
-            "INSERT INTO live_strategy VALUES ('hash1','momentum','n','paper',0,NULL)"
-        )
-    ledger = SqliteLedger(db)
-    ledger.record_sim_open("momentum", "lot-3")  # first write triggers migration
-
-    # Every legacy lot survived AND the new one landed in the same (re-keyed) book:
-    # the legacy scope's alias is followed, so the operator's config still names it.
-    assert ledger.sim_open_ids("momentum") == frozenset({"lot-1", "lot-3"})
-    assert ledger.sim_open_ids("ibkr_momentum_legacy") == frozenset({"lot-1", "lot-3"})
-    migrated = {lot.position_id: lot for lot in ledger.sim_open_lots("momentum")}
-    assert migrated["lot-1"].has_detail is False  # no invented size or entry
-    assert migrated["lot-1"].qty is None
-    # The old table is KEPT, closed out (lot-2 was closed), never dropped.
-    with get_connection(db) as con:
-        kept = con.execute("SELECT COUNT(*) FROM live_sim_lot_legacy").fetchone()
-    assert kept == (2,)
 
 
 def test_folded_sim_lots_are_the_account_role_of_the_one_book(tmp_path: Path) -> None:
@@ -649,48 +526,6 @@ def test_a_token_collision_cannot_alias_two_distinct_identities(
     assert ledger.load_open("S1") == (first, second)
 
 
-def test_legacy_token_keyed_intent_table_is_rekeyed_and_preserved(
-    tmp_path: Path,
-) -> None:
-    """D7: an e362843 ``(scope, token)`` intent table is preserved and re-keyed.
-
-    The legacy rows survive under a kept copy AND are restored into the identity-
-    keyed table, never dropped.
-    """
-    path = tmp_path / "ledger.sqlite"
-    with get_connection(path) as con:
-        con.executescript(
-            """
-            CREATE TABLE live_order_intent (
-                scope TEXT NOT NULL, token TEXT NOT NULL, symbol TEXT NOT NULL,
-                action TEXT NOT NULL, position_id TEXT, state TEXT NOT NULL,
-                attempt INTEGER NOT NULL, order_ref TEXT NOT NULL,
-                order_id TEXT, decision_ts INTEGER, updated_at INTEGER NOT NULL,
-                PRIMARY KEY (scope, token)
-            );
-            INSERT INTO live_order_intent VALUES
-              ('S1','t1','AAPL','long',NULL,'working',1,'r1','o1',0,1),
-              ('S1','t2','MSFT','long','265','working',0,'r2','o2',0,1);
-            """
-        )
-    ledger = SqliteLedger(path)
-    # The first WRITE triggers the migration + re-key (reads alone never do).
-    assert ledger.prune(TS) == 0
-    key = _key("AAPL")
-    close_key = _key("MSFT", pid="265")
-    assert ledger.load(key) is not None and ledger.load(close_key) is not None
-    # Both the open (position_id None) and the close survived the re-key.
-    assert {r.key.position_id for r in ledger.load_open("S1")} == {None, "265"}
-    # The legacy table is kept (renamed), never dropped.
-    assert "live_order_intent_legacy" in _tables(path)
-    # Re-keyed: token is NOT part of the primary key anymore.
-    with get_connection(path) as con:
-        info = {
-            r[1] for r in con.execute("PRAGMA table_info(live_order_intent)") if r[5]
-        }
-    assert info == {"scope", "symbol", "action", "position_id"}
-
-
 pytestmark = pytest.mark.db
 
 
@@ -726,56 +561,3 @@ def test_intent_record_roundtrips_tif_and_stuck_cycles(ledger: SqliteLedger) -> 
     record = ledger.load(key)
     assert record is not None
     assert (record.tif, record.stuck_cycles) == ("GTC", 2)
-
-
-def test_existing_identity_table_gains_the_new_columns_additively(
-    tmp_path: Path,
-) -> None:
-    """N1: an existing identity-keyed table is ALTERed in place, rows preserved."""
-    path = tmp_path / "ledger.sqlite"
-    with get_connection(path) as con:
-        con.executescript(
-            """
-            CREATE TABLE live_order_intent (
-                scope TEXT NOT NULL, token TEXT NOT NULL, symbol TEXT NOT NULL,
-                action TEXT NOT NULL, position_id TEXT NOT NULL, state TEXT NOT NULL,
-                attempt INTEGER NOT NULL, order_ref TEXT NOT NULL,
-                order_id TEXT, decision_ts INTEGER, updated_at INTEGER NOT NULL,
-                PRIMARY KEY (scope, symbol, action, position_id)
-            );
-            INSERT INTO live_order_intent VALUES
-              ('S1','t','AAPL','long','','working',0,'r0','o0',NULL,1);
-            """
-        )
-    ledger = SqliteLedger(path)
-    assert ledger.prune(TS) == 0  # first write triggers the additive migration
-    record = ledger.load(_key("AAPL"))
-    assert record is not None  # the row survived the ALTER
-    assert (record.tif, record.stuck_cycles) == ("DAY", 0)  # SQL defaults
-
-
-def test_restore_tolerates_an_unexpected_legacy_shape(tmp_path: Path) -> None:
-    """N7: a legacy table with a mismatched shape is preserved, never raised on.
-
-    Without the column guard the restore SELECT names a missing column, so the
-    first write of EVERY cycle raises.
-    """
-    path = tmp_path / "ledger.sqlite"
-    with get_connection(path) as con:
-        con.executescript(
-            """
-            CREATE TABLE live_order_intent (
-                scope TEXT NOT NULL, token TEXT NOT NULL, symbol TEXT NOT NULL,
-                action TEXT NOT NULL, position_id TEXT, state TEXT NOT NULL,
-                attempt INTEGER NOT NULL, order_id TEXT, decision_ts INTEGER,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (scope, token)
-            );
-            INSERT INTO live_order_intent VALUES
-              ('S1','t','AAPL','long',NULL,'working',0,'o0',NULL,1);
-            """
-        )
-    ledger = SqliteLedger(path)
-    assert ledger.prune(TS) == 0  # does not raise
-    # The legacy rows are kept under the migrated copy, never dropped.
-    assert "live_order_intent_legacy" in _tables(path)
