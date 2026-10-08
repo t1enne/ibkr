@@ -5,7 +5,7 @@ from :func:`src.db.path.resolve_db_path`. There is no per-instance rebind here:
 these two tables have exactly one target in the process, so a single class-level
 binding is the simplest correct thing.
 
-The path used to be ``os.getcwd()/".."/"data"/"db.sqlite"`` (see
+The path used to be ``os.getcwd()/".."/"data"/"ibkr.db"`` (see
 :mod:`src.data.types` history): that read or WROTE a different file depending on
 the caller's working directory. Resolving it file-relative fixes that, and is a
 deliberate behaviour change.

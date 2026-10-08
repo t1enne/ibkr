@@ -137,7 +137,7 @@ Two SQLite files, both under the repo's `../data/` directory (`py/`'s sibling),
 all resolved by **`src/db/path.py`** — one path truth per file, file-relative (never
 `os.getcwd()`, which silently reads the wrong file from another directory).
 
-- **`data/db.sqlite`** — candles, `symbol`, `fundamental`: bulk, regenerable
+- **`data/ibkr.db`** — candles, `symbol`, `fundamental`: bulk, regenerable
   research data. `IBKR_DB_PATH` overrides it. `resolve_db_path()` /
   `DEFAULT_DB_PATH`.
 - **`data/live.db`** — the durable live book (`live_*`). `IBKR_LIVE_DB_PATH`
@@ -157,7 +157,7 @@ uv run ibkr db migrate --down --yes  # unwind (refuses an irreversible target)
   into `src.live` / `src.data`. `src/db/__init__.py` must NOT re-export
   `migrations.versions.*` — that would drag `src.live` into every `import src.db`.
 - **`sqlite3` CLI may not be installed.** Query with Python instead:
-  `python -c "import sqlite3; c=sqlite3.connect('../data/db.sqlite')"`, or use
+  `python -c "import sqlite3; c=sqlite3.connect('../data/ibkr.db')"`, or use
   the CLI above.
 
 ### Migrations
@@ -382,18 +382,17 @@ than drop. The cycle lease is an OS advisory lock on `<db>.<scope_tag>.cycle.loc
 **The split was a one-off, already performed.** The book lives in `data/live.db`
 and was populated by a verified row-for-row copy whose tooling
 (`ibkr db adopt-live`) has since been removed as spent. The stale `live_*` tables
-that copy left behind in `data/db.sqlite` were then DROPPED by
+that copy left behind in `data/ibkr.db` were then DROPPED by
 `data_0002_drop_migrated_live_tables` — the one sanctioned exception to
 rename-never-drop, gated on a guard that refuses unless the live file exists, is
-migrated, and holds at least as many rows per table. `data/db.sqlite` now holds
+migrated, and holds at least as many rows per table. `data/ibkr.db` now holds
 only `symbol` / `candle` / `fundamental` (plus the 1-row `kysely_*` lineage
 tables).
 
 Getting this wrong is the dangerous direction: a ledger pointed at an empty or
 wrong file reads a held position as FLAT and re-enters it (double exposure).
 Verify `ibkr db status` and the live file's `live_position` rows before trusting a
-flat book. `data/db.sqlite.pre-adopt.bak` and `data/live.db.pre-drop.bak` are the
-pre-step snapshots.
+flat book.
 
 `src/db/connection.py` holds one process-global peewee handle per file (`db`,
 `live_db`). The `live_*` **models** deliberately do NOT bind to one: peewee binds
@@ -595,13 +594,18 @@ src/live/
 ├── identity.py         # IntentKey / IntentRecord / order identity (bar-free cOID)
 ├── reconcile.py        # pure: signals + book → OrderIntent[] (posture diff)
 ├── engine.py           # the cycle: lease → resync → reconcile → place → record
-├── broker.py           # LiveBroker / PortfolioSource Protocol seams + sim broker
+├── adapter.py          # LiveAdapter Protocol seam + resolution; both adapters stateless
 ├── ports.py            # small injected seams (e.g. BookExposure)
 ├── lease.py            # exclusive cycle lock
 ├── ledger.py           # SqliteLedger seam over the stores below
 ├── ledger_base.py      # schema/template/DDL/migration plumbing
-├── ledger_sim.py       # sim-lot book
 ├── ledger_migration.py # preserve-don't-drop migrations and re-keys
+├── models.py           # live_* peewee models (per-instance bind, not process-global)
+├── scope.py            # scope minting / strategy-intent config hash
+├── signals.py          # strategy signals → live intents
+├── divergence.py       # our fill-derived book vs the account book
+├── pf.py               # portfolio views / reconciliation inputs
+├── result.py           # cycle result + reported outcomes
 ├── cli.py              # `ibkr live run` / `abandon`, report rendering, exit codes
 └── adapters/ibkr/      # the real edge: broker, orders, trades, mapping, authz
 ```

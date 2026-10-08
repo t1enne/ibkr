@@ -4,7 +4,7 @@ Behaviour only: rows PRESERVED (counts), the legacy copies EXIST, the bare legac
 scope is re-keyed and aliased, and a read still writes nothing. No shape
 assertions (no column lists) — those are characterisation and rot.
 
-The pre-migration fixture is extracted from the operator's real ``data/db.sqlite``
+The pre-migration fixture is extracted from the operator's real ``data/ibkr.db``
 so the test exercises LIVE data (12 sim lots, 5 conid positions, a bare scope),
 never a hand-built approximation. It is read-only: the source file is constantly
 rewritten by an external process, so nothing here asserts against it.
@@ -23,7 +23,7 @@ import pandas as pd
 
 from src.live.ledger import LedgerReadError, SqliteLedger
 
-#: Reads the operator's mutable live DB (``../data/db.sqlite``) — a ``db`` test,
+#: Reads the operator's mutable live DB (``../data/ibkr.db``) — a ``db`` test,
 #: excluded from ``make check`` (test-fast) like the other sqlite-backed suites.
 pytestmark = pytest.mark.db
 
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.db
 _EPOCH = cast("pd.Timestamp", pd.Timestamp("1970-01-02T00:00:00Z"))
 
 #: The operator's DB, relative to this file: ``py/src/live/tests/`` -> ``data/``.
-_LIVE_DB = Path(__file__).resolve().parents[3].parent / "data" / "db.sqlite"
+_LIVE_DB = Path(__file__).resolve().parents[3].parent / "data" / "ibkr.db"
 
 #: The live tables the re-key touches. ``live_position`` and ``live_execution``
 #: are counted separately because the sim fold GROWS the former.

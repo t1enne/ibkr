@@ -3,9 +3,9 @@
 Working list of open items for `src/live/` and `src/live/adapters/ibkr/`.
 
 Read `AGENTS.md` (repo rules) and `SKILL.md` (alpha research) before changing
-anything here. Note: `docs/PLAN_LIVE_HEXAGONAL.md` exists but the review pass that
-produced most of this list deliberately did NOT read it, so that findings stood on
-the code alone. Keep it that way when re-verifying — argue from the code.
+anything here. The review pass that produced most of this list deliberately
+argued from the code alone, not from a design document. Keep that posture when
+re-verifying.
 
 Contract note: `openapi.spec.json` is **stale** for `/iserver/account/orders` (it
 lists 35 fields with neither `cOID` nor `order_ref`; the live response has 31
@@ -215,7 +215,7 @@ Either state the bound or keep the counter monotonic independently of retention.
 
 ### [x] D18 — CLOSED: the live book has its own sqlite file (`data/live.db`)
 
-The live book no longer shares `../data/db.sqlite` with candles/research. Paths
+The live book no longer shares `../data/ibkr.db` with candles/research. Paths
 are one truth per file in the leaf `src/db/path.py` (`resolve_db_path` /
 `resolve_live_db_path`, both file-relative, both env-overridable); the ledger
 defaults to the live file. The DDL-extraction and migration framework landed with
@@ -224,11 +224,11 @@ it: `src/db/` (path/connection/models/introspect + `migrations/`), our own
 `DATA_MIGRATIONS` registries, and `ibkr db migrate|status`.
 
 **The orphaned source tables are gone.** After the copy, the stale `live_*` tables
-left in `../data/db.sqlite` were dropped by
+left in `../data/ibkr.db` were dropped by
 `data_0002_drop_migrated_live_tables` — the one sanctioned exception to
 rename-never-drop, gated on a guard that refuses unless the live file exists, is
 migrated, and holds at least as many rows per table (the folded `live_position` /
-`live_sim_lot` pair is counted against `live_position`). `db.sqlite` now holds only
+`live_sim_lot` pair is counted against `live_position`). `ibkr.db` now holds only
 `symbol` / `candle` / `fundamental` plus the 1-row `kysely_*` lineage tables. A
 ledger pointed at the wrong file reads a FLAT book — verify `live_position` before
 trusting it. See AGENTS.md § The database / § Where state lives.
@@ -392,9 +392,9 @@ One MKT round trip on Paper closes that gap.
   whole-share notional.
 - **Open exposure divergence guard** exists with the in-cycle delta so a flip's
   own close is excused (`f72d720`) — keep that case covered.
-- **Ledger split** (`ledger.py` → `ledger_base` / `ledger_sim` /
-  `ledger_migration`) verified refactor-only, migrations atomic and
-  rename-never-drop.
+- **Ledger split** (`ledger.py` → `ledger_base` / `ledger_migration`, with the
+  sim-lot store later folded back into `ledger.py`) verified refactor-only,
+  migrations atomic and rename-never-drop.
 - **Removed:** `ports.Gateway`, `reconcile.size_qty`, the vestigial imports fixed
   by the `src/timestamps.py` leaf (killed the `src/exec` collection cycle).
 - **Closed finding history** (all fixed): C1, H1, H1b, H3, H4, H5, M1–M8,

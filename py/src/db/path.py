@@ -34,9 +34,7 @@ _LIVE_DB_PATH_ENV = "IBKR_LIVE_DB_PATH"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: The bulk candle/research/resampled-fundamentals file.
-DEFAULT_DB_PATH = Path(
-    os.environ.get(_DB_PATH_ENV) or _REPO_ROOT / "data" / "db.sqlite"
-)
+DEFAULT_DB_PATH = Path(os.environ.get(_DB_PATH_ENV) or _REPO_ROOT / "data" / "ibkr.db")
 
 #: The durable live book (see module docstring for why it is its own file).
 LIVE_DB_PATH = Path(

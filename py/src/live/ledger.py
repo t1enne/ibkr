@@ -937,9 +937,9 @@ class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
     The default path is the LIVE file (:func:`src.db.path.resolve_live_db_path`),
     NOT the candle file: the book is durable state no download can rebuild, so it
     no longer shares a file with bulk research data (D-Q7). The split was a
-    one-off verified copy (:file:`data/db.sqlite` still holds the source tables as
-    the kept copy); a ledger pointed at the wrong file reads the book as FLAT and
-    re-opens every position.
+    one-off verified copy, and the stale source tables left behind in the candle
+    file were then dropped by ``data_0002_drop_migrated_live_tables``; a ledger
+    pointed at the wrong file reads the book as FLAT and re-opens every position.
     """
 
     def __init__(self, db_path: str | Path | None = None) -> None:

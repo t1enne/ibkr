@@ -462,12 +462,13 @@ working-orders read, so an order placed by any other client can never be adopted
 
 ### State and locking
 
-One sqlite file (the same `../data/db.sqlite` the candles live in, overridable)
+One sqlite file (the same `../data/ibkr.db` the candles live in, overridable)
 holds `live_strategy`, `live_cash`, `live_position`, `live_execution`,
-`live_sim_lot` and `live_order_intent`, alongside `*_legacy` tables kept by past
-migrations. Migrations **rename rather than drop**, so an upgrade preserves
+`live_order_intent` and `live_scope_alias`, alongside `*_legacy` tables kept by
+past migrations. Migrations **rename rather than drop**, so an upgrade preserves
 history. A cycle holds an OS advisory lock next to the database
-(`<db>.cycle.lock`), so two overlapping cycles cannot place off the same book.
+(`<db>.<scope_tag>.cycle.lock`), so two overlapping cycles cannot place off the
+same book, while two different scopes still run concurrently.
 
 ### Exit codes
 

@@ -2,7 +2,7 @@
 
 After the file split the ``live_*`` tables exist in TWO places: the live book in
 ``data/live.db`` (migrated, read, authoritative) and a stale shell of them in
-``data/db.sqlite``, left behind because the split copied rather than moved.
+``data/ibkr.db``, left behind because the split copied rather than moved.
 
 Those shells are worse than clutter. Nothing migrates them — ``ibkr db migrate``
 runs ``LIVE_MIGRATIONS`` against the live file and ``DATA_MIGRATIONS`` against this
