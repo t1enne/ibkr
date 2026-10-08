@@ -393,7 +393,7 @@ reconcile cycle you schedule yourself (there is no daemon):
 uv run ibkr live run strats/pass/<config>.json --adapter sim --dry-run
 
 # Place through the Client Portal Gateway on a real account.
-uv run ibkr live run strats/pass/<config>.json --adapter ibkr --allow-live
+uv run ibkr live run strats/pass/<config>.json --adapter ibkr
 
 # Keep the gateway up + logged in, fresh session 24/7 (foreground; Ctrl-C to
 # stop supervising — the container keeps running). Default subcommand is `start`.
@@ -403,24 +403,23 @@ uv run ibkr gw stop       # tear the compose stack down
 
 # The gateway lifecycle is `ibkr gw`; a cycle only needs the session there.
 # Top up candles separately with the existing orchestrator when you need them.
-uv run ibkr live run strats/pass/<config>.json --adapter ibkr --allow-live
 
 # Clear one wedged intent key so the next cycle may re-mint it.
 uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 ```
 
 `--adapter sim` settles a paper book locally from a JSON fixture; `--adapter ibkr`
-places real orders (and is the default). A config
-with `"mode": "paper"` pointed at a live account is **refused** — `--allow-live`
-is the explicit acknowledgement.
+places real orders (and is the default). A config with `"mode": "paper"` pointed
+at a live account is **refused**: switch the config to `"mode": "live"` or point
+it at a paper account.
 
 The gateway lifecycle lives in `ibkr gw`: `gw start` (the default subcommand)
 brings the compose stack up detached, logs the session in via Playwright when
 it is unauthenticated (`--mode paper|live`, default `$TRADING_MODE`), then
 supervises the gateway in the foreground — a `/tickle` keepalive and a daily
 container bounce for the fresh IBKR session. `gw stop` tears the stack down.
-The cycle's own readiness/authz gate still runs on every `live run`, so a
-half-open session is never traded as if it were prepared. See
+A cycle does not probe readiness — keeping the session fresh is `ibkr gw`'s job;
+`live run` only resolves the account and checks its mode may trade it. See
 `ibkr gw start --help` for the rest.
 
 ### The cycle

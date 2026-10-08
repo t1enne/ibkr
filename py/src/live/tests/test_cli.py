@@ -578,7 +578,7 @@ def test_ibkr_dry_run_adapter_still_refuses_to_place(
 
     from src.bt.state import PortfolioState
     from src.live.adapters.ibkr.adapter import IbkrAdapter
-    from src.live.result import Err, Ok
+    from src.live.result import Err
 
     seen: dict[str, object] = {}
 
@@ -589,9 +589,6 @@ def test_ibkr_dry_run_adapter_still_refuses_to_place(
     class _Gateway:
         def __init__(self, *a: object, **k: object) -> None:
             self.client = _Client()
-
-        async def ensure_ready(self, *a: object, **k: object):
-            return Ok(None)
 
         async def aclose(self) -> None:
             return None

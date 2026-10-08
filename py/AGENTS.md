@@ -250,12 +250,15 @@ There is no daemon — you schedule it. Open work: `todo.md`.
 
 ```bash
 uv run ibkr live run strats/pass/<cfg>.json --adapter sim --dry-run  # places/writes nothing
-uv run ibkr live run strats/pass/<cfg>.json --adapter ibkr --allow-live
+uv run ibkr live run strats/pass/<cfg>.json --adapter ibkr
 uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 ```
 
-- `--allow-live` is required to read a `live` account; a `paper` config pointed
-  at a live account is refused.
+- A `paper` config pointed at a live account is refused; the config's `mode` is
+  the only switch for reading a live account.
+- **No gateway lifecycle in `live`.** `ibkr gw` starts/stops the stack and keeps
+  the session fresh (`/tickle` + daily bounce). A cycle resolves the account and
+  checks its mode, nothing more — it never probes gateway readiness.
 - **Adapter resolution:** CLI `--adapter` (unset by default) > config `adapter` >
   legacy config `broker` > `ibkr`. Both adapters (`ibkr`, `sim`) are STATELESS —
   the fetched book travels in as a parameter and the settled results come back

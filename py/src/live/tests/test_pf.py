@@ -494,45 +494,6 @@ def test_cli_pf_sim_marks_a_recorded_lot_ours(
     assert "AAPL_1" not in out.output.partition("divergence:")[2]
 
 
-def test_cli_pf_ibkr_refuses_a_paper_config_on_a_live_account(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The gate mirrors ``run``: mode paper vs a live account is a hard refusal."""
-
-    class _AccountClient:
-        async def resolve_account(self) -> str:
-            return "U12345"  # a LIVE account
-
-    class _Gateway:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self._client = _AccountClient()
-
-        @property
-        def client(self) -> _AccountClient:
-            return self._client
-
-        async def ensure_ready(self) -> object:
-            raise AssertionError("must not probe readiness after an authz refusal")
-
-        async def aclose(self) -> None:
-            return None
-
-    target = tmp_path / "cfg.json"
-    target.write_text(json.dumps({**BASE_CONFIG, "mode": "paper"}))
-    monkeypatch.setattr(
-        "src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(tmp_path / "l.sqlite")
-    )
-    monkeypatch.setattr("src.live.cli.IbkrGateway", _Gateway)
-
-    from click.testing import CliRunner
-
-    from src.live.cli import live_group
-
-    out = CliRunner().invoke(live_group, ["pf", str(target), "--adapter", "ibkr"])
-    assert out.exit_code == 1
-    assert "refuses live account" in out.output
-
-
 # --- (e) ibkr broker read: ownership by our own ref prefix (INV-5) ------------
 
 

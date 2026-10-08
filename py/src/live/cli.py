@@ -96,8 +96,8 @@ def _stderr_log(message: str) -> None:
     click.echo(message, err=True)
 
 
-class GatewayNotReady(RuntimeError):
-    """The broker gateway is not ready; the cycle never ran."""
+class SessionNotReady(RuntimeError):
+    """The broker session could not be reached, or may not trade the account."""
 
     def __init__(self, error: FeedError) -> None:
         super().__init__(error.message)
@@ -124,16 +124,6 @@ def live_group() -> None:
     "key, then the back-compat `broker` key), defaulting to `ibkr`.",
 )
 @click.option(
-    "--allow-live",
-    is_flag=True,
-    help="Required to read a LIVE account (mode: live).",
-)
-@click.option(
-    "--no-gateway",
-    is_flag=True,
-    help="Skip the gateway readiness check (trust an externally kept-alive gateway).",
-)
-@click.option(
     "--allow-unsafe",
     is_flag=True,
     help=(
@@ -149,8 +139,6 @@ def live_run(
     max_age: int,
     fmt: str,
     adapter: str | None,
-    allow_live: bool,
-    no_gateway: bool,
     allow_unsafe: bool,
 ) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
@@ -203,15 +191,13 @@ def live_run(
                     max_age_days=max_age,
                     dry_run=dry_run,
                     gateway=gateway,
-                    allow_live=allow_live,
-                    no_gateway=no_gateway,
                     cost=cost,
                 )
             )
     except (
         StaleDataError,
         PortfolioFetchError,
-        GatewayNotReady,
+        SessionNotReady,
         CycleInProgressError,
         LedgerReadError,
         ValueError,
@@ -250,41 +236,27 @@ async def _run_cycle(
     max_age_days: int,
     dry_run: bool,
     gateway: IbkrGateway | None,
-    allow_live: bool,
-    no_gateway: bool,
     cost: CostProvenance,
 ) -> CycleReport:
-    """Gate the cycle, then run it: resolve account + authz before any read.
+    """Resolve the account + authz, then run the cycle.
 
     The gateway adapter is what this adds over the sim path, and it runs BEFORE
-    ``run_cycle``: a cycle that cannot reach an authenticated broker session, or
-    that is not permitted to trade the account it found, must fail without ever
-    touching the screen or the book. ``no_gateway`` (plan §7.5) trusts an
-    externally kept-alive gateway and skips the readiness probe — loudly, never
-    silently.
+    ``run_cycle``: a cycle that cannot reach a broker session, or that is not
+    permitted to trade the account it found, must fail without ever touching the
+    screen or the book. Keeping a session *fresh* is ``ibkr gw``'s job — this
+    only proves a usable one exists.
     """
     if gateway is not None:
         try:
             account = await gateway.client.resolve_account()
         except IbkrError as exc:
-            raise GatewayNotReady(FeedError(kind="auth", message=str(exc))) from exc
+            raise SessionNotReady(FeedError(kind="auth", message=str(exc))) from exc
         decision = authorize(
             mode=cfg.mode,
             account=account,
-            allow_live=allow_live,
-            dry_run=dry_run,
         )
         if isinstance(decision, Err):
-            raise GatewayNotReady(cast("FeedError", decision.error))
-        if no_gateway:
-            _stderr_log(
-                "gateway readiness check skipped (--no-gateway; "
-                "trusting an externally kept-alive gateway)"
-            )
-        else:
-            ready = await gateway.ensure_ready()
-            if isinstance(ready, Err):
-                raise GatewayNotReady(cast("FeedError", ready.error))
+            raise SessionNotReady(cast("FeedError", decision.error))
     try:
         return await run_cycle(
             cfg,
@@ -395,16 +367,6 @@ live_group.add_command(live_abandon)
     "Absent = store-only (no broker read).",
 )
 @click.option(
-    "--allow-live",
-    is_flag=True,
-    help="Required to read a LIVE account (implies mode: live without a config).",
-)
-@click.option(
-    "--no-gateway",
-    is_flag=True,
-    help="Skip the gateway readiness check (trust an externally kept-alive gateway).",
-)
-@click.option(
     "--watch",
     "watch_seconds",
     type=click.FloatRange(min=0, min_open=True),
@@ -418,8 +380,6 @@ def live_pf(
     config_path: str | None,
     fmt: str,
     adapter: str | None,
-    allow_live: bool,
-    no_gateway: bool,
     watch_seconds: float | None,
 ) -> None:
     """Show scopes, their P&L and one merged positions table, plus the broker.
@@ -434,8 +394,7 @@ def live_pf(
     ``--adapter`` is a FILTER, not a requirement: given, it selects the broker
     to read (``ibkr`` account-wide, or the ``sim`` book straight from the store)
     and the report includes the broker block + divergence; absent, the report is
-    store-only and no broker is touched. Without a config, a live account needs
-    ``--allow-live``.
+    store-only and no broker is touched.
 
     ``--watch SECONDS`` turns the one-shot report into a polling view: the store
     and broker are re-read and re-rendered every SECONDS until Ctrl-C (exit 0).
@@ -455,15 +414,22 @@ def live_pf(
         raise click.ClickException("--watch cannot be combined with --format json")
     ledger = SqliteLedger()
     if watch_seconds is not None:
-        _watch_pf(ledger, config_path, adapter, allow_live, no_gateway, watch_seconds)
+        _watch_pf(ledger, config_path, adapter, watch_seconds)
         return
     try:
         report = (
-            _all_scopes_report(ledger, adapter, allow_live, no_gateway)
+            _all_scopes_report(
+                ledger,
+                adapter,
+            )
             if config_path is None
-            else _config_report(ledger, config_path, adapter, allow_live, no_gateway)
+            else _config_report(
+                ledger,
+                config_path,
+                adapter,
+            )
         )
-    except (GatewayNotReady, ValueError, LedgerReadError) as exc:
+    except (SessionNotReady, ValueError, LedgerReadError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(render_pf(report, fmt, _styler(fmt, sys.stdout.isatty())))
 
@@ -471,13 +437,11 @@ def live_pf(
 def _all_scopes_report(
     ledger: SqliteLedger,
     adapter: str | None,
-    allow_live: bool,
-    no_gateway: bool,
 ) -> PfReport:
     """Every scope in the store, plus a broker read when ``--adapter`` names one."""
     scopes = ledger.scopes_of_store()
     stores = tuple(read_store(ledger, scope) for scope in scopes)
-    broker = _pf_broker(ledger, adapter, None, None, stores, allow_live, no_gateway)
+    broker = _pf_broker(ledger, adapter, None, None, stores)
     return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker)
 
 
@@ -485,14 +449,18 @@ def _config_report(
     ledger: SqliteLedger,
     config_path: str,
     adapter: str | None,
-    allow_live: bool,
-    no_gateway: bool,
 ) -> PfReport:
     """The config's scope, plus a broker read when one is resolved."""
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
     store = read_store(ledger, _config_scope(cfg), initial_capital=cfg.initial_capital)
-    broker = _pf_broker(ledger, adapter, raw, cfg, (store,), allow_live, no_gateway)
+    broker = _pf_broker(
+        ledger,
+        adapter,
+        raw,
+        cfg,
+        (store,),
+    )
     return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=(store,), broker=broker)
 
 
@@ -515,8 +483,6 @@ def _pf_broker(
     raw: Mapping[str, object] | None,
     cfg: LiveConfig | None,
     stores: tuple[StoreSide, ...],
-    allow_live: bool,
-    no_gateway: bool,
 ) -> BrokerSide | None:
     """Resolve the broker to read (if any) and read it.
 
@@ -524,8 +490,7 @@ def _pf_broker(
     config that never named one reads NO broker (store-only), so ``live pf
     <strategy.json>`` works with no configuration beyond the strategy. A ``sim``
     read is the store's own account book (``read_sim_broker``) — no fixture, no
-    gateway. Without a config the mode is ``live`` when ``--allow-live`` and
-    ``paper`` otherwise.
+    gateway.
     """
     resolved = adapter
     if resolved is None and raw is not None and cfg is not None:
@@ -535,55 +500,25 @@ def _pf_broker(
         return None
     if resolved == "sim":
         return read_sim_broker(ledger, stores[0].scope if stores else "")
-    mode: Literal["paper", "live"] = (
-        cfg.mode if cfg is not None else ("live" if allow_live else "paper")
-    )
     owned = frozenset(lot.id for store in stores for lot in store.lots)
     return asyncio.run(
         _read_ibkr_pf(
-            mode,
             tuple(store.scope for store in stores),
             owned,
-            allow_live,
-            no_gateway,
         )
     )
 
 
-async def _gate_ibkr_pf(
-    mode: Literal["paper", "live"],
-    allow_live: bool,
-    no_gateway: bool,
-) -> tuple[IbkrGateway, str]:
-    """Open ONE authenticated session and gate it: account, authz, readiness.
+async def _open_ibkr_session() -> tuple[IbkrGateway, str]:
+    """Open ONE authenticated session and resolve its account.
 
-    Mirrors ``_run_cycle``'s gate order exactly — reach an authenticated session,
-    prove *mode* may read the account, then probe readiness — so a pf read is
-    refused under the same rules as a cycle. Returns the OPEN gateway and the
-    resolved account; the caller owns ``aclose``. A failure is a typed
-    ``GatewayNotReady`` (exit 1), never a traceback. ``--no-gateway`` keeps the
-    session without probing readiness, exactly as the one-shot path does.
+    Returns the OPEN gateway and the resolved account; the caller owns
+    ``aclose``. A failure is a typed ``SessionNotReady`` (exit 1), never a
+    traceback.
     """
     gateway = IbkrGateway(IbkrClient())
     try:
-        try:
-            account = await gateway.client.resolve_account()
-        except IbkrError as exc:
-            raise GatewayNotReady(FeedError(kind="auth", message=str(exc))) from exc
-        decision = authorize(
-            mode=mode, account=account, allow_live=allow_live, dry_run=True
-        )
-        if isinstance(decision, Err):
-            raise GatewayNotReady(cast("FeedError", decision.error))
-        if no_gateway:
-            _stderr_log(
-                "gateway readiness check skipped (--no-gateway; "
-                "trusting an externally kept-alive gateway)"
-            )
-        else:
-            ready = await gateway.ensure_ready()
-            if isinstance(ready, Err):
-                raise GatewayNotReady(cast("FeedError", ready.error))
+        account = await gateway.client.resolve_account()
         return gateway, account
     except BaseException:
         await gateway.aclose()
@@ -591,24 +526,20 @@ async def _gate_ibkr_pf(
 
 
 async def _read_ibkr_pf(
-    mode: Literal["paper", "live"],
     scopes: tuple[str, ...],
     owned: frozenset[str],
-    allow_live: bool,
-    no_gateway: bool,
 ) -> BrokerSide:
-    """Gate then read the IBKR book: resolve account + authz before any read.
+    """Open a session, resolve the account, then read the IBKR book once.
 
-    The one-shot path: gate (``_gate_ibkr_pf``), read the book once, then close.
     The client is ALWAYS closed in the ``finally``; nothing is placed and no lease
     is taken.
     """
-    gateway, account = await _gate_ibkr_pf(mode, allow_live, no_gateway)
+    gateway, account = await _open_ibkr_session()
     try:
         try:
             return await read_ibkr_broker(gateway.client, account, scopes, owned)
         except IbkrError as exc:
-            raise GatewayNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
+            raise SessionNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
     finally:
         await gateway.aclose()
 
@@ -637,8 +568,6 @@ def _watch_pf(
     ledger: SqliteLedger,
     config_path: str | None,
     adapter: str | None,
-    allow_live: bool,
-    no_gateway: bool,
     interval: float,
 ) -> None:
     """Re-read the store + broker and re-render every *interval* until Ctrl-C.
@@ -649,9 +578,7 @@ def _watch_pf(
     and the loop keeps going. Teardown restores the screen on every exit path.
     """
     tty = sys.stdout.isatty()
-    session = _open_watch_session(
-        ledger, config_path, adapter, allow_live, no_gateway, _styler("text", tty)
-    )
+    session = _open_watch_session(ledger, config_path, adapter, _styler("text", tty))
     try:
         watch_pf_loop(
             session.frame,
@@ -676,8 +603,6 @@ def _open_watch_session(
     ledger: SqliteLedger,
     config_path: str | None,
     adapter: str | None,
-    allow_live: bool,
-    no_gateway: bool,
     style: Styler = PLAIN,
 ) -> _WatchSession:
     """Resolve the watch's frame + teardown ONCE, before the loop starts.
@@ -695,9 +620,6 @@ def _open_watch_session(
                 ledger,
                 ledger.scopes_of_store,
                 0.0,
-                "live" if allow_live else "paper",
-                allow_live,
-                no_gateway,
             )
         return _WatchSession(_store_frame(ledger, None, adapter, style), _noop)
     cfg = load_live_config(config_path)
@@ -708,16 +630,13 @@ def _open_watch_session(
         name = resolved if named else None
     if name != "ibkr":
         return _WatchSession(
-            _store_frame(ledger, cfg if name is not None else None, name, style, raw),
+            _store_frame(ledger, cfg if name is not None else None, name, style),
             _noop,
         )
     return _ibkr_watch_session(
         ledger,
         lambda: (_config_scope(cfg),),
         cfg.initial_capital,
-        cfg.mode,
-        allow_live,
-        no_gateway,
         style,
     )
 
@@ -726,9 +645,6 @@ def _ibkr_watch_session(
     ledger: SqliteLedger,
     scopes_fn: Callable[[], tuple[str, ...]],
     initial_capital: float,
-    mode: Literal["paper", "live"],
-    allow_live: bool,
-    no_gateway: bool,
     style: Styler = PLAIN,
 ) -> _WatchSession:
     """Gate ONE ibkr session on a persistent loop, then read only the book.
@@ -741,9 +657,7 @@ def _ibkr_watch_session(
     """
     loop = asyncio.new_event_loop()
     try:
-        gateway, account = loop.run_until_complete(
-            _gate_ibkr_pf(mode, allow_live, no_gateway)
-        )
+        gateway, account = loop.run_until_complete(_open_ibkr_session())
     except BaseException:
         loop.close()
         raise
@@ -776,12 +690,11 @@ def _store_frame(
     cfg: LiveConfig | None,
     adapter: str | None,
     style: Styler = PLAIN,
-    raw: Mapping[str, object] | None = None,
 ) -> Callable[[], str]:
     """A store (+ sim broker) frame builder for the scopes a watch covers."""
 
     def frame() -> str:
-        stores, broker = _store_and_broker(ledger, cfg, adapter, raw)
+        stores, broker = _store_and_broker(ledger, cfg, adapter)
         return render_pf(
             PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
             "text",
@@ -795,7 +708,6 @@ def _store_and_broker(
     ledger: SqliteLedger,
     cfg: LiveConfig | None,
     adapter: str | None,
-    raw: Mapping[str, object] | None = None,
 ) -> tuple[tuple[StoreSide, ...], BrokerSide | None]:
     """Re-read the store side and (for ``sim``) the store's account book, per tick.
 
