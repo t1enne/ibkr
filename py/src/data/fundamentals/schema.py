@@ -19,9 +19,15 @@ from dataclasses import dataclass, fields
 from typing import Literal, Sequence
 
 import pandas as pd
-from peewee import CharField, FloatField, IntegerField, Model, SqliteDatabase
+from peewee import SqliteDatabase
 
-from src.data.types import db
+from src.db.models.fundamentals import (
+    NATURAL_KEY_COLUMNS,
+    NATURAL_KEY_DDL,
+    NATURAL_KEY_INDEX,
+    FundamentalSchema,
+    ensure_natural_key_index,
+)
 
 # ---------------------------------------------------------------------------
 # normalized types
@@ -142,52 +148,15 @@ class FundamentalRow:
 # peewee model + write path
 # ---------------------------------------------------------------------------
 
+#: The peewee model and its natural-key constants live in :mod:`src.db.models`
+#: (a table the migration framework cannot import is a table it cannot create,
+#: index or migrate), and are re-exported here so the fundamentals package keeps
+#: one import surface. The storage value type and the normalized statement
+#: dataclasses above stay in this module.
+
 # PIT dates are stored as epoch milliseconds (int), matching the existing
 # ``candle.timestamp`` convention so both tables share one time encoding.
 _MS_PER_DAY = 86_400_000
-
-#: Natural key of a stated fact, enforced UNIQUE (mirrors
-#: ``candle_ticker_timestamp_idx`` on the candle table, which is what makes the
-#: candle insert idempotent). ``form`` is deliberately **excluded**: ``filed``
-#: already disambiguates two filings of one period, while a period-only key would
-#: collide the original with its restatement and destroy the PIT distinction.
-NATURAL_KEY_COLUMNS: tuple[str, ...] = (
-    "ticker",
-    "statement",
-    "field",
-    "period_start",
-    "period_end",
-    "filed",
-)
-
-#: Name of the UNIQUE index backing :data:`NATURAL_KEY_COLUMNS`.
-NATURAL_KEY_INDEX = "fundamental_natural_key_idx"
-
-#: Peewee derives index names from the table+columns (an overlong hashed name),
-#: so the index is created explicitly by :func:`bootstrap` under a stable name
-#: instead. The DDL lives next to :data:`NATURAL_KEY_COLUMNS` so the two cannot
-#: drift apart.
-NATURAL_KEY_DDL = (
-    f"CREATE UNIQUE INDEX IF NOT EXISTS {NATURAL_KEY_INDEX} "
-    f"ON fundamental ({', '.join(NATURAL_KEY_COLUMNS)})"
-)
-
-
-class FundamentalSchema(Model):
-    """Sparse fiscal fundamentals row (see :class:`FundamentalRow`)."""
-
-    ticker = CharField()
-    statement = CharField()
-    field = CharField()
-    value = FloatField()
-    period_start = IntegerField()
-    period_end = IntegerField()
-    filed = IntegerField()
-    form = CharField()
-
-    class Meta:
-        database = db
-        table_name = "fundamental"
 
 
 def _default_conn() -> SqliteDatabase:
@@ -208,44 +177,15 @@ def bootstrap(db_conn=None) -> None:
     schema write. ``db_conn`` (a :class:`SqliteDatabase`) overrides the module
     default, which is what tests and any non-default DB use.
 
-    The index is created separately from ``create_tables`` because that call
-    does not ALTER an existing table: a DB migrated before the index existed
-    already has the table and would otherwise never gain the constraint that
-    makes :func:`insert_fundamentals` idempotent. ``IF NOT EXISTS`` keeps the
-    whole thing idempotent and safe on a table created in the same call.
-
-    A table that predates the constraint may already hold duplicate natural keys
-    (the very rows the constraint prevents going forward), which would make
-    ``CREATE UNIQUE INDEX`` fail. Those exact-duplicate rows are collapsed first
-    — see :func:`_collapse_duplicate_keys`. Restatements are not duplicates (they
-    differ in ``filed``) and are never touched.
+    The index work is delegated to
+    :func:`~src.db.models.fundamentals.ensure_natural_key_index` — the same call
+    ``data_0001_baseline`` makes — so a table created by the migration and one
+    created here cannot drift apart.
     """
     conn = db_conn if db_conn is not None else _default_conn()
     with _using(conn):
         conn.create_tables([FundamentalSchema])
-        _collapse_duplicate_keys(conn)
-        conn.execute_sql(NATURAL_KEY_DDL)
-
-
-#: Delete every row sharing a natural key except the lowest ``id`` (the first
-#: write, which is what :func:`insert_fundamentals` would now have kept anyway).
-#: A grouped subquery rather than a window function, so it runs on any SQLite.
-_COLLAPSE_DUPES = (
-    "DELETE FROM fundamental WHERE id NOT IN ("
-    "SELECT MIN(id) FROM fundamental "
-    f"GROUP BY {', '.join(NATURAL_KEY_COLUMNS)})"
-)
-
-
-def _collapse_duplicate_keys(conn: SqliteDatabase) -> int:
-    """Remove exact-duplicate natural-key rows; return how many were removed.
-
-    Needed only to make the UNIQUE index creatable on a table that predates it.
-    Safe when there is nothing to collapse (the DELETE matches no rows) and on a
-    table created in the same call (it is empty).
-    """
-    removed = conn.execute_sql(_COLLAPSE_DUPES).rowcount
-    return int(removed) if removed and removed > 0 else 0
+        ensure_natural_key_index(conn)
 
 
 @contextmanager

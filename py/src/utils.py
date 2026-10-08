@@ -10,6 +10,11 @@ import numpy as np
 
 from src.data.resample import resample_ohlcv
 
+# ``src.db`` is a leaf package (path/connection/models import nothing from
+# ``src.*``), so the connection helper can be imported at module level — the
+# lazy-import hop that used to dodge the ``src.data`` initializer cycle is gone.
+from src.db.connection import get_connection
+
 # ``to_optional_ts``/``parse_timestamp`` moved to the ``src.timestamps`` leaf so
 # ``src.data._shared`` can import them without reaching back into ``src.utils``
 # (which imports ``src.data.resample`` and closed an import cycle). Re-exported
@@ -27,8 +32,6 @@ def get_local_candles(
     end_date: Optional[pd.Timestamp] = None,
     bar: str = "1h",
 ) -> pd.DataFrame:
-    from src.data.db import get_connection  # lazy: avoid src.data pkg-init cycle
-
     con = get_connection()
     cur = con.cursor()
     _start = start_date if start_date else _DEFAULT_START

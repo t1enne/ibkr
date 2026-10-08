@@ -20,7 +20,6 @@ sibling script.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import subprocess
 import sys
 import time
@@ -30,12 +29,14 @@ from typing import Literal
 
 from src.data.ibkr.client import IbkrClient, IbkrError, is_authenticated
 from src.data.ibkr.login import TradingMode, login_from_env
+from src.db.connection import get_connection
+from src.db.path import resolve_db_path
 
 # ── Config ────────────────────────────────────────────────────────────────
 PY_DIR = Path(__file__).resolve().parents[3]  # .../py
 ROOT = PY_DIR.parent  # repo root
-DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "db.sqlite"
+#: The candle file, resolved by :mod:`src.db.path` (honours ``IBKR_DB_PATH``).
+DB_PATH = resolve_db_path()
 ENV_PATH = PY_DIR / ".env"
 GATEWAY_TIMEOUT = 180  # seconds to wait for the healthcheck after up -d
 DL_DAYS = 30
@@ -241,7 +242,7 @@ async def ensure_gateway_async() -> None:
 
 
 def symbols_from_db() -> list[str]:
-    con = sqlite3.connect(DB_PATH)
+    con = get_connection()
     try:
         rows = con.execute("SELECT ticker FROM symbol ORDER BY ticker").fetchall()
     finally:

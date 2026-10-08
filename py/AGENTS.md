@@ -133,27 +133,69 @@ questions are answered by one query.
 
 ### The database
 
-- **Path:** SQLite at `../data/db.sqlite` — **relative to the repo's parent**
-  (`/home/nasrt/Documents/code/dev/ibkr/data/db.sqlite`), NOT inside this `py/`
-  dir. ~166 MB, `journal_mode=wal`.
-  - `src/data/db.py::_DEFAULT_DB_PATH` resolves it file-relative
-    (correct — use this).
-  - `src/data/types.py::db_path` resolves it via
-    `os.getcwd()/../data/...`, so it depends on the CWD being the repo's parent.
-    Prefer `query_candles`/`get_connection` from `src.data.db` over the peewee
-    instance.
-- `sqlite3` CLI may not be installed. Query with Python instead:
+Two SQLite files, both under the repo's `../data/` directory (`py/`'s sibling),
+all resolved by **`src/db/path.py`** — one path truth per file, file-relative (never
+`os.getcwd()`, which silently reads the wrong file from another directory).
+
+- **`data/db.sqlite`** — candles, `symbol`, `fundamental`: bulk, regenerable
+  research data. `IBKR_DB_PATH` overrides it. `resolve_db_path()` /
+  `DEFAULT_DB_PATH`.
+- **`data/live.db`** — the durable live book (`live_*`). `IBKR_LIVE_DB_PATH`
+  overrides it. `resolve_live_db_path()` / `LIVE_DB_PATH`. It is a SEPARATE file
+  because the book is state no download can rebuild: a bloated or corrupt research
+  write must not be able to take it down with it (todo D18).
+
+```bash
+uv run ibkr db status              # every migration + applied/pending, both files
+uv run ibkr db migrate --dry-run   # what WOULD run; writes nothing
+uv run ibkr db migrate             # apply pending (both files)
+uv run ibkr db migrate --down --yes  # unwind (refuses an irreversible target)
+```
+
+- **`src/db/` is a leaf layer:** `path`, `connection`, `models`, `introspect`
+  import NOTHING from `src.*`. Only `src/db/migrations/versions/**` may reach back
+  into `src.live` / `src.data`. `src/db/__init__.py` must NOT re-export
+  `migrations.versions.*` — that would drag `src.live` into every `import src.db`.
+- **`sqlite3` CLI may not be installed.** Query with Python instead:
   `python -c "import sqlite3; c=sqlite3.connect('../data/db.sqlite')"`, or use
-  the CLI below.
+  the CLI above.
+
+### Migrations
+
+- **`src/db/migrations/`**: `types` (frozen `Migration` + `Registry`),
+  `bookkeeping` (our own `peewee_migration` table — NOT kysely's),
+  `runner` (`run_pending` / `run_down` / `status`), `helpers`,
+  `versions/` (the explicit ordered tuples `LIVE_MIGRATIONS` / `DATA_MIGRATIONS`).
+- **Order is the tuple order** in `versions/__init__.py`. There is no filename scan
+  and no discovery — a rename cannot silently reorder history.
+- **Two registries, never one.** `ibkr db migrate` runs both (one per file); the
+  ledger's `_ready_schema` runs **LIVE only**, so the first write of a cycle never
+  replays a slow multi-million-row candle migration.
+- **Concurrency:** a batch's `up()`s + bookkeeping writes share ONE
+  `BEGIN IMMEDIATE` transaction, so racing runners serialize on the SQLite write
+  lock. There is no separate lock table — the write lock IS the mutex.
+- **`down()` only where a genuine, lossless inverse exists.** Live migrations
+  rename and never drop, so `live_0001_baseline.down` is absent and `run_down`
+  refuses loudly (`IrreversibleMigrationError`) rather than partially unwinding.
+  `data_0001_baseline.down` is a real no-op (it owns no rows).
+- **The baseline is an idempotent absorber, and its guards are load-bearing.**
+  `live_0001_baseline.up` is the old `ledger_migration.migrate()` body lifted
+  verbatim: recognition guards distinguish three `live_position` shapes, re-keys
+  early-return when the key is current, column adds are `IF NOT EXISTS`-style.
+  An operator's DB has no `peewee_migration` row, so this runs against whatever
+  shape that file is in. Do not "clean up" the guards to assume a version.
 
 ### Schema
 
-- **`symbol`**: `conid` (PK), `ticker`, `name`, `market`, `currency`. ~309 rows.
+- **`symbol`**: `conid` (PK), `ticker`, `name`, `market`, `currency`.
 - **`candle`**: `id` (PK autoincrement), `ticker`, `conid`, `timestamp` (ms epoch),
   `open`, `high`, `low`, `close`, `volume`. Indexed on `(ticker, timestamp)` —
   always filter by `ticker`, never join through `symbol.conid` (that join is
   unindexed and ~20x slower). `ticker` is stored UPPERCASE.
-- Two migration tables (`kysely_migration`) — schema versioning, ignore.
+- **`peewee_migration`**: `name` (PK), `applied_at`. OUR bookkeeping, separate from
+  the TS-created `kysely_migration` (which the TypeScript data pipeline owns and
+  may rewrite — sharing it would couple two tools' rollout state).
+- **The `live_*` tables** live in `data/live.db`, not here (see § Where state lives).
 
 ### Quick verification
 
@@ -326,14 +368,38 @@ temp sqlite via `IBKR_DB_PATH`.
 
 ### Where state lives
 
-One sqlite file (the same `../data/db.sqlite` the candles use, overridable via
-`db_path`): `live_strategy`, `live_cash`, `live_position` (the ONE book table —
-both roles, told apart by `source`), `live_execution`, `live_order_intent`,
-`live_scope_alias` (a re-keyed legacy scope reads as its new name), plus the
-`*_legacy` copies past migrations preserve (e.g. `live_position_legacy`,
-`live_sim_lot_legacy`) rather than drop. The cycle lease is an OS advisory lock
-on `<db>.<scope_tag>.cycle.lock` — sound on a single host with a local filesystem
-only.
+The live book has its **OWN sqlite file**, `../data/live.db` (overridable via
+`IBKR_LIVE_DB_PATH`, or `db_path` on `SqliteLedger`), resolved by
+`src/db/path.py::resolve_live_db_path`. It is split from the candle file because
+the book is durable state no download can rebuild (todo D18). Tables:
+`live_strategy`, `live_cash`, `live_position` (the ONE book table — both roles,
+told apart by `source`), `live_execution`, `live_order_intent`, `live_scope_alias`
+(a re-keyed legacy scope reads as its new name), plus the `*_legacy` copies past
+migrations preserve (e.g. `live_position_legacy`, `live_sim_lot_legacy`) rather
+than drop. The cycle lease is an OS advisory lock on `<db>.<scope_tag>.cycle.lock`
+— sound on a single host with a local filesystem only.
+
+**The split was a one-off, already performed.** The book lives in `data/live.db`
+and was populated by a verified row-for-row copy whose tooling
+(`ibkr db adopt-live`) has since been removed as spent. The stale `live_*` tables
+that copy left behind in `data/db.sqlite` were then DROPPED by
+`data_0002_drop_migrated_live_tables` — the one sanctioned exception to
+rename-never-drop, gated on a guard that refuses unless the live file exists, is
+migrated, and holds at least as many rows per table. `data/db.sqlite` now holds
+only `symbol` / `candle` / `fundamental` (plus the 1-row `kysely_*` lineage
+tables).
+
+Getting this wrong is the dangerous direction: a ledger pointed at an empty or
+wrong file reads a held position as FLAT and re-enters it (double exposure).
+Verify `ibkr db status` and the live file's `live_position` rows before trusting a
+flat book. `data/db.sqlite.pre-adopt.bak` and `data/live.db.pre-drop.bak` are the
+pre-step snapshots.
+
+`src/db/connection.py` holds one process-global peewee handle per file (`db`,
+`live_db`). The `live_*` **models** deliberately do NOT bind to one: peewee binds
+at CLASS level and tests run two ledgers on two paths in one process, so they keep
+the per-instance `SqliteDatabase(path)` + `bind_ctx(LIVE_MODELS)` pattern (see
+`src/live/models.py`). Do not "simplify" that to a process-wide handle.
 
 ## Language & Toolchain
 

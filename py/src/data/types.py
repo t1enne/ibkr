@@ -12,26 +12,33 @@ Types defined here:
   ProgressFn     — Protocol for progress callbacks (I/O boundary)
   ISymbol        — dataclass mirroring SymbolSchema peewee model
   ICandle        — dataclass mirroring CandleSchema peewee model
-  SymbolSchema   — peewee ORM model for symbols
-  CandleSchema   — peewee ORM model for candles
-  db             — SqliteDatabase instance (shared by models)
-"""
 
-import atexit
-import os
+The peewee models and the process-global ``db`` handle now live in :mod:`src.db`
+(``symbol``/``candle`` have exactly one concrete target, so they no longer belong
+to the ``src.data`` package's own initializer). Both are RE-EXPORTED here so that
+existing ``from src.data.types import SymbolSchema, db`` keeps working unchanged.
+"""
 
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional, Protocol, TypedDict
 
-from peewee import Model, IntegerField, CharField, FloatField, SqliteDatabase
+from src.db.connection import db
+from src.db.models.candles import CandleSchema, SymbolSchema
 
-
-# ── Database instance ───────────────────────────────────────────
-
-db_path = os.path.join(os.getcwd(), "..", "data", "db.sqlite")
-db = SqliteDatabase(db_path, pragmas={"journal_mode": "wal"})
-atexit.register(db.close)
+__all__ = [
+    "CandleDict",
+    "CandleSchema",
+    "FetchPlan",
+    "ICandle",
+    "ISymbol",
+    "PreviewResult",
+    "ProgressFn",
+    "SymbolSchema",
+    "SyncResult",
+    "UniverseConf",
+    "db",
+]
 
 
 # ── Dataclass mirrors of ORM models ────────────────────────────
@@ -60,36 +67,6 @@ class ICandle:
     low: float
     close: float
     volume: float
-
-
-# ── Peewee ORM models ──────────────────────────────────────────
-
-
-class SymbolSchema(Model):
-    conid = IntegerField(primary_key=True)
-    ticker = CharField()
-    name = CharField(null=True)
-    market = CharField()
-    currency = CharField()
-
-    class Meta:
-        database = db
-        table_name = "symbol"
-
-
-class CandleSchema(Model):
-    conid = IntegerField()
-    ticker = CharField()
-    timestamp = IntegerField()
-    open = FloatField()
-    high = FloatField()
-    low = FloatField()
-    close = FloatField()
-    volume = FloatField()
-
-    class Meta:
-        database = db
-        table_name = "candle"
 
 
 # ── Candle data ──────────────────────────────────────────────────

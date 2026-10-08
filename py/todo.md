@@ -213,16 +213,25 @@ Either state the bound or keep the counter monotonic independently of retention.
 - **Fix sketch:** report realised slippage = (fill price − ref price)/ref price
   per fill.
 
-### [ ] D18 — the live book shares `data/db.sqlite` with candles and research; no backup/checkpoint policy
+### [x] D18 — CLOSED: the live book has its own sqlite file (`data/live.db`)
 
-- **Where:** `src/data/db.py:14-15` (default DB path `../data/db.sqlite`);
-  `src/live/ledger.py:7-8` ("Tables live in the SAME candle DB").
-- **Problem:** the durable live position store sits in the same SQLite file as
-  bulk candle/research data, with no backup, no `wal_checkpoint`/VACUUM policy
-  (grep confirms). A corrupt or bloated research write can take the live book with
-  it; there is no snapshot to restore from.
-- **Fix sketch:** periodic checkpoint + file backup of the live tables, or a
-  separate DB file for the live book.
+The live book no longer shares `../data/db.sqlite` with candles/research. Paths
+are one truth per file in the leaf `src/db/path.py` (`resolve_db_path` /
+`resolve_live_db_path`, both file-relative, both env-overridable); the ledger
+defaults to the live file. The DDL-extraction and migration framework landed with
+it: `src/db/` (path/connection/models/introspect + `migrations/`), our own
+`peewee_migration` bookkeeping table (not kysely's), ordered `LIVE_MIGRATIONS` /
+`DATA_MIGRATIONS` registries, and `ibkr db migrate|status`.
+
+**The orphaned source tables are gone.** After the copy, the stale `live_*` tables
+left in `../data/db.sqlite` were dropped by
+`data_0002_drop_migrated_live_tables` — the one sanctioned exception to
+rename-never-drop, gated on a guard that refuses unless the live file exists, is
+migrated, and holds at least as many rows per table (the folded `live_position` /
+`live_sim_lot` pair is counted against `live_position`). `db.sqlite` now holds only
+`symbol` / `candle` / `fundamental` plus the 1-row `kysely_*` lineage tables. A
+ledger pointed at the wrong file reads a FLAT book — verify `live_position` before
+trusting it. See AGENTS.md § The database / § Where state lives.
 
 ### [ ] D19 — a scaled live cohort prints no shortfall (silent undersizing)
 

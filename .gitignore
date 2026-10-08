@@ -15,8 +15,12 @@ wheels
 node_modules
 
 gateway
-db.sqlite
-db.sqlite-*
+ibkr.db
+ibkr.db-*$
+# The durable live book. Position state, not source — never commit it.
+live.db
+live.db-*
+live.db.*
 hono/static/main.css
 
 # generated

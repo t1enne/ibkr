@@ -22,6 +22,15 @@ import pandas as pd
 import peewee
 from peewee import Model, SqliteDatabase
 
+#: Re-exported from :mod:`src.db.introspect` so the ledger's own modules (and any
+#: caller that grew to depend on them here) keep one import site, while the
+#: implementation lives in the leaf module the migration framework can use too.
+from src.db.introspect import (  # noqa: F401
+    primary_key_columns as _primary_key_columns,
+    table_columns as _table_columns,
+    table_exists as _table_exists,
+)
+
 _TEMPLATE_DB = SqliteDatabase(None)
 
 
@@ -63,27 +72,6 @@ def _is_missing_table(error: peewee.OperationalError) -> bool:
     is the only discriminator left.
     """
     return "no such table" in str(error)
-
-
-def _table_exists(db: SqliteDatabase, name: str) -> bool:
-    """Whether *name* is a table in *db*."""
-    return bool(
-        db.execute_sql(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-        ).fetchall()
-    )
-
-
-def _table_columns(db: SqliteDatabase, name: str) -> set[str]:
-    """The column names of *name* in *db* (empty when the table does not exist)."""
-    return {str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})")}
-
-
-def _primary_key_columns(db: SqliteDatabase, name: str) -> set[str]:
-    """The primary-key column names of *name* (from ``PRAGMA table_info``)."""
-    return {
-        str(row[1]) for row in db.execute_sql(f"PRAGMA table_info({name})") if row[5]
-    }
 
 
 # Timestamps round-trip through INTEGER epoch milliseconds — the same clock the

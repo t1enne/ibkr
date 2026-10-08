@@ -21,7 +21,7 @@ from typing import Protocol, cast
 import pandas as pd
 
 from src.bt.state import PortfolioState
-from src.data.db import get_connection
+from src.db.connection import get_connection
 from src.live.adapter import LiveAdapter
 from src.live.pure import OrderResult
 from src.live.divergence import Divergence, book_from_executions, guard_divergence

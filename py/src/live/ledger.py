@@ -43,17 +43,12 @@ from typing import cast
 
 import pandas as pd
 import peewee
-from peewee import (
-    CompositeKey,
-    FloatField,
-    IntegerField,
-    SqliteDatabase,
-    TextField,
-    fn,
-)
+from peewee import SqliteDatabase, fn
 
 from src.bt.state import ActionType
-from src.data.db import _DEFAULT_DB_PATH
+from src.db.migrations.runner import run_pending
+from src.db.migrations.versions import LIVE_MIGRATIONS
+from src.db.path import resolve_live_db_path
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import (
@@ -72,21 +67,29 @@ from src.live.identity import (
 )
 from src.live.lease import file_lease
 from src.live.ledger_base import (
-    _Base,
     _is_missing_table,
     _ms,
     _SqliteOps,
     _ts,
     LedgerReadError,
 )
-from src.live.ledger_migration import _restore_intents, _restore_positions, migrate
+from src.live.models import (
+    LIVE_MODELS,
+    SOURCE_ACCOUNT,
+    SOURCE_EXECUTIONS,
+    LiveCash,
+    LiveExecution,
+    LiveOrderIntent,
+    LivePosition,
+    LiveStrategy,
+)
 
 logger = logging.getLogger(__name__)
 
-#: ``live_position.source`` for the sim lot book (the human/broker-editable surface).
-SOURCE_ACCOUNT = "account"
-#: ``live_position.source`` for the fill fold (the engine-owned, append-only truth).
-SOURCE_EXECUTIONS = "executions"
+#: The ``bind_ctx`` group: every live model, rebindable per ledger instance.
+#: Rebound here (not globally) because peewee binds at CLASS level and two ledgers
+#: on two paths share these classes — see :mod:`src.live.models`.
+_MODELS = LIVE_MODELS
 
 
 def _alias_scope(db: peewee.SqliteDatabase, scope: str) -> str:
@@ -105,135 +108,6 @@ def _alias_scope(db: peewee.SqliteDatabase, scope: str) -> str:
     except peewee.OperationalError:
         return scope
     return scope if row is None else str(row[0])
-
-
-class LiveStrategy(_Base):
-    strategy_id = TextField(primary_key=True)
-    scope = TextField(null=False, default="")
-    #: Scope segments (plan §4.1), additive: which adapter/config wrote this scope.
-    adapter = TextField(null=False, default="")
-    config_name = TextField(null=False, default="")
-    instance = TextField(null=False, default="")
-    name = TextField()
-    mode = TextField()
-    created_at = IntegerField()
-    last_cycle_at = IntegerField(null=True)
-
-    class Meta:
-        table_name = "live_strategy"
-
-
-class LivePosition(_Base):
-    """The ONE book table: both roles, told apart by ``source``.
-
-    ``position_id`` is TEXT because the two roles name lots differently: an IBKR
-    lot is ``str(conid)`` (what the IBKR portfolio source mints, so the re-key
-    keeps every existing row's identity), a sim lot the broker's synthetic
-    ``SYM_<ts>_<seq>`` id.
-    """
-
-    scope = TextField()
-    position_id = TextField()
-    symbol = TextField()
-    side = TextField()
-    qty = FloatField()
-    entry_price = FloatField()
-    stop_loss = FloatField(null=True)
-    take_profit = FloatField(null=True)
-    tag = TextField(default="")
-    order_ref = TextField(default="")
-    opened_at = IntegerField(null=True)
-    closed_at = IntegerField(null=True)
-    #: The entry/exit legs' fees (sim fill detail; NULL when unknown).
-    entry_commission = FloatField(null=True)
-    exit_price = FloatField(null=True)
-    exit_commission = FloatField(null=True)
-    source = TextField(null=False, default=SOURCE_ACCOUNT)
-
-    class Meta:
-        table_name = "live_position"
-        primary_key = CompositeKey("scope", "position_id")
-        indexes = ((("scope", "closed_at"), False),)
-
-
-class LiveExecution(_Base):
-    scope = TextField()
-    execution_id = TextField()
-    #: The lot this fill belongs to (``str(conid)`` for IBKR; a sim lot's id).
-    position_id = TextField(default="")
-    side = TextField()
-    qty = FloatField()
-    price = FloatField()
-    commission = FloatField()
-    cash_delta = FloatField()
-    ts = IntegerField()
-
-    class Meta:
-        table_name = "live_execution"
-        primary_key = CompositeKey("scope", "execution_id")
-
-
-class LiveCash(_Base):
-    scope = TextField(primary_key=True)
-    initial_capital = FloatField()
-    updated_at = IntegerField()
-
-    class Meta:
-        table_name = "live_cash"
-
-
-class LiveScopeAlias(_Base):
-    """Migration audit: the scope a legacy book moved to (plan §4.4 step 4).
-
-    Written once per re-keyed scope so a read can follow a bare legacy scope to
-    the charged one; the rows themselves are re-keyed in every live table, never
-    dropped.
-    """
-
-    legacy_scope = TextField(primary_key=True)
-    new_scope = TextField()
-
-    class Meta:
-        table_name = "live_scope_alias"
-
-
-class LiveOrderIntent(_Base):
-    """The durable owner of OPEN order state, keyed by the IDENTITY columns.
-
-    The primary key is ``(scope, symbol, action, position_id)`` — the intent
-    identity itself (``position_id`` is ``''`` for an open) — NOT the crc32
-    ``token``: a crc32 collision can never alias two distinct identities' rows
-    (D7). The ``token`` stays as a plain column, the bar-free cOID prefix."""
-
-    scope = TextField()
-    token = TextField()
-    symbol = TextField()
-    action = TextField()
-    position_id = TextField(default="")
-    state = TextField()
-    attempt = IntegerField()
-    order_ref = TextField()
-    order_id = TextField(null=True)
-    decision_ts = IntegerField(null=True)
-    #: The time-in-force the order was placed with (see ``identity.DEFAULT_TIF``).
-    tif = TextField(default="DAY")
-    #: Consecutive resyncs this OPEN record stayed unresolved (wedged-key alarm).
-    stuck_cycles = IntegerField(default=0)
-    updated_at = IntegerField()
-
-    class Meta:
-        table_name = "live_order_intent"
-        primary_key = CompositeKey("scope", "symbol", "action", "position_id")
-
-
-_MODELS = (
-    LiveStrategy,
-    LivePosition,
-    LiveExecution,
-    LiveCash,
-    LiveScopeAlias,
-    LiveOrderIntent,
-)
 
 
 @dataclass(frozen=True)
@@ -1059,12 +933,19 @@ class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
     Construction writes NOTHING (no DDL): a ``--dry-run`` that only reads must
     leave the schema untouched. The schema is created lazily on the first
     write; reads of a missing table return an empty book.
+
+    The default path is the LIVE file (:func:`src.db.path.resolve_live_db_path`),
+    NOT the candle file: the book is durable state no download can rebuild, so it
+    no longer shares a file with bulk research data (D-Q7). The split was a
+    one-off verified copy (:file:`data/db.sqlite` still holds the source tables as
+    the kept copy); a ledger pointed at the wrong file reads the book as FLAT and
+    re-opens every position.
     """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._db_path = db_path
         self._schema_ready = False
-        path = str(db_path) if db_path is not None else str(_DEFAULT_DB_PATH)
+        path = str(resolve_live_db_path(db_path))
         self._database = SqliteDatabase(path)
 
     @property
@@ -1075,28 +956,29 @@ class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
     # -- lazy DDL / migration ---------------------------------------------
 
     def _ready_schema(self) -> None:
-        """Create the live tables exactly once, on the first WRITE only.
+        """Run the LIVE migrations exactly once, on the first WRITE only.
 
-        The migration + DDL run in ONE ``BEGIN IMMEDIATE`` transaction. That takes
-        the SQLite write lock up front, so two processes racing the first
-        migration (the overlap the cycle lease guards against) are SERIALIZED: the
-        second blocks until the first commits, re-reads the migrated schema and is
-        a no-op. There is no check-then-act window, so neither a ``no such table``
-        nor a double-drop race is reachable. It is deliberately NOT wrapped in the
-        cycle lease — ``ensure_strategy``/``ensure_cash`` write before ``run_cycle``
-        takes the lease, and re-taking it here would deadlock a cycle already
-        holding it. What this does NOT do: it does not serialize those later
-        idempotent writes against a live cycle; each is its own atomic write, and
-        the lease remains the cross-process guard for placement.
+        :func:`run_pending` applies every pending migration and its bookkeeping
+        row inside ONE ``BEGIN IMMEDIATE`` transaction. That takes the SQLite
+        write lock up front, so two processes racing the first migration (the
+        overlap the cycle lease guards against) are SERIALIZED: the second blocks
+        until the first commits, re-reads the bookkeeping and finds nothing
+        pending. There is no check-then-act window, so neither a ``no such table``
+        nor a double-re-key race is reachable.
+
+        It is deliberately NOT wrapped in the cycle lease —
+        ``ensure_strategy``/``ensure_cash`` write before ``run_cycle`` takes the
+        lease, and re-taking it here would deadlock a cycle already holding it.
+        What this does NOT do: it does not serialize those later idempotent writes
+        against a live cycle; each is its own atomic write, and the lease remains
+        the cross-process guard for placement.
+
+        ONLY :data:`LIVE_MIGRATIONS` runs here. The live first write must never
+        replay a bulk candle migration before it can place an order.
         """
         if self._schema_ready:
             return
-        with self._database.atomic(lock_type="IMMEDIATE"):
-            legacy = migrate(self._database)
-            self._database.create_tables(_MODELS)
-            _restore_positions(self._database, legacy)
-            if legacy.intents is not None:
-                _restore_intents(self._database, legacy.intents)
+        run_pending(self._database, LIVE_MIGRATIONS)
         self._schema_ready = True
 
     @contextmanager
@@ -1118,7 +1000,7 @@ class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
         on process exit, so a crashed run never wedges live trading; there is no
         TTL. Single host / local filesystem only (the caveat ``lease`` documents).
         """
-        path = self._db_path if self._db_path is not None else _DEFAULT_DB_PATH
+        path = self._db_path if self._db_path is not None else resolve_live_db_path()
         tag = scope_tag(scope) if scope else "global"
         return file_lease(str(path), tag)
 

@@ -1,31 +1,25 @@
-"""DB helpers — connection and query functions.
+"""Candle reads — the one query this module still owns.
 
-Pure sqlite3 wrappers. No ORM dependency at this layer.
+Connection handling and path resolution moved to :mod:`src.db` (``path`` +
+``connection``). ``get_connection`` and ``_DEFAULT_DB_PATH`` are RE-EXPORTED here
+so existing callers keep working; the path they resolve is now file-relative
+instead of ``os.getcwd()``-dependent.
 """
 
 from __future__ import annotations
 
-import os
-import sqlite3
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-#: Overrides the default DB file. Lets a test (or a second book) point at its own
-#: sqlite without changing every call site that relies on the default path.
+from src.db.connection import get_connection  # noqa: F401  (re-export)
+from src.db.path import DEFAULT_DB_PATH
+
+#: Kept for back-compat with callers that read the private name from here.
 _DB_PATH_ENV = "IBKR_DB_PATH"
+_DEFAULT_DB_PATH = DEFAULT_DB_PATH
 
-_DEFAULT_DB_PATH = Path(
-    os.environ.get(_DB_PATH_ENV)
-    or Path(__file__).resolve().parent.parent.parent.parent / "data" / "db.sqlite"
-)
-
-
-def get_connection(db_path: Optional[str | Path] = None) -> sqlite3.Connection:
-    """Return a sqlite3 connection to the candle database."""
-    path = Path(db_path) if db_path else _DEFAULT_DB_PATH
-    return sqlite3.connect(str(path))
+__all__ = ["get_connection", "query_candles"]
 
 
 def query_candles(
@@ -33,7 +27,7 @@ def query_candles(
     start_ts: Optional[pd.Timestamp] = None,
     end_ts: Optional[pd.Timestamp] = None,
     bar: str = "1h",
-    db_path: Optional[str | Path] = None,
+    db_path: Optional[str | None] = None,
 ) -> pd.DataFrame:
     """Load OHLCV candles for a symbol from the local database.
 

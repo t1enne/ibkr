@@ -224,7 +224,7 @@ def _data_end(config: StrategyConfig) -> pd.Timestamp:
     (never crashes the command on an empty probe). Returns a **naive** local
     timestamp (the clock the engine/DB share).
     """
-    from src.data.db import get_connection  # lazy: avoid pkg-init cycle
+    from src.db.connection import get_connection  # leaf pkg: no import cycle
     from src.utils import parse_timestamp
 
     symbols = _screen_symbols(config)
