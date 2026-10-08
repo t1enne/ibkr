@@ -23,6 +23,7 @@ from click.testing import CliRunner
 from dataclasses import replace
 
 from src.bt.state import ActionType
+from src.shared.style import COLOR, strip_ansi
 from src.data.db import get_connection
 from src.data.ibkr.client import IbkrClient
 from src.exec.types import OrderSide
@@ -1106,3 +1107,52 @@ def test_cli_watch_without_a_config_still_reads_the_ibkr_broker(
     assert out.exit_code == 0, out.output
     assert len(gateway_builds) == 1  # the no-config watch gates ONE session
     assert _tables(db) == set()  # and still writes no DDL
+
+
+# --- (g) styling: sparing, tty-gated, width-neutral ---------------------------
+
+
+def test_render_pf_text_is_byte_clean_by_default() -> None:
+    """Regression: styling is opt-in, so the plain render carries no escape byte."""
+    text = render_pf(_report(), "text")
+    assert "\x1b" not in text
+
+
+def test_render_pf_json_ignores_a_styler() -> None:
+    """Regression: `--format json` is parsed by a machine, so it is never styled."""
+    out = render_pf(_report(), "json", COLOR)
+    assert "\x1b" not in out
+    assert json.loads(out)["positions"][0]["symbol"] == "AAPL"
+
+
+def test_styling_is_sparing_and_leaves_the_layout_alone() -> None:
+    """The coloured report is the plain one plus codes: same visible columns.
+
+    Only a NAMED role is coloured (the block titles, the sign of a P&L, the
+    state/owner markers), so the vast majority of cells carry no code at all.
+    """
+    plain = render_pf(_report(), "text")
+    styled = render_pf(_report(), "text", COLOR)
+    assert strip_ansi(styled) == plain
+    assert [len(strip_ansi(line)) for line in styled.splitlines()] == [
+        len(line) for line in plain.splitlines()
+    ]
+    coded = sum(1 for line in styled.splitlines() if "\x1b" in line)
+    assert 0 < coded < len(styled.splitlines())  # some, not all
+
+
+def test_a_losing_scopes_stats_read_red_and_a_winning_one_green() -> None:
+    """The P&L columns carry the sign colour an operator scans for."""
+    store = _side(
+        lots=(_lot(),),
+        trades=(
+            _fill("AAPL", "BUY", 10.0, 100.0),
+            _fill("MSFT", "BUY", 5.0, 50.0),
+            _fill("MSFT", "SELL", 5.0, 60.0),
+        ),
+    )
+    stats = scope_stats(store)
+    assert stats.realized_pnl > 0  # MSFT round-tripped at a profit
+    text = render_pf(PfReport(as_of=TS, stores=(store,)), "text", COLOR)
+    assert "\x1b[32m" in text  # a green figure is present
+    assert "\x1b[31m" not in text  # and nothing lost, so no red one

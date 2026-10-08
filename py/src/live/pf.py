@@ -20,7 +20,7 @@ else is pure.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from typing import cast
 
@@ -28,6 +28,7 @@ import pandas as pd
 
 from src.bt.cmds._shared import _json_default
 from src.bt.state import PortfolioState, Position
+from src.shared.style import PLAIN, Role, Styler
 from src.bt.table import Col, Table, render
 from src.data.ibkr.client import IbkrClient
 from src.live.identity import ref_is_ours
@@ -653,31 +654,54 @@ def _aggregate_unrealized(rows: tuple[PositionRow, ...]) -> float | None:
     return sum(cast("float", row.unrealized) for row in open_rows)
 
 
-def render_pf(report: PfReport, fmt: str) -> str:
-    """Deterministic text tables (default) or a JSON document for one pf read."""
+def render_pf(report: PfReport, fmt: str, style: Styler = PLAIN) -> str:
+    """Deterministic text tables (default) or a JSON document for one pf read.
+
+    *style* carries ANSI roles for the TEXT view only; JSON is parsed by machines,
+    so it is never styled and *style* is ignored for it.
+    """
     if fmt == "json":
         return _render_json(report)
-    return _render_text(report)
+    return _render_text(report, style)
+
+
+#: The colour of each merged-position state — deliberately sparing: only a state
+#: that needs acting on (a wedged order, a refusal) is coloured loudly, and an
+#: ordinary open lot or a clean fill stays quiet.
+_STATE_ROLES: Mapping[str, Role] = {
+    "open": "strong",
+    "closed": "dim",
+    "filled": "good",
+    "working": "warn",
+    "pending": "warn",
+    "unfilled": "warn",
+    "unresolved": "bad",
+    "rejected": "bad",
+}
+
+#: The broker's owner marker: a foreign lot on a shared account is a caution, not
+#: an error (usually it is another scope's or the human's).
+_OWNER_ROLES: Mapping[str, Role] = {"ours": "good", "NOT-OURS": "warn"}
 
 
 _BROKER_POSITION_COLS = (
-    Col("symbol"),
+    Col("symbol", role="strong"),
     Col("id"),
     Col("side"),
     Col("qty", ">"),
     Col("avg", ">"),
     Col("last", ">"),
     Col("mktvalue", ">"),
-    Col("owner"),
+    Col("owner", roles=_OWNER_ROLES),
 )
 _ORDER_COLS = (
-    Col("symbol"),
+    Col("symbol", role="strong"),
     Col("side"),
     Col("order_id"),
     Col("filled", ">"),
     Col("status"),
     Col("ref"),
-    Col("owner"),
+    Col("owner", roles=_OWNER_ROLES),
 )
 _SCOPE_COLS = (
     Col("scope"),
@@ -693,10 +717,10 @@ _STATS_COLS = (
     Col("initial", ">"),
     Col("cash", ">"),
     Col("open_cost", ">"),
-    Col("realized", ">"),
-    Col("unreal", ">"),
-    Col("total", ">"),
-    Col("ret%", ">"),
+    Col("realized", ">", sign=True),
+    Col("unreal", ">", sign=True),
+    Col("total", ">", sign=True),
+    Col("ret%", ">", sign=True),
     Col("comm", ">"),
     Col("lots", ">"),
     Col("trd", ">"),
@@ -706,14 +730,14 @@ _STATS_COLS = (
 )
 _POSITION_COLS = (
     Col("scope"),
-    Col("symbol"),
+    Col("symbol", role="strong"),
     Col("side"),
-    Col("state"),
+    Col("state", roles=_STATE_ROLES),
     Col("qty", ">"),
     Col("entry", ">"),
     Col("last", ">"),
-    Col("upnl", ">"),
-    Col("rpnl", ">"),
+    Col("upnl", ">", sign=True),
+    Col("rpnl", ">", sign=True),
     Col("sl", ">"),
     Col("tp", ">"),
     Col("order_id"),
@@ -774,7 +798,7 @@ def _intent_dict(record: IntentRecord) -> dict[str, object]:
     }
 
 
-def _render_text(report: PfReport) -> str:
+def _render_text(report: PfReport, style: Styler = PLAIN) -> str:
     """Every side as one aggregated table (``src.bt.table``), no scalar run-on lines.
 
     All scopes fold into a SINGLE scopes / stats / positions table (each row
@@ -783,42 +807,58 @@ def _render_text(report: PfReport) -> str:
     each row is a symbol's lot, the newest order for it and the P&L its fills
     imply, so the old lots/orders/trades trio (which repeated the same order ref
     three times) is gone. The broker side, when read, is its own table block.
+
+    *style* is applied sparingly and only through named roles (a title, a caution,
+    a sign) — see ``src.shared.style``; the default writes no escape byte.
     """
-    blocks: list[list[str]] = [[f"as_of: {report.as_of}"]]
+    blocks: list[list[str]] = [[style.role(f"as_of: {report.as_of}", "note")]]
     if report.stores:
-        blocks.append(_table("scopes", _SCOPE_COLS, _scope_rows(report.stores)))
+        blocks.append(_table("scopes", _SCOPE_COLS, _scope_rows(report.stores), style))
         blocks.append(
-            _table("stats", _STATS_COLS, _stats_rows(report.stores, report.broker))
+            _table(
+                "stats",
+                _STATS_COLS,
+                _stats_rows(report.stores, report.broker),
+                style,
+            )
         )
     blocks.append(
         _table(
             "positions",
             _POSITION_COLS,
             _position_text_rows(report.stores, report.broker),
+            style,
         )
     )
     if report.broker is not None:
-        blocks.append(_broker_lines(report.broker))
+        blocks.append(_broker_lines(report.broker, style))
     divergence = _divergence(report)
     if report.broker is None:
-        blocks.append(["divergence: - (broker not read)"])
+        blocks.append([style.role("divergence: - (broker not read)", "note")])
     else:
         blocks.append(
-            [f"divergence: {item}" for item in divergence] or ["divergence: none"]
+            [style.role(f"divergence: {item}", "warn") for item in divergence]
+            or [style.role("divergence: none", "note")]
         )
     return "\n\n".join("\n".join(block) for block in blocks)
 
 
 def _table(
-    title: str, columns: tuple[Col, ...], rows: tuple[tuple[str, ...], ...]
+    title: str,
+    columns: tuple[Col, ...],
+    rows: tuple[tuple[str, ...], ...],
+    style: Styler,
 ) -> list[str]:
     """A titled table block, or ``"<title>: none"`` when there is nothing to show."""
     if not rows:
-        return [f"{title}: none"]
-    return [f"{title}:", *render(Table(columns=columns, rows=rows))]
+        return [style.role(f"{title}:", "title") + style.role(" none", "note")]
+    return [
+        style.role(f"{title}:", "title"),
+        *render(Table(columns=columns, rows=rows), styler=style),
+    ]
 
 
-def _broker_lines(broker: BrokerSide) -> list[str]:
+def _broker_lines(broker: BrokerSide, style: Styler = PLAIN) -> list[str]:
     """The broker block: one scalar line, then the account's positions and orders.
 
     The account's book is shown whole (foreign lots included) because the account
@@ -832,7 +872,7 @@ def _broker_lines(broker: BrokerSide) -> list[str]:
         scalars.append(f"net_liq={broker.net_liquidation:.2f}")
     if broker.cash is not None:
         scalars.append(f"cash={broker.cash:.2f}")
-    lines = ["broker: " + "  ".join(scalars)]
+    lines = [style.role("broker:", "title") + "  " + "  ".join(scalars)]
     lines.extend(
         _table(
             "broker positions",
@@ -850,6 +890,7 @@ def _broker_lines(broker: BrokerSide) -> list[str]:
                 )
                 for lot in broker.positions
             ),
+            style,
         )
     )
     lines.extend(
@@ -868,9 +909,10 @@ def _broker_lines(broker: BrokerSide) -> list[str]:
                 )
                 for order in broker.working_orders
             ),
+            style,
         )
     )
-    lines.extend(f"warning: {w}" for w in broker.warnings)
+    lines.extend(style.role(f"warning: {w}", "warn") for w in broker.warnings)
     return lines
 
 

@@ -23,6 +23,7 @@ import peewee
 
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
+from src.shared.style import COLOR, PLAIN, Styler
 from src.bt.table import Col, Table, render as render_table
 from src.bt.state import ActionType, PortfolioState
 from src.bt.state.factories import create_initial_portfolio
@@ -472,7 +473,7 @@ def live_pf(
         )
     except (GatewayNotReady, ValueError, LedgerReadError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(render_pf(report, fmt))
+    click.echo(render_pf(report, fmt, _styler(fmt, sys.stdout.isatty())))
 
 
 def _all_scopes_report(
@@ -639,6 +640,16 @@ _CLEAR_HOME = "\x1b[H\x1b[2J"
 _TICK_SEPARATOR = "-" * 72
 
 
+def _styler(fmt: str, tty: bool) -> Styler:
+    """ANSI styling only for a human's terminal AND the human text format.
+
+    Both halves are required: a pipe or cron log must receive text with no escape
+    byte in it (a pager or ``grep`` would otherwise see codes), and ``--format
+    json`` is parsed by a machine that a colour code would only corrupt.
+    """
+    return COLOR if fmt == "text" and tty else PLAIN
+
+
 def _watch_pf(
     ledger: SqliteLedger,
     config_path: str | None,
@@ -654,12 +665,15 @@ def _watch_pf(
     re-read per tick. A per-tick read failure is rendered as a typed error line
     and the loop keeps going. Teardown restores the screen on every exit path.
     """
-    session = _open_watch_session(ledger, config_path, adapter, allow_live, no_gateway)
+    tty = sys.stdout.isatty()
+    session = _open_watch_session(
+        ledger, config_path, adapter, allow_live, no_gateway, _styler("text", tty)
+    )
     try:
         watch_pf_loop(
             session.frame,
             interval,
-            tty=sys.stdout.isatty(),
+            tty=tty,
             sleeper=time.sleep,
             out=sys.stdout,
         )
@@ -681,6 +695,7 @@ def _open_watch_session(
     adapter: str | None,
     allow_live: bool,
     no_gateway: bool,
+    style: Styler = PLAIN,
 ) -> _WatchSession:
     """Resolve the watch's frame + teardown ONCE, before the loop starts.
 
@@ -701,7 +716,7 @@ def _open_watch_session(
                 allow_live,
                 no_gateway,
             )
-        return _WatchSession(_store_frame(ledger, None, adapter), _noop)
+        return _WatchSession(_store_frame(ledger, None, adapter, style), _noop)
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
     name = adapter
@@ -710,7 +725,8 @@ def _open_watch_session(
         name = resolved if named else None
     if name != "ibkr":
         return _WatchSession(
-            _store_frame(ledger, cfg if name is not None else None, name), _noop
+            _store_frame(ledger, cfg if name is not None else None, name, style),
+            _noop,
         )
     return _ibkr_watch_session(
         ledger,
@@ -719,6 +735,7 @@ def _open_watch_session(
         cfg.mode,
         allow_live,
         no_gateway,
+        style,
     )
 
 
@@ -729,6 +746,7 @@ def _ibkr_watch_session(
     mode: Literal["paper", "live"],
     allow_live: bool,
     no_gateway: bool,
+    style: Styler = PLAIN,
 ) -> _WatchSession:
     """Gate ONE ibkr session on a persistent loop, then read only the book.
 
@@ -760,6 +778,7 @@ def _ibkr_watch_session(
         return render_pf(
             PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
             "text",
+            style,
         )
 
     def close() -> None:
@@ -770,7 +789,10 @@ def _ibkr_watch_session(
 
 
 def _store_frame(
-    ledger: SqliteLedger, cfg: LiveConfig | None, adapter: str | None
+    ledger: SqliteLedger,
+    cfg: LiveConfig | None,
+    adapter: str | None,
+    style: Styler = PLAIN,
 ) -> Callable[[], str]:
     """A store (+ sim broker) frame builder for the scopes a watch covers."""
 
@@ -779,6 +801,7 @@ def _store_frame(
         return render_pf(
             PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
             "text",
+            style,
         )
 
     return frame
