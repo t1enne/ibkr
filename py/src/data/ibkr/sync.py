@@ -8,6 +8,13 @@ delegates here.
 Flow, unchanged: probe the session; if the container is down bring it up and wait
 for it to answer; if the session is unauthenticated run the Playwright login; then
 download 1h candles for every ticker in the local DB.
+
+The bring-up is ``ensure_gateway_session``, which raises a typed
+``GatewayStartError`` rather than exiting; only the cron shim
+(``ensure_gateway_async``) turns that into ``sys.exit``. ``ibkr gw start``
+awaits the same function in-process on its first cycle (and then supervises
+the session — see ``src/gw/supervise.py``), so the gateway lifecycle needs no
+sibling script.
 """
 
 from __future__ import annotations
@@ -19,9 +26,10 @@ import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Literal
 
 from src.data.ibkr.client import IbkrClient, IbkrError, is_authenticated
-from src.data.ibkr.login import login_from_env
+from src.data.ibkr.login import TradingMode, login_from_env
 
 # ── Config ────────────────────────────────────────────────────────────────
 PY_DIR = Path(__file__).resolve().parents[3]  # .../py
@@ -66,14 +74,22 @@ async def gw_responding(client: IbkrClient) -> bool:
         return exc.kind == "auth"  # 401 = server up, just unauthenticated
 
 
-def ensure_gateway() -> None:
-    """Synchronous entry point: run the (async) gateway bring-up to completion."""
-    asyncio.run(ensure_gateway_async())
+#: What the bring-up had to do. ``ready``: nothing. ``started``: the container
+#: came up. ``logged-in``: the Playwright login ran.
+GatewayAction = Literal["ready", "started", "logged-in"]
 
 
-async def ensure_gateway_async() -> None:
-    client = IbkrClient()
-    # Running container? "gateway   ... (healthy)" in `docker ps` output.
+class GatewayStartError(RuntimeError):
+    """The gateway could not be made reachable/authenticated.
+
+    Typed rather than raised as ``SystemExit`` so a CLI caller owns the exit code:
+    the cron shim converts it to ``sys.exit``, ``ibkr gw start`` to a
+    ``ClickException``. Nothing here touches the account, the ledger or an order.
+    """
+
+
+def _container_healthy() -> bool:
+    """True when ``docker ps`` reports the compose gateway container healthy."""
     ps = subprocess.run(
         [
             "docker",
@@ -86,53 +102,142 @@ async def ensure_gateway_async() -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    healthy = "healthy" in ps
+    return "healthy" in ps
 
-    if healthy and await tickle_auth(client):
-        log("Gateway healthy + authenticated — nothing to start/login.")
-        await client.aclose()
-        return
 
-    if not healthy:
-        log("Gateway not healthy — docker compose up -d.")
-        run(
-            [
-                "docker",
-                "compose",
-                "--ansi",
-                "never",
-                "--project-directory",
-                str(ROOT),
-                "up",
-                "-d",
-            ]
-        )
+def _compose_up() -> None:
+    """Start the compose stack detached (the one place `-d` is spelled)."""
+    run(
+        [
+            "docker",
+            "compose",
+            "--ansi",
+            "never",
+            "--project-directory",
+            str(ROOT),
+            "up",
+            "-d",
+        ]
+    )
 
-    # Wait for the server to answer. ``asyncio.sleep`` (not ``time.sleep``) so
-    # the coroutine yields instead of blocking the loop it runs on.
-    waited = 0
-    while waited < GATEWAY_TIMEOUT and not await gw_responding(client):
-        await asyncio.sleep(2)
-        waited += 2
-    if not await gw_responding(client):
-        sys.exit(f"Gateway did not become reachable within {GATEWAY_TIMEOUT}s.")
 
-    if await tickle_auth(client):
-        log("Gateway authenticated after start — skipping login.")
-        await client.aclose()
-        return
+def compose_restart() -> None:
+    """Bounce the gateway container (the daily IBKR session reset).
 
-    log("No authenticated session — running the Playwright login.")
-    # ``login_from_env`` is a coroutine: AWAIT it. Calling ``asyncio.run`` here
-    # would nest event loops inside this running loop and raise RuntimeError.
-    await login_from_env(env_path=ENV_PATH)
-    await asyncio.sleep(3)
-    if not await tickle_auth(client):
+    ``docker compose restart`` re-launches the running container in place; the
+    caller (``ibkr gw start``) re-runs ``ensure_gateway_session`` afterwards to
+    wait for it and re-log the session in.
+    """
+    run(
+        [
+            "docker",
+            "compose",
+            "--ansi",
+            "never",
+            "--project-directory",
+            str(ROOT),
+            "restart",
+        ]
+    )
+
+
+def compose_down() -> None:
+    """Tear the gateway stack down (``ibkr gw stop``)."""
+    run(
+        [
+            "docker",
+            "compose",
+            "--ansi",
+            "never",
+            "--project-directory",
+            str(ROOT),
+            "down",
+        ]
+    )
+
+
+async def ensure_gateway_session(
+    mode: TradingMode | None = None,
+    *,
+    timeout: int = GATEWAY_TIMEOUT,
+    env_path: Path | str = ENV_PATH,
+) -> GatewayAction:
+    """Bring the gateway up and log the session in when it is unauthenticated.
+
+    An already-healthy + authenticated gateway is left alone. Otherwise the
+    container is started (when ``docker ps`` does not call it healthy) and polled
+    until it answers, and the Playwright login runs when ``/tickle`` still reports
+    an unauthenticated session. ``mode`` is the session the login should open — a
+    live caller passes its config's ``mode`` so a ``paper`` config never opens the
+    LIVE session; ``None`` falls back to the environment's ``TRADING_MODE``.
+
+    Raises ``GatewayStartError`` instead of ``sys.exit``: the caller owns the exit
+    code. Account-side state is never touched.
+    """
+    client = IbkrClient()
+    try:
+        try:
+            healthy = _container_healthy()
+        except OSError as exc:  # no docker binary on the host
+            raise GatewayStartError(f"docker unavailable: {exc}") from exc
+        if healthy and await tickle_auth(client):
+            log("Gateway healthy + authenticated — nothing to start/login.")
+            return "ready"
+
+        if not healthy:
+            log("Gateway not healthy — docker compose up -d.")
+            try:
+                _compose_up()
+            except (subprocess.CalledProcessError, OSError) as exc:
+                raise GatewayStartError(f"docker compose up failed: {exc}") from exc
+
+        # Wait for the server to answer. ``asyncio.sleep`` (not ``time.sleep``) so
+        # the coroutine yields instead of blocking the loop it runs on.
+        waited = 0
+        while waited < timeout and not await gw_responding(client):
+            await asyncio.sleep(2)
+            waited += 2
+        if not await gw_responding(client):
+            raise GatewayStartError(
+                f"Gateway did not become reachable within {timeout}s."
+            )
+
+        if await tickle_auth(client):
+            log("Gateway authenticated after start — skipping login.")
+            return "started"
+
+        log("No authenticated session — running the Playwright login.")
+        # ``login_from_env`` is a coroutine: AWAIT it. Calling ``asyncio.run`` here
+        # would nest event loops inside this running loop and raise RuntimeError.
+        await login_from_env(mode=mode, env_path=env_path)
         await asyncio.sleep(3)
-        sys.exit("Login ran but /tickle still reports unauthenticated.")
-    await client.aclose()
+        if not await tickle_auth(client):
+            await asyncio.sleep(3)
+            raise GatewayStartError(
+                "Login ran but /tickle still reports unauthenticated."
+            )
+        log("Session authenticated after login.")
+        return "logged-in"
+    finally:
+        await client.aclose()
 
-    log("Session authenticated after login.")
+
+def ensure_gateway() -> None:
+    """Synchronous entry point: run the (async) gateway bring-up to completion."""
+    asyncio.run(ensure_gateway_async())
+
+
+async def ensure_gateway_async() -> None:
+    """Cron shim: the bring-up, with a failure as a non-zero process exit.
+
+    ``sync_market_data.py``'s contract is a non-zero exit on a failed
+    gateway/login, so the typed ``GatewayStartError`` is converted HERE and
+    nowhere else.
+    """
+    try:
+        await ensure_gateway_session()
+    except GatewayStartError as exc:
+        sys.exit(str(exc))
 
 
 def symbols_from_db() -> list[str]:

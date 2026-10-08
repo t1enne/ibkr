@@ -13,6 +13,7 @@ import click
 
 from src.bt.cli import bt_group
 from src.data.cli import data_group
+from src.gw.cli import gw_group
 from src.live.cli import live_group
 from src.research.cli import research_cmd
 
@@ -26,6 +27,7 @@ main.add_command(data_group)
 main.add_command(bt_group)
 main.add_command(research_cmd)
 main.add_command(live_group)
+main.add_command(gw_group)
 
 
 if __name__ == "__main__":
