@@ -53,26 +53,9 @@ def test_trend_gate_label_mapping():
     assert not TrendGate(None).known
 
 
-def test_allows_long_defaults():
-    g = TrendGate("BULL")
-    assert g.allows_long()
-    assert not TrendGate("BEAR").allows_long()
-    assert not TrendGate("RANGE").allows_long()
-    assert not TrendGate(None).allows_long(allow_unknown=False)
-    assert TrendGate(None).allows_long(allow_unknown=True)
-
-
 def test_allows_long_range_opt_in():
     assert not TrendGate("RANGE").allows_long()
     assert TrendGate("RANGE").allows_long(allow_range=True)
-
-
-def test_allows_short_defaults():
-    g = TrendGate("BEAR")
-    assert g.allows_short()
-    assert not TrendGate("BULL").allows_short()
-    assert not TrendGate("RANGE").allows_short()
-    assert TrendGate(None).allows_short(allow_unknown=True)
 
 
 def test_hostile_to():

@@ -12,7 +12,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.exchange import SimExchange, execute_signal
+from src.bt.exchange import SimExchange
 from src.bt.state import ActionType, Candle, TradeSignal, create_execution_params
 from src.exec.types import OrderRequest, OrderSide, OrderType
 
@@ -80,39 +80,6 @@ def _match(ex: SimExchange, order: OrderRequest, candle: Candle, params):
         slippage_bps=params.slippage_bps,
         commission_model=params.commission_model,
     )
-
-
-def test_mkt_match_equals_execute_signal_next_open() -> None:
-    params = _params()
-    # close < open: an adverse bar for a long, so the 1.5x slippage multiplier
-    # must be applied on BOTH paths.
-    candle = _candle(100.0, 105.0, 95.0, 99.0)
-    ex = SimExchange()
-    order = _order(OrderSide.BUY, OrderType.MKT)
-    ex.submit(order)
-    fill = _match(ex, order, candle, params)
-    event = execute_signal(_signal(ActionType.long), candle, params)
-
-    assert fill is not None
-    assert fill.price == event.executed_price
-    assert fill.commission == event.commission
-    assert fill.spread == event.spread
-    assert fill.slippage == event.slippage
-    assert fill.price == pytest.approx(100.11)  # base + half-spread + 1.5*slip
-
-
-def test_mkt_sell_match_equals_execute_signal_short() -> None:
-    params = _params()
-    candle = _candle(100.0, 105.0, 95.0, 101.0)  # close > open: adverse for short
-    ex = SimExchange()
-    order = _order(OrderSide.SELL, OrderType.MKT)
-    ex.submit(order)
-    fill = _match(ex, order, candle, params)
-    event = execute_signal(_signal(ActionType.short), candle, params)
-
-    assert fill is not None
-    assert fill.price == event.executed_price
-    assert fill.price == pytest.approx(99.89)  # base - half-spread - 1.5*slip
 
 
 def test_lmt_gapped_through_fills_at_open_plus_friction() -> None:

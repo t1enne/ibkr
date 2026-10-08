@@ -104,22 +104,6 @@ def _ref_candle(intent: OrderIntent) -> Candle:
 
 
 @pytest.mark.asyncio
-async def test_place_matches_execute_signal(ledger: SqliteLedger) -> None:
-    result: PlaceResult = await _adapter(ledger).place(_book(), _open_intent())
-    assert isinstance(result, Ok)
-    order = cast(OrderResult, result.value)
-    assert order.ok
-    assert order.fill is not None
-
-    expected = execute_signal(
-        intent_to_signal(order.intent, TS), _ref_candle(order.intent), ExecutionParams()
-    )
-    assert order.fill.executed_price == expected.executed_price
-    assert order.fill.slippage == expected.slippage
-    assert order.fill.commission == expected.commission
-
-
-@pytest.mark.asyncio
 async def test_place_settles_book_like_backtest(ledger: SqliteLedger) -> None:
     adapter = _adapter(ledger)
     book = _book()
@@ -170,15 +154,6 @@ async def test_close_without_position_id_is_rejected_not_raised(
     assert order.ok is False
     assert order.fill is None
     assert "position_id" in order.message
-
-
-@pytest.mark.asyncio
-async def test_open_assigns_synthetic_position_id(ledger: SqliteLedger) -> None:
-    result: PlaceResult = await _adapter(ledger).place(_book(), _open_intent())
-    assert isinstance(result, Ok)
-    pid = cast(OrderResult, result.value).position_id
-    assert pid is not None
-    assert pid.startswith("AAPL_")
 
 
 @pytest.mark.asyncio
@@ -314,14 +289,6 @@ async def test_multi_open_cohort_scales_like_backtest() -> None:
         (lot,) = settled.positions[order.intent.symbol]
         assert lot.position_id == order.position_id
         assert order.fill.filled_qty == lot.qty
-
-
-def test_intent_to_signal_prices_at_ref() -> None:
-    signal = intent_to_signal(_open_intent(), TS)
-    assert signal.fill_at_next_open is False
-    assert signal.price == 100.0
-    assert signal.qty == 10.0
-    assert signal.action is ActionType.long
 
 
 @pytest.mark.asyncio

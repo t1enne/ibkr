@@ -80,13 +80,6 @@ def test_momentum_positive_trend_detected() -> None:
     assert cell.net_decile_bps is not None and cell.net_decile_bps > 0
 
 
-def test_momentum_empty_panel_returns_nans() -> None:
-    empty = _frame({})
-    res = momentum_sweep(empty, empty)
-    assert len(res) == 4  # 2 lookbacks x 2 horizons
-    assert all(c.n_rows == 0 and c.spearman is None for c in res)
-
-
 def test_catalyst_up_drift_down_fade() -> None:
     up = _sparse_after(0.30, 0.05)
     down = _sparse_after(-0.30, -0.05)

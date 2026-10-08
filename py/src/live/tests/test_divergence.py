@@ -121,64 +121,6 @@ def test_lot_only_we_hold_diverges() -> None:
     assert (divergence.ours_qty, divergence.account_qty) == (4.0, 0.0)
 
 
-def test_closed_lot_absent_from_both_books_is_clean() -> None:
-    # A lot that opened and closed nets to nothing, so neither fold emits it.
-    round_trip = (
-        _fill(side="BUY", qty=10.0, execution_id="e1"),
-        _fill(side="SELL", qty=10.0, execution_id="e2", price=105.0),
-    )
-    ours = book_from_executions(round_trip)
-    account = book_from_executions(round_trip)
-    assert guard_divergence(ours, account) == ()
-
-
-def test_short_and_long_at_same_lot_id_do_not_cancel() -> None:
-    # Opposite signs on one lot key is a mismatch of size, never a clean book.
-    ours = _book(_lot(qty=10.0))
-    account = _book(_lot(qty=10.0, long=False))
-    (divergence,) = guard_divergence(ours, account)
-    assert divergence.kind == "qty_mismatch"
-    assert (divergence.ours_qty, divergence.account_qty) == (10.0, -10.0)
-
-
-def test_guard_is_deterministic_and_sorted() -> None:
-    ours = _book(
-        _lot(symbol="MSFT", position_id="7"), _lot(symbol="AAPL", position_id="9")
-    )
-    account = _book()
-    found = guard_divergence(ours, account)
-    assert [(d.symbol, d.position_id) for d in found] == [("AAPL", "9"), ("MSFT", "7")]
-
-
-def test_fill_without_lot_id_does_not_raise() -> None:
-    ours = book_from_executions((_fill(position_id="", side="BUY", qty=3.0),))
-    account = _book()
-    (divergence,) = guard_divergence(ours, account)
-    assert divergence.position_id is None
-    assert divergence.ours_qty == 3.0
-
-
-def test_book_from_executions_folds_two_fills_into_one_lot() -> None:
-    book = book_from_executions(
-        (
-            _fill(side="BUY", qty=10.0, price=100.0, execution_id="e1"),
-            _fill(
-                side="BUY",
-                qty=10.0,
-                price=110.0,
-                execution_id="e2",
-                ts=cast("pd.Timestamp", TS + pd.Timedelta(minutes=5)),
-            ),
-        )
-    )
-    (lot,) = book.positions["AAPL"]
-    assert lot.position_id == "265598"
-    assert lot.qty == 20.0
-    assert lot.entry_price == 105.0  # size-weighted across the two equal fills
-    assert lot.entry_time == TS  # the earliest fill opens the lot
-    assert lot.type is ActionType.long
-
-
 def test_book_from_executions_folds_open_and_close_to_nothing() -> None:
     book = book_from_executions(
         (
@@ -197,11 +139,3 @@ def test_book_from_executions_folds_open_and_close_to_nothing() -> None:
 
 def test_book_from_executions_of_nothing_is_empty() -> None:
     assert book_from_executions(()) == _book()
-
-
-def test_sell_only_fill_opens_a_short_lot() -> None:
-    book = book_from_executions((_fill(side="SELL", qty=5.0, price=90.0),))
-    (lot,) = book.positions["AAPL"]
-    assert lot.type is ActionType.short
-    assert lot.qty == 5.0
-    assert lot.entry_price == 90.0

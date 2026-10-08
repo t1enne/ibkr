@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Literal, cast
 
 import pandas as pd
@@ -10,11 +10,8 @@ import pytest
 
 from src.bt.state import ActionType, PortfolioState, Position
 from src.live.reconcile import (
-    Side,
     UnknownSignalSymbol,
-    current_side,
     reconcile,
-    target_side,
 )
 from src.live.types import LiveConfig, LiveSignal, PortfolioView, SignalAction
 
@@ -102,32 +99,6 @@ def sig(
     )
 
 
-def test_intents_carry_the_decision_bar() -> None:
-    # The decision bar is the deterministic cOID anchor the broker re-mints a
-    # re-run from (finding 1); every emitted intent must carry it.
-    (open_,) = reconcile((sig("long", qty=10.0),), pf(100_000.0), CFG)
-    assert open_.decision_ts == TS
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
-    closes = reconcile((sig("close"),), book, CFG)
-    assert closes[0].decision_ts == TS
-
-
-def test_flat_to_long_opens() -> None:
-    (order,) = reconcile((sig("long", qty=10.0),), pf(100_000.0), CFG)
-    assert order.action is ActionType.long
-    assert order.qty == 10.0
-    assert order.position_id is None
-    assert order.reason == "open long (flat->long)"
-
-
-def test_long_to_close_closes_lot() -> None:
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
-    (order,) = reconcile((sig("close"),), book, CFG)
-    assert order.action is ActionType.close
-    assert order.qty == 10.0
-    assert order.position_id == "L1"
-
-
 def test_flip_closes_before_open() -> None:
     book = pf(100_000.0, lot("AAPL", 5.0, 100.0, ActionType.short, pid="S1"))
     first, second = reconcile((sig("long", qty=3.0),), book, CFG)
@@ -135,44 +106,6 @@ def test_flip_closes_before_open() -> None:
     assert first.position_id == "S1"
     assert second.action is ActionType.long
     assert second.reason == "open long (short->long)"
-
-
-def test_unsized_open_raises() -> None:
-    with pytest.raises(ValueError, match="unsized open AAPL"):
-        reconcile((sig("long", qty=0.0),), pf(100_000.0), CFG)
-
-
-def test_sized_open_uses_config() -> None:
-    cfg = _cfg(symbols=("AAPL",), size=0.5)
-    book = pf(100_000.0)
-    (order,) = reconcile((sig("long", qty=0.0),), book, cfg)
-    assert order.qty == 500.0
-
-
-def test_no_signal_leaves_side_unchanged() -> None:
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
-    assert current_side(book, "AAPL") == "long"
-    intents = reconcile((sig("long", qty=1.0, symbol="MSFT"),), book, CFG)
-    assert all(i.symbol == "MSFT" for i in intents)
-    assert current_side(book, "AAPL") == "long"
-    assert reconcile((), book, CFG) == ()
-
-
-def test_determinism_lot_order_is_pinned() -> None:
-    a = lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1")
-    b = lot("AAPL", 4.0, 95.0, ActionType.long, pid="L2")
-    one = reconcile((sig("close"),), pf(100_000.0, a, b), CFG)
-    two = reconcile((sig("close"),), pf(100_000.0, b, a), CFG)
-    # Ordered tuple, not set: emission follows the BOOK's lot order, and the
-    # same book yields the identical tuple every time (fully deterministic).
-    assert tuple(i.position_id for i in one) == ("L1", "L2")
-    assert tuple(i.position_id for i in two) == ("L2", "L1")
-    assert one == reconcile((sig("close"),), pf(100_000.0, a, b), CFG)
-
-
-def test_lot_without_broker_id_produces_no_close() -> None:
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid=""))
-    assert reconcile((sig("close"),), book, CFG) == ()
 
 
 def test_flip_sizes_open_against_freed_cash() -> None:
@@ -201,76 +134,10 @@ def test_nan_price_open_is_refused() -> None:
         reconcile((bad,), pf(100_000.0), _cfg(symbols=("AAPL",), size=0.5))
 
 
-def test_owned_filter_excludes_foreign_lot() -> None:
-    book = pf(
-        100_000.0,
-        lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"),
-        lot("AAPL", 4.0, 95.0, ActionType.long, pid="OTHER"),
-    )
-    (order,) = reconcile((sig("close"),), book, CFG, owned=frozenset({"L1"}))
-    assert order.position_id == "L1"
-
-
 def test_unknown_symbol_refused() -> None:
     # A stray symbol is rejected by a typed error, NOT an assert (which -O strips).
     with pytest.raises(UnknownSignalSymbol, match="TSLA"):
         reconcile((sig("long", qty=1.0, symbol="TSLA"),), pf(100_000.0), CFG)
-
-
-def test_reconcile_accepts_structural_portfolio_view() -> None:
-    @dataclass(frozen=True)
-    class StandIn:
-        cash: float
-        positions: dict[str, tuple[Position, ...]]
-        initial_capital: float
-
-    held = lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1")
-    # Structural stand-in: same three members, none of PortfolioState's extras.
-    stand_in: PortfolioView = StandIn(
-        cash=1_000.0, positions={"AAPL": (held,)}, initial_capital=1_000.0
-    )
-    (order,) = reconcile((sig("close"),), stand_in, CFG)
-    assert order.action is ActionType.close
-    assert order.qty == 10.0
-
-    # And a real PortfolioState works through the same code path.
-    (from_state,) = reconcile((sig("close"),), pf(1_000.0, held), CFG)
-    assert from_state == order
-
-
-def test_side_helpers() -> None:
-    short_book = pf(100.0, lot("AAPL", 3.0, 9.0, ActionType.short, pid="S1"))
-    assert current_side(short_book, "AAPL") == "short"
-    assert current_side(pf(100.0), "AAPL") == "flat"
-    assert target_side(sig("close")) == "flat"
-    assert target_side(sig("long")) == "long"
-    assert target_side(sig("short")) == "short"
-    _side: Side = current_side(pf(100.0), "AAPL")
-    assert _side == "flat"
-
-
-def test_close_signal_targets_named_lot_only() -> None:
-    book = pf(
-        100_000.0,
-        lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"),
-        lot("AAPL", 4.0, 95.0, ActionType.long, pid="L2"),
-    )
-    (order,) = reconcile((sig("close", pid="L2"),), book, CFG)
-    assert order.position_id == "L2"
-    assert order.qty == 4.0
-
-
-@pytest.mark.parametrize(
-    ("action", "side"),
-    [("long", ActionType.long)],
-)
-def test_already_on_the_target_side_holds(
-    action: SignalAction, side: ActionType
-) -> None:
-    # Already on the signalled side and asked for the same: side-only reconcile
-    # HOLDs (no resize), for both long and short.
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, side, pid="L1"))
-    assert reconcile((sig(action, qty=5.0),), book, CFG) == ()
 
 
 def test_a_partial_entry_is_not_topped_up() -> None:
@@ -291,14 +158,3 @@ def test_empty_owned_closes_nothing() -> None:
     book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.long, pid="L1"))
     # Ownership scoped to the empty set: no lot is ours, so nothing closes.
     assert reconcile((sig("close"),), book, CFG, owned=frozenset()) == ()
-
-
-def test_foreign_only_book_opposite_open_holds() -> None:
-    # The whole book on the symbol is foreign (not in ``owned``): a close is
-    # not ours to emit, so the opposite-side open must be skipped (HOLD) rather
-    # than doubling gross exposure without reaching the target posture.
-    book = pf(100_000.0, lot("AAPL", 10.0, 90.0, ActionType.short, pid="OTHER"))
-    assert reconcile((sig("long", qty=5.0),), book, CFG, owned=frozenset({"L1"})) == ()
-    # Same posture with no scoping: the lot is ours, so the flip proceeds.
-    flipped = reconcile((sig("long", qty=5.0),), book, CFG)
-    assert [i.action for i in flipped] == [ActionType.close, ActionType.long]

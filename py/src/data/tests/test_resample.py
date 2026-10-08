@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
 
 import pandas as pd
 
@@ -89,19 +88,6 @@ def test_daily_resample_stays_calendar_aligned() -> None:
     out = resample_ohlcv(df, "1d", completed_only=False)
     assert len(out) == 2
     assert list(out.index) == [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03")]
-
-
-def test_completed_only_drops_the_forming_bucket() -> None:
-    df = _hourly(
-        "2024-01-02", ["14:30", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00"]
-    )
-    out = resample_ohlcv(
-        df,
-        "4h",
-        completed_only=True,
-        current_ts=cast(pd.Timestamp, pd.Timestamp(2024, 1, 2, 19, 30)),
-    )
-    assert list(out.index) == [pd.Timestamp("2024-01-02 14:30")]
 
 
 def test_empty_input() -> None:

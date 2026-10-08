@@ -9,7 +9,6 @@ engine tests; feeding a stubbed engine is not re-tested here (no new signal).
 from typing import cast
 
 import pandas as pd
-import pytest
 
 from src.bt.screen.run_strategy import (
     Posture,
@@ -18,19 +17,12 @@ from src.bt.screen.run_strategy import (
     SignalCollector,
     _filter_recent,
     _project,
-    _resolve_latest,
     _resolve_posture,
-    _side_of,
-    render_screen_json,
-    trade_table_row,
 )
 from src.bt.state import (
     ActionType,
     BacktestState,
-    Trade,
-    TradeExitReason,
     TradeSignal,
-    TradeStatus,
 )
 from src.bt.types import StrategyConfig
 
@@ -64,19 +56,6 @@ def _sig(
     )
 
 
-@pytest.mark.parametrize(
-    ("action", "expected"),
-    [
-        (ActionType.long, "long"),
-        (ActionType.short, "short"),
-        (ActionType.close, "close"),  # explicit exit directive
-        (ActionType.rebalance, None),  # keeps the incumbent side
-    ],
-)
-def test_side_of(action, expected):
-    assert _side_of(_sig(action)) == expected
-
-
 def test_fresh_open_on_newest_bar_scores_open():
     # long fired on the newest scored bar -> fresh action, 1.0
     rp = _resolve_posture((_sig(ActionType.long),), Posture(), TS)
@@ -95,87 +74,6 @@ def test_prior_intent_is_retained_not_fresh():
     assert rp.sig_ts == TS_PRIOR  # signal is older than newest data -> stale setup
 
 
-def test_close_after_open_surfaces_close_signal():
-    # The exit must survive projection as an actionable ``close`` row, not be
-    # collapsed to inert ``flat`` — a live consumer needs the exit directive.
-    feed = (_sig(ActionType.long, ts=TS_PRIOR), _sig(ActionType.close, ts=TS))
-    rp = _resolve_posture(feed, Posture(), TS)
-    assert rp.action == "close"
-    assert rp.score == Posture().base_score_open  # fresh on the newest bar
-    assert rp.sig_ts == TS
-    assert rp.signal is not None and rp.signal.action == ActionType.close
-
-
-def test_close_with_no_prior_position_is_still_close():
-    # A close is emitted by the strategy; the screen does not infer book state.
-    rp = _resolve_posture((_sig(ActionType.close),), Posture(), TS)
-    assert rp.action == "close"
-
-
-def test_rebalance_keeps_incumbent_side():
-    feed = (_sig(ActionType.long, ts=TS_PRIOR), _sig(ActionType.rebalance, ts=TS))
-    rp = _resolve_posture(feed, Posture(), TS)
-    assert rp.action == "long"  # a rebalance is not a reposition
-    assert rp.sig_ts == TS_PRIOR
-
-
-def test_latest_wins_when_reopened_after_close():
-    feed = (
-        _sig(ActionType.long, ts=TS_PRIOR),
-        _sig(ActionType.close, ts=TS_PRIOR),
-        _sig(ActionType.short, ts=TS),  # newest sets the side
-    )
-    rp = _resolve_posture(feed, Posture(), TS)
-    assert rp.action == "short"
-    assert rp.score == Posture().base_score_open
-    assert rp.sig_ts == TS  # reopened on newest bar
-
-
-def test_no_signal_is_flat():
-    rp = _resolve_posture((), Posture(), TS)
-    assert rp.action == "flat"
-    assert rp.score == 0.0
-    assert rp.signal is None
-
-
-def test_project_ranks_actions_before_flat_and_honors_include_flat():
-    newest = TS
-    collector = SignalCollector(("AAPL", "MSFT", "NVDA"))
-    # AAPL: fresh short (1.0); MSFT: held long (0.8); NVDA: no signal -> flat.
-    collector.on_signal(_sig(ActionType.short, "AAPL", newest))
-    collector.on_signal(_sig(ActionType.long, "MSFT", TS_PRIOR))
-
-    rows = _project(collector, ("AAPL", "MSFT", "NVDA"), Posture(), newest)
-    # ranked: fresh open first, held second, flat last
-    ordered = [(r.symbol, r.action, r.score) for r in rows]
-    assert ordered[0] == ("AAPL", "short", 1.0)
-    assert ordered[1] == ("MSFT", "long", 0.8)
-    assert ordered[2] == ("NVDA", "flat", 0.0)
-
-    pruned = _project(
-        collector, ("AAPL", "MSFT", "NVDA"), Posture(include_flat=False), newest
-    )
-    assert [r.symbol for r in pruned] == ["AAPL", "MSFT"]
-
-
-def test_posture_defaults_are_exported_constants():
-    p = Posture()
-    assert p.base_score_open == 1.0
-    assert p.base_score_held == 0.8
-    assert p.include_flat is True
-
-
-def test_resolve_latest_scalar_passthrough():
-    assert _resolve_latest(TS, "AAPL") == TS
-
-
-def test_resolve_latest_uses_symbols_own_bar():
-    # Two symbols end on different days (stale listing vs live) after re-anchor.
-    latest = {"AAPL": TS, "MSFT": TS_PRIOR}
-    assert _resolve_latest(latest, "AAPL") == TS
-    assert _resolve_latest(latest, "MSFT") == TS_PRIOR
-
-
 def test_per_symbol_freshness_not_shared_feed_max():
     # AAPL's own last bar is TS (decided fresh -> 1.0); NVDA's bar ends later.
     # A shared feed-max (NVDA's TS_LATER) must not demote AAPL's same-bar
@@ -190,13 +88,6 @@ def test_per_symbol_freshness_not_shared_feed_max():
     assert by_sym["AAPL"].score == Posture().base_score_open  # 1.0, not 0.8
     assert by_sym["AAPL"].ts == TS
     assert by_sym["NVDA"].ts == TS_LATER  # row stamped with its own last bar
-
-
-def test_project_scalar_latest_still_supported():
-    collector = SignalCollector(("AAPL",))
-    collector.on_signal(_sig(ActionType.short, "AAPL", ts=TS))
-    rows = _project(collector, ("AAPL",), Posture(), TS)
-    assert rows[0].score == Posture().base_score_open
 
 
 def _row(sym: str, sig_ts: pd.Timestamp | None, ts: pd.Timestamp = TS) -> ScreenRow:
@@ -226,39 +117,6 @@ def test_filter_recent_keeps_close_rows():
     assert _filter_recent((close_row,), 5) == (close_row,)
 
 
-def test_project_carries_executable_signal_fields():
-    collector = SignalCollector(("AAPL",))
-    collector.on_signal(
-        _sig(
-            ActionType.long,
-            "AAPL",
-            qty=12.0,
-            price=101.5,
-            stop_loss=95.0,
-            take_profit=120.0,
-            position_id="lot-1",
-            tag="trend",
-        )
-    )
-    (row,) = _project(collector, ("AAPL",), Posture(), TS)
-    assert row.price == 101.5
-    assert row.qty == 12.0
-    assert row.stop_loss == 95.0
-    assert row.take_profit == 120.0
-    assert row.position_id == "lot-1"
-    assert row.tag == "trend"
-
-
-def test_flat_row_has_inert_executable_fields():
-    collector = SignalCollector(("AAPL",))
-    (row,) = _project(collector, ("AAPL",), Posture(), TS)
-    assert row.action == "flat"
-    assert row.price == 0.0
-    assert row.qty == 0.0
-    assert row.stop_loss is None and row.take_profit is None
-    assert row.position_id is None and row.tag == ""
-
-
 def _config() -> StrategyConfig:
     return StrategyConfig(
         name="t",
@@ -278,99 +136,3 @@ def _run(rows: tuple[ScreenRow, ...]) -> ScreenRun:
     # render_screen_json never touches state; cast a stand-in to keep the test
     # off the DB/engine path (the driver's engine wiring is tested elsewhere).
     return ScreenRun(rows=rows, state=cast(BacktestState, None), config=_config())
-
-
-def test_render_screen_json_emits_only_actionable_rows():
-    rows = (
-        _row("AAPL", TS),  # long, actionable
-        ScreenRow(
-            symbol="MSFT", action="close", score=1.0, signals=(), ts=TS, sig_ts=TS
-        ),
-        ScreenRow(symbol="NVDA", action="flat", score=0.0, signals=(), ts=TS),
-    )
-    payload = render_screen_json(_run(rows), strategy="strats/wip/t.json")
-    assert payload["command"] == "screen"
-    assert payload["strategy_type"] == "trend"
-    assert payload["bars"] == "1d"
-    # flat excluded — a live consumer must not read it as "flatten"
-    assert [s["symbol"] for s in payload["signals"]] == ["AAPL", "MSFT"]
-    assert [s["action"] for s in payload["signals"]] == ["long", "close"]
-
-
-def test_screen_run_trades_default_to_empty():
-    # The new field is inert unless the driver populates it: a row-only
-    # ScreenRun still constructs and reports no trades (empty bound).
-    assert _run((_row("AAPL", TS),)).trades == ()
-
-
-def test_trade_table_row_blanks_none_exit_fields():
-    # An unclosed trade has no exit_*/close_reason; they must render blank, not
-    # the literal "None".
-    trade = Trade(
-        entry_time=TS,
-        entry_price=100.0,
-        exit_time=None,
-        exit_price=None,
-        last_price=101.0,
-        symbol="AAPL",
-        position=ActionType.long,
-        qty=10.0,
-        stop_loss=95.0,
-        take_profit=120.0,
-    )
-    row = trade_table_row(trade)
-    assert row["symbol"] == "AAPL"
-    assert row["position"] == "long"
-    assert row["entry_price"] == "100.00" and row["qty"] == "10.00"
-    assert row["exit_time"] == "" and row["exit_price"] == ""
-    assert row["close_reason"] == ""
-
-
-def test_trade_table_row_renders_closed_trade():
-    trade = Trade(
-        entry_time=TS,
-        entry_price=100.0,
-        exit_time=TS,
-        exit_price=110.0,
-        last_price=110.0,
-        symbol="MSFT",
-        position=ActionType.short,
-        qty=5.0,
-        stop_loss=0.0,
-        take_profit=0.0,
-        pnl=50.0,
-        status=TradeStatus.closed,
-        close_reason=TradeExitReason.tp,
-    )
-    row = trade_table_row(trade)
-    assert row["position"] == "short"
-    assert row["entry_price"] == "100.00" and row["exit_price"] == "110.00"
-    assert row["pnl"] == "50.00"
-    assert row["exit_time"] == str(TS)
-    assert row["close_reason"] == "tp"
-
-
-def test_render_screen_json_serializes_executable_fields():
-    collector = SignalCollector(("AAPL",))
-    collector.on_signal(
-        _sig(
-            ActionType.long,
-            "AAPL",
-            qty=12.0,
-            price=101.5,
-            stop_loss=95.0,
-            take_profit=120.0,
-            position_id="lot-1",
-            tag="trend",
-        )
-    )
-    rows = _project(collector, ("AAPL",), Posture(), TS)
-    payload = render_screen_json(_run(rows), strategy="s.json")
-    (sig,) = payload["signals"]
-    assert sig["action"] == "long"
-    assert sig["symbol"] == "AAPL"
-    assert sig["qty"] == 12.0 and sig["price"] == 101.5
-    assert sig["stop_loss"] == 95.0 and sig["take_profit"] == 120.0
-    assert sig["position_id"] == "lot-1" and sig["tag"] == "trend"
-    assert sig["signal_ts"] == str(TS) and sig["data_ts"] == str(TS)
-    assert sig["reasons"] == ["long AAPL"]

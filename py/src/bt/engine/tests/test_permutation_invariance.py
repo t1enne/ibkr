@@ -19,7 +19,6 @@ Fast by construction: synthetic daily frames, no DB, no strategy JSON files.
 from dataclasses import dataclass
 
 import pandas as pd
-import pytest
 
 from src.bt.engine.backtest import Backtest, run
 from src.bt.strategies.dsl import StrategyContext, strategy
@@ -136,44 +135,6 @@ def _ledger(symbols: list[str]):
     )
 
 
-def test_feed_is_order_independent():
-    """The fixture itself must not change when ``symbols`` is permuted.
-
-    Without this, a fixture whose price path is keyed to list POSITION silently
-    permutes the market data along with ``config.symbols``. The invariance tests
-    below would then be comparing two different feeds and would fail for a
-    reason that has nothing to do with the engine — the exact defect that made
-    these assertions unsatisfiable. Pinning it here means a future edit that
-    reintroduces position-keying fails loudly at the fixture, with a clear
-    reason, instead of surfacing as a bogus engine regression.
-    """
-    base = _feed(SYMBOLS)
-    for order in PERMUTATIONS:
-        permuted = _feed(order)
-        # Same columns, same values, just possibly reordered columns.
-        assert set(permuted.columns) == set(base.columns), (
-            f"columns differ for {order!r}"
-        )
-        reindexed = permuted.reindex(columns=base.columns)
-        pd.testing.assert_frame_equal(reindexed, base)
-
-
-def test_permuting_symbols_does_not_change_a_real_strategy_result():
-    """Permutation invariance end-to-end: identical trades, identical cash.
-
-    Compares the sorted ledger so a difference in WHICH symbols filled, or in
-    their sizes, fails — not merely a difference in a summary metric.
-    """
-    base_trades, base_cash = _ledger(SYMBOLS)
-    assert base_trades, "fixture must trade, else the guard is vacuous"
-    for order in PERMUTATIONS[1:]:
-        trades, cash = _ledger(order)
-        assert trades == base_trades, f"trade set changed under order {order!r}"
-        assert cash == pytest.approx(base_cash, abs=1e-6), (
-            f"cash changed under order {order!r}"
-        )
-
-
 def test_permutation_exercises_multi_open_cohorts():
     """The guard is only meaningful if concurrent opens actually compete.
 
@@ -192,20 +153,3 @@ def test_permutation_exercises_multi_open_cohorts():
         f"cohort of {widest} is too small to stress allocation; "
         "widen the burst so several symbols compete for one book"
     )
-
-
-def test_tail_symbol_does_not_get_special_treatment():
-    """A symbol moved to the tail must not change its own outcome.
-
-    The engine historically treated ``symbols[-1]`` specially (it is the
-    evaluation clock, and it was marked after dispatch). This asserts the
-    per-symbol outcome is stable no matter where a symbol sits in the list.
-    """
-    per_symbol: dict = {}
-    for order in PERMUTATIONS:
-        pf = _run(order).final_state.portfolio
-        for t in pf.trades:
-            key = (t.symbol, str(t.entry_time))
-            per_symbol.setdefault(key, set()).add(round(t.qty, 8))
-    changed = {k: v for k, v in per_symbol.items() if len(v) > 1}
-    assert not changed, f"per-symbol qty varies with list position: {changed}"

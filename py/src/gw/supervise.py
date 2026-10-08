@@ -33,9 +33,7 @@ TICKLE_SECONDS = 60
 RESTART_SECONDS = 24 * 60 * 60
 
 
-async def _tickle_window(
-    client: IbkrClient, *, interval: int, window: int
-) -> bool:
+async def _tickle_window(client: IbkrClient, *, interval: int, window: int) -> bool:
     """Tickle every *interval* until *window* elapses.
 
     Returns True when the whole window elapsed (time for the daily bounce),

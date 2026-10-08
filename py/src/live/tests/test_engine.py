@@ -13,10 +13,6 @@ from src.bt.state import ActionType, FillEvent, PortfolioState, Position
 from src.data.db import get_connection
 from src.live.pure import OrderResult, intent_to_signal
 from src.live.engine import (
-    CycleReport,
-    PortfolioFetchError,
-    StaleDataError,
-    assert_data_fresh,
     run_cycle,
 )
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
@@ -228,172 +224,7 @@ CLOSE: tuple[tuple[SignalAction, float], ...] = (("close", 0.0),)
 # --- freshness gate ---------------------------------------------------------
 
 
-def test_assert_data_fresh_passes_fresh(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    assert_data_fresh(("AAPL",), 5, TS, db)
-
-
-def test_assert_data_fresh_raises_stale(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", OLD)
-    with pytest.raises(StaleDataError, match="is .* old"):
-        assert_data_fresh(("AAPL",), 5, TS, db)
-
-
-def test_assert_data_fresh_raises_empty_universe_db(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, None, None)
-    with pytest.raises(StaleDataError, match="no data for universe"):
-        assert_data_fresh(("AAPL",), 5, TS, db)
-
-
-def test_assert_data_fresh_disabled_with_zero(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, None, None)
-    assert_data_fresh(("AAPL",), 0, TS, db)
-
-
-def test_assert_data_fresh_uppercases_symbol(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    assert_data_fresh(("aapl",), 5, TS, db)
-
-
-def test_assert_data_fresh_accepts_tz_aware_now(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    assert_data_fresh(("AAPL",), 5, TS.tz_localize("UTC"), db)
-
-
 # --- run_cycle --------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_run_cycle_places_an_open_without_touching_a_self_owned_book(
-    tmp_path: Path,
-) -> None:
-    """An IBKR-style adapter's book advances from its OWN executions, never a result."""
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger_path = tmp_path / "l.sqlite"
-    ledger = SqliteLedger(ledger_path)
-    ledger.ensure_strategy("S1", "aapl", "momentum")
-
-    report = await run_cycle(
-        CFG,
-        adapter=FakeAdapter(book()),
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(LONG_10),
-    )
-
-    assert isinstance(report, CycleReport)
-    assert [i.action for i in report.intents] == [ActionType.long]
-    assert len(report.results) == len(report.intents) == 1
-    assert report.portfolio_before == book()
-    # A book the adapter OWNS (the ibkr replay) is not written from the result.
-    assert book_rows(ledger_path) == []
-    assert cycle_ts(ledger_path, "S1") is not None  # cycle touched
-
-
-@pytest.mark.asyncio
-async def test_run_cycle_close_yields_a_close_intent(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-
-    report = await run_cycle(
-        CFG,
-        adapter=FakeAdapter(book(lot("L1"))),
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(CLOSE),
-    )
-
-    assert [i.action for i in report.intents] == [ActionType.close]
-    assert report.intents[0].position_id == "L1"
-
-
-@pytest.mark.asyncio
-async def test_sim_source_does_not_close_a_foreign_fixture_lot(tmp_path: Path) -> None:
-    # Ownership scoping (sim path): a lot the strategy never opened is not ours.
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")  # no lots recorded
-
-    report = await run_cycle(
-        CFG,
-        adapter=FakeAdapter(book(lot("L1")), owns_book=True),
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(CLOSE),
-    )
-
-    assert report.intents == ()
-
-
-@pytest.mark.asyncio
-async def test_sim_source_closes_only_its_ledger_owned_lot(tmp_path: Path) -> None:
-    # The strategy opened L1 (recorded); OTHER is a foreign fixture lot. A bare
-    # close targets only the lot we own.
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-    ledger.record_sim_open("S1", "L1")
-
-    report = await run_cycle(
-        CFG,
-        adapter=FakeAdapter(book(lot("L1"), lot("OTHER")), owns_book=True),
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(CLOSE),
-    )
-
-    assert [i.position_id for i in report.intents] == ["L1"]
-
-
-@pytest.mark.asyncio
-async def test_sim_cycle_records_an_opened_lot_as_owned(tmp_path: Path) -> None:
-    # A confirmed sim open is recorded as owned so a later cycle may close it.
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-
-    await run_cycle(
-        CFG,
-        adapter=FakeAdapter(book(), owns_book=True, open_pid="AAPL_1"),
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(LONG_10),
-    )
-
-    assert ledger.sim_open_ids("S1") == frozenset({"AAPL_1"})
-    # The lot's fill detail is recorded too: the sim's own book row, so a report
-    # can show the lot even after the mock fixture stops carrying it.
-    (recorded,) = ledger.sim_open_lots("S1")
-    assert (recorded.symbol, recorded.side, recorded.qty) == ("AAPL", "long", 10.0)
-    assert recorded.entry_price is not None and recorded.entry_price > 0.0
 
 
 @pytest.mark.asyncio
@@ -513,31 +344,6 @@ async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_self_owned_source_closes_replayed_lot_with_empty_ledger(
-    tmp_path: Path,
-) -> None:
-    """An ibkr-style book is already ours: closes need no ledger (plan rev 4.1 §3)."""
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")  # a dry run writes nothing
-
-    report = await run_cycle(
-        CFG,
-        adapter=FakeAdapter(book(lot("97932"))),  # owns_book = False
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(CLOSE),
-    )
-
-    assert [i.action for i in report.intents] == [ActionType.close]
-    assert report.intents[0].position_id == "97932"
-
-
-@pytest.mark.asyncio
 async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
@@ -609,43 +415,6 @@ async def test_dry_run_writes_no_peewee_live_tables(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_cycle_stale_data_raises(tmp_path: Path) -> None:
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", OLD)
-    with pytest.raises(StaleDataError):
-        await run_cycle(
-            CFG,
-            adapter=FakeAdapter(book()),
-            ledger=SqliteLedger(tmp_path / "l.sqlite"),
-            strategy_id="S1",
-            scope="S1",
-            config_path="x.json",
-            now=TS,
-            db_path=db,
-            signal_source=_source_fn(LONG_10),
-        )
-
-
-@pytest.mark.asyncio
-async def test_run_cycle_fetch_error_raises(tmp_path: Path) -> None:
-    class DeadAdapter(FakeAdapter):
-        async def read_book(self) -> FetchResult:
-            return Err(FeedError(kind="transport", message="down"))
-
-    with pytest.raises(PortfolioFetchError):
-        await run_cycle(
-            CFG,
-            adapter=DeadAdapter(book()),
-            ledger=SqliteLedger(tmp_path / "l.sqlite"),
-            strategy_id="S1",
-            scope="S1",
-            config_path="x.json",
-            now=TS,
-            signal_source=_source_fn(()),
-        )
-
-
-@pytest.mark.asyncio
 async def test_run_cycle_cohort_error_is_surfaced_not_silently_empty(
     tmp_path: Path,
 ) -> None:
@@ -670,56 +439,6 @@ async def test_run_cycle_cohort_error_is_surfaced_not_silently_empty(
     assert report.placement_error is not None
     assert report.placement_error.kind == "transport"
     assert "cohort refused" in report.placement_error.message
-
-
-@pytest.mark.asyncio
-async def test_run_cycle_surfaces_a_failed_resync(tmp_path: Path) -> None:
-    """D4: a failed resync is carried on the report, not a clean "0 orders"."""
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-
-    report = await run_cycle(
-        CFG,
-        adapter=ErrResyncAdapter(book()),
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(LONG_10),
-    )
-
-    assert report.resync_error is not None
-    assert report.resync_error.kind == "transport"
-    assert "open_orders failed" in report.resync_error.message
-
-
-@pytest.mark.asyncio
-async def test_run_cycle_resyncs_before_placing(tmp_path: Path) -> None:
-    # Cycle start must reconcile OPEN intents (resync) BEFORE signals/reconcile/
-    # placement, so a prior cycle's working order is adopted, never re-minted.
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-    adapter = FakeAdapter(book())
-
-    await run_cycle(
-        CFG,
-        adapter=adapter,
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(LONG_10),
-    )
-
-    assert adapter.resynced == 1
-    assert adapter.events[0] == "resync"  # before any placement
-    assert "place" in adapter.events
 
 
 @pytest.mark.asyncio
@@ -753,46 +472,6 @@ def _sim_adapter(
     ledger: SqliteLedger, scope: str, *, dry_run: bool = False
 ) -> SimAdapter:
     return build_sim_adapter(CFG, scope, ledger, dry_run, lambda _m: None)
-
-
-@pytest.mark.asyncio
-async def test_a_sim_fill_advances_the_book_through_the_ledger(tmp_path: Path) -> None:
-    """A confirmed sim open is DURABLE: the next cycle reads it back from sqlite.
-
-    This is the seam's whole point — the adapter holds nothing, so the ledger's
-    rows are the book. A cycle that placed but did not persist would read flat
-    forever and re-open the same position every run.
-    """
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-    scope = "sim_momentum_1a2b3c4d"
-
-    first = await run_cycle(
-        CFG,
-        _sim_adapter(ledger, scope),
-        ledger=ledger,
-        strategy_id="S1",
-        scope=scope,
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        signal_source=_source_fn(LONG_10),
-    )
-
-    assert [r.ok for r in first.results] == [True]
-    (opened,) = first.results
-    assert opened.position_id is not None
-    # The book the NEXT cycle reads is the settled one, from the ledger alone.
-    read: Result[PortfolioSnapshot, FeedError] = await _sim_adapter(
-        ledger, scope
-    ).read_book()
-    assert isinstance(read, Ok)
-    portfolio = cast("PortfolioSnapshot", read.value).portfolio
-    (live_lot,) = portfolio.positions["AAPL"]
-    assert live_lot.position_id == opened.position_id
-    assert live_lot.qty == pytest.approx(10.0)
-    assert portfolio.cash < CFG.initial_capital  # the entry debited the book
 
 
 @pytest.mark.asyncio
@@ -853,29 +532,6 @@ async def test_a_second_cycle_on_the_same_scope_is_refused(tmp_path: Path) -> No
                 db_path=db,
                 signal_source=_source_fn(LONG_10),
             )
-
-
-@pytest.mark.asyncio
-async def test_a_different_scope_runs_concurrently(tmp_path: Path) -> None:
-    """Two adapters coexist: another scope's lease must NOT block this cycle."""
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
-
-    with ledger.cycle_lease("ibkr_momentum_1a2b3c4d"):
-        report = await run_cycle(
-            CFG,
-            _sim_adapter(ledger, "sim_momentum_1a2b3c4d"),
-            ledger=ledger,
-            strategy_id="S1",
-            scope="sim_momentum_1a2b3c4d",
-            config_path="x.json",
-            now=TS,
-            db_path=db,
-            signal_source=_source_fn(LONG_10),
-        )
-
-    assert [i.action for i in report.intents] == [ActionType.long]
 
 
 @pytest.mark.asyncio

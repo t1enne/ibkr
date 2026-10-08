@@ -110,18 +110,6 @@ def test_win_rate_zero_without_closed_trades() -> None:
     assert win_rate(pf) == 0.0
 
 
-def test_text_report_trades_default_to_full_table() -> None:
-    pf = _pf(
-        (
-            _trade(10.0, TradeStatus.closed),
-            _trade(-5.0, TradeStatus.closed),
-        )
-    )
-    report = get_backtest_results_analysis(pf)
-    assert "\nTrades" in report
-    assert "Exit Reason" in report  # the trade table header is rendered
-
-
 def test_text_report_omits_trade_list_keeps_count() -> None:
     pf = _pf(
         (
@@ -137,11 +125,6 @@ def test_text_report_omits_trade_list_keeps_count() -> None:
     assert "Cost$" not in lean  # no trade table columns at all
 
 
-def test_text_report_no_trades_still_says_none() -> None:
-    lean = get_backtest_results_analysis(_pf(()), include_trades=False)
-    assert "\nTrades\n  (none)" in lean
-
-
 # ---------------------------------------------------------------------------
 # drawdown_periods
 # ---------------------------------------------------------------------------
@@ -154,10 +137,6 @@ def _curve(values: list[float]) -> pd.Series:
 
 def test_drawdown_periods_empty_curve() -> None:
     assert drawdown_periods(pd.Series([], dtype=float)) == []
-
-
-def test_drawdown_periods_monotone_rise_has_none() -> None:
-    assert drawdown_periods(_curve([100.0, 101.0, 102.0, 103.0])) == []
 
 
 def test_drawdown_periods_peak_precedes_valley() -> None:

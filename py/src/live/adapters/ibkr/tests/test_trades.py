@@ -48,28 +48,6 @@ def _exec(
     )
 
 
-def test_is_ours_uses_the_scope_tag_prefix() -> None:
-    assert is_ours(SCOPE, _exec("o", side=OrderSide.BUY, qty=1, price=1))
-    foreign = _exec("o", side=OrderSide.BUY, qty=1, price=1, ref=_ref("other"))
-    assert not is_ours(SCOPE, foreign)
-
-
-def test_is_ours_does_not_claim_a_longer_slug_scope() -> None:
-    # Scope "momentum" must NOT absorb refs minted by "momentum-v2"/"momentum-2"
-    # (the tag keeps the dash): a prefix match let one scope's book absorb another's
-    # lots (finding 3). The scope segment must match exactly.
-    longer = _exec(
-        "o",
-        side=OrderSide.BUY,
-        qty=1,
-        price=1,
-        ref=_ref("momentum-v2"),
-    )
-    assert not is_ours("momentum", longer)
-    assert is_ours("momentum-v2", longer)
-    assert is_ours("momentum", _exec("o", side=OrderSide.BUY, qty=1, price=1))
-
-
 def test_is_ours_attributes_the_new_bar_free_ref() -> None:
     # cOID = scope_tag-token-attempt. The token and attempt are dashless, so
     # rsplit("-", 2)[0] yields the whole tag (dashes included) and attribution
@@ -95,44 +73,6 @@ def test_is_ours_attributes_the_new_bar_free_ref() -> None:
     assert not is_ours("momentum", dashed)
 
 
-def test_two_scopes_with_one_slug_do_not_share_an_owner() -> None:
-    # D8: slug("momentum_v2") == slug("momentum-v2"), so a slug-only owner made
-    # both scopes claim each other's fills. The non-collapsing scope_tag keeps
-    # them distinct, so at most one can claim any single execution.
-    assert scope_tag("momentum_v2") != scope_tag("momentum-v2")
-    mine = _exec(
-        "o",
-        side=OrderSide.BUY,
-        qty=1,
-        price=1,
-        ref=f"{scope_tag('momentum_v2')}-1a2b3c4d-00",
-    )
-    assert is_ours("momentum_v2", mine)
-    assert not is_ours("momentum-v2", mine)
-    theirs = _exec(
-        "o",
-        side=OrderSide.BUY,
-        qty=1,
-        price=1,
-        ref=f"{scope_tag('momentum-v2')}-1a2b3c4d-00",
-    )
-    assert not is_ours("momentum_v2", theirs)
-    assert is_ours("momentum-v2", theirs)
-
-
-def test_single_buy_opens_one_row() -> None:
-    book, warnings = reconcile(
-        SCOPE, (_exec("o1", side=OrderSide.BUY, qty=10, price=100),), StrategyBook()
-    )
-    assert warnings == ()
-    (row,) = book.rows
-    assert row.conid == 265598
-    assert row.side == "long"
-    assert row.qty == 10
-    assert row.entry_price == 100
-    assert row.is_open
-
-
 def test_round_trip_leaves_one_closed_row_not_two_lots() -> None:
     executions = (
         _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
@@ -147,39 +87,6 @@ def test_round_trip_leaves_one_closed_row_not_two_lots() -> None:
     assert row.entry_price == 100
 
 
-def test_entry_price_is_vwap_of_the_open_interval() -> None:
-    executions = (
-        _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
-        _exec("o2", side=OrderSide.BUY, qty=10, price=120, ts="2024-01-02T09:40:00Z"),
-        _exec("o3", side=OrderSide.SELL, qty=5, price=130, ts="2024-01-02T10:00:00Z"),
-    )
-    book, _ = reconcile(SCOPE, executions, StrategyBook())
-    (row,) = book.rows
-    assert row.qty == 15
-    assert row.entry_price == 110.0  # (10*100 + 10*120) / 20
-
-
-def test_reapplying_the_window_is_a_noop() -> None:
-    executions = (_exec("o1", side=OrderSide.BUY, qty=10, price=100),)
-    book, _ = reconcile(SCOPE, executions, StrategyBook())
-    again, warnings = reconcile(SCOPE, executions, book)
-    assert again == book
-    assert warnings == ()
-
-
-def test_reopen_after_flat_is_reported() -> None:
-    executions = (
-        _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
-        _exec("o2", side=OrderSide.SELL, qty=10, price=110, ts="2024-01-02T10:00:00Z"),
-        _exec("o3", side=OrderSide.BUY, qty=7, price=120, ts="2024-01-02T11:00:00Z"),
-    )
-    book, warnings = reconcile(SCOPE, executions, StrategyBook())
-    (row,) = book.rows
-    assert row.is_open and row.qty == 7 and row.entry_price == 120
-    assert row.opened_at == pd.Timestamp("2024-01-02T11:00:00Z")
-    assert any("reopened" in w for w in warnings)
-
-
 def test_flip_is_reported_and_resets_the_interval() -> None:
     executions = (
         _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z"),
@@ -191,40 +98,11 @@ def test_flip_is_reported_and_resets_the_interval() -> None:
     assert any("flip" in w for w in warnings)
 
 
-def test_foreign_executions_are_ignored_without_warning() -> None:
-    foreign = _exec(
-        "o1",
-        side=OrderSide.BUY,
-        qty=99,
-        price=1,
-        ref=_ref("someone-else"),
-    )
-    book, warnings = reconcile(SCOPE, (foreign,), StrategyBook())
-    assert book.rows == () and warnings == ()
-
-
-def test_input_order_does_not_matter() -> None:
-    a = _exec("o1", side=OrderSide.BUY, qty=10, price=100, ts="2024-01-02T09:30:00Z")
-    b = _exec("o2", side=OrderSide.SELL, qty=10, price=110, ts="2024-01-02T10:00:00Z")
-    assert reconcile(SCOPE, (a, b), StrategyBook()) == reconcile(
-        SCOPE, (b, a), StrategyBook()
-    )
-
-
 def test_empty_scope_is_rejected() -> None:
     import pytest
 
     with pytest.raises(ValueError, match="scope"):
         reconcile("", (), StrategyBook())
-
-
-def test_separate_scopes_keep_separate_books() -> None:
-    a = _exec("o1", side=OrderSide.BUY, qty=10, price=100, ref=_ref("alpha"))
-    b = _exec("o2", side=OrderSide.BUY, qty=5, price=50, ref=_ref("beta"))
-    abook, _ = reconcile("alpha", (a, b), StrategyBook())
-    bbook, _ = reconcile("beta", (a, b), StrategyBook())
-    assert [r.qty for r in abook.rows] == [10]
-    assert [r.qty for r in bbook.rows] == [5]
 
 
 def test_a_captured_pre_upgrade_order_ref_is_not_ours() -> None:

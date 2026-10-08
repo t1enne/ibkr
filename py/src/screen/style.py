@@ -24,7 +24,7 @@ be imported individually or used as ``Fmt.score(...)``.
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import Final
 
 
 # ── ANSI color codes ───────────────────────────────────────────

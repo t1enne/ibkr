@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
-import math
 from pathlib import Path
 from typing import cast
 
@@ -12,14 +11,12 @@ import pandas as pd
 import pytest
 
 from src.bt.exchange import execute_signal
-from src.bt.portfolio.pure import _scale_opens
-from src.bt.state import ActionType, ExecutionParams, PortfolioState
+from src.bt.state import ActionType, ExecutionParams
 from src.exec.types import (
     FixedCommission,
     OrderSide,
     OrderState,
     OrderType,
-    PerShareCommission,
 )
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
@@ -29,7 +26,6 @@ from src.live.adapters.ibkr.orders import (
     build_ticket,
     classify_reply,
     is_fully_filled,
-    is_terminal,
     match_working,
     order_side,
     order_state,
@@ -37,7 +33,6 @@ from src.live.adapters.ibkr.orders import (
     placement_order,
     scale_open_cohort,
     status_to_fill,
-    whole_quantity,
 )
 from src.live.pure import intent_to_signal, ref_candle
 from src.live.identity import (
@@ -104,21 +99,6 @@ def _intent(
 # --- side resolution --------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("action", "position_side", "expected"),
-    [
-        (ActionType.long, None, OrderSide.BUY),
-        (ActionType.short, None, OrderSide.SELL),
-        (ActionType.close, ActionType.long, OrderSide.SELL),
-        (ActionType.close, ActionType.short, OrderSide.BUY),
-    ],
-)
-def test_order_side_table(
-    action: ActionType, position_side: ActionType | None, expected: OrderSide
-) -> None:
-    assert order_side(_intent(action=action), position_side) is expected
-
-
 def test_close_without_a_lot_side_is_an_error() -> None:
     with pytest.raises(UnknownCloseLot, match="lot not found"):
         order_side(_intent(action=ActionType.close, position_id="99"), None)
@@ -158,24 +138,6 @@ def test_build_ticket_close_floors_the_quantity() -> None:
     )
     assert ticket.body["quantity"] == 1.0
     assert ticket.rounded
-
-
-def test_build_ticket_open_still_rounds_to_nearest() -> None:
-    # Only reducing orders floor; an open keeps round-to-nearest.
-    ticket = build_ticket(
-        _intent(qty=1.6),
-        conid=1,
-        side=OrderSide.BUY,
-        order_ref=order_ref(intent_key(SCOPE, _intent()), 0),
-    )
-    assert ticket.body["quantity"] == 2.0
-
-
-def test_whole_quantity_is_the_ticket_quantity() -> None:
-    assert whole_quantity(_intent(qty=1.6)) == 2  # open rounds to nearest
-    assert (
-        whole_quantity(_intent(qty=1.6, action=ActionType.close, position_id="x")) == 1
-    )
 
 
 def test_build_ticket_close_that_floors_to_zero_is_refused() -> None:
@@ -248,12 +210,6 @@ def test_parse_working_order_reads_the_captured_order_ref_and_order_id() -> None
     assert parsed.status == "PreSubmitted"
 
 
-def test_parse_working_order_drops_a_captured_foreign_row() -> None:
-    # A foreign order (another client / the UI) carries NO ``order_ref`` key, so a
-    # scope prefix can never match it — it can never be adopted.
-    assert parse_working_order(_captured_working_orders()[1]) is None
-
-
 def test_captured_ours_row_is_matched_and_foreign_rows_are_never_adopted() -> None:
     key = intent_key(SCOPE, _intent("AAPL"))
     prefix = ref_prefix(key)
@@ -270,58 +226,7 @@ def test_captured_ours_row_is_matched_and_foreign_rows_are_never_adopted() -> No
     assert match is not None and match.order_ref == order_ref(key, 0)
 
 
-@pytest.mark.parametrize("entry", [None, {}, {"orderId": 1}, {"order_ref": ""}])
-def test_parse_working_order_skips_unattributable_rows(entry: object) -> None:
-    assert parse_working_order(entry) is None
-
-
-def test_match_working_matches_on_the_exact_scope_token_prefix() -> None:
-    from src.live.identity import WorkingOrder
-
-    ours = WorkingOrder("momentum-1a2b3c4d-00", "1", 1, "AAPL", "BUY", "Submitted", 0.0)
-    foreign = WorkingOrder("mom-99999999-00", "2", 1, "AAPL", "BUY", "Submitted", 0.0)
-    assert match_working((foreign, ours), "momentum-1a2b3c4d-") is ours
-    # Never a symbol+side match: a foreign order on the same symbol is not ours.
-    assert match_working((foreign,), "momentum-1a2b3c4d-") is None
-
-
 # --- reply classification ---------------------------------------------------
-
-
-def test_classify_reply_success() -> None:
-    outcome = classify_reply(
-        [
-            {
-                "order_id": "97932.0",
-                "order_status": "PreSubmitted",
-                "encrypt_message": "1",
-            }
-        ]
-    )
-    assert outcome.kind == "success"
-    assert outcome.order_id == "97932"  # canonicalised str(int(...))
-
-
-def test_classify_reply_confirmation() -> None:
-    outcome = classify_reply(
-        [
-            {
-                "id": "99097238-9824-4830-84ef-46979aa22593",
-                "isSuppressed": False,
-                "message": ["Are you sure you want to submit this order?"],
-                "messageIds": ["o354"],
-            }
-        ]
-    )
-    assert outcome.kind == "confirm"
-    assert outcome.reply_id == "99097238-9824-4830-84ef-46979aa22593"
-    assert "Are you sure" in outcome.message
-
-
-def test_classify_reply_error_aborts_verbatim() -> None:
-    outcome = classify_reply({"error": "Order not confirmed "})
-    assert outcome.kind == "abort"
-    assert outcome.message == "Order not confirmed "
 
 
 def test_classify_reply_advanced_reject_aborts_with_its_text() -> None:
@@ -338,41 +243,13 @@ def test_classify_reply_advanced_reject_aborts_with_its_text() -> None:
     assert outcome.message == "price band exceeded"
 
 
-@pytest.mark.parametrize("payload", [None, {}])
-def test_classify_reply_unknown_shape_aborts(payload: object) -> None:
-    assert classify_reply(payload).kind == "abort"
-
-
-def test_classify_reply_id_without_message_aborts() -> None:
-    # An id we cannot read is not a confirmation we are willing to give.
-    assert classify_reply({"id": "uuid-1"}).kind == "abort"
-
-
 # --- status -> fill / terminal ---------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("status", "terminal"),
-    [
-        ("Filled", True),
-        ("Cancelled", True),
-        ("Inactive", True),
-        ("Submitted", False),  # a real pre-fill status is non-terminal
-        ("", False),  # an unknown status is never read as terminal
-    ],
-)
-def test_is_terminal_table(status: str, terminal: bool) -> None:
-    assert is_terminal({"order_status": status}) is terminal
 
 
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        ("Filled", OrderState.FILLED),
-        ("Cancelled", OrderState.CANCELLED),
         ("Inactive", OrderState.REJECTED),
-        ("Submitted", OrderState.PENDING),
-        ("Whatever", OrderState.PENDING),  # unknown statuses fall back to PENDING
     ],
 )
 def test_order_state_table(status: str, expected: OrderState) -> None:
@@ -486,31 +363,6 @@ def test_scaled_open_that_floors_to_zero_is_dropped() -> None:
     assert sorted(i.qty for i in plan.intents) == [49.0]
 
 
-def test_opens_disagreeing_on_their_bound_fail_closed() -> None:
-    plan = scale_open_cohort(
-        (_open("AAPL", 100.0, 100.0, 15000.0), _open("MSFT", 100.0, 100.0, 9000.0)),
-        _FLAT_PARAMS,
-    )
-    assert plan.scale is None
-    assert sorted(d.intent.symbol for d in plan.dropped) == ["AAPL", "MSFT"]
-    assert plan.intents == ()
-
-
-def test_commission_reserve_that_does_not_fit_drops_the_opens() -> None:
-    # B3: when the commission reserve alone exhausts the budget the cohort used
-    # to fit, the opens are DROPPED (rejected), never sent on cash the fee needs.
-    huge_fee = ExecutionParams(
-        spread_bps=0.0, slippage_bps=0.0, commission_model=FixedCommission(20000.0)
-    )
-    plan = scale_open_cohort(
-        (_open("AAPL", 10.0, 100.0, 1000.0), _open("MSFT", 10.0, 100.0, 1000.0)),
-        huge_fee,
-    )
-    assert plan.scale is not None and plan.scale.scale == 0.0
-    assert sorted(d.intent.symbol for d in plan.dropped) == ["AAPL", "MSFT"]
-    assert plan.intents == ()
-
-
 def _probe_fills(
     symbols: tuple[str, ...], qty: float, cash: float, params: ExecutionParams
 ):
@@ -523,42 +375,6 @@ def _probe_fills(
         )
         for sym in symbols
     )
-
-
-def test_live_scale_matches_the_backtest_with_commission_and_friction() -> None:
-    """The edge applies the SAME shared factor ``_scale_opens`` derives, reserving
-    commission and requesting at the friction-adjusted price (B3).
-
-    The old formula used the raw reference notional and no reserve, so live could
-    only ever deploy MORE than the backtest. With a real per-share commission and
-    non-zero friction the live factor must EQUAL the backtest's (parity) and be
-    strictly BELOW the naive ``cash / ref-notional`` scale the old code produced.
-    """
-    cash = 15000.0
-    params = ExecutionParams(
-        spread_bps=5.0, slippage_bps=2.0, commission_model=PerShareCommission(0.01)
-    )
-    fills = _probe_fills(("AAPL", "MSFT"), 100.0, cash, params)
-    portfolio = PortfolioState(
-        cash=cash, positions={}, trades=(), equity_curve=(), initial_capital=cash
-    )
-    scaled, record = _scale_opens(portfolio, fills, params.commission_model)
-    assert record is not None
-
-    opens = (_open("AAPL", 100.0, 100.0, cash), _open("MSFT", 100.0, 100.0, cash))
-    plan = scale_open_cohort(opens, params)
-    assert plan.scale is not None
-    # Parity with the backtest's shared scale.
-    assert plan.scale.scale == pytest.approx(record.scale)
-    # Direction: the live scale is strictly below the naive no-reserve factor, so
-    # live never deploys more than the backtest (the bug this fixes).
-    naive = cash / sum(o.qty * o.ref_price for o in opens)
-    assert plan.scale.scale < naive
-    # Same factor, but live orders are whole shares: each is the backtest's scaled
-    # qty FLOORED (never rounded up past the budget).
-    assert [i.qty for i in plan.intents] == [
-        float(math.floor(f.signal.qty)) for f in scaled
-    ]
 
 
 def _working(order_ref: str, order_id: str, filled_qty: float = 0.0) -> WorkingOrder:

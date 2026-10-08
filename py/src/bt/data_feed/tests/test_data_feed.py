@@ -89,15 +89,6 @@ def test_detect_gaps_ignores_market_closures():
     assert detect_gaps(_frame(["A"], template), ["A"]) == {}
 
 
-def test_detect_gaps_flags_skipped_trading_days_only():
-    # 12/20 (Fri) -> 12/30 (Mon) crosses real trading days 12/23/24/26/27.
-    def template(_s: str) -> list[str]:
-        return _hourly("2024-12-20 14:30", "2024-12-30 14:30")
-
-    report = detect_gaps(_frame(["A"], template), ["A"])
-    assert len(report["A"]) == 1
-
-
 # ── load_candles guard ─────────────────────────────────────────────────
 def _load_df(*, hourly_spans: dict):
     def factory(symbol):

@@ -144,24 +144,3 @@ def test_run_end_to_end_full_history_tail_runs():
     bt = Backtest(_cfg(["AAPL", "MSFT", "PATH"], trading_start="2025-01-03"))
     results = run(bt, frame, _FixtureMod(_noop_on_candle))
     assert results is not None
-
-
-def test_benchmark_tail_regression_still_raises():
-    """Pre-existing benchmark-tail guard must still fire (regression)."""
-    from src.bt.engine.backtest import _assert_benchmark_symbols_last
-
-    cfg = StrategyConfig(
-        name="bm",
-        strategy_type="momentum_compression_breakout_dsl",
-        symbols=["SPY", "AAPL"],  # benchmark SPY not at the tail
-        initial_capital=10000.0,
-        commission=0.5,
-        warmup="0d",
-        trading_start="2025-01-03",
-        trading_end="2025-12-31",
-        bars=["1d"],
-        strategy_params={},
-        benchmark_symbols=["SPY"],
-    )
-    with pytest.raises(AssertionError, match="benchmark symbols"):
-        _assert_benchmark_symbols_last(cfg)

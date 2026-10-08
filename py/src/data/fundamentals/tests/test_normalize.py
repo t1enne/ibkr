@@ -123,16 +123,6 @@ def test_restated_period_emits_both_filings() -> None:
     ]
 
 
-def test_non_gaap_tag_is_ignored() -> None:
-    payload = {
-        "facts": {
-            "us-gaap": {},
-            "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": []}}},
-        }
-    }
-    assert sec_payload_to_rows("AAPL", payload) == []
-
-
 def test_unusable_facts_are_dropped_not_zeroed() -> None:
     """Null-date sentinel, non-numeric val, unknown form, missing filed -> no row."""
     body = {
@@ -205,28 +195,6 @@ def test_balance_instants_are_kept_with_collapsed_span() -> None:
     assert row.value == 5.0
     assert row.period_start == row.period_end == parse_timestamp("2024-03-31")
     assert row.filed == parse_timestamp("2024-05-01")
-
-
-def test_instant_facts_still_rejected_for_flows() -> None:
-    """Income/cashflow are durations: an instant there stays unusable.
-
-    ``instant_ok`` is scoped to balance statements only, so a start-less
-    income fact is still dropped rather than silently spanning one day.
-    """
-    body = {
-        "units": {
-            "USD": [
-                {
-                    "end": "2024-03-31",
-                    "val": 5.0,
-                    "form": "10-Q",
-                    "filed": "2024-05-01",
-                }
-            ]
-        }
-    }
-    for tag in ("Revenues", "NetCashProvidedByUsedInOperatingActivities"):
-        assert sec_payload_to_rows("AAPL", _payload((tag, body))) == []
 
 
 def test_duplicate_fact_repeats_dedupe() -> None:

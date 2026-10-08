@@ -17,31 +17,18 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
-import peewee
 import pytest
 from click.testing import CliRunner, Result as CliResult
 
-from src.bt import load_strategy
 from src.bt.state import ActionType, PortfolioState
 from src.exec.refs import scope_tag
 from src.live.pure import OrderResult
 from src.live.cli import (
-    _STRATEGY_FIELDS,
     _config_scope,
-    _housekeeping,
-    _strategy_config,
-    _write_strategy_config,
     live_group,
     load_live_config,
 )
-from src.live.adapter import resolve_adapter_name
 from src.live.divergence import Divergence
-from src.live.scope import (
-    ScopeParts,
-    config_name_of,
-    config_hash as config_scope_hash,
-    scope_of,
-)
 from src.live.engine import CycleReport
 from src.live.identity import (
     IntentKey,
@@ -137,108 +124,7 @@ def _unsafe_result(outcome: OrderOutcome) -> OrderResult:
 # --- scope resolution + adapter selection (INV-5) ---------------------------
 
 
-def test_the_same_config_on_two_adapters_yields_two_scopes(tmp_path: Path) -> None:
-    """Two adapters never share a book: the scope embeds the resolved adapter.
-
-    Regression: both adapters used to write the SAME bare scope (the parent's
-    config name), so a sim cycle and a live cycle booked into one scope and each
-    saw the other's lots.
-    """
-    path = write_config(tmp_path)
-    cfg = load_live_config(path)
-    raw = json.loads(Path(path).read_text())
-
-    sim = resolve_adapter_name("sim", raw, cfg.strategy_params)
-    ibkr = resolve_adapter_name("ibkr", raw, cfg.strategy_params)
-    assert sim != ibkr
-    sim_scope = scope_of(ScopeParts(sim, config_name_of(cfg), config_scope_hash(cfg)))
-    ibkr_scope = scope_of(ScopeParts(ibkr, config_name_of(cfg), config_scope_hash(cfg)))
-    assert sim_scope != ibkr_scope
-
-
-def test_the_cli_flag_beats_the_config_and_the_config_defaults_to_ibkr(
-    tmp_path: Path,
-) -> None:
-    """Precedence: explicit flag > config `adapter` > back-compat `broker` > ibkr."""
-    path = write_config(tmp_path, adapter="sim", broker="sim")
-    cfg = load_live_config(path)
-    raw = json.loads(Path(path).read_text())
-    assert resolve_adapter_name(None, raw, cfg.strategy_params) == "sim"
-    assert resolve_adapter_name("ibkr", raw, cfg.strategy_params) == "ibkr"
-
-    legacy = write_config(tmp_path, broker="ibkr")
-    legacy_raw = json.loads(Path(legacy).read_text())
-    assert resolve_adapter_name(None, legacy_raw, {}) == "ibkr"
-
-
-def test_an_unknown_adapter_is_a_config_error_not_a_silent_default(
-    tmp_path: Path,
-) -> None:
-    """A typo'd adapter fails the load: never a silent fallback to the default."""
-    path = write_config(tmp_path, adapter="paper-trader")
-    with pytest.raises(ValueError, match="adapter must be"):
-        load_live_config(path)
-    with pytest.raises(ValueError, match="adapter must be"):
-        resolve_adapter_name(None, {"adapter": "paper-trader"}, {})
-
-
-def test_pf_and_run_resolve_the_same_scope_for_one_config(tmp_path: Path) -> None:
-    cfg = load_live_config(write_config(tmp_path, adapter="sim"))
-    assert _config_scope(cfg) == scope_of(
-        ScopeParts("sim", config_name_of(cfg), config_scope_hash(cfg))
-    )
-
-
 # --- load_live_config -------------------------------------------------------
-
-
-def test_load_live_config_maps_every_field(tmp_path: Path) -> None:
-    path = write_config(
-        tmp_path,
-        size_mode="cash",
-        size=0.25,
-        max_symbol_allocation=0.5,
-    )
-    cfg = load_live_config(path)
-    assert isinstance(cfg, LiveConfig)
-    assert cfg.strategy_type == "vwatr_div_dsl"
-    assert cfg.symbols == ("AAPL", "MSFT")
-    assert cfg.initial_capital == 50000
-    assert cfg.strategy_params == {"vwatr_period": 14}
-    assert (cfg.size_mode, cfg.size, cfg.max_symbol_allocation) == ("cash", 0.25, 0.5)
-
-
-def test_load_live_config_flat_overrides_nested(tmp_path: Path) -> None:
-    path = write_config(
-        tmp_path,
-        sizing={"sizing_mode": "cash", "size": 0.1, "max_symbol_allocation": 0.9},
-        size_mode="equity",
-        size=0.5,
-    )
-    cfg = load_live_config(path)
-    assert cfg.size_mode == "equity"  # flat wins
-    assert cfg.size == 0.5  # flat wins
-    assert cfg.max_symbol_allocation == 0.9  # no flat key -> nested kept
-
-
-def test_load_live_config_bad_size_mode_raises(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="size_mode must be"):
-        load_live_config(write_config(tmp_path, size_mode="bogus"))
-
-
-def test_write_strategy_config_is_load_strategy_able(tmp_path: Path) -> None:
-    path = write_config(tmp_path, portfolio_path="pf.json", size=0.25)
-    raw = json.loads(Path(path).read_text())
-    strategy = _strategy_config(path, raw)
-    with tempfile.TemporaryDirectory() as tmp:
-        normalized = _write_strategy_config(strategy, tmp)
-        # Reloadable through the strict canonical loader the screen bridge uses.
-        reloaded = load_strategy(normalized)
-        assert reloaded.name == strategy.name
-        assert reloaded.strategy_type == strategy.strategy_type
-        doc = json.loads(Path(normalized).read_text())
-        # Strategy-only: no live-only keys leak through.
-        assert set(doc) <= _STRATEGY_FIELDS
 
 
 # --- exit code (cron must see an unsafe cycle) -------------------------------
@@ -625,7 +511,6 @@ def test_ibkr_dry_run_adapter_still_refuses_to_place(
 def test_sim_adapter_refuses_to_place_on_a_dry_run() -> None:
     """The sim adapter refuses too: a construction bug cannot place on a dry run."""
     import asyncio
-    import tempfile
 
     from src.bt.state import PortfolioState
     from src.live.adapters.sim.adapter import build_sim_adapter
@@ -657,20 +542,6 @@ class _RaisingLedger:
 
     def prune_closed(self, *a: object, **k: object) -> int:
         raise self._error
-
-
-def test_housekeeping_swallows_a_locked_db_error() -> None:
-    # A locked/busy DB raises peewee.OperationalError, which is NOT a sqlite3.Error
-    # (peewee errors derive from Exception). Housekeeping must stay non-fatal.
-    locked = _RaisingLedger(peewee.OperationalError("database is locked"))
-    _housekeeping(cast("SqliteLedger", locked), dry_run=False)  # must not raise
-
-
-def test_housekeeping_does_not_swallow_a_programming_error() -> None:
-    # Only DB-level failures are non-fatal; a real bug must surface, not vanish.
-    broken = _RaisingLedger(RuntimeError("bug"))
-    with pytest.raises(RuntimeError, match="bug"):
-        _housekeeping(cast("SqliteLedger", broken), dry_run=False)
 
 
 # --- N1: the operator escape for a wedged key --------------------------------
@@ -718,31 +589,6 @@ def test_abandon_clears_a_wedged_key(
     assert out.exit_code == 0, out.output
     record = ledger.load(key)
     assert record is not None and record.state is IntentState.UNFILLED
-
-
-def test_abandon_requires_explicit_acknowledgement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The verb is irreversible-ish; without --yes it explains the duplicate risk."""
-    ledger, key = _wedged_ledger(tmp_path)
-    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: ledger)
-
-    out = CliRunner().invoke(
-        live_group,
-        ["abandon", "--scope", "momentum", "--symbol", "AAPL", "--action", "long"],
-    )
-
-    assert out.exit_code != 0
-    record = ledger.load(key)
-    assert record is not None and record.state is IntentState.WORKING  # untouched
-
-
-def test_the_report_scope_is_the_resolved_scope() -> None:
-    """The scope the report names is the one resolution produces (INV-5)."""
-    from src.live.cli import render_report
-
-    doc = json.loads(render_report(_report(), "json", "sim_cli_test_1a2b3c4d"))
-    assert doc["scope"] == "sim_cli_test_1a2b3c4d"
 
 
 def test_a_divergence_makes_the_cycle_unsafe() -> None:

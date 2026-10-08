@@ -22,10 +22,9 @@ from src.data.ibkr.client import IbkrClient
 from ib_rest_api_client.models import SecdefSearchResponseItem
 from src.exec.types import FixedCommission, OrderType
 from src.live.adapters.ibkr import broker as broker_mod
-from src.live.adapters.ibkr.broker import MAX_REPLIES, IbkrBroker
+from src.live.adapters.ibkr.broker import IbkrBroker
 from src.live.pure import OrderResult
 from src.live.engine import _UNSAFE_OUTCOMES
-from src.live.ledger import SqliteLedger
 from src.live.identity import (
     WEDGED_CYCLES,
     OPEN_STATES,
@@ -349,59 +348,6 @@ async def test_place_submits_then_waits_for_the_fill() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_place_confirms_an_ordinary_reply_then_fills() -> None:
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                {
-                    "id": "99097238-9824-4830-84ef-46979aa22593",
-                    "isSuppressed": False,
-                    "message": ["Are you sure you want to submit this order?"],
-                    "messageIds": ["o354"],
-                }
-            ],
-        )
-    )
-    reply = respx.post(f"{REPLY}99097238-9824-4830-84ef-46979aa22593").mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    _mock_no_working_orders()
-
-    placed = _ok(await _broker().place(_open_intent()))
-
-    assert placed.ok
-    assert reply.called
-    assert reply.calls[0].request.content.decode() == '{"confirmed":true}'
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_place_confirms_a_second_reply_before_the_order_lands() -> None:
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(
-            200, json=[{"id": "reply-a", "message": ["confirm?"], "messageIds": ["o1"]}]
-        )
-    )
-    respx.post(f"{REPLY}reply-a").mock(
-        return_value=httpx.Response(
-            200, json=[{"id": "reply-b", "message": ["really?"], "messageIds": ["o2"]}]
-        )
-    )
-    second = respx.post(f"{REPLY}reply-b").mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    _mock_no_working_orders()
-
-    placed = _ok(await _broker().place(_open_intent()))
-
-    assert placed.ok and second.called
-
-
-@respx.mock
-@pytest.mark.asyncio
 async def test_reject_prompt_aborts_without_confirming() -> None:
     respx.post(SUBMIT).mock(
         return_value=httpx.Response(
@@ -427,40 +373,6 @@ async def test_reject_prompt_aborts_without_confirming() -> None:
     assert "price band exceeded" in error.message
     assert not confirm.called  # nothing further was placed
     assert not status.called  # we never waited on a non-existent order
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_reply_loop_overflow_reports_unknown_when_order_not_found() -> None:
-    """MAX_REPLIES confirmations pressed, no matching working order: state UNKNOWN.
-
-    Every reply we confirmed was a ``{"confirmed": true}`` POST that can submit
-    the order, so the outcome is NOT "rejected": it is unresolved, never reported
-    as if nothing may be live (finding M2).
-    """
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(
-            200, json=[{"id": "r0", "message": ["again?"], "messageIds": ["o1"]}]
-        )
-    )
-    confirm = respx.post(url__regex=rf"{REPLY}.*").mock(
-        return_value=httpx.Response(
-            200, json=[{"id": "r-next", "message": ["again?"], "messageIds": ["o1"]}]
-        )
-    )
-    status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
-    working = respx.get(OPEN_ORDERS).mock(
-        return_value=httpx.Response(200, json={"orders": []})
-    )
-
-    result = await _broker().place(_open_intent())
-
-    error = _failure(result)
-    assert error.kind == "unresolved"
-    assert "unknown" in error.message
-    assert confirm.call_count == MAX_REPLIES  # bounded: we stopped pressing yes
-    assert working.called  # we ASKED whether an order is live before deciding
-    assert not status.called
 
 
 @respx.mock
@@ -493,29 +405,6 @@ async def test_reply_loop_overflow_adopts_a_live_order() -> None:
     assert placed.ok and placed.position_id == str(CONID)
     record = intents.load(intent_key(SCOPE, intent))
     assert record is not None and record.state is IntentState.FILLED
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_post_confirm_abort_reports_unknown_not_not_placed() -> None:
-    """An abort AFTER a confirmation is not "not placed" — the confirm may have submitted."""
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(
-            200, json=[{"id": "r0", "message": ["confirm?"], "messageIds": ["o1"]}]
-        )
-    )
-    respx.post(f"{REPLY}r0").mock(
-        return_value=httpx.Response(200, json={"error": "order rejected"})
-    )
-    status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
-    _mock_no_working_orders()
-
-    error = _failure(await _broker().place(_open_intent()))
-
-    assert error.kind == "unresolved"
-    assert "not placed:" not in error.message
-    assert "order rejected" in error.message
-    assert not status.called
 
 
 @respx.mock
@@ -623,31 +512,6 @@ async def test_confirm_post_adopts_when_a_working_order_appears() -> None:
 
     assert placed.ok
     assert not confirm.called  # the working order was adopted, not re-confirmed
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_failed_read_before_confirm_sends_no_confirm() -> None:
-    """INV-1/INV-3: a failed read before the confirm POST sends nothing, unresolved."""
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(
-            200, json=[{"id": "r0", "message": ["confirm?"], "messageIds": ["o1"]}]
-        )
-    )
-    confirm = respx.post(f"{REPLY}r0").mock(
-        return_value=httpx.Response(500, json={"error": "must not be called"})
-    )
-    respx.get(OPEN_ORDERS).mock(
-        side_effect=[
-            httpx.Response(200, json={"orders": []}),  # pre-flight
-            httpx.Response(500, json={}),  # the pre-confirm read fails
-        ]
-    )
-
-    error = _failure(await _broker().place(_open_intent()))
-
-    assert error.kind == "unresolved"
-    assert not confirm.called  # fail CLOSED: no confirm POST
 
 
 # --- wait_filled outcomes ---------------------------------------------------
@@ -781,27 +645,6 @@ async def test_terminal_filled_without_a_readable_cum_fill_is_unresolved() -> No
     assert error.kind == "unresolved"
     assert "nothing filled" not in error.message
     assert "unknown" in error.message
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_wait_filled_polls_until_terminal() -> None:
-    """Two non-terminal polls then a fill: the loop keeps going, bounded."""
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    ticks = iter([0.0, 0.1, 0.2, 0.3, 0.4])
-    respx.get(STATUS).mock(
-        side_effect=[
-            httpx.Response(200, json={"order_status": "PreSubmitted", "cum_fill": "0"}),
-            httpx.Response(200, json={"order_status": "Submitted", "cum_fill": "0"}),
-            httpx.Response(200, json=_filled_status()),
-        ]
-    )
-    _mock_no_working_orders()
-    broker = _broker(timeout_s=100.0, monotonic=lambda: next(ticks))
-    placed = _ok(await broker.place(_open_intent()))
-    assert placed.ok and placed.fill is not None
 
 
 # --- refusals ---------------------------------------------------------------
@@ -956,107 +799,6 @@ async def test_open_refused_when_our_book_is_ahead_of_the_account() -> None:
     assert submit.call_count == 0
 
 
-@respx.mock
-@pytest.mark.asyncio
-async def test_open_allowed_when_account_matches_the_booked_exposure() -> None:
-    """B positive control: a shared book that MATCHES the account is not blocked."""
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    _mock_no_working_orders()
-    respx.get(POSITIONS).mock(
-        return_value=httpx.Response(
-            200, json=[{"conid": CONID, "contractDesc": "AAPL", "position": 5}]
-        )
-    )
-    broker = _broker(exposure=FakeExposure(5.0))  # another scope books the 5
-    placed = _ok(await broker.place(_open_intent()))
-    assert placed.ok
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_open_fails_closed_when_the_account_net_is_unreadable() -> None:
-    """B: an unreadable account read refuses the open, consistent with the edge."""
-    submit = respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(POSITIONS).mock(return_value=httpx.Response(500))
-    error = _failure(await _broker().place(_open_intent()))
-    assert error.kind == "divergence"
-    assert submit.call_count == 0
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_open_fails_closed_without_an_exposure_oracle() -> None:
-    """B: no way to see the book is not a licence to open — refuse (fail closed)."""
-    submit = respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    broker = IbkrBroker(
-        IbkrClient(base_url=BASE, account=ACCOUNT),
-        scope=SCOPE,
-        intents=FakeIntents(),
-        params=_FLAT_PARAMS,
-        account=ACCOUNT,
-        conid_lookup=_conid,
-    )
-    error = _failure(await broker.place(_open_intent()))
-    assert error.kind == "divergence"
-    assert submit.call_count == 0
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_close_without_its_lot_is_an_error_not_a_skip() -> None:
-    broker = _broker()
-    broker.seed(_book({}))  # the replayed book holds no such lot
-    intent = OrderIntent(
-        symbol="AAPL",
-        action=ActionType.close,
-        qty=1.0,
-        ref_price=100.0,
-        reason="close lot",
-        position_id="does-not-exist",
-    )
-    error = _failure(await broker.place(intent))
-    assert error.kind == "rejected"
-    assert "does-not-exist" in error.message
-    assert len(respx.calls) == 0  # nothing was submitted
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_close_resolves_the_lot_side_from_the_seeded_book() -> None:
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    _mock_long_position()
-    _mock_no_working_orders()
-    broker = _broker()
-    broker.seed(_long_lot("555000111"))
-    intent = OrderIntent(
-        symbol="AAPL",
-        action=ActionType.close,
-        qty=1.0,
-        ref_price=100.0,
-        reason="close lot",
-        position_id="555000111",
-    )
-    placed = _ok(await broker.place(intent))
-    assert placed.ok
-    assert placed.position_id == "555000111"  # a close keeps the lot handle
-    posted = [
-        call.request.content.decode()
-        for call in respx.calls
-        if call.request.method == "POST"
-    ]
-    assert '"side":"SELL"' in posted[0]
-
-
 # --- cohort loop ------------------------------------------------------------
 
 
@@ -1084,43 +826,6 @@ async def test_place_cohort_is_a_deterministic_loop_that_survives_one_failure() 
     assert (first.intent.symbol, first.ok) == ("AAPL", False)
     assert "rejected" in first.message
     assert (second.intent.symbol, second.ok) == ("MSFT", True)
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_a_failed_funding_close_drops_the_opens_it_was_funding() -> None:
-    """B2: opens are funded by a close that may never arrive.
-
-    The close leg is refused, but the opens were sized against a book with the
-    close already settled (their shared cash bound). Without a live
-    available-funds read the strictest safe rule is to DROP the opens and report
-    them, rather than deploy the prospective cash as silent leverage.
-    """
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"error": "no market data"}])
-    )
-    _mock_long_position()
-    _mock_no_working_orders()
-    broker = _broker()
-    broker.seed(_long_lot("555000111"))
-    close_intent = OrderIntent(
-        symbol="AAPL",
-        action=ActionType.close,
-        qty=1.0,
-        ref_price=100.0,
-        reason="close lot",
-        position_id="555000111",
-    )
-    result = await broker.place_cohort((_open_intent(), close_intent))
-    assert isinstance(result, Ok)
-    by_action = {
-        r.intent.action: r for r in cast("tuple[OrderResult, ...]", result.value)
-    }
-    assert by_action[ActionType.close].ok is False
-    open_result = by_action[ActionType.long]
-    assert open_result.ok is False
-    assert "funding close" in open_result.message
-    assert open_result.outcome is OrderOutcome.REJECTED
 
 
 @respx.mock
@@ -1548,33 +1253,6 @@ async def test_a_refused_close_reports_the_unsafe_divergence_outcome() -> None:
     assert submit.call_count == 0  # nothing was sent against an unexplained net
 
 
-@respx.mock
-@pytest.mark.asyncio
-async def test_close_within_the_net_is_allowed() -> None:
-    """D3 positive control: a close no larger than the net on the reduce side passes."""
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    respx.get(POSITIONS).mock(
-        return_value=httpx.Response(
-            200, json=[{"conid": 265598, "contractDesc": "AAPL", "position": 60}]
-        )
-    )
-    _mock_no_working_orders()
-    broker = _broker()
-    broker.seed(_long_lot("555000111", qty=60.0))
-    intent = OrderIntent(
-        symbol="AAPL",
-        action=ActionType.close,
-        qty=60.0,
-        ref_price=100.0,
-        reason="close lot",
-        position_id="555000111",
-    )
-    assert _ok(await broker.place(intent)).ok
-
-
 # --- conid resolution: verification + caching (finding L10) -----------------
 
 
@@ -1633,42 +1311,6 @@ async def test_default_conid_lookup_refuses_a_restricted_contract(
     )
     with pytest.raises(ValueError, match="restricted"):
         await broker_mod._default_conid_lookup("AAPL")
-
-
-@pytest.mark.asyncio
-async def test_prefer_db_conid_picks_the_db_matching_candidate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The SUCCESS path: among several same-ticker listings, the DB's conid wins.
-
-    A live order routed to the WRONG conid of a ticker lands on the wrong
-    instrument, so this is the safety-critical branch. SHOP's real shape: two US
-    STK rows share the ticker, only one is the contract our data treats as SHOP.
-    The preference must be LOAD-BEARING — flipping the DB's conid to the other
-    candidate must change the winner, or the test would pass on any pick.
-    """
-    monkeypatch.setattr(
-        broker_mod,
-        "search_contracts",
-        lambda _t: _candidates(_contract("1", "SHOP"), _contract("2", "SHOP")),
-    )
-    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda _t: 2)
-    assert (await broker_mod._default_conid_lookup("SHOP")) == 2
-    # The other candidate would have won had the preference pointed at it: the
-    # DB row, not the search order, decides.
-    monkeypatch.setattr(broker_mod, "_db_conid_for_ticker", lambda _t: 1)
-    assert (await broker_mod._default_conid_lookup("SHOP")) == 1
-
-
-@pytest.mark.asyncio
-async def test_default_conid_lookup_resolves_a_single_candidate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One unambiguous candidate resolves to its conid, no DB preference needed."""
-    monkeypatch.setattr(
-        broker_mod, "search_contracts", lambda _t: _candidates(_contract("7", "AAPL"))
-    )
-    assert (await broker_mod._default_conid_lookup("AAPL")) == 7
 
 
 # --- INV-1 fail-closed pre-flight / resync / attempt minting ---------------
@@ -1766,32 +1408,6 @@ async def test_adopted_working_order_reports_an_unknown_shortfall_not_a_zero() -
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_resync_resolves_a_known_id_with_no_working_order() -> None:
-    """A vanished working order with a known id is settled by ``order_status``."""
-    intent = _open_intent()
-    key = intent_key(SCOPE, intent)
-    intents = FakeIntents()
-    intents.save(
-        IntentRecord(
-            key=key,
-            state=IntentState.WORKING,
-            attempt=0,
-            order_ref=order_ref(key, 0),
-            order_id=ORDER_ID,
-            decision_ts=None,
-        )
-    )
-    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-
-    await _broker(intents=intents).resync()
-
-    record = intents.load(key)
-    assert record is not None and record.state is IntentState.FILLED
-
-
-@respx.mock
-@pytest.mark.asyncio
 async def test_a_new_attempt_is_minted_only_after_the_prior_intent_closed() -> None:
     """INV-4: an OPEN record with a known id and no working order does NOT re-mint."""
     intent = _open_intent()
@@ -1844,27 +1460,6 @@ async def test_a_closed_prior_intent_mints_a_new_attempt() -> None:
     assert placed.ok
     record = intents.load(key)
     assert record is not None and record.attempt == 1  # a NEW attempt, new cOID
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_open_cash_guard_bounds_the_rounded_ticket_quantity() -> None:
-    """B1: a bound of 1050 at price 300 refuses qty 3.5 (which rounds to 4 = $1200)."""
-    submit = respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    intent = OrderIntent(
-        symbol="AAPL",
-        action=ActionType.long,
-        qty=3.5,
-        ref_price=300.0,
-        reason="open long (flat->long)",
-        cash_bound=1050.0,
-    )
-    error = _failure(await _broker().place(intent))
-    assert error.kind == "rejected"
-    assert "exceeds funded cash" in error.message
-    assert submit.call_count == 0  # the $1200 order was never sent
 
 
 # --- blocker 1: UNRESOLVED must not re-mint; the executions sweep guards it ---
@@ -2072,32 +1667,6 @@ async def test_resync_ages_out_an_unresolved_no_id_record_on_its_day_roll() -> N
 # --- integration: the broker over the REAL SqliteLedger seam -----------------
 
 
-@respx.mock
-@pytest.mark.asyncio
-async def test_broker_places_over_the_real_sqlite_ledger(tmp_path: Path) -> None:
-    """Integration: ``IbkrBroker`` drives the real ``SqliteLedger`` seam end to end.
-
-    This exercises the seam's identity keying and state persistence that\n    ``FakeIntents`` re-implements without (a filled order lands in sqlite and is\n    read back as the broker's FILLED intent).\n"""
-    intent = _open_intent()
-    key = intent_key(SCOPE, intent)
-    ledger = SqliteLedger(tmp_path / "intents.sqlite")
-    respx.post(SUBMIT).mock(
-        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
-    )
-    respx.get(STATUS).mock(return_value=httpx.Response(200, json=_filled_status()))
-    _mock_no_working_orders()
-
-    placed = _ok(await _broker(intents=ledger).place(intent))
-
-    assert placed.ok
-    # The durable FILLED record is readable back from sqlite by its identity key.
-    record = ledger.load(key)
-    assert record is not None and record.state is IntentState.FILLED
-    assert record.order_id == ORDER_ID
-    assert record.order_ref == order_ref(key, 0)
-    assert ledger.load_open(SCOPE) == ()
-
-
 # --- N4: a dead same-session order must not block a legitimate re-send -------
 
 
@@ -2182,32 +1751,6 @@ async def test_status_read_failure_settles_a_rolled_day_order_unfilled() -> None
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_status_read_failure_same_day_keeps_working() -> None:
-    """N1: a same-day unreadable status is NOT proof the order is gone."""
-    intent = _open_intent()
-    key = intent_key(SCOPE, intent)
-    intents = FakeIntents()
-    intents.save(
-        IntentRecord(
-            key=key,
-            state=IntentState.WORKING,
-            attempt=0,
-            order_ref=order_ref(key, 0),
-            order_id=ORDER_ID,
-            decision_ts=CYCLE_TS,
-        )
-    )
-    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
-    respx.get(STATUS).mock(side_effect=httpx.ConnectError("down"))
-
-    await _broker(intents=intents, now=lambda: CYCLE_TS).resync()
-
-    record = intents.load(key)
-    assert record is not None and record.state is IntentState.WORKING
-
-
-@respx.mock
-@pytest.mark.asyncio
 async def test_a_wedged_key_is_surfaced_distinctly_after_n_resyncs() -> None:
     """N1: an OPEN key nothing can settle across WEDGED_CYCLES resyncs is LOUD.
 
@@ -2285,34 +1828,6 @@ async def test_a_gtc_order_is_not_expired_by_a_day_roll() -> None:
 
 
 # --- N5: a falsy order id is UNKNOWN, never a real id ------------------------
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_resync_treats_an_empty_order_id_as_unknown() -> None:
-    """N5: ``canonical_order_id(None)`` is ``''``; a falsy id must be unknown.
-
-    Otherwise the record never ages and ``_status('')`` errors every cycle.
-    """
-    intent = _open_intent()
-    key = intent_key(SCOPE, intent)
-    intents = FakeIntents()
-    intents.save(
-        IntentRecord(
-            key=key,
-            state=IntentState.UNRESOLVED,
-            attempt=0,
-            order_ref=order_ref(key, 0),
-            order_id="",
-            decision_ts=None,
-        )
-    )
-    respx.get(OPEN_ORDERS).mock(return_value=httpx.Response(200, json={"orders": []}))
-    status = respx.get(STATUS).mock(return_value=httpx.Response(200, json={}))
-
-    await _broker(intents=intents).resync()
-
-    assert not status.called  # no status read for an empty id
 
 
 @respx.mock

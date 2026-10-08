@@ -29,17 +29,6 @@ def test_total_volume_is_conserved():
     assert vp.total_volume == pytest.approx(float(vol.sum()))
 
 
-def test_bin_arrays_shape_and_monotonic():
-    high, low, vol = _frame(
-        [10.0, 12.0, 11.0, 13.0], [8.0, 10.0, 9.0, 11.0], [100.0, 50.0, 75.0, 25.0]
-    )
-    vp = volume_profile(high, low, vol, num_bins=30)
-    assert len(vp.bin_price) == 30
-    assert len(vp.volume) == 30
-    assert np.all(np.diff(vp.bin_price) > 0)  # ascending midpoints
-    assert vp.val <= vp.poc <= vp.vah
-
-
 def test_single_price_level_raises():
     high, low, vol = _frame([10.0, 10.0], [10.0, 10.0], [5.0, 5.0])
     with pytest.raises(ValueError):

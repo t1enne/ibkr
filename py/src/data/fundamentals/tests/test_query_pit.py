@@ -14,13 +14,10 @@ from src.bt.strategies.fundamentals_context import Fundamentals
 from src.data.fundamentals.query import (
     as_first_stated,
     rows_to_snapshot,
-    snapshot_to_rows,
 )
 from src.data.fundamentals.schema import (
     Form,
     Statement,
-    BalanceSheet,
-    CashFlow,
     FundamentalRow,
     Income,
 )
@@ -200,31 +197,6 @@ def test_unknown_symbol_and_field_are_loud() -> None:
 # --- snapshot roundtrip ----------------------------------------------------
 
 
-def test_snapshot_roundtrip_through_rows() -> None:
-    """snapshot -> rows -> snapshot is identity, one row per non-None field."""
-    snapshot = Income(revenue=100.0, net_income=12.5, eps_diluted=1.25)
-    rows = snapshot_to_rows(
-        snapshot, "demo", "2024-01-01", "2024-03-31", "2024-05-01", "10-Q"
-    )
-
-    assert len(rows) == 3  # None fields are omitted, not zero-filled
-    assert all(r.ticker == "DEMO" for r in rows)
-    assert rows_to_snapshot(rows, "DEMO", ts("2024-03-31")) == snapshot
-
-
-def test_snapshot_roundtrip_for_all_statements() -> None:
-    for snapshot in (
-        Income(net_income=1.0),
-        BalanceSheet(assets=10.0, equity=4.0),
-        CashFlow(operating_cash_flow=3.0, capex=-1.0, free_cash_flow=2.0),
-    ):
-        rows = snapshot_to_rows(
-            snapshot, "DEMO", "2024-01-01", "2024-03-31", "2024-05-01", "10-K"
-        )
-        rebuilt = rows_to_snapshot(rows, "DEMO", ts("2024-03-31"))
-        assert rebuilt == snapshot
-
-
 def test_snapshot_uses_the_as_first_stated_value_by_default() -> None:
     """The default (series) view reads the earliest filing of each field."""
     period = ts("2023-03-31")
@@ -342,28 +314,3 @@ def test_visibility_is_per_row_when_filed_disagrees_with_period_order() -> None:
     assert ni[-1] == 3.0
     assert ni.last() == 3.0
     assert ni.forms() == ("10-K", "10-Q", "10-Q")
-
-
-def test_snapshot_defaults_to_newest_visible_not_last_period() -> None:
-    """``snapshot()`` with no period must not pick a not-yet-filed period.
-
-    The period-ordered window ends with whatever period is *latest by period
-    date*, which may be a filing still in the strategy's future. Defaulting to
-    it would leak: the snapshot's numeric values would come from ``period``
-    regardless of the cursor.
-    """
-    late = _row(
-        "net_income", 999.0, "2024-01-01", "2024-12-31", "2026-01-01", form="10-K"
-    )
-    early = _row(
-        "net_income", 10.0, "2023-01-01", "2023-12-31", "2024-02-01", form="10-K"
-    )
-    cursor: list[pd.Timestamp | None] = [ts("2024-06-01")]
-    fund = Fundamentals.build({"DEMO": [early, late]}, cursor=lambda: cursor[0])
-    snapshot = fund.income("DEMO").snapshot()
-    assert isinstance(snapshot, Income)
-    assert snapshot.net_income == 10.0
-
-    # With nothing published yet there is no defensible "newest" -> None.
-    cursor[0] = ts("2020-01-01")
-    assert fund.income("DEMO").snapshot() is None

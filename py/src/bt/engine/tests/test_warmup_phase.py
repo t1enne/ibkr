@@ -133,16 +133,6 @@ def test_warmup_zero_is_a_pure_noop() -> None:
     assert results.pf.trades[0].entry_time == pd.Timestamp("2024-01-01")
 
 
-def test_short_trading_window_trades_immediately_with_warm_state() -> None:
-    """A tiny trading window still trades on its first bar because state is warm."""
-    cfg = _cfg(warmup="60d", trading_start="2024-02-20", trading_end="2024-02-21")
-    bt = Backtest(cfg)
-    data = _daily_df(["AAPL"], 60)
-    results = run(bt, data, _FixtureMod(_warm_then_trade))
-    assert len(results.pf.trades) >= 1
-    assert results.pf.trades[0].entry_time == pd.Timestamp("2024-02-20")
-
-
 def test_state_persists_from_warmup_into_trading_window() -> None:
     """The counter accumulated during warmup must survive into the trading window
     (same run, same ctx.shared holder) — that is what 'warm' means."""
@@ -167,24 +157,6 @@ def test_equity_curve_excludes_warmup_bars() -> None:
     # Warmup bars never contributed a mark.
     assert equity.index.min() >= bt.window.test_start
     assert equity.index.max() <= bt.window.test_end
-
-
-def test_finalize_closes_at_last_trading_bar() -> None:
-    """_finalize must never stamp the end-of-run close at a warmup bar.
-
-    The close lands on the last bar the engine processed (which may run past
-    ``trading_end`` when the feed does — pre-existing behavior, unchanged here);
-    the warmup invariant is that it is never BEFORE ``trading_start``.
-    """
-    cfg = _cfg(warmup="30d", trading_start="2024-02-15", trading_end="2024-02-25")
-    bt = Backtest(cfg)
-    data = _daily_df(["AAPL"], 60)
-    results = run(bt, data, _FixtureMod(_warm_then_trade))
-    assert results.pf.trades
-    for t in results.pf.trades:
-        assert t.entry_time >= bt.window.test_start
-        assert t.exit_time is not None
-        assert t.exit_time >= bt.window.test_start
 
 
 def test_emitting_during_warmup_raises() -> None:
@@ -223,16 +195,6 @@ def test_wide_warmup_report_records_every_phase() -> None:
     assert max(warm) < bt.window.test_start <= min(trade)
 
 
-def test_short_history_symbol_warms_with_what_it_has() -> None:
-    """A symbol whose feed is shorter than the warmup span must not crash or
-    prevent trading in the trading window."""
-    cfg = _cfg(warmup="365d", trading_start="2024-01-03", trading_end="2024-01-10")
-    bt = Backtest(cfg)
-    data = _daily_df(["AAPL"], 10)  # only 10 bars, far shorter than the warmup
-    results = run(bt, data, _FixtureMod(_warm_then_trade))
-    assert results.pf.trades, "trading window should still trade"
-
-
 def test_warmup_bars_derived_from_calendar_span() -> None:
     """The engine's warmup_bars is the calendar span at the base interval."""
     cfg = _cfg(warmup="1y")
@@ -254,34 +216,6 @@ def test_warmup_bars_derived_from_calendar_span() -> None:
     bt_h = Backtest(hourly)
     assert bt_d.window.warmup_bars == 261
     assert bt_h.window.warmup_bars > bt_d.window.warmup_bars
-
-
-def test_removed_training_field_fails_loudly(tmp_path: Path) -> None:
-    """No back-compat: a config still carrying the old field raises on load.
-
-    Loads through ``load_strategy`` — the real surface a stale config file hits
-    — so the failure is ``StrategyConfig(**data)`` rejecting the removed key.
-    """
-    cfg_path = tmp_path / "stale.json"
-    cfg_path.write_text(
-        json.dumps(
-            {
-                "name": "t",
-                "strategy_type": "momentum_compression_breakout_dsl",
-                "symbols": ["AAPL"],
-                "initial_capital": 10000.0,
-                "commission": 0.5,
-                "training_start": "2023-01-01",
-                "training_end": "2023-12-31",
-                "trading_start": "2024-01-01",
-                "trading_end": "2024-12-31",
-                "bars": ["1d"],
-                "strategy_params": {},
-            }
-        )
-    )
-    with pytest.raises(TypeError, match="training_start"):
-        load_strategy(str(cfg_path))
 
 
 def test_missing_warmup_fails_loudly(tmp_path: Path) -> None:

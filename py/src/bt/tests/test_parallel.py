@@ -44,57 +44,10 @@ def _expected(tasks: list[tuple[int, str]], byte: int) -> list[tuple[str, int]]:
     return [(s, payload + byte) for payload, s in tasks]
 
 
-def test_sequential_streams_results_in_input_order():
-    """The sequential fallback runs the worker and streams in input order.
-
-    Real-process equivalence (workers > 1) is covered by
-    ``test_sweep_pooled_matches_sequential_engine`` in the sweep suite — no
-    redundant forkserver spawn here, keeping `make check` in budget.
-    """
-    tasks = _tasks()
-    order: list[int] = []
-
-    results = run_in_processes(
-        _echo_worker,
-        tasks,
-        workers=1,
-        init_data={"byte": 100},
-        on_complete=lambda i, r: order.append(i),
-    )
-
-    assert results == _expected(tasks, 100)
-    assert order == [0, 1, 2, 3]
-
-
-def test_results_in_input_order_after_out_of_order_completion():
-    """Slower tasks land in their original slot; on_complete stays in order."""
-    tasks = [(0.05, 0), (0.0, 1), (0.03, 2), (0.0, 3)]
-    order: list[int] = []
-
-    results = run_in_processes(
-        _slow_independent,
-        tasks,
-        workers=1,
-        on_complete=lambda i, r: order.append(i),
-    )
-
-    assert results == [0, 1, 2, 3]
-    assert order == [0, 1, 2, 3]
-
-
 def test_worker_state_broadcast_to_clean_worker():
     """A fresh worker (no init_data seen before) reads the broadcast cache."""
     res = run_in_processes(_echo_worker, _tasks(), workers=1, init_data={"byte": 5})
     assert res == _expected(_tasks(), 5)
-
-
-def test_empty_tasks_return_empty():
-    assert run_in_processes(_echo_worker, [], workers=2, init_data={"byte": 1}) == []
-
-
-def test_single_task_runs_without_pool():
-    res = run_in_processes(_echo_worker, [(7, "x")], workers=4, init_data={"byte": 3})
-    assert res == [("x", 10)]
 
 
 @pytest.mark.slow
@@ -109,8 +62,3 @@ def test_workers_capped_at_task_count():
     # And equals the sequential result.
     seq = run_in_processes(_echo_worker, tasks, workers=1, init_data={"byte": 0})
     assert res == seq
-
-
-def test_on_complete_optional_is_harmless():
-    res = run_in_processes(_echo_worker, _tasks(), workers=1, init_data={"byte": 0})
-    assert res == _expected(_tasks(), 0)

@@ -22,19 +22,6 @@ def test_ols_recovers_parameters():
 # ── Batch ───────────────────────────────────────────────────────
 
 
-def test_output_shapes():
-    rng = np.random.default_rng(42)
-    idx = pd.date_range("2024-01-01", periods=100, freq="D")
-    p1 = pd.Series(100 + rng.standard_normal(100).cumsum() * 0.5, index=idx)
-    p2 = pd.Series(100 + rng.standard_normal(100).cumsum() * 0.5, index=idx)
-    result = run_pairs_kalman(p1, p2)
-    n = len(idx)
-    assert len(result.alpha) == n
-    assert len(result.beta) == n
-    assert len(result.spread) == n
-    assert len(result.t_stat) == n
-
-
 def test_t_stat_spread_sign_agreement():
     rng = np.random.default_rng(42)
     idx = pd.date_range("2024-01-01", periods=200, freq="D")

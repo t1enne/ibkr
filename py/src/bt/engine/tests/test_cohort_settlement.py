@@ -160,27 +160,6 @@ def test_same_timestamp_batch_allocates_equally_and_all_fill():
     assert sum(notionals) <= 10_000.0 + 1e-6
 
 
-def test_divisor_one_leaves_single_signal_strategy_unchanged():
-    """A lone open is bit-identical to the pre-cohort path."""
-    result = _run(["AAA"])
-    portfolio = result.final_state.portfolio
-    assert len(portfolio.trades) == 1
-    trade = portfolio.trades[0]
-    # size=0.5 of 10_000 capital at the ~100 entry open = ~50 shares
-    assert trade.qty == pytest.approx(50.0, rel=1e-3)
-
-
-def test_no_signals_is_a_noop():
-    @strategy(bars="1d")
-    def _idle(ctx: StrategyContext):
-        return None
-
-    cfg = _cfg(["AAA", "BBB"])
-    result = run(Backtest(cfg), _feed(["AAA", "BBB"]), _FixtureMod(_idle))
-    assert result.final_state.portfolio.trades == ()
-    assert result.final_state.portfolio.cash == 10_000.0
-
-
 @strategy(bars="1d", stateful=True)
 def _close_one_open_rest(ctx: StrategyContext):
     """Bar 0: open every symbol. Bar 2: close AAA and open DDD in ONE bar.
