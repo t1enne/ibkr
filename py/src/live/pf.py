@@ -27,6 +27,7 @@ from typing import cast
 import pandas as pd
 
 from src.bt.cmds._shared import _json_default
+from src.bt.state import ActionType
 from src.shared.style import PLAIN, Role, Styler
 from src.bt.table import Col, Table, render
 from src.data.ibkr.client import IbkrClient, IbkrError
@@ -623,7 +624,7 @@ def _position_row(
 ) -> PositionRow:
     """One merged row: the lot view when open, else the fill/order trail."""
     qty = view.qty if view is not None else abs(flow.net)
-    side = _side(view, flow)
+    side = _side(view, flow, intent)
     entry = view.entry if view is not None else _avg_entry(flow)
     return PositionRow(
         scope=scope,
@@ -668,13 +669,26 @@ def _order_ref(view: _LotView | None, intent: IntentRecord | None) -> str:
     return intent.order_ref if intent is not None else ""
 
 
-def _side(view: _LotView | None, flow: _Flows) -> str:
-    """``long``/``short``: the open lot's own side, else the fills' direction."""
+def _side(view: _LotView | None, flow: _Flows, intent: IntentRecord | None) -> str:
+    """``long``/``short``: the open lot's own side, else the fills', else the ORDER's.
+
+    With no lot and no fill there is no exposure to read a side off, so the newest
+    intent's action names it — a pending long OPEN is LONG, not "not a buy". A
+    close (or no intent at all) leaves the side BLANK: an unprovable side is never
+    defaulted to a short.
+    """
     if view is not None:
         return view.side
     if flow.net != 0.0:
         return _LONG if flow.net > 0 else _SHORT
-    return _LONG if flow.buy_qty else _SHORT
+    if flow.buy_qty or flow.sell_qty:
+        return _LONG if flow.buy_qty else _SHORT
+    if intent is not None:
+        if intent.key.action is ActionType.long:
+            return _LONG
+        if intent.key.action is ActionType.short:
+            return _SHORT
+    return ""
 
 
 def _status(intent: IntentRecord | None, flow: _Flows) -> str:

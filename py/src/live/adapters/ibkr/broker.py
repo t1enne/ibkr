@@ -369,15 +369,11 @@ class IbkrBroker:
                     symbol=intent.symbol,
                 )
             )
-        account = self._account or self._client.account
-        if not account:
-            return Err(
-                FeedError(
-                    kind="auth",
-                    message="no account configured (set IBKR_ACCOUNT)",
-                    symbol=intent.symbol,
-                )
-            )
+        account = (
+            self._account
+            or self._client.account
+            or await self._client.resolve_account()
+        )
         prepared = await self._prepare_leg(intent)
         if isinstance(prepared, Err):
             return Err(cast("FeedError", prepared.error))

@@ -251,14 +251,14 @@ class IbkrClient:
 
     async def portfolio_summary(self, account: str | None = None) -> dict[str, Any]:
         """``/portfolio/{acct}/summary`` — cash and net liquidation for the book."""
-        account = self._require_account(account)
+        account = await self._account_for(account)
         return cast("dict[str, Any]", await self._get(f"portfolio/{account}/summary"))
 
     async def positions(
         self, account: str | None = None, page: int = 0
     ) -> list[dict[str, Any]]:
         """``/portfolio/{acct}/positions/{page}`` — one page of net positions."""
-        account = self._require_account(account)
+        account = await self._account_for(account)
         body = await self._get(f"portfolio/{account}/positions/{page}")
         return cast("list[dict[str, Any]]", _as_list(body, "positions"))
 
@@ -270,7 +270,7 @@ class IbkrClient:
         pages ~30 rows). A hard page cap guards against a gateway that never
         returns a short page.
         """
-        account = self._require_account(account)
+        account = await self._account_for(account)
         out: list[dict[str, Any]] = []
         for page in range(1000):
             rows = await self.positions(account, page)
@@ -287,7 +287,7 @@ class IbkrClient:
         drop it, so the next ``positions`` read is freshly obtained. It discards a
         cache only — no order and no account state is touched.
         """
-        account = self._require_account(account)
+        account = await self._account_for(account)
         await self._post(f"portfolio/{account}/positions/invalidate")
 
     async def trades(self) -> list[dict[str, Any]]:
@@ -306,18 +306,18 @@ class IbkrClient:
 
     # -- helpers -----------------------------------------------------------
 
-    def _require_account(self, account: str | None) -> str:
-        """The explicit account, the configured one, or a typed failure.
+    async def _account_for(self, account: str | None) -> str:
+        """The explicit account, the configured one, else the session's own.
 
-        Never guesses across multiple accounts: an unset account is an
-        ``auth`` failure (the caller must name which book it reads).
+        An unset ``IBKR_ACCOUNT`` is NOT an error: the gateway already knows
+        which book the authenticated session serves, so fall back to
+        :meth:`resolve_account` and read what it names. Only a session that
+        serves no account at all is a typed ``auth`` failure.
         """
         resolved = account or self.account
-        if not resolved:
-            raise IbkrError(
-                "auth", "no account configured (set IBKR_ACCOUNT)", "portfolio"
-            )
-        return resolved
+        if resolved:
+            return resolved
+        return await self.resolve_account()
 
 
 def _as_list(body: object, field: str) -> list[object]:
