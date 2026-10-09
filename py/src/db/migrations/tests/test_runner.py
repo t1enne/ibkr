@@ -122,6 +122,43 @@ def test_a_hand_migrated_db_absorbs_the_baseline_without_new_legacy_tables(
     assert "live_position" in db.get_tables()
 
 
+# ── 2b. a failed schema build rolls the legacy rename back ────────
+
+
+def test_a_failed_live_baseline_build_rolls_the_rename_back(
+    db: peewee.SqliteDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy rename and the current-schema build are ONE transaction.
+
+    The live baseline renames a pre-4.1 ``live_position`` to its preserved
+    ``*_legacy`` copy and then builds the current table. When the build fails the
+    rename must roll back with it: a committed rename against an unbuilt schema
+    leaves neither shape readable, so the book reads downstream as FLAT and every
+    position is re-opened.
+    """
+    from src.db.migrations.versions.live_0001_baseline import up as live_up
+
+    db.execute_sql(
+        "CREATE TABLE live_position (strategy_id TEXT, position_id TEXT, "
+        "symbol TEXT, side TEXT, qty REAL, status TEXT, "
+        "PRIMARY KEY (strategy_id, position_id))"
+    )
+    db.execute_sql(
+        "INSERT INTO live_position VALUES ('h1','lot-1','AAPL','long',10.0,'open')"
+    )
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("schema build failed mid-transaction")
+
+    monkeypatch.setattr(db, "create_tables", explode)
+    with pytest.raises(RuntimeError, match="mid-transaction"):
+        run_pending(db, (Migration(name="live_0001_baseline", up=live_up),))
+
+    (symbol,) = db.execute_sql("SELECT symbol FROM live_position").fetchone()
+    assert symbol == "AAPL", "a legacy row must survive a failed schema build"
+    assert bookkeeping.applied_names(db) == frozenset()
+
+
 # ── 3. a raising up() rolls back ──────────────────────────────────
 
 

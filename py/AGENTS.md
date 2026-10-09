@@ -168,9 +168,11 @@ uv run ibkr db migrate --down --yes  # unwind (refuses an irreversible target)
   `versions/` (the explicit ordered tuples `LIVE_MIGRATIONS` / `DATA_MIGRATIONS`).
 - **Order is the tuple order** in `versions/__init__.py`. There is no filename scan
   and no discovery — a rename cannot silently reorder history.
-- **Two registries, never one.** `ibkr db migrate` runs both (one per file); the
-  ledger's `_ready_schema` runs **LIVE only**, so the first write of a cycle never
-  replays a slow multi-million-row candle migration.
+- **Two registries, never one.** `ibkr db migrate` runs both (one per file). The
+  ledger writes **no DDL at all** and never migrates — a ledger bound to an
+  unmigrated file fails loud (`no such table`) rather than building a half-schema
+  under a live order, so a cycle never replays a slow multi-million-row candle
+  migration before it can place.
 - **Concurrency:** a batch's `up()`s + bookkeeping writes share ONE
   `BEGIN IMMEDIATE` transaction, so racing runners serialize on the SQLite write
   lock. There is no separate lock table — the write lock IS the mutex.

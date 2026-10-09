@@ -17,6 +17,7 @@ from src.live.engine import (
 )
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
 from src.live.ledger import SimLot, SqliteLedger
+from src.live.tests.ledgers import live_ledger
 from src.live.lease import CycleInProgressError
 from src.live.result import Err, Ok, Result
 from src.live.types import (
@@ -233,7 +234,7 @@ async def test_sim_ownership_survives_a_config_hash_change(tmp_path: Path) -> No
     # stable scope: the earlier lot stays closable (never HOLD-forever).
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
     ledger.record_sim_open("momentum", "L1")
 
     report = await run_cycle(
@@ -256,7 +257,7 @@ async def test_run_cycle_refuses_when_a_cycle_lease_is_held(tmp_path: Path) -> N
     # A cron overlap / racing human run must refuse to start, not both place.
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
 
     with ledger.cycle_lease("S1"):
         with pytest.raises(CycleInProgressError):
@@ -278,7 +279,7 @@ async def test_dry_run_takes_no_lease(tmp_path: Path) -> None:
     # A read-only run must never be blocked by a live cycle holding the lease.
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
 
     with ledger.cycle_lease("S1"):
         report = await run_cycle(
@@ -302,7 +303,7 @@ async def test_sim_unnamed_open_records_nothing(tmp_path: Path) -> None:
     # A lot the broker did not name can never be targeted by a close: not owned.
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
 
     report = await run_cycle(
         CFG,
@@ -325,7 +326,7 @@ async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
     # A rejected close records NOTHING: the lot stays owned for a later cycle.
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
     ledger.record_sim_open("S1", "L1")
 
     await run_cycle(
@@ -345,6 +346,12 @@ async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
+    """A read-only cycle writes NOTHING — not a row, not a byte of schema.
+
+    Deliberately bound to an UNMIGRATED file: the ledger owns no DDL at all, so
+    even a dry run against a virgin path must leave ``sqlite_master`` empty and
+    read the missing tables as an empty book.
+    """
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
     ledger_path = tmp_path / "l.sqlite"
@@ -376,52 +383,13 @@ async def test_dry_run_writes_nothing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dry_run_writes_no_peewee_live_tables(tmp_path: Path) -> None:
-    """peewee lazy DDL: a dry-run cycle leaves the live models absent from
-    ``sqlite_master`` (create_tables never runs on a read-only path)."""
-    db = tmp_path / "c.sqlite"
-    make_candle_db(db, "AAPL", TS)
-    ledger_path = tmp_path / "l.sqlite"
-    ledger = SqliteLedger(ledger_path)
-    adapter = FakeAdapter(book())
-
-    report = await run_cycle(
-        CFG,
-        adapter=adapter,
-        ledger=ledger,
-        strategy_id="S1",
-        scope="S1",
-        config_path="x.json",
-        now=TS,
-        db_path=db,
-        dry_run=True,
-        signal_source=_source_fn(LONG_10),
-    )
-
-    assert report.results == () and adapter.placed == []
-    with get_connection(ledger_path) as con:
-        tables = {
-            r[0]
-            for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-    live_tables = {
-        "live_strategy",
-        "live_position",
-        "live_execution",
-        "live_cash",
-        "live_order_intent",
-    }
-    assert tables.isdisjoint(live_tables)  # peewee DDL withheld on a dry run
-
-
-@pytest.mark.asyncio
 async def test_run_cycle_cohort_error_is_surfaced_not_silently_empty(
     tmp_path: Path,
 ) -> None:
     """A cohort-level ``Err`` must reach the report, not read as "0 orders" (M1)."""
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
 
     report = await run_cycle(
         CFG,
@@ -446,7 +414,7 @@ async def test_dry_run_never_resyncs(tmp_path: Path) -> None:
     # resync persists state, which a read-only run must not do.
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
     adapter = FakeAdapter(book())
 
     await run_cycle(
@@ -479,7 +447,7 @@ async def test_a_sim_close_settles_and_leaves_the_book_flat(tmp_path: Path) -> N
     """A close through the adapter+ledger round trip empties the book."""
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
     scope = "sim_momentum_1a2b3c4d"
 
     await run_cycle(
@@ -517,7 +485,7 @@ async def test_a_second_cycle_on_the_same_scope_is_refused(tmp_path: Path) -> No
     """The lease is PER SCOPE: one scope refuses a concurrent cycle."""
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
 
     with ledger.cycle_lease("sim_a_1"):
         with pytest.raises(CycleInProgressError):
@@ -547,7 +515,7 @@ async def test_a_hand_edited_account_lot_is_a_divergence_and_unsafe(
     """
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
     scope = "sim_momentum_1a2b3c4d"
     # An account lot with NO fill behind it (the edit a human makes).
     ledger.record_sim_lot(
@@ -584,7 +552,7 @@ async def test_agreeing_books_report_no_divergence(tmp_path: Path) -> None:
     """A cycle whose fills explain its account rows is clean."""
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
-    ledger = SqliteLedger(tmp_path / "l.sqlite")
+    ledger = live_ledger(tmp_path / "l.sqlite")
     scope = "sim_momentum_1a2b3c4d"
 
     first = await run_cycle(

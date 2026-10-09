@@ -7,26 +7,32 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
+import peewee
 import pytest
 
 
+from src.bt.state import ActionType, FillEvent
 from src.data.db import get_connection
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
-from src.bt.state import ActionType
 from src.live.identity import (
     IntentKey,
     IntentRecord,
     IntentState,
     order_ref,
 )
+from src.live import ledger as ledger_module
 from src.live.ledger import (
     LedgerReadError,
+    SimLot,
     SqliteLedger,
 )
 from src.live.lease import CycleInProgressError
-from src.live.ledger import SimLot
+from src.live.tests.ledgers import live_ledger
+from src.live.pure import OrderResult, intent_to_signal
+from src.live.pure_plan import ResultWrite
+from src.live.types import OrderIntent
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
 OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
@@ -34,7 +40,7 @@ OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
 
 @pytest.fixture
 def ledger(tmp_path: Path) -> SqliteLedger:
-    return SqliteLedger(tmp_path / "ledger.sqlite")
+    return live_ledger(tmp_path / "ledger.sqlite")
 
 
 def _exec(
@@ -73,6 +79,23 @@ def test_constructing_a_ledger_writes_no_ddl(tmp_path: Path) -> None:
     # A --dry-run must write nothing, including no schema (plan §6 phase 3.5).
     db = tmp_path / "fresh.sqlite"
     SqliteLedger(db)
+    assert _tables(db) == set()
+
+
+def test_a_write_on_an_unmigrated_file_fails_loud_and_writes_no_ddl(
+    tmp_path: Path,
+) -> None:
+    """The schema is ``ibkr db migrate``'s job: the ledger never builds one.
+
+    Pins the WHOLE post-migration-bootstrap contract. A ledger that quietly
+    created its tables on the first write would pass every other test here while
+    re-introducing the half-schema-under-a-live-order failure — so an unmigrated
+    file must raise, and must leave ``sqlite_master`` empty.
+    """
+    db = tmp_path / "unmigrated.sqlite"
+    ledger = SqliteLedger(db)
+    with pytest.raises(peewee.OperationalError, match="live_cash"):
+        ledger.ensure_cash("S1", 1000.0)
     assert _tables(db) == set()
 
 
@@ -142,7 +165,7 @@ def test_the_executions_book_refuses_a_non_conid_row(ledger: SqliteLedger) -> No
     An account-role row read as a book row would read downstream as "flat" and
     re-open the position, so the projection raises rather than skips it.
     """
-    ledger.ensure_cash("S1", 1000.0)  # first write builds the schema
+    ledger.ensure_cash("S1", 1000.0)
     with get_connection(ledger.db_path) as con:
         con.execute(
             "INSERT INTO live_position (scope, position_id, symbol, side, qty, "
@@ -157,9 +180,9 @@ def test_two_ledgers_on_two_paths_do_not_retarget_each_other(tmp_path: Path) -> 
     # peewee binds a model at CLASS level, so a single module-global database let a
     # second SqliteLedger silently retarget the first's connection (writes landing
     # in the wrong file, or a half-created schema). Each instance owns its db now.
-    a = SqliteLedger(tmp_path / "a.sqlite")
+    a = live_ledger(tmp_path / "a.sqlite")
     a.ensure_cash("S1", 111.0)
-    b = SqliteLedger(tmp_path / "b.sqlite")
+    b = live_ledger(tmp_path / "b.sqlite")
     b.ensure_cash("S1", 222.0)
     a.ensure_cash("S2", 333.0)  # a still writes to its OWN file
 
@@ -179,43 +202,6 @@ def test_prune_closed_deletes_only_old_closed(ledger: SqliteLedger) -> None:
     deleted = ledger.prune_closed(TS)
     assert deleted == 1
     assert ledger.load_book("S1").rows == ()
-
-
-def test_migration_check_and_action_are_one_atomic_unit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # D7(a): the "is-this-legacy" check and the rename run in ONE transaction, so a
-    # concurrent process cannot see a half-migrated schema and no check-then-act
-    # window exists. We prove ATOMICITY: when the DDL step fails the rename is
-    # fully ROLLED BACK — before the fix the rename committed on its own and the
-    # legacy table survived a failed first write. That, plus ``BEGIN IMMEDIATE``
-    # taking SQLite's write lock up front, is what makes two racing migration
-    # PROCESSES serialize instead of dropping each other's table.
-    db = tmp_path / "atomic.sqlite"
-    setup = get_connection(db)
-    setup.execute(
-        "CREATE TABLE live_position (strategy_id TEXT, position_id TEXT, "
-        "symbol TEXT, side TEXT, qty REAL, status TEXT, "
-        "PRIMARY KEY (strategy_id, position_id))"
-    )
-    setup.execute(
-        "INSERT INTO live_position VALUES ('h1','lot-1','AAPL','long',10.0,'open')"
-    )
-    setup.commit()
-    setup.close()
-    ledger = SqliteLedger(db)
-
-    def explode(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("schema build failed mid-transaction")
-
-    monkeypatch.setattr(ledger._database, "create_tables", explode)
-    with pytest.raises(RuntimeError, match="mid-transaction"):
-        ledger.ensure_strategy("h1", "momentum", "phase")
-    monkeypatch.undo()
-
-    with get_connection(db) as con:
-        kept = con.execute("SELECT symbol FROM live_position").fetchall()
-    assert kept == [("AAPL",)]  # no row lost to a failed migration
 
 
 def test_sim_lot_detail_round_trips_and_survives_a_bare_reopen(
@@ -252,6 +238,108 @@ def test_sim_lot_detail_round_trips_and_survives_a_bare_reopen(
     ledger.mark_sim_closed("S1", "AAPL_7", opened)
     assert ledger.sim_open_ids("S1") == frozenset()
     assert ledger.sim_open_lots("S1") == ()
+
+
+def test_an_ownership_only_lot_mints_no_fill_when_read_back(
+    ledger: SqliteLedger,
+) -> None:
+    """A lot with no size implies no fill, even after the row round-trips.
+
+    The row stores ``qty=0.0`` (the NOT NULL sentinel) with a real symbol, so a
+    detail test keyed on the symbol alone would mint a phantom zero-qty entry leg
+    into the scope's history — and that leg is what ``cash_of`` sums.
+    """
+    ledger.record_sim_lot(
+        "S1", SimLot(position_id="AAPL_9", symbol="AAPL", side="long")
+    )
+    (lot,) = ledger.sim_lots("S1")
+    assert lot.symbol == "AAPL" and lot.has_detail is False
+    assert ledger.sim_executions("S1") == ()
+
+
+def _result(pid: str | None, intent: OrderIntent, *, price: float) -> OrderResult:
+    return OrderResult(
+        intent=intent,
+        fill=FillEvent(
+            signal=intent_to_signal(intent, TS),
+            filled_qty=10.0,
+            executed_price=price,
+            commission=1.0,
+            slippage=0.0,
+            timestamp=TS,
+        ),
+        ok=True,
+        position_id=pid,
+    )
+
+
+def _open_result(pid: str = "L1") -> OrderResult:
+    return _result(
+        pid,
+        OrderIntent(
+            symbol="AAPL",
+            action=ActionType.long,
+            qty=10.0,
+            ref_price=100.0,
+            reason="test",
+        ),
+        price=100.0,
+    )
+
+
+def _close_result(pid: str = "L1", *, price: float = 110.0) -> OrderResult:
+    return _result(
+        None,
+        OrderIntent(
+            symbol="AAPL",
+            action=ActionType.close,
+            qty=10.0,
+            ref_price=price,
+            reason="test",
+            position_id=pid,
+        ),
+        price=price,
+    )
+
+
+def test_record_results_applies_every_write_of_a_cycle_atomically(
+    ledger: SqliteLedger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One cycle's results land TOGETHER: the caller never sees a half-cycle.
+
+    The failure is forced on the LAST write of a two-lot batch — after the first
+    lot's row is already inserted — so a per-write transaction would leave that
+    row behind and this asserts the whole batch rolled back. The patch wraps the
+    real ``_apply_write`` (the forced error is not the only write attempted), so
+    the first lot's insert really is in flight when the second one raises.
+    """
+    ledger.record_results("S1", (_open_result("L1"),), TS)
+    real = ledger_module._apply_write
+    calls = 0
+
+    def fail_last(scope: str, write: ResultWrite) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise peewee.IntegrityError("forced mid-cycle failure")
+        real(scope, write)
+
+    monkeypatch.setattr(ledger_module, "_apply_write", fail_last)
+    with pytest.raises(peewee.IntegrityError):
+        ledger.record_results("S1", (_open_result("L2"), _close_result("L2")), TS)
+    monkeypatch.undo()
+    assert ledger.sim_open_ids("S1") == frozenset({"L1"})
+    assert {r.execution_id for r in ledger.executions_of("S1")} == {"L1:open"}
+
+
+def test_re_running_the_same_results_changes_nothing(ledger: SqliteLedger) -> None:
+    """REPLACE/IGNORE keep a re-applied cycle idempotent (a re-run is a no-op)."""
+    results = (_open_result("L1"), _close_result("L1"))
+    ledger.record_results("S1", results, TS)
+    before = (ledger.sim_lots("S1"), ledger.executions_of("S1"))
+    ledger.record_results("S1", results, TS)
+    assert (ledger.sim_lots("S1"), ledger.executions_of("S1")) == before
+    assert len(ledger.executions_of("S1")) == 2  # entry + exit, no duplicates
 
 
 # --- pending order intents (PendingIntents) ---------------------------------

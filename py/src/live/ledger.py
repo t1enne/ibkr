@@ -7,9 +7,11 @@ re-applying the window is a no-op. The table carries both book ROLES, told apart
 by ``source``: ``executions`` rows are the immutable fold of our own fills (the
 IBKR reconcile book, keyed ``str(conid)``), ``account`` rows are the
 human/broker-editable exposure surface (the sim lot book).
-Live-only: the backtest persists nothing. Tables live in the SAME candle DB
-(``src.data.db``), created idempotently on first WRITE — a read (and therefore a
-``--dry-run``) writes no DDL.
+Live-only: the backtest persists nothing. Tables live in the LIVE file
+(``src.db.path.resolve_live_db_path``), whose schema is owned by ``src.db`` and
+applied by ``ibkr db migrate``. The ledger writes NO DDL: it never creates or
+migrates tables, so a ledger on an unmigrated file fails loud (``no such
+table``) rather than building a half-schema under a live order.
 
 ``strategy_id`` (the config hash) survives on ``live_strategy`` as an AUDIT
 column only — never an ownership filter. Ownership is the ``scope`` (the cOID
@@ -19,15 +21,21 @@ summary (N strategies share one account).
 
 Storage is peewee ORM over the same SQLite file. The model DDL mirrors the
 previous raw ``CREATE TABLE`` SQL column-for-column, so an existing phase-3.5
-book rows read back unchanged (``create_tables`` is ``IF NOT EXISTS`` and skips
-already-present matching tables). DDL stays lazy: ``create_tables`` runs only
-inside a WRITE path, never at import, never for a read/``--dry-run``.
+book rows read back unchanged. The ledger only ever reads and writes rows; the
+schema (and its lossless migrations) belong to ``src.db``.
 
 ``SqliteLedger`` is the seam implementing the live Protocols; its per-domain
 methods live in their own mixins (``SimLotStore`` and the stores below) so each
 class stays small. Shared plumbing (the template binding, the base model, the
 epoch codec) is in ``ledger_base``; the lossless migrations are in
 ``ledger_migration``. Every public method keeps its name and signature.
+
+The value shapes (``SimLot``/``ExecutionRecord``/``StrategyAudit``) live in
+:mod:`src.live.types` and the money/decision code (the write planner
+``plan_result_writes`` and the execution projections) lives in
+:mod:`src.live.pure_plan`; this module re-exports them so every existing import
+path keeps working. The ledger itself only reads rows and applies planned writes
+in ONE transaction per cycle.
 """
 
 from __future__ import annotations
@@ -37,7 +45,6 @@ import json
 import logging
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -46,18 +53,15 @@ import peewee
 from peewee import SqliteDatabase, fn
 
 from src.bt.state import ActionType
-from src.db.migrations.runner import run_pending
-from src.db.migrations.versions import LIVE_MIGRATIONS
 from src.db.path import resolve_live_db_path
 from src.exec.refs import scope_tag
-from src.exec.types import OrderSide
+
 from src.live.adapters.ibkr.trades import (
     BookRow,
     Execution,
     StrategyBook,
     is_ours,
 )
-from src.live.pure import OrderResult
 from src.live.identity import (
     OPEN_STATES,
     IntentKey,
@@ -83,6 +87,27 @@ from src.live.models import (
     LivePosition,
     LiveStrategy,
 )
+from src.live.pure import OrderResult
+from src.live.pure_plan import (
+    LotClose,
+    LotOpen,
+    ResultWrite,
+    execution_cash_delta,
+    next_attempt,
+    plan_result_writes,
+    sim_fill_records,
+)
+from src.live.types import ExecutionRecord, SimLot, StrategyAudit
+
+__all__ = [
+    "ExecutionRecord",
+    "LotClose",
+    "LotOpen",
+    "SimLot",
+    "SqliteLedger",
+    "StrategyAudit",
+    "execution_cash_delta",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +117,13 @@ logger = logging.getLogger(__name__)
 _MODELS = LIVE_MODELS
 
 _T = TypeVar("_T")
+
+#: The terminal (closed) intent states ``prune`` is allowed to delete.
+_CLOSED_INTENTS = [
+    IntentState.FILLED.value,
+    IntentState.UNFILLED.value,
+    IntentState.REJECTED.value,
+]
 
 
 def _read(db: SqliteDatabase, query: Callable[[], _T], default: _T) -> _T:
@@ -109,96 +141,6 @@ def _read(db: SqliteDatabase, query: Callable[[], _T], default: _T) -> _T:
         if not _is_missing_table(exc):
             raise LedgerReadError(str(exc)) from exc
         return default
-
-
-@dataclass(frozen=True)
-class StrategyAudit:
-    """One ``live_strategy`` audit row: which config revision wrote this scope.
-
-    ``strategy_id`` is the config HASH (an audit key, never an ownership filter);
-    ``created_at``/``last_cycle_at`` are the epoch-ms columns read back as UTC
-    timestamps (``None`` when unwritten).
-    """
-
-    strategy_id: str
-    scope: str
-    name: str
-    created_at: pd.Timestamp | None
-    last_cycle_at: pd.Timestamp | None
-
-
-@dataclass(frozen=True)
-class ExecutionRecord:
-    """One stored fill (``live_execution``) projected for the report.
-
-    ``live_execution`` stores ``position_id`` but no symbol, so ``symbol`` is
-    resolved from the scope's book rows (the lot's symbol, ``""`` when no row
-    remains). ``ts`` is the fill's UTC instant.
-    """
-
-    scope: str
-    execution_id: str
-    #: ``None`` for a sim fill (a sim lot has no conid). IBKR rows derive it from
-    #: the stored ``position_id``.
-    conid: int | None
-    symbol: str
-    side: str
-    qty: float
-    price: float
-    commission: float
-    cash_delta: float
-    ts: pd.Timestamp | None
-    #: The lot this fill belongs to, in the BOOK's id space: ``str(conid)`` for an
-    #: IBKR row, the sim lot's own minted id for a sim row. This is the fold key
-    #: ``book_from_executions`` groups on; ``conid`` cannot serve (it is ``None``
-    #: for every sim fill, which would merge a symbol's whole sim book into one lot).
-    #: Last and defaulted so an existing caller that only knows the conid still
-    #: constructs.
-    position_id: str = ""
-
-
-@dataclass(frozen=True)
-class SimLot:
-    """One sim lot: the minted ``position_id``, its entry, and its exit (when closed).
-
-    The detail is optional because a row may predate it (an ownership-only
-    record): ``symbol``/``side``/``qty``/``entry_price`` are ``None`` then, so a
-    caller can always tell "we own it" from "we know what it is" rather than
-    reading an invented size as a real one. ``exit_price``/``exit_commission``
-    are set only by a close, which is what makes the row a completed round trip.
-    """
-
-    position_id: str
-    symbol: str | None = None
-    side: str | None = None
-    qty: float | None = None
-    entry_price: float | None = None
-    stop_loss: float | None = None
-    take_profit: float | None = None
-    tag: str | None = None
-    opened_at: pd.Timestamp | None = None
-    entry_commission: float | None = None
-    exit_price: float | None = None
-    exit_commission: float | None = None
-    closed_at: pd.Timestamp | None = None
-
-    @property
-    def has_detail(self) -> bool:
-        """Whether this row carries the lot's own size and entry."""
-        return bool(self.symbol) and self.qty is not None
-
-    @property
-    def is_open(self) -> bool:
-        """Whether the lot is still held (no exit recorded)."""
-        return self.closed_at is None
-
-
-#: The terminal (closed) intent states ``prune`` is allowed to delete.
-_CLOSED_INTENTS = [
-    IntentState.FILLED.value,
-    IntentState.UNFILLED.value,
-    IntentState.REJECTED.value,
-]
 
 
 class MetadataStore(_SqliteOps):
@@ -384,7 +326,7 @@ class BookStore(_SqliteOps):
                     qty=execution.qty,
                     price=execution.price,
                     commission=execution.commission,
-                    cash_delta=_cash_delta(execution),
+                    cash_delta=execution_cash_delta(execution),
                     ts=_ms(execution.ts),
                 ).on_conflict("IGNORE").execute()
 
@@ -435,7 +377,7 @@ class BookStore(_SqliteOps):
         return tuple(
             record
             for lot in self.sim_lots(scope)
-            for record in _sim_fill_records(scope, lot)
+            for record in sim_fill_records(scope, lot)
             if record.execution_id not in stored
         )
 
@@ -537,25 +479,14 @@ class SimLotStore(_SqliteOps):
     """
 
     def record_sim_lot(self, scope: str, lot: SimLot) -> None:
-        """Record a sim lot the strategy just opened (resurrects a closed one)."""
+        """Upsert a sim lot row (resurrects a closed one).
+
+        Not the production write path — :meth:`record_results` is, and it plans
+        its writes purely. This is the seeding/repair entry, and it delegates to
+        the same helper so the row shape cannot drift from the planned one.
+        """
         with self._write():
-            LivePosition.insert(
-                scope=scope,
-                position_id=lot.position_id,
-                symbol=lot.symbol or "",
-                side=lot.side or "",
-                qty=0.0 if lot.qty is None else lot.qty,
-                entry_price=0.0 if lot.entry_price is None else lot.entry_price,
-                stop_loss=lot.stop_loss,
-                take_profit=lot.take_profit,
-                tag=lot.tag or "",
-                opened_at=None if lot.opened_at is None else _ms(lot.opened_at),
-                closed_at=None if lot.closed_at is None else _ms(lot.closed_at),
-                entry_commission=lot.entry_commission,
-                exit_price=lot.exit_price,
-                exit_commission=lot.exit_commission,
-                source=SOURCE_ACCOUNT,
-            ).on_conflict("REPLACE").execute()
+            _insert_lot(scope, lot)
 
     def record_sim_open(self, scope: str, position_id: str) -> None:
         """Record an ownership-only sim lot (no fill detail), never clobbering one.
@@ -598,19 +529,18 @@ class SimLotStore(_SqliteOps):
 
         An unknown id is a no-op. Re-marking an already-closed lot is
         IDEMPOTENT: a close that does not say what it exited at never erases an
-        exit already recorded.
+        exit already recorded. Not the production write path — see
+        :meth:`record_sim_lot`; it delegates to the same helper so the exit-field
+        rule lives in ONE place.
         """
+        write = LotClose(
+            position_id,
+            closed_at,
+            exit_price=exit_price,
+            commission=commission,
+        )
         with self._write():
-            fields: dict[str, object] = {"closed_at": _ms(closed_at)}
-            if exit_price is not None:
-                fields["exit_price"] = exit_price
-            if commission is not None:
-                fields["exit_commission"] = commission
-            LivePosition.update(**fields).where(
-                (LivePosition.scope == scope)
-                & (LivePosition.position_id == position_id)
-                & (LivePosition.source == SOURCE_ACCOUNT)
-            ).execute()
+            _update_lot_closed(scope, write)
 
     def sim_lots(self, scope: str) -> tuple[SimLot, ...]:
         """Every sim lot this scope ever opened, oldest first (empty if unwritten)."""
@@ -652,76 +582,77 @@ class SimLotStore(_SqliteOps):
         records nothing), and a CLOSE marks the targeted lot closed without
         erasing an exit already recorded.
 
-        Each touched lot's implied fills are ALSO persisted into
-        ``live_execution``, so the ledger holds the same fill rows a real broker
-        would replay while :meth:`sim_executions` skips what is already stored.
+        WHICH rows to write is decided by the pure
+        :func:`src.live.pure_plan.plan_result_writes` over the scope's stored
+        lots; this method only applies them, all in ONE transaction, so a cycle's
+        results land together or not at all (never a half-recorded cycle).
         """
-        for result in results:
-            if not result.ok:
-                continue
-            intent = result.intent
-            if intent.action is ActionType.close:
-                if not intent.position_id:
-                    continue
-                self.mark_sim_closed(
-                    scope,
-                    intent.position_id,
-                    now,
-                    exit_price=result.fill.executed_price if result.fill else None,
-                    commission=result.fill.commission if result.fill else None,
-                )
-                pid = intent.position_id
-            else:
-                if not result.position_id:
-                    continue
-                self.record_sim_lot(scope, _result_lot(result))
-                pid = result.position_id
-            for record in self._fills_of(scope, pid):
-                self._insert_execution(record)
-
-    def _fills_of(self, scope: str, position_id: str) -> tuple[ExecutionRecord, ...]:
-        """The fills the stored lot with *position_id* now implies (empty if none)."""
-        for lot in self.sim_lots(scope):
-            if lot.position_id == position_id:
-                return _sim_fill_records(scope, lot)
-        return ()
-
-    def _insert_execution(self, record: ExecutionRecord) -> None:
-        """Persist one already-derived fill row, keyed so a re-run is a no-op."""
+        writes = plan_result_writes(scope, results, self.sim_lots(scope), now)
+        if not writes:
+            return
         with self._write():
-            LiveExecution.insert(
-                scope=record.scope,
-                execution_id=record.execution_id,
-                position_id=record.position_id,
-                side=record.side,
-                qty=record.qty,
-                price=record.price,
-                commission=record.commission,
-                cash_delta=record.cash_delta,
-                ts=0 if record.ts is None else _ms(record.ts),
-            ).on_conflict("IGNORE").execute()
+            for write in writes:
+                _apply_write(scope, write)
 
 
-def _result_lot(result: OrderResult) -> SimLot:
-    """The lot an OPEN fill created, from the fill and the intent behind it.
+def _apply_write(scope: str, write: ResultWrite) -> None:
+    """Apply one planned write; the caller holds the transaction (never nests one)."""
+    if isinstance(write, LotOpen):
+        _insert_lot(scope, write.lot)
+    elif isinstance(write, LotClose):
+        _update_lot_closed(scope, write)
+    else:
+        _insert_execution(write.record)
 
-    A result with no fill still records the lot (ownership is never lost to
-    missing detail): size and entry simply stay unknown, and the row reads as an
-    ownership-only one rather than inventing a position.
-    """
-    fill = result.fill
-    return SimLot(
-        position_id=cast("str", result.position_id),
-        symbol=result.intent.symbol,
-        side=result.intent.action.value,
-        qty=fill.filled_qty if fill is not None else None,
-        entry_price=fill.executed_price if fill is not None else None,
-        stop_loss=result.intent.stop_loss,
-        take_profit=result.intent.take_profit,
-        tag=result.intent.tag or None,
-        opened_at=fill.timestamp if fill is not None else None,
-        entry_commission=fill.commission if fill is not None else None,
-    )
+
+def _insert_lot(scope: str, lot: SimLot) -> None:
+    """Upsert one lot row, keyed ``(scope, position_id)`` (REPLACE)."""
+    LivePosition.insert(
+        scope=scope,
+        position_id=lot.position_id,
+        symbol=lot.symbol or "",
+        side=lot.side or "",
+        qty=0.0 if lot.qty is None else lot.qty,
+        entry_price=0.0 if lot.entry_price is None else lot.entry_price,
+        stop_loss=lot.stop_loss,
+        take_profit=lot.take_profit,
+        tag=lot.tag or "",
+        opened_at=None if lot.opened_at is None else _ms(lot.opened_at),
+        closed_at=None if lot.closed_at is None else _ms(lot.closed_at),
+        entry_commission=lot.entry_commission,
+        exit_price=lot.exit_price,
+        exit_commission=lot.exit_commission,
+        source=SOURCE_ACCOUNT,
+    ).on_conflict("REPLACE").execute()
+
+
+def _update_lot_closed(scope: str, write: LotClose) -> None:
+    """Stamp a lot closed, with the exit leg when the close reported one."""
+    fields: dict[str, object] = {"closed_at": _ms(write.closed_at)}
+    if write.exit_price is not None:
+        fields["exit_price"] = write.exit_price
+    if write.commission is not None:
+        fields["exit_commission"] = write.commission
+    LivePosition.update(**fields).where(
+        (LivePosition.scope == scope)
+        & (LivePosition.position_id == write.position_id)
+        & (LivePosition.source == SOURCE_ACCOUNT)
+    ).execute()
+
+
+def _insert_execution(record: ExecutionRecord) -> None:
+    """Persist one derived fill row, keyed so a re-run is a no-op."""
+    LiveExecution.insert(
+        scope=record.scope,
+        execution_id=record.execution_id,
+        position_id=record.position_id,
+        side=record.side,
+        qty=record.qty,
+        price=record.price,
+        commission=record.commission,
+        cash_delta=record.cash_delta,
+        ts=0 if record.ts is None else _ms(record.ts),
+    ).on_conflict("IGNORE").execute()
 
 
 def _sim_lot(row: LivePosition) -> SimLot:
@@ -748,8 +679,10 @@ def _sim_lot(row: LivePosition) -> SimLot:
 class IntentStore(_SqliteOps):
     """Ledger mixin: the durable owner of OPEN order state (``PendingIntents``).
 
-    Reads tolerate a missing table (empty), like ``load_book``; writes create it
-    lazily. The identity columns (scope/symbol/action/position_id) are the primary
+    Reads tolerate a missing table (empty), like ``load_book``. A missing table on
+    a WRITE is not tolerated: the ledger writes no DDL (``ibkr db migrate`` owns
+    the schema), so an unmigrated file fails loud. The identity columns
+    (scope/symbol/action/position_id) are the primary
     key, so two intents whose crc32 tokens collide stay separately addressable by
     IDENTITY. NOTE: that is a ROW-level guarantee only — the broker still
     attributes a working order by the token-keyed ref prefix, so two colliding
@@ -822,7 +755,7 @@ class IntentStore(_SqliteOps):
         dedupe cannot swallow it.
         """
         existing = self.load(key)
-        attempt = existing.attempt + 1 if existing is not None else 0
+        attempt = next_attempt(existing)
         record = IntentRecord(
             key=key,
             state=IntentState.PENDING,
@@ -882,9 +815,12 @@ class IntentStore(_SqliteOps):
 class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
     """peewee-backed per-scope book. One database per ledger, bound on init.
 
-    Construction writes NOTHING (no DDL): a ``--dry-run`` that only reads must
-    leave the schema untouched. The schema is created lazily on the first
-    write; reads of a missing table return an empty book.
+    The ledger writes NO DDL, ever: construction writes nothing (a ``--dry-run``
+    that only reads must leave the file untouched) and neither does a write.
+    Schema is ``src.db``'s job — run ``ibkr db migrate`` before the first cycle.
+    An unmigrated file therefore fails LOUD on the first write; a read of a
+    genuinely missing table still returns an empty book (see
+    :class:`LedgerReadError` for the drifted-table case).
 
     The default path is the LIVE file (:func:`src.db.path.resolve_live_db_path`),
     NOT the candle file: the book is durable state no download can rebuild, so it
@@ -896,7 +832,6 @@ class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._db_path = db_path
-        self._schema_ready = False
         path = str(resolve_live_db_path(db_path))
         self._database = SqliteDatabase(path)
 
@@ -905,39 +840,10 @@ class SqliteLedger(MetadataStore, SimLotStore, BookStore, IntentStore):
         """The resolved sqlite path this ledger is bound to (read-only)."""
         return str(self._database.database)
 
-    # -- lazy DDL / migration ---------------------------------------------
-
-    def _ready_schema(self) -> None:
-        """Run the LIVE migrations exactly once, on the first WRITE only.
-
-        :func:`run_pending` applies every pending migration and its bookkeeping
-        row inside ONE ``BEGIN IMMEDIATE`` transaction. That takes the SQLite
-        write lock up front, so two processes racing the first migration (the
-        overlap the cycle lease guards against) are SERIALIZED: the second blocks
-        until the first commits, re-reads the bookkeeping and finds nothing
-        pending. There is no check-then-act window, so neither a ``no such table``
-        nor a double-re-key race is reachable.
-
-        It is deliberately NOT wrapped in the cycle lease —
-        ``ensure_strategy``/``ensure_cash`` write before ``run_cycle`` takes the
-        lease, and re-taking it here would deadlock a cycle already holding it.
-        What this does NOT do: it does not serialize those later idempotent writes
-        against a live cycle; each is its own atomic write, and the lease remains
-        the cross-process guard for placement.
-
-        ONLY :data:`LIVE_MIGRATIONS` runs here. The live first write must never
-        replay a bulk candle migration before it can place an order.
-        """
-        if self._schema_ready:
-            return
-        run_pending(self._database, LIVE_MIGRATIONS)
-        self._schema_ready = True
-
     @contextmanager
     def _write(self) -> Iterator[None]:
-        """A write: models bound to this ledger's db, lazy DDL once, then atomic."""
+        """A write: models bound to this ledger's db, then atomic."""
         with self._database.bind_ctx(_MODELS):
-            self._ready_schema()
             with self._database.atomic():
                 yield
 
@@ -965,87 +871,6 @@ def config_hash(config: Mapping[str, object]) -> str:
     """
     payload = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _cash_delta(execution: Execution) -> float:
-    """Signed cash flow of one execution: a SELL credits, a BUY debits (net of fee)."""
-    gross = execution.qty * execution.price
-    if execution.side is OrderSide.SELL:
-        return gross - execution.commission
-    return -(gross + execution.commission)
-
-
-def _sim_fill_records(scope: str, lot: SimLot) -> tuple[ExecutionRecord, ...]:
-    """The fills one sim lot implies: its entry, plus its exit when it has one.
-
-    A lot without detail (an ownership-only row) implies nothing — there is no
-    size or price to book, and inventing one would put a phantom fill in the
-    scope's history. An open long DEBITS cash on the entry and will CREDIT it on
-    the exit; a short is the mirror, so the side of each leg follows the lot.
-    """
-    if not lot.has_detail:
-        return ()
-    qty = cast("float", lot.qty)
-    entry = cast("float", lot.entry_price)
-    short = lot.side == "short"
-    records = [
-        _sim_fill(
-            scope,
-            f"{lot.position_id}:open",
-            lot,
-            OrderSide.SELL if short else OrderSide.BUY,
-            qty,
-            entry,
-            lot.entry_commission,
-            lot.opened_at,
-        )
-    ]
-    if lot.exit_price is not None:
-        records.append(
-            _sim_fill(
-                scope,
-                f"{lot.position_id}:close",
-                lot,
-                OrderSide.BUY if short else OrderSide.SELL,
-                qty,
-                lot.exit_price,
-                lot.exit_commission,
-                lot.closed_at,
-            )
-        )
-    return tuple(records)
-
-
-def _sim_fill(
-    scope: str,
-    execution_id: str,
-    lot: SimLot,
-    side: OrderSide,
-    qty: float,
-    price: float,
-    commission: float | None,
-    ts: pd.Timestamp | None,
-) -> ExecutionRecord:
-    """One sim leg as the same record shape a replayed IBKR fill produces."""
-    fee = commission or 0.0
-    gross = qty * price
-    return ExecutionRecord(
-        scope=scope,
-        execution_id=execution_id,
-        conid=None,
-        position_id=lot.position_id,
-        symbol=lot.symbol or "",
-        side=side.value,
-        qty=qty,
-        price=price,
-        commission=fee,
-        cash_delta=(gross - fee) if side is OrderSide.SELL else -(gross + fee),
-        ts=ts,
-    )
-
-
-#: Public name for the cash-flow helper (used by the IBKR portfolio source).
-execution_cash_delta = _cash_delta
 
 
 def _intent_fields(record: IntentRecord) -> dict[str, object]:

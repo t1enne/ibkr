@@ -38,6 +38,7 @@ from src.live.identity import (
     order_ref,
 )
 from src.live.ledger import SqliteLedger
+from src.live.tests.ledgers import live_ledger
 from src.live.types import (
     FeedError,
     LiveConfig,
@@ -429,14 +430,14 @@ def test_dry_run_leaves_every_row_count_unchanged(
     strings: a dry run must be indistinguishable from never having run.
     """
     db = tmp_path / "live.sqlite"
-    ledger = SqliteLedger(db)
+    ledger = live_ledger(db)
     ledger.ensure_cash("sim_cli_test_1a2b3c4d", 50000.0)  # a pre-existing row set
     before = _row_counts(db)
 
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
         return _report()
 
-    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: SqliteLedger(db))
+    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: live_ledger(db))
     monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
     path = write_config(tmp_path, adapter="sim")
     out = CliRunner().invoke(live_group, ["run", path, "--dry-run"])
@@ -519,7 +520,7 @@ def test_sim_adapter_refuses_to_place_on_a_dry_run() -> None:
     adapter = build_sim_adapter(
         _dry_cfg(),
         "sim_x_1",
-        SqliteLedger(tempfile.mkdtemp() + "/l.sqlite"),
+        live_ledger(tempfile.mkdtemp() + "/l.sqlite"),
         True,
         lambda _m: None,
     )
@@ -548,7 +549,7 @@ class _RaisingLedger:
 
 
 def _wedged_ledger(tmp_path: Path) -> tuple[SqliteLedger, IntentKey]:
-    ledger = SqliteLedger(tmp_path / "abandon.sqlite")
+    ledger = live_ledger(tmp_path / "abandon.sqlite")
     key = IntentKey(
         scope="momentum", symbol="AAPL", action=ActionType.long, position_id=None
     )

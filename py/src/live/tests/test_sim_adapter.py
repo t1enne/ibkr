@@ -31,6 +31,7 @@ from src.bt.state import (
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
 from src.live.identity import OrderOutcome
 from src.live.ledger import SqliteLedger
+from src.live.tests.ledgers import live_ledger
 from src.live.pure import OrderResult, intent_to_signal, sim_place_cohort
 from src.live.reconcile import reconcile
 from src.live.result import Err, Ok, Result
@@ -46,7 +47,7 @@ _NO_LOG: Callable[[str], None] = lambda _m: None  # noqa: E731
 @pytest.fixture(name="ledger")
 def _ledger() -> SqliteLedger:
     """A throwaway sqlite store these behaviour tests never read."""
-    return SqliteLedger(Path(tempfile.mkdtemp()) / "sim.sqlite")
+    return live_ledger(Path(tempfile.mkdtemp()) / "sim.sqlite")
 
 
 def _config() -> LiveConfig:

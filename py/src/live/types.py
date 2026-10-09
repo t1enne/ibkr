@@ -16,6 +16,8 @@ import pandas as pd
 
 from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
+
+__all__ = ["ExecutionRecord", "SimLot", "StrategyAudit"]
 from src.bt.state.factories import build_commission_model, create_execution_params
 from src.config import live_adapter
 from src.exec.types import OrderType
@@ -29,6 +31,95 @@ if TYPE_CHECKING:
 #: Actions the screen can emit that require a live decision. ``flat`` is never
 #: produced: absence of a signal is HOLD downstream.
 SignalAction = Literal["long", "short", "close"]
+
+
+@dataclass(frozen=True)
+class StrategyAudit:
+    """One ``live_strategy`` audit row: which config revision wrote this scope.
+
+    ``strategy_id`` is the config HASH (an audit key, never an ownership filter);
+    ``created_at``/``last_cycle_at`` are the epoch-ms columns read back as UTC
+    timestamps (``None`` when unwritten).
+    """
+
+    strategy_id: str
+    scope: str
+    name: str
+    created_at: pd.Timestamp | None
+    last_cycle_at: pd.Timestamp | None
+
+
+@dataclass(frozen=True)
+class ExecutionRecord:
+    """One stored fill (``live_execution``) projected for the report.
+
+    ``live_execution`` stores ``position_id`` but no symbol, so ``symbol`` is
+    resolved from the scope's book rows (the lot's symbol, ``""`` when no row
+    remains). ``ts`` is the fill's UTC instant.
+    """
+
+    scope: str
+    execution_id: str
+    #: ``None`` for a sim fill (a sim lot has no conid). IBKR rows derive it from
+    #: the stored ``position_id``.
+    conid: int | None
+    symbol: str
+    side: str
+    qty: float
+    price: float
+    commission: float
+    cash_delta: float
+    ts: pd.Timestamp | None
+    #: The lot this fill belongs to, in the BOOK's id space: ``str(conid)`` for an
+    #: IBKR row, the sim lot's own minted id for a sim row. This is the fold key
+    #: ``book_from_executions`` groups on; ``conid`` cannot serve (it is ``None``
+    #: for every sim fill, which would merge a symbol's whole sim book into one lot).
+    #: Last and defaulted so an existing caller that only knows the conid still
+    #: constructs.
+    position_id: str = ""
+
+
+@dataclass(frozen=True)
+class SimLot:
+    """One sim lot: the minted ``position_id``, its entry, and its exit (when closed).
+
+    The detail is optional because a row may predate it (an ownership-only
+    record): ``symbol``/``side``/``qty``/``entry_price`` are ``None`` then, so a
+    caller can always tell "we own it" from "we know what it is" rather than
+    reading an invented size as a real one. ``exit_price``/``exit_commission``
+    are set only by a close, which is what makes the row a completed round trip.
+    """
+
+    position_id: str
+    symbol: str | None = None
+    side: str | None = None
+    qty: float | None = None
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    tag: str | None = None
+    opened_at: pd.Timestamp | None = None
+    entry_commission: float | None = None
+    exit_price: float | None = None
+    exit_commission: float | None = None
+    closed_at: pd.Timestamp | None = None
+
+    @property
+    def has_detail(self) -> bool:
+        """Whether this row carries the lot's own size and entry.
+
+        Size is what makes a fill derivable, so a stored ``qty`` of zero (the
+        sentinel an ownership-only row is written with) reads as NO detail — no
+        legitimate lot holds nothing, and treating it as detailed would mint a
+        phantom zero-qty fill into the scope's history.
+        """
+        return bool(self.symbol) and bool(self.qty)
+
+    @property
+    def is_open(self) -> bool:
+        """Whether the lot is still held (no exit recorded)."""
+        return self.closed_at is None
+
 
 #: Which source produced a cost figure (plan §7.3). ``broker_executions`` is the
 #: broker's own per-execution number (exact); ``modelled`` is the sim
