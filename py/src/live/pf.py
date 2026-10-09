@@ -376,8 +376,6 @@ class PositionRow:
     realized: float
     stop_loss: float | None
     take_profit: float | None
-    order_id: str
-    order_ref: str
 
 
 @dataclass(frozen=True)
@@ -638,8 +636,6 @@ def _position_row(
         realized=_realized(flow, side, qty, entry),
         stop_loss=view.stop_loss if view is not None else None,
         take_profit=view.take_profit if view is not None else None,
-        order_id=(intent.order_id or "") if intent is not None else "",
-        order_ref=_order_ref(view, intent),
     )
 
 
@@ -820,8 +816,6 @@ _POSITION_COLS = (
     Col("rpnl", ">", sign=True),
     Col("sl", ">"),
     Col("tp", ">"),
-    Col("order_id"),
-    Col("ref"),
 )
 
 
@@ -1063,8 +1057,6 @@ def _position_text_rows(
             f"{row.realized:.2f}",
             _opt(row.stop_loss),
             _opt(row.take_profit),
-            row.order_id or "-",
-            row.order_ref or "-",
         )
         for store in stores
         for row in position_rows(store, broker)
