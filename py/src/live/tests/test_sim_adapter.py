@@ -29,6 +29,7 @@ from src.bt.state import (
     Position,
 )
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
+from src.live.adapters.sim.store import SimBookStore
 from src.live.identity import OrderOutcome
 from src.live.ledger import SqliteLedger
 from src.live.tests.ledgers import live_ledger
@@ -74,7 +75,10 @@ def _adapter(
     dry_run: bool = False,
 ) -> SimAdapter:
     """A sim adapter over *ledger*; ``sim_t_x`` names its book."""
-    adapter = build_sim_adapter(cfg or _config(), "sim_t_x", ledger, dry_run, _NO_LOG)
+    store = SimBookStore(Path(tempfile.mkdtemp()) / "sim.json")
+    adapter = build_sim_adapter(
+        cfg or _config(), "sim_t_x", ledger, dry_run, _NO_LOG, store=store
+    )
     return adapter if exchange is None else replace(adapter, exchange=exchange)
 
 
@@ -322,6 +326,7 @@ async def test_place_propagates_a_cohort_err_without_relying_on_an_assert(
         dry_run=base.dry_run,
         log=base.log,
         exchange=base.exchange,
+        store=base.store,
     )
     result = await adapter.place(_book(), _open_intent())
     assert isinstance(result, Err)

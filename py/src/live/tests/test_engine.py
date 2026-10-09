@@ -16,7 +16,8 @@ from src.live.engine import (
     run_cycle,
 )
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
-from src.live.ledger import SimLot, SqliteLedger
+from src.live.adapters.sim.store import SimBook, SimBookStore
+from src.live.ledger import SqliteLedger
 from src.live.tests.ledgers import live_ledger
 from src.live.lease import CycleInProgressError
 from src.live.result import Err, Ok, Result
@@ -81,6 +82,30 @@ def signal(action: SignalAction, qty: float = 0.0) -> LiveSignal:
         signal_ts=TS,
         price=100.0,
         qty=qty,
+    )
+
+
+def _open_result(pid: str) -> OrderResult:
+    """An OK open fill minting ``<pid>:open`` — seeds ownership of *pid*."""
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.long,
+        qty=10.0,
+        ref_price=100.0,
+        reason="seed",
+    )
+    return OrderResult(
+        intent=intent,
+        fill=FillEvent(
+            signal=intent_to_signal(intent, TS),
+            filled_qty=10.0,
+            executed_price=100.0,
+            commission=0.0,
+            slippage=0.0,
+            timestamp=TS,
+        ),
+        ok=True,
+        position_id=pid,
     )
 
 
@@ -235,7 +260,7 @@ async def test_sim_ownership_survives_a_config_hash_change(tmp_path: Path) -> No
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
     ledger = live_ledger(tmp_path / "l.sqlite")
-    ledger.record_sim_open("momentum", "L1")
+    ledger.record_results("momentum", (_open_result("L1"),), TS)
 
     report = await run_cycle(
         CFG,
@@ -318,7 +343,7 @@ async def test_sim_unnamed_open_records_nothing(tmp_path: Path) -> None:
     )
 
     assert report.results[0].ok
-    assert ledger.sim_open_ids("S1") == frozenset()
+    assert ledger.owned_ids("S1") == frozenset()
 
 
 @pytest.mark.asyncio
@@ -327,7 +352,7 @@ async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
     ledger = live_ledger(tmp_path / "l.sqlite")
-    ledger.record_sim_open("S1", "L1")
+    ledger.record_results("S1", (_open_result("L1"),), TS)
 
     await run_cycle(
         CFG,
@@ -341,7 +366,7 @@ async def test_sim_rejected_close_records_nothing(tmp_path: Path) -> None:
         signal_source=_source_fn(CLOSE),
     )
 
-    assert ledger.sim_open_ids("S1") == frozenset({"L1"})
+    assert ledger.owned_ids("S1") == frozenset({"L1"})
 
 
 @pytest.mark.asyncio
@@ -437,9 +462,13 @@ async def test_dry_run_never_resyncs(tmp_path: Path) -> None:
 
 
 def _sim_adapter(
-    ledger: SqliteLedger, scope: str, *, dry_run: bool = False
+    ledger: SqliteLedger,
+    scope: str,
+    store: SimBookStore,
+    *,
+    dry_run: bool = False,
 ) -> SimAdapter:
-    return build_sim_adapter(CFG, scope, ledger, dry_run, lambda _m: None)
+    return build_sim_adapter(CFG, scope, ledger, dry_run, lambda _m: None, store=store)
 
 
 @pytest.mark.asyncio
@@ -449,10 +478,11 @@ async def test_a_sim_close_settles_and_leaves_the_book_flat(tmp_path: Path) -> N
     make_candle_db(db, "AAPL", TS)
     ledger = live_ledger(tmp_path / "l.sqlite")
     scope = "sim_momentum_1a2b3c4d"
+    store = SimBookStore(tmp_path / "sim.json")
 
     await run_cycle(
         CFG,
-        _sim_adapter(ledger, scope),
+        _sim_adapter(ledger, scope, store),
         ledger=ledger,
         strategy_id="S1",
         scope=scope,
@@ -461,11 +491,11 @@ async def test_a_sim_close_settles_and_leaves_the_book_flat(tmp_path: Path) -> N
         db_path=db,
         signal_source=_source_fn(LONG_10),
     )
-    assert ledger.sim_open_ids(scope) != frozenset()
+    assert ledger.owned_ids(scope) != frozenset()
 
     closed = await run_cycle(
         CFG,
-        _sim_adapter(ledger, scope),
+        _sim_adapter(ledger, scope, store),
         ledger=ledger,
         strategy_id="S1",
         scope=scope,
@@ -477,7 +507,7 @@ async def test_a_sim_close_settles_and_leaves_the_book_flat(tmp_path: Path) -> N
 
     assert [i.action for i in closed.intents] == [ActionType.close]
     assert [r.ok for r in closed.results] == [True]
-    assert ledger.sim_open_ids(scope) == frozenset()
+    assert ledger.owned_ids(scope) == frozenset()
 
 
 @pytest.mark.asyncio
@@ -491,7 +521,7 @@ async def test_a_second_cycle_on_the_same_scope_is_refused(tmp_path: Path) -> No
         with pytest.raises(CycleInProgressError):
             await run_cycle(
                 CFG,
-                _sim_adapter(ledger, "sim_a_1"),
+                _sim_adapter(ledger, "sim_a_1", SimBookStore(tmp_path / "s.json")),
                 ledger=ledger,
                 strategy_id="S1",
                 scope="sim_a_1",
@@ -506,33 +536,39 @@ async def test_a_second_cycle_on_the_same_scope_is_refused(tmp_path: Path) -> No
 async def test_a_hand_edited_account_lot_is_a_divergence_and_unsafe(
     tmp_path: Path,
 ) -> None:
-    """The sim divergence path: our fill fold vs the account rows disagree.
+    """The sim divergence path: our fill fold vs the JSON account book disagree.
 
-    A human editing the human-editable surface (here: opening a lot the fills do
-    not explain) must surface as a report ``Divergence`` and make the cycle
-    unsafe. Silently adopting the edit would re-size onto a book we cannot
-    explain.
+    A human editing the JSON book (here: opening a lot the fills do not explain)
+    must surface as a report ``Divergence`` and make the cycle unsafe. Silently
+    adopting the edit would re-size onto a book we cannot explain.
     """
     db = tmp_path / "c.sqlite"
     make_candle_db(db, "AAPL", TS)
     ledger = live_ledger(tmp_path / "l.sqlite")
     scope = "sim_momentum_1a2b3c4d"
+    store = SimBookStore(tmp_path / "sim.json")
     # An account lot with NO fill behind it (the edit a human makes).
-    ledger.record_sim_lot(
+    store.write(
         scope,
-        SimLot(
-            position_id="HAND_1",
-            symbol="AAPL",
-            side="long",
-            qty=5.0,
-            entry_price=100.0,
-            opened_at=TS,
+        SimBook(
+            account="SIM",
+            positions=(
+                {
+                    "conid": 265598,
+                    "position_id": "HAND_1",
+                    "contractDesc": "AAPL",
+                    "position": 5.0,
+                    "avgCost": 100.0,
+                    "mktPrice": 100.0,
+                    "currency": "USD",
+                },
+            ),
         ),
     )
 
     report = await run_cycle(
         CFG,
-        _sim_adapter(ledger, scope),
+        _sim_adapter(ledger, scope, store),
         ledger=ledger,
         strategy_id="S1",
         scope=scope,
@@ -554,10 +590,11 @@ async def test_agreeing_books_report_no_divergence(tmp_path: Path) -> None:
     make_candle_db(db, "AAPL", TS)
     ledger = live_ledger(tmp_path / "l.sqlite")
     scope = "sim_momentum_1a2b3c4d"
+    store = SimBookStore(tmp_path / "sim.json")
 
     first = await run_cycle(
         CFG,
-        _sim_adapter(ledger, scope),
+        _sim_adapter(ledger, scope, store),
         ledger=ledger,
         strategy_id="S1",
         scope=scope,
@@ -568,7 +605,7 @@ async def test_agreeing_books_report_no_divergence(tmp_path: Path) -> None:
     )
     second = await run_cycle(
         CFG,
-        _sim_adapter(ledger, scope),
+        _sim_adapter(ledger, scope, store),
         ledger=ledger,
         strategy_id="S1",
         scope=scope,

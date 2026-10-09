@@ -352,7 +352,7 @@ class _RecordingLedger:
         self.leases.append(scope)
         return nullcontext()
 
-    def sim_open_ids(self, scope: str) -> frozenset[str]:
+    def owned_ids(self, scope: str) -> frozenset[str]:
         return frozenset()
 
     def executions_of(self, scope: str):
@@ -446,7 +446,7 @@ def test_dry_run_leaves_every_row_count_unchanged(
     assert _row_counts(db) == before
     assert not (
         db.parent
-        / f"{db.name}.{scope_tag(_config_scope(load_live_config(path)))}.cycle.lock"
+        / f"{db.name}.{scope_tag(_config_scope(load_live_config(path), 'sim'))}.cycle.lock"
     ).exists()
 
 

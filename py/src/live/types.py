@@ -9,6 +9,7 @@ depends only on the minimal :class:`PortfolioView` Protocol that
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast, get_args
 
@@ -17,7 +18,7 @@ import pandas as pd
 from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
 
-__all__ = ["ExecutionRecord", "SimLot", "StrategyAudit"]
+__all__ = ["ExecutionRecord", "StrategyAudit", "synthetic_conid"]
 from src.bt.state.factories import build_commission_model, create_execution_params
 from src.config import live_adapter
 from src.exec.types import OrderType
@@ -31,6 +32,17 @@ if TYPE_CHECKING:
 #: Actions the screen can emit that require a live decision. ``flat`` is never
 #: produced: absence of a signal is HOLD downstream.
 SignalAction = Literal["long", "short", "close"]
+
+
+def synthetic_conid(symbol: str) -> int:
+    """A stable per-symbol conid: ``crc32(symbol) & 0x7fffffff``.
+
+    A sim fill/book has no real conid, but the ``live_execution.conid`` column is
+    NOT NULL and the JSON position rows are IBKR-shaped, so a symbol-keyed
+    synthetic one fills both. ONE definition, shared by the sim store and the
+    ledger, so the two cannot drift.
+    """
+    return zlib.crc32(symbol.encode()) & 0x7FFFFFFF
 
 
 @dataclass(frozen=True)
@@ -77,48 +89,6 @@ class ExecutionRecord:
     #: Last and defaulted so an existing caller that only knows the conid still
     #: constructs.
     position_id: str = ""
-
-
-@dataclass(frozen=True)
-class SimLot:
-    """One sim lot: the minted ``position_id``, its entry, and its exit (when closed).
-
-    The detail is optional because a row may predate it (an ownership-only
-    record): ``symbol``/``side``/``qty``/``entry_price`` are ``None`` then, so a
-    caller can always tell "we own it" from "we know what it is" rather than
-    reading an invented size as a real one. ``exit_price``/``exit_commission``
-    are set only by a close, which is what makes the row a completed round trip.
-    """
-
-    position_id: str
-    symbol: str | None = None
-    side: str | None = None
-    qty: float | None = None
-    entry_price: float | None = None
-    stop_loss: float | None = None
-    take_profit: float | None = None
-    tag: str | None = None
-    opened_at: pd.Timestamp | None = None
-    entry_commission: float | None = None
-    exit_price: float | None = None
-    exit_commission: float | None = None
-    closed_at: pd.Timestamp | None = None
-
-    @property
-    def has_detail(self) -> bool:
-        """Whether this row carries the lot's own size and entry.
-
-        Size is what makes a fill derivable, so a stored ``qty`` of zero (the
-        sentinel an ownership-only row is written with) reads as NO detail — no
-        legitimate lot holds nothing, and treating it as detailed would mint a
-        phantom zero-qty fill into the scope's history.
-        """
-        return bool(self.symbol) and bool(self.qty)
-
-    @property
-    def is_open(self) -> bool:
-        """Whether the lot is still held (no exit recorded)."""
-        return self.closed_at is None
 
 
 #: Which source produced a cost figure (plan §7.3). ``broker_executions`` is the

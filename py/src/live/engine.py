@@ -167,7 +167,7 @@ class CycleLedger(Protocol):
 
     ``cycle_lease(scope)`` is the PER-SCOPE concurrency guard (two adapters run
     concurrently; two cycles on one scope do not). ``executions_of`` is our
-    fill-derived book, the divergence guard's "ours" side. ``sim_open_ids`` scopes
+    fill-derived book, the divergence guard's "ours" side. ``owned_ids`` scopes
     a close to the lots the scope is recorded as owning. ``record_results`` is the
     ONE write point for placement outcomes, and ``touch_cycle``/``prune`` are the
     audit + housekeeping writes.
@@ -177,7 +177,7 @@ class CycleLedger(Protocol):
 
     def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None: ...
 
-    def sim_open_ids(self, scope: str) -> frozenset[str]: ...
+    def owned_ids(self, scope: str) -> frozenset[str]: ...
 
     def executions_of(self, scope: str) -> tuple[ExecutionRecord, ...]: ...
 
@@ -392,7 +392,7 @@ async def _place(
     # An adapter that OWNS its book (IBKR's replay is already only our lots) needs
     # no ownership filter (``None``); one that may hold lots we never opened (the
     # sim account book, a human-edited ``live_position``) is scoped to ours.
-    owned = ledger.sim_open_ids(scope) if adapter.owns_book else None
+    owned = ledger.owned_ids(scope) if adapter.owns_book else None
     intents = reconcile(signals, book, config, owned)
     if dry_run or not intents:
         return _Placement(intents=intents, results=Ok(()))

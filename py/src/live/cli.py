@@ -42,6 +42,7 @@ from src.live.engine import (
 from src.live.lease import CycleInProgressError
 from src.live.identity import OPEN_STATES, IntentKey, IntentState
 from src.live.ledger import LedgerReadError, SqliteLedger, config_hash
+from src.live.adapters.sim.store import SimBookStore, resolve_sim_book_path
 from src.live.pf import (
     BrokerSide,
     PfReport,
@@ -435,10 +436,19 @@ def _config_report(
     config_path: str,
     adapter: str | None,
 ) -> PfReport:
-    """The config's scope, plus a broker read when one is resolved."""
+    """The config's scope, plus a broker read when one is resolved.
+
+    The adapter is resolved ONCE here (``--adapter``, then the config's own key),
+    exactly as ``live run`` does, so BOTH the scope and the broker read address
+    the same adapter: ``pf --adapter sim`` after ``run --adapter sim`` reads the
+    sim scope, not the config's default.
+    """
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
-    store = read_store(ledger, _config_scope(cfg), initial_capital=cfg.initial_capital)
+    resolved = resolve_adapter_name(adapter, raw, cfg.strategy_params)
+    store = read_store(
+        ledger, _config_scope(cfg, resolved), initial_capital=cfg.initial_capital
+    )
     broker = _pf_broker(
         ledger,
         adapter,
@@ -449,16 +459,16 @@ def _config_report(
     return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=(store,), broker=broker)
 
 
-def _config_scope(cfg: LiveConfig) -> str:
+def _config_scope(cfg: LiveConfig, resolved_adapter: AdapterName) -> str:
     """The scope a config addresses: ``<adapter>_<config_name>_<config_hash>``.
 
     The SAME mint ``live run`` uses, so ``pf``/``status`` read the scope a cycle
-    writes. A config's own ``adapter`` key decides the segment (``sim`` when it
-    never named one), matching ``resolve_adapter_name``'s precedence minus the
-    CLI flag — a diagnostic read is not a run.
+    writes. *resolved_adapter* is the caller's :func:`resolve_adapter_name`
+    result, so the CLI ``--adapter`` flag selects the scope exactly as it does a
+    run.
     """
     return scope_of(
-        ScopeParts(cfg.adapter, config_name_of(cfg), config_scope_hash(cfg))
+        ScopeParts(resolved_adapter, config_name_of(cfg), config_scope_hash(cfg))
     )
 
 
@@ -484,7 +494,12 @@ def _pf_broker(
     if resolved is None:
         return None
     if resolved == "sim":
-        return read_sim_broker(ledger, stores[0].scope if stores else "")
+        scope = stores[0].scope if stores else ""
+        return read_sim_broker(
+            SimBookStore(resolve_sim_book_path()),
+            scope,
+            ledger.owned_ids(scope),
+        )
     owned = frozenset(lot.id for store in stores for lot in store.lots)
     return asyncio.run(
         _read_ibkr_pf(
@@ -605,21 +620,31 @@ def _open_watch_session(
                 ledger.scopes_of_store,
                 0.0,
             )
-        return _WatchSession(_store_frame(ledger, None, adapter, style), _noop)
-    cfg = load_live_config(config_path)
-    raw = _read_json(config_path)
-    name = adapter
-    if name is None:
-        resolved, named = resolve_broker(raw, cfg.strategy_params)
-        name = resolved if named else None
-    if name != "ibkr":
         return _WatchSession(
-            _store_frame(ledger, cfg if name is not None else None, name, style),
+            _store_frame(
+                ledger, None, adapter, cast("AdapterName", live_adapter()), style
+            ),
             _noop,
         )
+    cfg = load_live_config(config_path)
+    raw = _read_json(config_path)
+    # The scope-selecting adapter is resolved ONCE, as the one-shot path does, so
+    # the watch agrees with ``live run --adapter`` and with the one-shot ``pf``.
+    resolved = resolve_adapter_name(adapter, raw, cfg.strategy_params)
+    # The READ broker follows ``_pf_broker``'s rule: the flag, else a config's
+    # EXPLICITLY named broker, else no broker (store-only). A config that never
+    # named one must not open an ibkr session just because the default is ibkr.
+    read_as = adapter
+    if read_as is None:
+        # ``resolve_broker`` reads the ``broker`` key and reports whether it was
+        # named explicitly; ``ibkr`` is a fallback, not a selection.
+        named, was_named = resolve_broker(raw, cfg.strategy_params)
+        read_as = named if was_named else None
+    if read_as != "ibkr":
+        return _WatchSession(_store_frame(ledger, cfg, read_as, resolved, style), _noop)
     return _ibkr_watch_session(
         ledger,
-        lambda: (_config_scope(cfg),),
+        lambda: (_config_scope(cfg, resolved),),
         cfg.initial_capital,
         style,
     )
@@ -673,12 +698,18 @@ def _store_frame(
     ledger: SqliteLedger,
     cfg: LiveConfig | None,
     adapter: str | None,
+    resolved_adapter: AdapterName,
     style: Styler = PLAIN,
 ) -> Callable[[], str]:
-    """A store (+ sim broker) frame builder for the scopes a watch covers."""
+    """A store (+ sim broker) frame builder for the scopes a watch covers.
+
+    *adapter* is the broker to read per tick; *resolved_adapter* is the scope-
+    selecting adapter (the config's own when *cfg* is None and no flag was
+    given), so the two never disagree.
+    """
 
     def frame() -> str:
-        stores, broker = _store_and_broker(ledger, cfg, adapter)
+        stores, broker = _store_and_broker(ledger, cfg, adapter, resolved_adapter)
         return render_pf(
             PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
             "text",
@@ -692,6 +723,7 @@ def _store_and_broker(
     ledger: SqliteLedger,
     cfg: LiveConfig | None,
     adapter: str | None,
+    resolved_adapter: AdapterName,
 ) -> tuple[tuple[StoreSide, ...], BrokerSide | None]:
     """Re-read the store side and (for ``sim``) the store's account book, per tick.
 
@@ -703,11 +735,14 @@ def _store_and_broker(
     if cfg is None:
         stores = tuple(read_store(ledger, scope) for scope in ledger.scopes_of_store())
     else:
-        scope = _config_scope(cfg)
+        scope = _config_scope(cfg, resolved_adapter)
         stores = (read_store(ledger, scope, initial_capital=cfg.initial_capital),)
     if adapter != "sim":
         return stores, None
-    return stores, read_sim_broker(ledger, stores[0].scope if stores else "")
+    scope = stores[0].scope if stores else ""
+    return stores, read_sim_broker(
+        SimBookStore(resolve_sim_book_path()), scope, ledger.owned_ids(scope)
+    )
 
 
 def watch_pf_loop(

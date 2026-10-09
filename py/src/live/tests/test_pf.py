@@ -18,7 +18,7 @@ import pytest
 from src.bt.state import ActionType
 from src.data.db import get_connection
 from src.exec.refs import scope_tag
-from src.live.cli import load_live_config
+from src.live.cli import _config_report, load_live_config
 from src.live.identity import IntentKey, IntentRecord, IntentState, order_ref
 from src.live.ledger import ExecutionRecord, SqliteLedger
 from src.live.pf import (
@@ -120,7 +120,6 @@ def _side(
         lots=lots,
         orders=orders,
         trades=trades,
-        sim_open_ids=(),
     )
 
 
@@ -243,7 +242,6 @@ def _store(scope: str = "S1") -> StoreSide:
                 ts=TS,
             ),
         ),
-        sim_open_ids=("AAPL_1",),
     )
 
 
@@ -268,13 +266,28 @@ def test_render_pf_text_reports_no_divergence() -> None:
     )
 
 
-def test_ownership_only_sim_lot_still_diverges_by_id() -> None:
-    """A sim row with no fill detail diverges by id, so a legacy row is not lost."""
-    store = replace(_store(), lots=(), sim_open_ids=("LEGACY_1",), sim_lots=())
+def test_a_store_lot_the_broker_lacks_diverges_by_id() -> None:
+    """A store lot the broker does not carry diverges by id, so it is not lost."""
+    store = replace(
+        _store(),
+        lots=(StoreLot("LEGACY_1", "AAPL", "long", 10.0, 100.0, None, None, "", ""),),
+    )
     diverged = _divergence(
         PfReport(as_of=TS, stores=(store,), broker=replace(_broker(), positions=()))
     )
     assert "LEGACY_1" in diverged
+
+
+def test_a_qty_edited_broker_lot_diverges_by_size() -> None:
+    """A lot both books hold at different sizes is a qty divergence, not silence."""
+    broker = replace(
+        _broker(),
+        positions=(
+            BrokerLot("AAPL", "AAPL_1", 99.0, "long", 100.0, 110.0, 1100.0, True),
+        ),
+    )
+    diverged = _divergence(PfReport(as_of=TS, stores=(_store(),), broker=broker))
+    assert "qty mismatch" in diverged and "99" in diverged
 
 
 def test_an_edited_fixture_cash_is_reported_as_a_divergence() -> None:
@@ -311,6 +324,35 @@ def _cfg(tmp_path: Path, **live_keys: object) -> LiveConfig:
     target = tmp_path / "cfg.json"
     target.write_text(json.dumps({**BASE_CONFIG, **live_keys}))
     return load_live_config(str(target))
+
+
+def test_pf_adapter_flag_selects_the_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``pf --adapter sim`` reads the SIM scope a ``run --adapter sim`` wrote.
+
+    The bug: the flag only chose the broker to READ, not the scope, so a sim run
+    followed by ``pf --adapter sim`` reported the config's default (ibkr) scope.
+    Asserted on the scope handed to ``read_store`` — the only place the choice is
+    observable before any broker read.
+    """
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(BASE_CONFIG))  # no adapter key: defaults to ibkr
+    seen: list[str] = []
+
+    def fake_read(ledger: object, scope: str, **kw: object) -> StoreSide:
+        seen.append(scope)
+        return _store(scope=scope)
+
+    monkeypatch.setattr("src.live.cli.read_store", fake_read)
+    monkeypatch.setattr("src.live.cli._pf_broker", lambda *a, **k: None)
+    ledger = cast("SqliteLedger", object())
+
+    _config_report(ledger, str(path), None)  # no flag: the config's own scope
+    _config_report(ledger, str(path), "sim")  # flag: the sim scope
+
+    assert seen[0].startswith("ibkr_pf_test_")
+    assert seen[1].startswith("sim_pf_test_")
 
 
 # --- (e) ibkr broker read: ownership by our own ref prefix (INV-5) ------------

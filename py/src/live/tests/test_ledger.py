@@ -25,14 +25,12 @@ from src.live.identity import (
 from src.live import ledger as ledger_module
 from src.live.ledger import (
     LedgerReadError,
-    SimLot,
     SqliteLedger,
 )
 from src.live.lease import CycleInProgressError
 from src.live.tests.ledgers import live_ledger
 from src.live.pure import OrderResult, intent_to_signal
-from src.live.pure_plan import ResultWrite
-from src.live.types import OrderIntent
+from src.live.types import ExecutionRecord, OrderIntent
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
 OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
@@ -204,59 +202,6 @@ def test_prune_closed_deletes_only_old_closed(ledger: SqliteLedger) -> None:
     assert ledger.load_book("S1").rows == ()
 
 
-def test_sim_lot_detail_round_trips_and_survives_a_bare_reopen(
-    ledger: SqliteLedger,
-) -> None:
-    """A recorded lot keeps its fill detail; a bared ownership write never erases it."""
-    opened = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
-    ledger.record_sim_lot(
-        "S1",
-        SimLot(
-            position_id="AAPL_7",
-            symbol="AAPL",
-            side="long",
-            qty=3.0,
-            entry_price=10.0,
-            stop_loss=9.0,
-            take_profit=12.0,
-            tag="v",
-            opened_at=opened,
-        ),
-    )
-    ledger.record_sim_open("S1", "AAPL_7")  # re-open, less detail
-    (lot,) = ledger.sim_open_lots("S1")
-    assert (lot.symbol, lot.side, lot.qty, lot.entry_price) == (
-        "AAPL",
-        "long",
-        3.0,
-        10.0,
-    )
-    assert (lot.stop_loss, lot.take_profit, lot.tag) == (9.0, 12.0, "v")
-    assert lot.opened_at == opened
-    assert lot.has_detail is True
-
-    ledger.mark_sim_closed("S1", "AAPL_7", opened)
-    assert ledger.sim_open_ids("S1") == frozenset()
-    assert ledger.sim_open_lots("S1") == ()
-
-
-def test_an_ownership_only_lot_mints_no_fill_when_read_back(
-    ledger: SqliteLedger,
-) -> None:
-    """A lot with no size implies no fill, even after the row round-trips.
-
-    The row stores ``qty=0.0`` (the NOT NULL sentinel) with a real symbol, so a
-    detail test keyed on the symbol alone would mint a phantom zero-qty entry leg
-    into the scope's history — and that leg is what ``cash_of`` sums.
-    """
-    ledger.record_sim_lot(
-        "S1", SimLot(position_id="AAPL_9", symbol="AAPL", side="long")
-    )
-    (lot,) = ledger.sim_lots("S1")
-    assert lot.symbol == "AAPL" and lot.has_detail is False
-    assert ledger.sim_executions("S1") == ()
-
-
 def _result(pid: str | None, intent: OrderIntent, *, price: float) -> OrderResult:
     return OrderResult(
         intent=intent,
@@ -310,25 +255,25 @@ def test_record_results_applies_every_write_of_a_cycle_atomically(
     The failure is forced on the LAST write of a two-lot batch — after the first
     lot's row is already inserted — so a per-write transaction would leave that
     row behind and this asserts the whole batch rolled back. The patch wraps the
-    real ``_apply_write`` (the forced error is not the only write attempted), so
-    the first lot's insert really is in flight when the second one raises.
+    real ``_insert_execution`` (the forced error is not the only write attempted),
+    so the first lot's insert really is in flight when the second one raises.
     """
     ledger.record_results("S1", (_open_result("L1"),), TS)
-    real = ledger_module._apply_write
+    real = ledger_module._insert_execution
     calls = 0
 
-    def fail_last(scope: str, write: ResultWrite) -> None:
+    def fail_last(record: ExecutionRecord) -> None:
         nonlocal calls
         calls += 1
         if calls > 1:
             raise peewee.IntegrityError("forced mid-cycle failure")
-        real(scope, write)
+        real(record)
 
-    monkeypatch.setattr(ledger_module, "_apply_write", fail_last)
+    monkeypatch.setattr(ledger_module, "_insert_execution", fail_last)
     with pytest.raises(peewee.IntegrityError):
         ledger.record_results("S1", (_open_result("L2"), _close_result("L2")), TS)
     monkeypatch.undo()
-    assert ledger.sim_open_ids("S1") == frozenset({"L1"})
+    assert ledger.owned_ids("S1") == frozenset({"L1"})
     assert {r.execution_id for r in ledger.executions_of("S1")} == {"L1:open"}
 
 
@@ -336,9 +281,9 @@ def test_re_running_the_same_results_changes_nothing(ledger: SqliteLedger) -> No
     """REPLACE/IGNORE keep a re-applied cycle idempotent (a re-run is a no-op)."""
     results = (_open_result("L1"), _close_result("L1"))
     ledger.record_results("S1", results, TS)
-    before = (ledger.sim_lots("S1"), ledger.executions_of("S1"))
+    before = ledger.executions_of("S1")
     ledger.record_results("S1", results, TS)
-    assert (ledger.sim_lots("S1"), ledger.executions_of("S1")) == before
+    assert ledger.executions_of("S1") == before
     assert len(ledger.executions_of("S1")) == 2  # entry + exit, no duplicates
 
 

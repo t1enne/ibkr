@@ -87,6 +87,10 @@ class LiveExecution(_Base):
     execution_id = TextField()
     #: The lot this fill belongs to (``str(conid)`` for IBKR; a sim lot's id).
     position_id = TextField(default="")
+    #: Provenance-only: the real conid for an IBKR fill, a stable synthetic one
+    #: for a sim fill (which has no conid). NOT NULL in the migrated schema, so a
+    #: row that omits it is silently DROPPED by ``INSERT OR IGNORE``; never omit it.
+    conid = IntegerField(null=False)
     side = TextField()
     qty = FloatField()
     price = FloatField()

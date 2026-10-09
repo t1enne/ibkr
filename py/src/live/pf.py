@@ -32,11 +32,18 @@ from src.shared.style import PLAIN, Role, Styler
 from src.bt.table import Col, Table, render
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.live.identity import ref_is_ours
-from src.live.adapters.ibkr.mapping import IbkrPosition, parse_positions, parse_summary
+from src.live.adapters.ibkr.mapping import (
+    IbkrPosition,
+    num,
+    opt_str,
+    parse_positions,
+    parse_summary,
+)
 from src.live.adapters.ibkr.orders import parse_working_order
 from src.live.identity import IntentRecord, WorkingOrder
+from src.live.adapters.sim.store import SimBookStore
+from src.live.divergence import book_from_executions
 from src.live.ledger import ExecutionRecord, SqliteLedger, StrategyAudit
-from src.live.ledger import SimLot
 
 #: The side label a signed quantity reduces to; the broker side and the store
 #: side both use it so a long/short lot compares directly.
@@ -108,11 +115,9 @@ class StoreSide:
     ``db_path`` is the resolved sqlite file; ``strategy_rows`` is the audit trail
     (oldest first) so the report can name the latest revision and its cycle.
     ``orders`` is EVERY order intent for the scope (open and closed, newest
-    first); ``trades`` is every stored fill (oldest first) — the conid book's
-    replayed fills AND the sim path's own lot legs, so a sim scope reports the
-    same way a real one does. ``sim_lots`` are the sim path's own book rows (the
-    conid-keyed ``lots`` stay empty for a sim scope): the sim broker mints a
-    synthetic ``position_id``, never a conid.
+    first); ``trades`` is every stored fill (oldest first). ``lots`` are the OPEN
+    lots from the fill fold (``book_from_executions``), so both the IBKR reconcile
+    book and the sim path report the same way.
     """
 
     scope: str
@@ -123,8 +128,6 @@ class StoreSide:
     lots: tuple[StoreLot, ...]
     orders: tuple[IntentRecord, ...]
     trades: tuple[ExecutionRecord, ...]
-    sim_open_ids: tuple[str, ...]
-    sim_lots: tuple[StoreLot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -148,28 +151,28 @@ def read_store(
     """Read our durable store for *scope* through the ledger's PUBLIC reads only.
 
     Every figure comes from a public read method (``cash_of``,
-    ``initial_capital_of``, ``load_book``, ``load_open``, ``sim_open_lots``,
-    ``strategies_of``); this never writes and never touches a model directly. The
-    stored ``initial_capital`` wins for cash's seed; a scope that has never
-    written falls back to *initial_capital* (``0.0`` without a config, so a
-    scope read outside its own config invents no number).
+    ``initial_capital_of``, ``executions_of``, ``strategies_of``); this never
+    writes and never touches a model directly. The stored ``initial_capital``
+    wins for cash's seed; a scope that has never written falls back to
+    *initial_capital* (``0.0`` without a config, so a scope read outside its own
+    config invents no number).
     """
-    book = ledger.load_book(scope)
-    sim_lots = ledger.sim_open_lots(scope)
+    executions = ledger.executions_of(scope)
+    book = book_from_executions(executions)
     open_lots = tuple(
         StoreLot(
-            id=str(row.conid),
-            symbol=row.symbol,
-            side=row.side,
-            qty=row.qty,
-            entry_price=row.entry_price,
-            stop_loss=row.stop_loss,
-            take_profit=row.take_profit,
-            tag=row.tag,
-            order_ref=row.order_ref,
+            id=position.position_id,
+            symbol=position.symbol,
+            side=position.type.value,
+            qty=position.qty,
+            entry_price=position.entry_price,
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
+            tag=position.tag,
+            order_ref="",
         )
-        for row in book.rows
-        if row.is_open
+        for lots in book.positions.values()
+        for position in lots
     )
     return StoreSide(
         scope=scope,
@@ -179,62 +182,66 @@ def read_store(
         initial_capital=ledger.initial_capital_of(scope) or initial_capital,
         lots=open_lots,
         orders=ledger.intents_of(scope),
-        trades=ledger.executions_of(scope) + ledger.sim_executions(scope),
-        sim_open_ids=tuple(sorted(lot.position_id for lot in sim_lots)),
-        sim_lots=tuple(_sim_store_lot(lot) for lot in sim_lots),
+        trades=executions,
     )
 
 
-def _sim_store_lot(lot: SimLot) -> StoreLot:
-    """One sim lot as a store row. An ownership-only row carries no symbol/size."""
-    return StoreLot(
-        id=lot.position_id,
-        symbol=lot.symbol or "",
-        side=lot.side or "",
-        qty=lot.qty or 0.0,
-        entry_price=lot.entry_price or 0.0,
-        stop_loss=lot.stop_loss,
-        take_profit=lot.take_profit,
-        tag=lot.tag or "",
-        order_ref="",
-    )
+def read_sim_broker(
+    store: SimBookStore, scope: str, owned: frozenset[str]
+) -> BrokerSide:
+    """Read the sim ACCOUNT book from the JSON store (no fixture, no network).
 
-
-def read_sim_broker(ledger: SqliteLedger, scope: str) -> BrokerSide:
-    """Read the sim ACCOUNT book from the store itself (no fixture, no network).
-
-    ``source='account'`` rows are the human-editable side of the sim book; the
-    scope's own account rows are all ours (the scope embeds the adapter, so no
-    foreign strategy shares it), so every lot is ``owned=True``. A row with no
-    detail names a lot we own but cannot describe — it is skipped, exactly as the
-    adapter's account-book read skips it. ``source`` names the STORE, not a path:
-    the sim book is sqlite now.
+    The JSON book is the human-editable side of the sim account; a lot is
+    ``owned`` when its ``position_id`` is in the fill fold's open ids. ``source``
+    names the JSON file path. The summary's cash/net-liquidation are display-only
+    (the operator edits them to create a divergence).
     """
-    lots = tuple(
-        BrokerLot(
-            symbol=lot.symbol or "",
-            id=lot.position_id,
-            qty=lot.qty or 0.0,
-            side=lot.side or "",
-            avg_cost=lot.entry_price or 0.0,
-            last_price=lot.entry_price or 0.0,
-            market_value=(lot.qty or 0.0) * (lot.entry_price or 0.0),
-            owned=True,
-        )
-        for lot in ledger.sim_open_lots(scope)
-        if lot.has_detail
-    )
+    book = store.read(scope)
+    summary, _ = parse_summary(book.summary)
     return BrokerSide(
         adapter="sim",
-        source=ledger.db_path,
-        account="",
-        net_liquidation=None,
-        cash=ledger.cash_of(scope),
-        positions=lots,
+        source=str(store.path),
+        account=book.account,
+        net_liquidation=summary.net_liquidation or None,
+        cash=summary.total_cash,
+        positions=_broker_lots(book.positions, owned),
         working_orders=(),
         ours_orders=(),
         warnings=(),
     )
+
+
+def _broker_lots(
+    rows: tuple[Mapping[str, object], ...], owned: frozenset[str]
+) -> tuple[BrokerLot, ...]:
+    """One broker lot per JSON position row, keyed by its ``position_id``.
+
+    The rows are read DIRECTLY rather than through ``parse_positions``: the sim
+    book is per-lot, and two lots of one symbol share the synthetic ``conid``, so
+    a conid-keyed map would silently collapse them into one.
+    """
+    lots: list[BrokerLot] = []
+    for row in rows:
+        symbol = opt_str(row.get("contractDesc") or row.get("symbol"))
+        pid = opt_str(row.get("position_id"))
+        qty = num(row.get("position"))
+        if not symbol or qty == 0.0:
+            continue
+        side = opt_str(row.get("side")) or (_LONG if qty > 0 else _SHORT)
+        avg_cost = num(row.get("avgCost"))
+        lots.append(
+            BrokerLot(
+                symbol=symbol,
+                id=pid,
+                qty=abs(qty),
+                side=side,
+                avg_cost=avg_cost,
+                last_price=num(row.get("mktPrice")) or avg_cost,
+                market_value=qty * avg_cost,
+                owned=pid in owned,
+            )
+        )
+    return tuple(lots)
 
 
 async def read_ibkr_broker(
@@ -400,7 +407,6 @@ class ScopeStats:
     commission: float
     open_lots: int
     trades: int
-    sim_lots: int
     wins: int
     losses: int
 
@@ -410,9 +416,9 @@ def position_rows(
 ) -> tuple[PositionRow, ...]:
     """Every symbol *store* touched, merged into one row (broker marks optional).
 
-    The symbol set is the UNION of the open lots (our book rows plus the sim lots
-    the broker owns), the order intents and the stored fills, so a symbol only one
-    of the three names is not lost. *broker* is read for last prices only.
+    The symbol set is the UNION of the open lots, the order intents and the
+    stored fills, so a symbol only one of the three names is not lost. *broker*
+    is read for last prices only.
     """
     views, symbols = _open_views(store, broker)
     intents = _intents_by_symbol(store.orders)
@@ -458,7 +464,6 @@ def scope_stats(store: StoreSide, broker: BrokerSide | None = None) -> ScopeStat
         commission=sum(abs(trade.commission) for trade in store.trades),
         open_lots=len(store.lots),
         trades=len(store.trades),
-        sim_lots=len(store.sim_open_ids),
         wins=sum(1 for row in closed if row.realized > 0.0),
         losses=sum(1 for row in closed if row.realized < 0.0),
     )
@@ -469,19 +474,13 @@ def _open_views(
 ) -> tuple[dict[str, _LotView], list[str]]:
     """Open exposure per symbol, plus the deterministic list of symbols to show.
 
-    Our book rows and the sim lots we own BOTH become views. A sim lot that
-    carries its fill detail is a view of its own, so a lot the fixture no longer
-    holds still shows the size we own (that missing counterpart is exactly what
-    the divergence line reports). An ownership-only row has no detail, so the
-    broker's fixture lot with the same id supplies it, when one is there. A
-    symbol our book already covers is never re-added from the broker (the two
-    adapters key lots differently).
+    Our book rows become views (collapsed per symbol). A symbol our book already
+    covers is never re-added from the broker (the two adapters key lots
+    differently).
     """
     views = {
         symbol: _lot_view(lots) for symbol, lots in _lots_by_symbol(store.lots).items()
     }
-    for symbol, view in _sim_lot_views(store, broker).items():
-        views.setdefault(symbol, view)
     symbols = sorted(
         set(views)
         | {trade.symbol or "-" for trade in store.trades}
@@ -490,63 +489,9 @@ def _open_views(
     return views, symbols
 
 
-def _sim_lot_views(store: StoreSide, broker: BrokerSide | None) -> dict[str, _LotView]:
-    """One view per sim lot we own: its own detail, else the fixture's.
-
-    Rows that carry detail collapse per symbol the way a conid book with several
-    lots does (summed size, weighted entry). An ownership-only row has no detail,
-    so the fixture's lot with the same id supplies it — and never overwrites a
-    symbol a detailed row already described.
-    """
-    detailed = tuple(lot for lot in store.sim_lots if lot.symbol)
-    out = {
-        symbol: _lot_view(lots) for symbol, lots in _lots_by_symbol(detailed).items()
-    }
-    marks = {lot.id: lot for lot in (broker.positions if broker is not None else ())}
-    for lot in store.sim_lots:
-        if lot.symbol:
-            continue
-        mark = marks.get(lot.id)
-        if mark is not None:
-            out.setdefault(
-                mark.symbol,
-                _LotView(
-                    qty=mark.qty,
-                    entry=mark.avg_cost,
-                    side=mark.side,
-                    stop_loss=None,
-                    take_profit=None,
-                    order_ref="",
-                ),
-            )
-    return out
-
-
 def _owned_lots(store: StoreSide) -> tuple[StoreLot, ...]:
-    """The lots we own: our book rows plus the sim lots (id-only ones included).
-
-    An id named by more than one of the three sources is listed ONCE — the two
-    adapters key their lots differently, so a conid and a ``position_id`` can
-    collide as strings without being the same lot.
-    """
-    rows = store.lots + store.sim_lots
-    seen = {lot.id for lot in rows}
-    extra = tuple(
-        StoreLot(
-            id=i,
-            symbol="",
-            side="",
-            qty=0.0,
-            entry_price=0.0,
-            stop_loss=None,
-            take_profit=None,
-            tag="",
-            order_ref="",
-        )
-        for i in store.sim_open_ids
-        if i not in seen
-    )
-    return rows + extra
+    """The lots we own: the fill fold's open lots (``store.lots``)."""
+    return store.lots
 
 
 def _lots_by_symbol(lots: tuple[StoreLot, ...]) -> dict[str, tuple[StoreLot, ...]]:
@@ -656,13 +601,6 @@ def _realized(flow: _Flows, side: str, qty: float, entry: float | None) -> float
     share = qty / entry_qty if entry_qty else 0.0
     direction = 1.0 if long_side else -1.0
     return flow.cash + direction * qty * entry + entry_comm * share
-
-
-def _order_ref(view: _LotView | None, intent: IntentRecord | None) -> str:
-    """The lot's ENTRY ref when we hold one, else the newest intent's ref."""
-    if view is not None and view.order_ref:
-        return view.order_ref
-    return intent.order_ref if intent is not None else ""
 
 
 def _side(view: _LotView | None, flow: _Flows, intent: IntentRecord | None) -> str:
@@ -800,7 +738,6 @@ _STATS_COLS = (
     Col("comm", ">"),
     Col("lots", ">"),
     Col("trd", ">"),
-    Col("sim", ">"),
     Col("win", ">"),
     Col("loss", ">"),
 )
@@ -852,7 +789,6 @@ def _store_dict(store: StoreSide) -> dict[str, object]:
         "lots": [asdict(lot) for lot in store.lots],
         "orders": [_intent_dict(record) for record in store.orders],
         "trades": [asdict(trade) for trade in store.trades],
-        "sim_open_ids": list(store.sim_open_ids),
     }
 
 
@@ -1034,7 +970,6 @@ def _stats_row(stats: ScopeStats) -> tuple[str, ...]:
         f"{stats.commission:.2f}",
         str(stats.open_lots),
         str(stats.trades),
-        str(stats.sim_lots),
         str(stats.wins),
         str(stats.losses),
     )
@@ -1089,8 +1024,7 @@ def _divergence(report: PfReport) -> tuple[str, ...]:
     The mismatches a human acts on: a broker lot we do not record, a store lot
     the broker does not show, and — for ``sim``, whose broker cash IS this
     scope's cash — a cash figure that moved on one side only. Ownership is the
-    union of the scope's book rows (conid space) and its sim lots
-    (``position_id`` space): the two adapters key their lots differently.
+    scope's open lots (the fill fold's ``position_id`` space).
 
     Cash is only compared for ``sim``: an IBKR account's cash is shared by every
     strategy on it (and the store's own cash is the authority), so a difference
@@ -1118,8 +1052,18 @@ def _divergence(report: PfReport) -> tuple[str, ...]:
         for lot in store_lots.values()
         if lot.id not in broker_ids
     )
+    # A lot BOTH books hold but size differently: our fill fold says one number,
+    # the (possibly hand-edited) broker book another. Keyed by id so it reports
+    # once per lot; a tolerance keeps float noise out.
+    broker_qty = {lot.id: lot.qty for lot in broker.positions}
+    qty_mismatch = tuple(
+        f"qty mismatch {lot.id} {lot.symbol or '-'}: ours={lot.qty} "
+        f"account={broker_qty[lot.id]}"
+        for lot in store_lots.values()
+        if lot.id in broker_qty and abs(lot.qty - broker_qty[lot.id]) > _CASH_TOLERANCE
+    )
     cash = _cash_divergence(broker, report.stores) if broker.adapter == "sim" else ()
-    return ours_unmatched + store_unmatched + cash
+    return ours_unmatched + qty_mismatch + store_unmatched + cash
 
 
 #: Cash differences below this are rounding, not a divergence worth a line.

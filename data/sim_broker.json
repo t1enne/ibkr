@@ -1,0 +1,128 @@
+{
+  "scopes": {
+    "sim_vwatr_hv_gated_466aec71": {
+      "account": "SIM",
+      "summary": {
+        "totalcashvalue": {
+          "amount": 27707.857989673048,
+          "currency": "USD"
+        }
+      },
+      "positions": [
+        {
+          "position_id": "PLTR_1791586422.036004_4",
+          "conid": 1216023698,
+          "contractDesc": "PLTR",
+          "position": 40.7963,
+          "side": "long",
+          "avgCost": 198.809424,
+          "mktPrice": 198.809424,
+          "currency": "USD"
+        },
+        {
+          "position_id": "NVDA_1791586422.036004_2",
+          "conid": 661674263,
+          "contractDesc": "NVDA",
+          "position": 19.8738,
+          "side": "long",
+          "avgCost": 230.67375649999997,
+          "mktPrice": 230.67375649999997,
+          "currency": "USD"
+        },
+        {
+          "position_id": "CRWD_1791586422.036004_0",
+          "conid": 1133943819,
+          "contractDesc": "CRWD",
+          "position": 17.2231,
+          "side": "long",
+          "avgCost": 263.0883365,
+          "mktPrice": 263.0883365,
+          "currency": "USD"
+        },
+        {
+          "position_id": "DDOG_1791586422.036004_1",
+          "conid": 1576579731,
+          "contractDesc": "DDOG",
+          "position": 3.3614,
+          "side": "long",
+          "avgCost": 273.8131605,
+          "mktPrice": 273.8131605,
+          "currency": "USD"
+        },
+        {
+          "position_id": "PANW_1791586422.036004_3",
+          "conid": 14979477,
+          "contractDesc": "PANW",
+          "position": 10.4011,
+          "side": "long",
+          "avgCost": 398.539262,
+          "mktPrice": 398.539262,
+          "currency": "USD"
+        }
+      ],
+      "orders": [],
+      "trades": [
+        {
+          "execution_id": "PLTR_1791586422.036004_4:open",
+          "order_ref": "",
+          "symbol": "PLTR",
+          "conid": 1216023698,
+          "side": "B",
+          "size": 40.7963,
+          "price": 198.809424,
+          "commission": 0.05,
+          "trade_time_r": 1791586422036,
+          "account": "SIM"
+        },
+        {
+          "execution_id": "NVDA_1791586422.036004_2:open",
+          "order_ref": "",
+          "symbol": "NVDA",
+          "conid": 661674263,
+          "side": "B",
+          "size": 19.8738,
+          "price": 230.67375649999997,
+          "commission": 0.05,
+          "trade_time_r": 1791586422036,
+          "account": "SIM"
+        },
+        {
+          "execution_id": "CRWD_1791586422.036004_0:open",
+          "order_ref": "",
+          "symbol": "CRWD",
+          "conid": 1133943819,
+          "side": "B",
+          "size": 17.2231,
+          "price": 263.0883365,
+          "commission": 0.05,
+          "trade_time_r": 1791586422036,
+          "account": "SIM"
+        },
+        {
+          "execution_id": "DDOG_1791586422.036004_1:open",
+          "order_ref": "",
+          "symbol": "DDOG",
+          "conid": 1576579731,
+          "side": "B",
+          "size": 3.3614,
+          "price": 273.8131605,
+          "commission": 0.05,
+          "trade_time_r": 1791586422036,
+          "account": "SIM"
+        },
+        {
+          "execution_id": "PANW_1791586422.036004_3:open",
+          "order_ref": "",
+          "symbol": "PANW",
+          "conid": 14979477,
+          "side": "B",
+          "size": 10.4011,
+          "price": 398.539262,
+          "commission": 0.05,
+          "trade_time_r": 1791586422036,
+          "account": "SIM"
+        }
+      ]
+    }
+  }
+}
