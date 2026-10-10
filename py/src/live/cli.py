@@ -19,7 +19,6 @@ from typing import Any, Literal, TextIO, cast
 
 import click
 import pandas as pd
-import peewee
 
 from src.bt import load_strategy
 from src.bt.cmds._shared import _json_default
@@ -32,11 +31,13 @@ from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.gateway import IbkrGateway
 from src.live.adapter import LiveAdapter, resolve_adapter, resolve_adapter_name
 from src.live.pure import OrderResult
-from src.live.engine import (
-    CycleReport,
+from src.live.pipeline import (
     PortfolioFetchError,
-    StaleDataError,
     run_cycle,
+)
+from src.live.freshness import StaleDataError
+from src.live.report import (
+    CycleReport,
     unsafe_outcomes,
 )
 from src.live.lease import CycleInProgressError
@@ -156,8 +157,7 @@ def live_run(
     strategy = _strategy_config(config_path, raw)
     ledger = SqliteLedger()
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
-        ledger.ensure_strategy(strategy_id, scope, strategy.name)
-        ledger.ensure_cash(scope, cfg.initial_capital)
+        ledger.ensure_strategy(strategy_id, scope, strategy.name, cfg.initial_capital)
     gateway: IbkrGateway | None = None
     client: IbkrClient | None = None
     if resolved == "ibkr":
@@ -206,12 +206,10 @@ def live_run(
         # not a CLI contract.
         raise click.ClickException(str(exc)) from exc
     click.echo(render_report(report, fmt, scope))
-    _housekeeping(ledger, dry_run)
     # The report already prints placement_error/resync_error/the unsafe outcomes,
     # so the exit code is the machine-readable signal — never a duplicated message.
     # stdout stays the parseable contract (a JSON document for ``--format json``);
-    # the exit code is out-of-band. Checked AFTER the housekeeping so a prune
-    # failure cannot change the verdict.
+    # the exit code is out-of-band.
     if report.is_unsafe():
         if not allow_unsafe:
             raise click.exceptions.Exit(_UNSAFE_EXIT_CODE)
@@ -816,25 +814,6 @@ def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
     path = Path(tmp) / "strategy.json"
     path.write_text(json.dumps(asdict(strategy), default=_json_default))
     return str(path)
-
-
-def _housekeeping(ledger: SqliteLedger, dry_run: bool) -> None:
-    """Prune aged-out closed rows; never fail the cycle over cleanup.
-
-    A dry run writes nothing, so it skips the prune (the caller already skipped
-    ``ensure_strategy``).
-    """
-    if dry_run:
-        return
-    try:
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=90)
-        ledger.prune_closed(cast("pd.Timestamp", cutoff))
-    except peewee.OperationalError as exc:  # housekeeping is non-fatal
-        # peewee wraps sqlite3 errors (a lock, a busy DB) as peewee.OperationalError
-        # — NOT a sqlite3.Error — so this is the type a prune failure actually
-        # raises. The ledger's own reads catch the same type. LedgerReadError is
-        # not caught: prune_closed takes the WRITE path and never raises it.
-        _stderr_log(f"housekeeping: prune skipped ({exc})")
 
 
 def load_live_config(path: str) -> LiveConfig:

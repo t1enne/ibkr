@@ -1,10 +1,8 @@
 """Shared plumbing for the sqlite ledger and its mixins.
 
-The ledger's models and behaviour are split across modules (``ledger`` and
-``ledger_migration``) so each class stays under the repo's size budget. This
-module owns the pieces ALL of them need and that have no natural home: the peewee
-template binding, the base model, the read-failure type, the raw ``sqlite_master``
-/ ``PRAGMA`` helpers, and the epoch-millisecond codec.
+This module owns the pieces every ledger mixin needs and that have no natural
+home: the peewee template binding, the base model, the read-failure type and the
+epoch-millisecond codec.
 
 The template binding is a PLACEHOLDER: the model CLASSES are defined against it,
 but each ``SqliteLedger`` rebinds them (via ``bind_ctx``) to its OWN
@@ -21,15 +19,6 @@ from typing import cast
 import pandas as pd
 import peewee
 from peewee import Model, SqliteDatabase
-
-#: Re-exported from :mod:`src.db.introspect` so the ledger's own modules (and any
-#: caller that grew to depend on them here) keep one import site, while the
-#: implementation lives in the leaf module the migration framework can use too.
-from src.db.introspect import (  # noqa: F401
-    primary_key_columns as _primary_key_columns,
-    table_columns as _table_columns,
-    table_exists as _table_exists,
-)
 
 _TEMPLATE_DB = SqliteDatabase(None)
 

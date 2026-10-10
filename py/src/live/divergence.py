@@ -5,7 +5,7 @@ Two books describe the same scope and must agree:
 - **ours** — the fold of the scope's stored fills (``live_execution``). Append-only
   and engine-owned, so it is the truth: nobody hand-edits a fill.
 - **the account's** — the exposure surface the broker reports or the operator
-  edits (``live_position``, ``source='account'``). A human editing qty, deleting a
+  edits (the sim JSON book). A human editing qty, deleting a
   lot or adding one is exactly what moves it.
 
 They disagree when a lot exists on one side only, or when a lot on both sides has
@@ -14,18 +14,28 @@ silently onto the account's number: it surfaces a :class:`Divergence`, the cycle
 is refused, and the operator resolves it. This module is the oracle only — it
 reads no ledger, writes nothing, and is called by the cycle (never the reverse).
 
+What the oracle actually sees depends on the adapter. On the sim path the
+account side is the operator-editable JSON book, so a hit is a genuine human
+disagreement. On the IBKR path the adapter assembles the account side from the
+SAME broker trade window this fold is fed, so the two agree by construction and
+a hit means our sqlite fold drifted from the broker stream — a
+persistence-integrity check, not a broker-side edit. Do not expect the IBKR path
+to catch edits it cannot see.
+
 Both functions are pure: same inputs, same output, no I/O, no clock, no store.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import pandas as pd
 
 from src.bt.state import ActionType, PortfolioState, Position
-from src.live.ledger import ExecutionRecord
+from src.live.adapters.ibkr.trades import BookRow
+from src.live.ledger_base import LedgerReadError
+from src.live.types import ExecutionRecord
 
 #: Signed-quantity difference below which two books count as the same lot size.
 #: Loose enough to absorb float summation noise over a long fill history; tight
@@ -37,6 +47,9 @@ DivergenceKind = Literal["missing_ours", "missing_account", "qty_mismatch"]
 
 #: Open time for a lot whose fills carry no timestamp (a predates-``ts`` row).
 _EPOCH = cast("pd.Timestamp", pd.Timestamp(0, unit="ms", tz="UTC"))
+
+#: Absolute quantity below which a lot counts as flat (float summation noise).
+_EPS = 1e-9
 
 #: A lot's book identity: its symbol and its lot id (``None`` when unrecorded).
 LotKey = tuple[str, str | None]
@@ -151,6 +164,86 @@ def book_from_executions(
         trades=(),
         equity_curve=(),
         initial_capital=0.0,
+    )
+
+
+def book_rows_from_executions(
+    records: tuple[ExecutionRecord, ...],
+) -> tuple[BookRow, ...]:
+    """Fold stored fills into one ``BookRow`` per lot, mirroring ``trades._apply``.
+
+    The executions book is keyed by conid, so a lot id that is not an IBKR conid
+    cannot be read as one: a non-numeric ``position_id`` is a sim lot on a
+    conid-keyed book and raises :class:`LedgerReadError` rather than being
+    dropped. Rows come back sorted by conid, a round trip leaves one CLOSED row
+    (``closed_at`` at the fill that nets the lot to zero), and ``entry_price`` is
+    the VWAP of the current open interval's extending fills. Non-numeric lot ids
+    are rejected outright, so a sim fill must never reach this fold.
+    """
+    rows: dict[int, BookRow] = {}
+    for record in sorted(records, key=lambda r: _sort_ts(r.ts)):
+        conid = _conid_of(record.position_id)
+        rows[conid] = _fold(rows.get(conid), record, conid)
+    return tuple(rows[conid] for conid in sorted(rows))
+
+
+def _sort_ts(ts: pd.Timestamp | None) -> pd.Timestamp:
+    """A fill's fold instant: a missing timestamp sorts first (earliest)."""
+    return _EPOCH if ts is None else ts
+
+
+def _conid_of(position_id: str) -> int:
+    """The conid a lot id names; a non-numeric id is unreadable on this book."""
+    if not position_id.isdigit():
+        raise LedgerReadError(
+            f"live_execution lot id {position_id!r} is not an IBKR conid; the "
+            "executions book cannot read it"
+        )
+    return int(position_id)
+
+
+def _fold(row: BookRow | None, record: ExecutionRecord, conid: int) -> BookRow:
+    """Apply one stored fill to *row* (or open a new one); a closed row stays closed.
+
+    The net is signed (BUY adds, SELL subtracts). An extending fill blends the
+    entry VWAP; a reducing fill keeps it; a fill that nets to zero stamps
+    ``closed_at``; a flip resets the interval with the residual size. A fill after
+    the lot is flat re-opens it, exactly as the broker's own fold would.
+    """
+    signed = _signed_qty(record)
+    if row is None or row.closed_at is not None or row.qty <= _EPS:
+        return _open_row(record, conid, signed, abs(signed))
+    current = row.qty if row.side == "long" else -row.qty
+    if signed * current > 0:
+        total = row.qty + abs(signed)
+        blended = (row.entry_price * row.qty + record.price * abs(signed)) / total
+        return replace(row, qty=total, entry_price=blended)
+    if abs(signed) < row.qty - _EPS:
+        return replace(row, qty=row.qty - abs(signed))
+    if abs(abs(signed) - row.qty) <= _EPS:
+        return replace(row, qty=0.0, closed_at=_sort_ts(record.ts))
+    return _open_row(record, conid, signed, abs(signed) - row.qty)
+
+
+def _open_row(
+    record: ExecutionRecord, conid: int, signed: float, qty: float
+) -> BookRow:
+    """A fresh open interval from *record* (``qty`` is the residual for a flip)."""
+    return BookRow(
+        scope=record.scope,
+        conid=conid,
+        symbol=record.symbol,
+        side="long" if signed > 0 else "short",
+        qty=qty,
+        entry_price=record.price,
+        opened_at=_sort_ts(record.ts),
+        closed_at=None,
+        stop_loss=None,
+        take_profit=None,
+        tag="",
+        #: The stored fill carries no ``order_ref`` (that is minted per attempt at
+        #: the identity layer); the row leaves it blank rather than inventing one.
+        order_ref="",
     )
 
 

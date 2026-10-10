@@ -29,7 +29,7 @@ from src.live.cli import (
     load_live_config,
 )
 from src.live.divergence import Divergence
-from src.live.engine import CycleReport
+from src.live.report import CycleReport
 from src.live.identity import (
     IntentKey,
     IntentRecord,
@@ -141,9 +141,6 @@ def _invoke_run(
 
     class FakeLedger:
         def ensure_strategy(self, *a: object, **k: object) -> None: ...
-        def ensure_cash(self, *a: object, **k: object) -> None: ...
-        def prune_closed(self, *a: object, **k: object) -> int:
-            return 0
 
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
         return report
@@ -336,16 +333,11 @@ class _RecordingLedger:
 
     def ensure_strategy(self, *a: object, **k: object) -> None: ...
 
-    def ensure_cash(self, *a: object, **k: object) -> None: ...
-
-    def prune_closed(self, before: pd.Timestamp) -> int:
-        return 0
-
     def prune(self, before: pd.Timestamp) -> int:
         self.pruned += 1
         return 0
 
-    def touch_cycle(self, strategy_id: str, at: pd.Timestamp) -> None:
+    def touch_cycle(self, scope: str, at: pd.Timestamp) -> None:
         self.touched += 1
 
     def cycle_lease(self, scope: str = "") -> AbstractContextManager[None]:
@@ -376,7 +368,7 @@ def _dry_cfg() -> LiveConfig:
 
 @pytest.mark.asyncio
 async def test_run_cycle_dry_run_places_nothing() -> None:
-    from src.live.engine import run_cycle
+    from src.live.pipeline import run_cycle
 
     ledger = _RecordingLedger()
     adapter = _FakeAdapter()
@@ -431,7 +423,9 @@ def test_dry_run_leaves_every_row_count_unchanged(
     """
     db = tmp_path / "live.sqlite"
     ledger = live_ledger(db)
-    ledger.ensure_cash("sim_cli_test_1a2b3c4d", 50000.0)  # a pre-existing row set
+    ledger.ensure_strategy(
+        "h", "sim_cli_test_1a2b3c4d", "n", 50000.0
+    )  # pre-existing row
     before = _row_counts(db)
 
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
@@ -475,9 +469,6 @@ def test_ibkr_dry_run_adapter_still_refuses_to_place(
 
     class FakeLedger:
         def ensure_strategy(self, *a: object, **k: object) -> None: ...
-        def ensure_cash(self, *a: object, **k: object) -> None: ...
-        def prune_closed(self, *a: object, **k: object) -> int:
-            return 0
 
         def prune(self, *a: object, **k: object) -> int:
             return 0
@@ -530,19 +521,6 @@ def test_sim_adapter_refuses_to_place_on_a_dry_run() -> None:
     placed = asyncio.run(adapter.place(flat, _intent()))
     assert isinstance(placed, Err)
     assert cast("FeedError", placed.error).kind == "auth"
-
-
-# --- housekeeping ------------------------------------------------------------
-
-
-class _RaisingLedger:
-    """A stand-in whose ``prune_closed`` raises *error* (housekeeping's input)."""
-
-    def __init__(self, error: Exception) -> None:
-        self._error = error
-
-    def prune_closed(self, *a: object, **k: object) -> int:
-        raise self._error
 
 
 # --- N1: the operator escape for a wedged key --------------------------------

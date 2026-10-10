@@ -17,10 +17,13 @@ from typing import cast
 import pandas as pd
 
 from src.bt.state import ActionType, FillEvent
+from src.exec.types import OrderSide
 from src.live.identity import IntentKey, IntentRecord, IntentState
 from src.live.pure import OrderResult, intent_to_signal
 from src.live.pure_plan import (
     FillWrite,
+    _cash_delta,
+    commission_of,
     next_attempt,
     plan_result_writes,
 )
@@ -189,3 +192,23 @@ def test_next_attempt_starts_at_zero_and_never_reuses_one() -> None:
     assert next_attempt(None) == 0
     assert next_attempt(_record(0)) == 1
     assert next_attempt(_record(7)) == 8
+
+
+# --- commission_of: the inverse of the signed-cash rule ---------------------
+
+
+def test_commission_of_inverts_the_cash_rule_for_both_sides() -> None:
+    """The fee recovered from a stored ``cash_delta`` matches the one it encodes.
+
+    A BUY debits ``-(gross + fee)`` and a SELL credits ``gross - fee``; the
+    inverse must recover the fee exactly, including a zero-fee fill.
+    """
+    for side in ("BUY", "SELL"):
+        for fee in (0.0, 1.25):
+            delta = _cash_delta(
+                OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                10.0,
+                100.0,
+                fee,
+            )
+            assert commission_of(side, 10.0, 100.0, delta) == fee

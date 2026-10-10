@@ -5,12 +5,12 @@ migrations must run. There is no filename scan and no discovery: a rename cannot
 silently reorder history, and a new migration is added by editing this file where
 a reviewer sees it next to its neighbours.
 
-TWO registries, never one (D-Q7 / the file split):
+TWO registries, never one (the live/data file split):
 
-* :data:`LIVE_MIGRATIONS` — the durable live book. The ledger's first-write path
-  runs THIS and only this, because the live path must never replay a slow bulk
-  migration (a multi-million-row candle rewrite) before it can place an order.
-* :data:`DATA_MIGRATIONS` — the candle/research file.
+* :data:`LIVE_MIGRATIONS` — the durable live book in ``data/live.db``. It is one
+  clean baseline that builds the target schema; the live file carries no legacy
+  shape, so there is nothing to absorb or re-key.
+* :data:`DATA_MIGRATIONS` — the candle/research file in ``data/ibkr.db``.
 
 ``ibkr db migrate`` runs both (one per file); ``ibkr db status`` reports both.
 """
@@ -22,18 +22,12 @@ from src.db.migrations.versions import (
     data_0001_baseline,
     data_0002_drop_migrated_live_tables,
     live_0001_baseline,
-    live_0002_drop_legacy_artifacts,
 )
 
 #: The live book's history, oldest first. ``down`` is omitted where no safe
 #: inverse exists (see each module's docstring).
 LIVE_MIGRATIONS: Registry = (
     Migration(name=live_0001_baseline.NAME, up=live_0001_baseline.up, down=None),
-    Migration(
-        name=live_0002_drop_legacy_artifacts.NAME,
-        up=live_0002_drop_legacy_artifacts.up,
-        down=None,
-    ),
 )
 
 #: The candle/research file's history, oldest first.

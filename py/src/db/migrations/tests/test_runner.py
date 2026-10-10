@@ -3,11 +3,10 @@
 Only behaviour a broken runner would actually break is asserted here:
 
 * applying twice applies once (bookkeeping is the idempotence guard);
-* a baseline absorbs an already-hand-migrated DB — the operator's real situation,
-  and the one the recognition guards exist for;
 * a failing ``up`` leaves NO record and no schema change (the batch is one txn);
 * a ``down`` round trip unwinds exactly once, and an irreversible target is
-  refused rather than partially applied.
+  refused rather than partially applied;
+* the live baseline builds the target schema on a fresh file, idempotently.
 
 Deliberately NOT here (delete-on-sight per AGENTS.md): file-layout assertions,
 "the runner calls up()" wiring, bookkeeping column types, and registry-order tests.
@@ -25,6 +24,7 @@ from src.db.migrations import bookkeeping
 from src.db.migrations.runner import pending, run_down, run_pending
 from src.db.migrations.types import IrreversibleMigrationError, Migration
 from src.db.migrations.versions import data_0001_baseline
+from src.live.models import LIVE_TABLES
 
 #: The one migration this repo has with a genuine ``down``, as a LOCAL registry.
 #: Asserting the whole ``DATA_MIGRATIONS`` tuple would fail on every new migration,
@@ -60,7 +60,7 @@ def _drop_widget(db: peewee.SqliteDatabase) -> None:
 def test_run_pending_twice_applies_once(db: peewee.SqliteDatabase) -> None:
     """A second run writes nothing: the bookkeeping row IS the guard.
 
-    Guards the exact failure that would re-run a re-key on every boot.
+    Guards the exact failure that would re-run a migration on every boot.
     """
     calls: list[int] = []
 
@@ -81,82 +81,49 @@ def test_run_pending_twice_applies_once(db: peewee.SqliteDatabase) -> None:
     assert recorded == 1
 
 
-# ── 2. the baseline absorbs an already-migrated DB ────────────────
+# ── 2. the live baseline builds the target schema ─────────────────
 
 
-def test_a_hand_migrated_db_absorbs_the_baseline_without_new_legacy_tables(
+def test_a_fresh_live_baseline_creates_every_target_table(
     db: peewee.SqliteDatabase,
 ) -> None:
-    """A DB already migrated by the old code path absorbs ``live_0001`` as a no-op.
+    """A fresh file gets the target ``live_*`` tables, and only those.
 
-    This is the operator's real case: their file has the CURRENT schema and NO
-    ``peewee_migration`` table, so the baseline runs against it. It must leave the
-    rows and their identities exactly as they were and create NO ``*_legacy``
-    table — a ``_free_legacy_name``/``_rekey_positions`` guard regression would
-    rename the live book away and read it as flat.
+    The live file carries no legacy shape, so the baseline is a plain
+    ``create_tables(LIVE_MODELS)``. Asserted on the TABLE SET the baseline creates,
+    because a missing table would make the ledger read the book as flat.
     """
-    from src.db.migrations.versions.live_0001_baseline import up as live_up
+    from src.db.migrations.versions.live_0001_baseline import NAME, up as live_up
 
-    baseline = (Migration(name="live_0001_baseline", up=live_up),)
-    # First application through the runner, so the bookkeeping row exists to drop.
-    run_pending(db, baseline)
-    db.execute_sql(
-        "INSERT INTO live_position (scope, position_id, symbol, side, qty, "
-        "entry_price, source, order_ref, tag) VALUES "
-        "('S','42','AAPL','long',10.0,100.0,'executions','','')"
-    )
-    before = _counts(db)
+    baseline = (Migration(name=NAME, up=live_up),)
+    assert run_pending(db, baseline) == (NAME,)
 
-    # The operator's file, then. Wipe ONLY the bookkeeping, as their file has none.
-    db.execute_sql(f"DROP TABLE {bookkeeping.MIGRATION_TABLE}")
-
-    assert run_pending(db, baseline) == ("live_0001_baseline",)
-    after = _counts(db)
-
-    assert after["live_position"] == before["live_position"] == 1
-    assert not [name for name in after if name.endswith("_legacy")], (
-        "an already-current book must not be re-keyed into a legacy copy"
-    )
-    (position_id,) = db.execute_sql("SELECT position_id FROM live_position").fetchone()
-    assert position_id == "42", "the lot's identity must survive the absorption"
-    assert "live_position" in db.get_tables()
+    live_tables = {name for name in LIVE_TABLES if introspect.table_exists(db, name)}
+    assert live_tables == set(LIVE_TABLES)
 
 
-# ── 2b. a failed schema build rolls the legacy rename back ────────
-
-
-def test_a_failed_live_baseline_build_rolls_the_rename_back(
-    db: peewee.SqliteDatabase, monkeypatch: pytest.MonkeyPatch
+def test_the_live_baseline_is_idempotent_on_an_already_migrated_file(
+    db: peewee.SqliteDatabase,
 ) -> None:
-    """The legacy rename and the current-schema build are ONE transaction.
+    """Re-running the baseline against its own schema is a no-op.
 
-    The live baseline renames a pre-4.1 ``live_position`` to its preserved
-    ``*_legacy`` copy and then builds the current table. When the build fails the
-    rename must roll back with it: a committed rename against an unbuilt schema
-    leaves neither shape readable, so the book reads downstream as FLAT and every
-    position is re-opened.
+    ``create_tables`` is ``IF NOT EXISTS``, so an operator whose file is already
+    current (but has no bookkeeping row) can re-run without losing rows.
     """
     from src.db.migrations.versions.live_0001_baseline import up as live_up
+    from src.live.models import LiveStrategy
 
+    with db.bind_ctx((LiveStrategy,)):
+        db.create_tables((LiveStrategy,))
     db.execute_sql(
-        "CREATE TABLE live_position (strategy_id TEXT, position_id TEXT, "
-        "symbol TEXT, side TEXT, qty REAL, status TEXT, "
-        "PRIMARY KEY (strategy_id, position_id))"
-    )
-    db.execute_sql(
-        "INSERT INTO live_position VALUES ('h1','lot-1','AAPL','long',10.0,'open')"
+        "INSERT INTO live_strategy (scope, strategy_id, adapter, config_name, "
+        "instance, name, initial_capital, created_at, updated_at) "
+        "VALUES ('S', 'h', 'sim', 'n', 'i', 'n', 1000.0, 0, 0)"
     )
 
-    def explode(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("schema build failed mid-transaction")
-
-    monkeypatch.setattr(db, "create_tables", explode)
-    with pytest.raises(RuntimeError, match="mid-transaction"):
-        run_pending(db, (Migration(name="live_0001_baseline", up=live_up),))
-
-    (symbol,) = db.execute_sql("SELECT symbol FROM live_position").fetchone()
-    assert symbol == "AAPL", "a legacy row must survive a failed schema build"
-    assert bookkeeping.applied_names(db) == frozenset()
+    live_up(db)  # no bookkeeping needed: the DDL is idempotent by itself
+    (count,) = db.execute_sql("SELECT COUNT(*) FROM live_strategy").fetchone()
+    assert count == 1
 
 
 # ── 3. a raising up() rolls back ──────────────────────────────────
@@ -220,9 +187,8 @@ def test_run_down_refuses_an_irreversible_target_before_writing(
 ) -> None:
     """An irreversible migration is refused with NO partial unwind.
 
-    The live baseline renames and folds durable rows; its only inverse would drop
-    what it preserved. A refusal that still unwound the reversible migrations
-    ahead of it would leave the operator unable to tell where the schema stopped.
+    A refusal that still unwound the reversible migrations ahead of it would leave
+    the operator unable to tell where the schema stopped.
     """
 
     def forward(conn: peewee.SqliteDatabase) -> None:
@@ -251,15 +217,3 @@ def test_run_down_refuses_an_unknown_target(db: peewee.SqliteDatabase) -> None:
     with pytest.raises(IrreversibleMigrationError, match="never_applied"):
         run_down(db, _REVERSIBLE_ONLY, "never_applied")
     assert bookkeeping.applied_names(db) == {data_0001_baseline.NAME}
-
-
-def _counts(db: peewee.SqliteDatabase) -> dict[str, int]:
-    """Row count per table, so a NEW table shows up as a key."""
-    names = [
-        str(row[0])
-        for row in db.execute_sql("SELECT name FROM sqlite_master WHERE type='table'")
-    ]
-    return {
-        name: int(db.execute_sql(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
-        for name in names
-    }

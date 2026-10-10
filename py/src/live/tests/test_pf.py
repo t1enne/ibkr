@@ -72,7 +72,7 @@ def test_scopes_of_store_raises_on_a_shape_drifted_table(tmp_path: Path) -> None
 
     db = tmp_path / "drift.sqlite"
     with get_connection(db) as con:
-        con.execute("CREATE TABLE live_cash (wrong INTEGER)")  # no ``scope`` column
+        con.execute("CREATE TABLE live_execution (wrong INTEGER)")  # no ``scope``
     with pytest.raises(LedgerReadError):
         SqliteLedger(db).scopes_of_store()
 

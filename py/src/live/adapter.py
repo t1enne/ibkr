@@ -4,7 +4,7 @@
 backend a cycle trades through. They collapse here. Both adapters are STATELESS:
 the fetched book travels as a PARAMETER into ``place``/``place_cohort`` and the
 settled book leaves as the RETURNED results, so nothing mutable lives on the
-object. The durable book is sqlite (``live_position`` + ``live_cash``).
+object. The durable book is sqlite (``live_execution`` + ``live_strategy``).
 
 ``run_cycle`` depends only on this Protocol; the concrete adapters live in
 ``adapters/sim`` and ``adapters/ibkr`` and are reached through

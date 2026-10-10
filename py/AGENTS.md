@@ -176,16 +176,15 @@ uv run ibkr db migrate --down --yes  # unwind (refuses an irreversible target)
 - **Concurrency:** a batch's `up()`s + bookkeeping writes share ONE
   `BEGIN IMMEDIATE` transaction, so racing runners serialize on the SQLite write
   lock. There is no separate lock table — the write lock IS the mutex.
-- **`down()` only where a genuine, lossless inverse exists.** Live migrations
-  rename and never drop, so `live_0001_baseline.down` is absent and `run_down`
-  refuses loudly (`IrreversibleMigrationError`) rather than partially unwinding.
-  `data_0001_baseline.down` is a real no-op (it owns no rows).
-- **The baseline is an idempotent absorber, and its guards are load-bearing.**
-  `live_0001_baseline.up` is the old `ledger_migration.migrate()` body lifted
-  verbatim: recognition guards distinguish three `live_position` shapes, re-keys
-  early-return when the key is current, column adds are `IF NOT EXISTS`-style.
-  An operator's DB has no `peewee_migration` row, so this runs against whatever
-  shape that file is in. Do not "clean up" the guards to assume a version.
+- **`down()` only where a genuine, lossless inverse exists.** The live baseline
+  drops nothing it could rebuild, so `live_0001_baseline.down` is absent and
+  `run_down` refuses loudly (`IrreversibleMigrationError`) rather than partially
+  unwinding. `data_0001_baseline.down` is a real no-op (it owns no rows).
+- **The baseline is a plain schema build.** `live_0001_baseline.up` is
+  `create_tables(LIVE_MODELS)` and nothing else: the live file is disposable and
+  carries no legacy shape to absorb, recognise or re-key. `create_tables` is
+  `IF NOT EXISTS`, so the migration is idempotent on the fresh case and on a file
+  whose tables already match.
 
 ### Schema
 
@@ -266,7 +265,8 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
   silent fallback). That file is the ONE place a default adapter literal lives.
   Both adapters (`ibkr`, `sim`) are STATELESS —
   the fetched book travels in as a parameter and the settled results come back
-  out; the durable book lives in sqlite (`live_position`), never on the adapter.
+  out; the durable book lives in sqlite (`live_execution` + `live_strategy`),
+  never on the adapter.
 - **Scope grammar:** `scope = <adapter>_<config_name>_<config_hash>`, where
   `<config_hash>` is a short digest of the **strategy-intent fields only**
   (strategy type, symbols, params, bars, warm-up, sizing — `src/live/scope.py`).
@@ -274,11 +274,14 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
   a strategy-intent edit while exposed re-mints the scope, and the OLD scope's
   book is no longer reconciled by the new one → the new scope can enter the same
   position again, doubling exposure. Edit strategy intent while FLAT.
-- **One book table:** `live_position`, keyed `(scope, position_id)`, with
-  `source ∈ {account, executions}`. `account` is the human/broker-editable exposure
-  surface (sim lots); `executions` is the engine-owned fold of our own fills, used
-  as the divergence oracle. A human edit surfaces as `DIVERGENCE` (exit 3) — never
-  a silent re-size onto the account's number.
+- **One executions table, one strategy row:** `live_execution` is the append-only
+  fold of our own fills, keyed `(scope, execution_id)`, and is the ONLY durable
+  position record — the book is DERIVED from it (`book_rows_from_executions`).
+  `live_strategy` carries one merged row per scope (ownership, latest audit hash
+  and the `initial_capital` cash seed). The divergence oracle compares that fold
+  against the account book the adapter READ (the sim JSON book; IBKR's own
+  positions). A human edit to the account book surfaces as `DIVERGENCE` (exit 3)
+  — never a silent re-size onto the account's number.
 - **Per-scope lease:** `<db>.<scope_tag>.cycle.lock` (an OS advisory `flock`, held
   for the cycle). Per scope, not per DB, so two adapters (or two configs) run
   CONCURRENTLY while the same scope cannot overlap.
@@ -311,10 +314,9 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
 5. **Adoption matches our own `order_ref` by exact `scope_tag` prefix.** Never
    symbol+side — the account is shared with other scopes and with a human.
 
-Also: migrations **rename, never drop**, and re-keys preserve rows — the one
-carve-out is a DEAD COLUMN nobody reads (`live_strategy.mode`: dropped from the
-model, so `live_0001`'s model-driven DDL no longer creates it, plus a one-off
-`ALTER TABLE ... DROP COLUMN` on an already-migrated file). The close and
+Also: migrations **rename, never drop**, and re-keys preserve rows (the data file
+still obeys this; the live file has no legacy shape left to preserve). The close
+and
 open guards fail **closed** on every unknown, and the open guard may be excused
 only by our own already-confirmed reducing fills (a same-cycle flip) — do not
 widen that; stop-loss/take-profit and LMT are **refused**, never silently sent
@@ -382,13 +384,11 @@ The live book has its **OWN sqlite file**, `../data/live.db` (overridable via
 `IBKR_LIVE_DB_PATH`, or `db_path` on `SqliteLedger`), resolved by
 `src/db/path.py::resolve_live_db_path`. It is split from the candle file because
 the book is durable state no download can rebuild (todo D18). Tables:
-`live_strategy`, `live_cash`, `live_position` (the ONE book table — both roles,
-told apart by `source`), `live_execution`, `live_order_intent`. The `*_legacy`
-copies past migrations preserve, and the pre-grammar `live_scope_alias` mapping,
-are retired by `live_0002_drop_legacy_artifacts` once every row they hold is
-accounted for in the live tables. The cycle lease is an OS advisory lock on
-`<db>.<scope_tag>.cycle.lock` — sound on a single host with a local filesystem
-only.
+`live_strategy` (one merged row per scope: ownership, audit hash, cash seed),
+`live_execution` (the append-only fill fold, the ONLY position record) and
+`live_order_intent` (the owner of OPEN order state). The cycle lease is an OS
+advisory lock on `<db>.<scope_tag>.cycle.lock` — sound on a single host with a
+local filesystem only.
 
 **The split was a one-off, already performed.** The book lives in `data/live.db`
 and was populated by a verified row-for-row copy whose tooling
@@ -402,7 +402,7 @@ tables).
 
 Getting this wrong is the dangerous direction: a ledger pointed at an empty or
 wrong file reads a held position as FLAT and re-enters it (double exposure).
-Verify `ibkr db status` and the live file's `live_position` rows before trusting a
+Verify `ibkr db status` and the live file's `live_execution` rows before trusting a
 flat book.
 
 `src/db/connection.py` holds one process-global peewee handle per file (`db`,
@@ -604,13 +604,14 @@ src/bt/
 src/live/
 ├── identity.py         # IntentKey / IntentRecord / order identity (bar-free cOID)
 ├── reconcile.py        # pure: signals + book → OrderIntent[] (posture diff)
-├── engine.py           # the cycle: lease → resync → reconcile → place → record
+├── pipeline.py         # the cycle: lease → resync → reconcile → place → record
+├── report.py           # CycleReport + the unsafe predicate (the exit-code source)
+├── freshness.py        # StaleDataError + the stale-tail gate
 ├── adapter.py          # LiveAdapter Protocol seam + resolution; both adapters stateless
 ├── ports.py            # small injected seams (e.g. BookExposure)
 ├── lease.py            # exclusive cycle lock
 ├── ledger.py           # SqliteLedger seam over the stores below
-├── ledger_base.py      # schema/template/DDL/migration plumbing
-├── ledger_migration.py # preserve-don't-drop migrations and re-keys
+├── ledger_base.py      # schema/template/epoch-codec plumbing
 ├── models.py           # live_* peewee models (per-instance bind, not process-global)
 ├── scope.py            # scope minting / strategy-intent config hash
 ├── signals.py          # strategy signals → live intents
@@ -653,7 +654,7 @@ Strategies are defined in JSON files loaded via `load_strategy()` → `StrategyC
 
 - The IBKR data sync layer uses `httpx` with `asyncio`.
 - The backtest engine itself is synchronous (pure computation). Async only at the I/O boundary.
-- The live cycle (`src/live/engine.py`) is async end to end: it awaits the portfolio
+- The live cycle (`src/live/pipeline.py`) is async end to end: it awaits the portfolio
   read, the broker's working-orders read and every placement. Reconcile is pure and
   synchronous — keep I/O out of it so it stays directly testable.
 - Use `pytest-asyncio` for testing async code.

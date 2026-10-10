@@ -44,8 +44,9 @@ hand-built mock for a contract-shaped response.
 
 ### [ ] D10 — per-symbol staleness is ungated: one fresh symbol masks a dead one
 
-- **Where:** `src/live/engine.py:190-195` (`assert_data_fresh`), `:234` (default
-  `max_age_days=5`, `:263` call), `src/live/signals.py:93-95` (`_is_fresh`).
+- **Where:** `src/live/freshness.py` (`assert_data_fresh`), and the
+  `max_age_days=5` default in `src/live/pipeline.py` (`run_cycle`),
+  `src/live/signals.py` (`_is_fresh`).
 - **Problem:** the freshness gate compares the **universe's NEWEST** bar to the
   wall clock — `_newest_ms` is `SELECT MAX(timestamp) … WHERE ticker IN
   (universe)`, so *any* one fresh symbol satisfies it. `_is_fresh` then compares
@@ -122,7 +123,8 @@ surface it structurally (it is already logged to stderr).
 ### [ ] D9 — stale docstrings on the exposure guard
 
 `_open_exposure_guard` says "pending/open intent records are read as part of the
-book", but `net_exposure` reads only `live_position`; intent records are never
+book", but `net_exposure` reads only the fill-derived book (`live_execution` via
+`book_rows_from_executions`); intent records are never
 consulted. Also confirm `_resolve`'s note that the orders endpoint lists
 filled/cancelled session orders is still accurate (it is, per the captured
 fixture) and that no other comment still describes a superseded mechanism.
@@ -142,7 +144,8 @@ fixed for `FeedKind` — derive the set from the `Literal` via `get_args`.
 ### [ ] `owns_book` polarity is inverted at its most consequential use
 
 `IbkrPortfolioSource.owns_book = False` means "the book is already ours, apply no
-scope filter" (`engine.py` passes `owned=None`), and `MockPortfolioSource = True`
+scope filter" (`src/live/adapters/ibkr/portfolio_source.py` passes `owned=None`),
+and `MockPortfolioSource = True`
 means "scope closes to the sim-owned ids". Rename (e.g. `scope_closes_to_sim_lots`
 / a `CloseScoping` enum) or document it loudly at the IBKR site — it decides
 whether a close is emitted at all.
@@ -156,20 +159,21 @@ Either state the bound or keep the counter monotonic independently of retention.
 
 ### [ ] D13 — live NAV / equity is never persisted, so there is no drawdown or daily-loss monitor
 
-- **Where:** `src/live/portfolio_source.py:74` and `src/live/reconcile.py:198,221`
-  each set `equity_curve=()`.
+- **Where:** `src/live/adapters/ibkr/portfolio_source.py:74` (the IBKR live book
+  sets `equity_curve=()`) and `src/live/reconcile.py:198,221` (the reconciled
+  book does too).
 - **Problem:** the live book carries cash and positions but no equity series;
   scope equity is never persisted. So no drawdown, no daily-loss monitor, no
   "am I up" from our own data — the account summary is display-only
-  (`src/live/adapters/ibkr/portfolio_source.py:12`). This is the enabling gap
+  (`src/live/adapters/ibkr/portfolio_source.py`). This is the enabling gap
   behind D12's kill switch.
 - **Fix sketch:** persist a per-scope equity mark per cycle (own cash + positions
   valued at the cycle's reference prices) and compute drawdown from it.
 
 ### [ ] D14 — data ingestion is not wired to the live path; the freshness default is far too loose
 
-- **Where:** `src/live/engine.py:168-207` (`assert_data_fresh` only READS the DB);
-  `src/live/cli.py:110` (`--max-age` default `5` days).
+- **Where:** `src/live/freshness.py` (`assert_data_fresh` only READS the DB);
+  `src/live/cli.py` (`--max-age` default `5` days).
 - **Problem:** nothing in the live path downloads bars. If cron does not run
   `ibkr data dl` first, the cycle trades whatever is in the DB (or errors). The
   `5`-day default is far looser than any bar cadence — a daily strategy trading a
@@ -180,9 +184,9 @@ Either state the bound or keep the counter monotonic independently of retention.
 
 ### [ ] D15 — scope cash is derived from our own executions; a missed fill is unreconciled and two scopes can over-allocate
 
-- **Where:** `src/live/ledger.py:12-13` ("per-scope cash is derived from the
+- **Where:** `src/live/ledger.py` ("per-scope cash is derived from the
   scope's own executions, never read from the account summary");
-  `src/live/adapters/ibkr/portfolio_source.py:12`.
+  `src/live/adapters/ibkr/portfolio_source.py`.
 - **Problem:** cash and equity are the scope's `initial_capital` advanced by its
   own fills. A fill we never reconcile (7-day window lapse, contract drift —
   `ledger.py:3`) leaves cash permanently wrong with no account-side cross-check.
@@ -227,11 +231,12 @@ it: `src/db/` (path/connection/models/introspect + `migrations/`), our own
 left in `../data/ibkr.db` were dropped by
 `data_0002_drop_migrated_live_tables` — the one sanctioned exception to
 rename-never-drop, gated on a guard that refuses unless the live file exists, is
-migrated, and holds at least as many rows per table (the folded `live_position` /
-`live_sim_lot` pair is counted against `live_position`). `ibkr.db` now holds only
+migrated, and holds at least as many rows per table (the orphan tables the data
+file held then — `live_position`, `live_sim_lot`, and the folded pair — are
+counted against the old `live_position` destination). `ibkr.db` now holds only
 `symbol` / `candle` / `fundamental` plus the 1-row `kysely_*` lineage tables. A
-ledger pointed at the wrong file reads a FLAT book — verify `live_position` before
-trusting it. See AGENTS.md § The database / § Where state lives.
+ledger pointed at the wrong file reads a FLAT book — verify `live_execution` rows
+before trusting it. See AGENTS.md § The database / § Where state lives.
 
 ### [ ] D19 — a scaled live cohort prints no shortfall (silent undersizing)
 
@@ -392,9 +397,24 @@ One MKT round trip on Paper closes that gap.
   whole-share notional.
 - **Open exposure divergence guard** exists with the in-cycle delta so a flip's
   own close is excused (`f72d720`) — keep that case covered.
-- **Ledger split** (`ledger.py` → `ledger_base` / `ledger_migration`, with the
-  sim-lot store later folded back into `ledger.py`) verified refactor-only,
-  migrations atomic and rename-never-drop.
+- **Ledger split** (`ledger.py` → `ledger_base` + one merged `ledger.py`;
+the transient `ledger_migration` module was later deleted) verified
+refactor-only, migrations atomic and rename-never-drop.
+- **Live-ledger refactor (CLOSED).** `engine.py` deleted — `run_cycle` is now a
+  thin composer in `pipeline.py` over four named stages (`read_portfolio`,
+  `screen_signals`, `diff_intents`, `execute_cohort`); `CycleReport` /
+  `unsafe_outcomes` moved to `report.py`, `StaleDataError` / `assert_data_fresh`
+  to `freshness.py`. Live schema collapsed to ONE clean baseline
+  (`live_0001_baseline` = `create_tables(LIVE_MODELS)`; the `live_0002` drop and
+  `ledger_migration` are gone). Three tables only: merged `live_strategy` (PK
+  `scope`, absorbs `initial_capital`; `strategy_id` is an audit column), minimal
+  `live_execution` (PK `(scope, execution_id)`; no `conid`, no `commission`) and
+  `live_order_intent`. `live_position` / `live_cash` / `live_sim_lot` tables,
+  `prune_closed` and `SOURCE_ACCOUNT` / `SOURCE_EXECUTIONS` are gone — the book
+  is DERIVED from `live_execution` via `book_rows_from_executions`, `cash_of` is
+  `initial_capital` + `SUM(cash_delta)`, and `commission_of` recovers the fee.
+  `touch_cycle` is keyed by `scope`; `ensure_strategy` / `CashStore` replaced
+  `ensure_cash`. `data/live.db` is rebuilt fresh (dev env, no legacy).
 - **Removed:** `ports.Gateway`, `reconcile.size_qty`, the vestigial imports fixed
   by the `src/timestamps.py` leaf (killed the `src/exec` collection cycle).
 - **Closed finding history** (all fixed): C1, H1, H1b, H3, H4, H5, M1–M8,

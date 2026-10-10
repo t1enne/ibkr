@@ -1,514 +1,471 @@
-# Plan — live stop-loss / take-profit (rev 1)
+# Plan — live stop-loss / take-profit
 
-Status: **design only, nothing implemented.** Author: architect pass, 2026-10-07.
-Read `AGENTS.md` (invariants, `src/live` layout, size/type rules) and
-`todo.md` (open live defects) first. Companion plans: `PLAN_LIVE_HEXAGONAL.md`,
-`PLAN_LMT_ORDERS.md`. Pros/cons history belongs in
-`OPEN_QUESTIONS_PROS_CONS.md`.
+Status: **design, nothing implemented.**
+Read `AGENTS.md` (invariants, `src/live` layout, size/type rules) and `todo.md`
+(D3, D17) first. Companion plans: `PLAN_LIVE_HEXAGONAL.md`,
+`PLAN_LMT_ORDERS.md`. Pros/cons history → `OPEN_QUESTIONS_PROS_CONS.md`.
+
+> **Refactor impact (live-ledger refactor) — this plan needs a schema pass before
+> it is actionable.** The plan predates the refactor and its level-home premise is
+> now invalid: `live_position` (and `live_cash`) no longer exist, and the book is
+> DERIVED from `live_execution` via `book_rows_from_executions`. There is no
+> `live_position.stop_loss/take_profit` row for a level to land on, and
+> `ledger._lot_fields` is gone. The design choice "the level's home is the
+> POSITION row" (F4, §2 D8) must be re-decided against the three-table schema
+> (`live_strategy` / `live_execution` / `live_order_intent`) — e.g. a level column
+> on `live_execution` (additive, preserve-don't-drop) or a derived level read.
+> Every `engine.py` reference below now points at `src/live/pipeline.py` (the thin
+> `run_cycle` composer) or the stage it names. Do not implement this plan as
+> written until the level-home question is settled.
 
 ## 0. Why
 
-Many DSL strategies set `sl=`/`tp=` on `ctx.long(...)`/`ctx.short(...)` (grep
-`sl=` / `tp=` across `src/bt/strategies/` — e.g. `mfi_pivotdiv_dsl.py:316`,
-`cup_handle_dsl`, `pullback_freshlow_dsl`, `trend_pullback_atr_trail_dsl`).
-The IBKR live edge **refuses** any intent carrying a level
-(`adapters/ibkr/orders.py::validate_order`, ~:176, `UnsupportedStopOrder`), so
-those strategies are untradeable live. The decision: honour them, do not refuse.
+Level-carrying strategies are untradeable live: `adapters/ibkr/orders.py::
+validate_order` raises `UnsupportedStopOrder` for any intent with
+`stop_loss`/`take_profit`. The refusal is principled — this adapter places no
+resting order, so a naked entry would silently drop the strategy's risk levels —
+and `AGENTS.md` § Live trading encodes it. Decision: **honour the levels**,
+always, with no opt-in flag.
 
-The refusal exists for a good reason (module docstring, same file): this adapter
-places no resting order, so sending the entry naked would silently drop the
-strategy's risk levels — and `AGENTS.md` § Live trading states "stop-loss /
-take-profit and LMT are refused, never silently sent naked and never implied in
-the report". **This plan deliberately changes that invariant** (§9) and must say
-what replaces it.
+Two organising choices shape everything below:
+
+- **A stop is not a position-intent.** The level was to live on the position row
+  (the pre-refactor `live_position.stop_loss/take_profit` — see the refactor note
+  above, this home is now gone) and the resting order lives at the broker. A
+  protective stop gets **no `live_order_intent` row** (§2 D2). The broker's
+  working-orders read is the authority for what rests, and it is
+  already invariant 1 that no POST happens after a failed read.
+- **The DSL keeps both arming surfaces** — `ctx.long(sl=)`/`ctx.short(tp=)` at
+  entry (fractions, made absolute at emit) and `ctx.set_stops(sym, sl=, tp=)`
+  after entry (absolute prices, per lot, ratchet-only, `ActionType.stop_update`).
+  Both funnel into the same protective mint; live mints the child from whichever
+  the strategy used.
 
 ## 1. Findings that constrain the design
 
-| # | Finding | Consequence |
-| --- | --- | --- |
-| F1 | `sl`/`tp` are minted **once, at entry**, by `dsl.py::_emit` → `sl_tp_from_pct` (absolute prices). No strategy re-emits a moved stop: `ctx.long(sl=)` on an already-long symbol reconciles to HOLD. Trailing exits are `ctx.close`. | A stop-REPLACE path is unreachable from the DSL today. Design it correctly, do not depend on it. |
-| F2 | The refusal exits **0**, not 1: `validate_order` → `_prepare_leg` → `feed_error("rejected")` → `OrderResult(REJECTED)`, and `REJECTED` is not in `_UNSAFE_OUTCOMES` (`engine.py`). | A stop-carrying strategy is refused **every cycle at exit 0**; cron never alerts. Same shape as `todo.md` D3. This plan must fix it, not inherit it. |
-| F3 | `live_position.stop_loss/take_profit` are **never written on the IBKR path**: `trades._open_row` sets them `None` and `_apply` preserves via `replace`; the execution stream carries no level. | Levels must be persisted by us (`record_levels`). |
-| F4 | `singleOrderSubmissionRequest` (`openapi.spec.json:37848` — authoritative for submit, unlike the stale `/orders` list): requires `conid/orderType/quantity/side/tif`; `tif` enum includes `GTC`; `auxPrice` is "used … such as stop orders"; `parentId` = "child order in a bracket … equal to the cOID of the parent"; `isSingleGroup` = "orders in the containing array treated as an OCA group". | STP/child/bracket placement is expressible. GTC is available. |
-| F5 | Cancel = `DELETE /iserver/account/{accountId}/order/{orderId}`, response `orderCancelSuccess`, whose own spec text says it "does not report whether the cancellation can or will ultimately be enacted". | A cancel must be CONFIRMED by a subsequent working-orders read; fail closed otherwise. |
-| F6 | A just-filled lot is not yet in the seeded book, so `order_side`/`position_side_of` cannot resolve a protective child's side there. | The child carries its own `position_side` (§3). |
+| #   | Finding                                                                                                                                                                                                                                                                                                                       | Consequence                                                                                                                                                                                                              |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| F1  | Levels arrive both at entry (fraction → absolute) and post-entry (`ctx.set_stops`, absolute).                                                                                                                                                                                                                                 | Level maintenance is a live requirement, not a nicety.                                                                                                                                                                   |
+| F2  | The refusal exits **0**, not 1: `validate_order` → `_prepare_leg` → `feed_error("rejected")` → `OrderResult(REJECTED)`, absent from `_UNSAFE_OUTCOMES`.                                                                                                                                                                       | A level-carrying strategy is refused every cycle at exit 0; cron never alerts. Same shape as `todo.md` D3. Fix here, do not inherit.                                                                                     |
+| F3  | Stop fills are `close`s of the parent lot (same conid, same sign), so `trades.reconcile` already reduces the row and stamps `closed_at`.                                                                                                                                                                                      | No `trades.py` change; a fired stop needs no intent row to be booked.                                                                                                                                                    |
+| F4  | (Pre-refactor) `live_position.stop_loss/take_profit` were never written on the IBKR path: `trades._open_row` set them `None` and `ledger._lot_fields` hard-coded `"stop_loss": None, "take_profit": None` on every fold. **The `live_position` table and `_lot_fields` no longer exist** — this finding must be re-cast against the derived book (see the refactor note).                                                                                                                     | Was: the level's home is the POSITION row (no separate record, no new write seam). Now: the level home must be re-decided against `live_execution` (the entries' intent already carries the levels, so the fix is to let the fill/lot write carry them).                              |
+| F5  | The live bridge **drops** level updates: `signals.ACTIONABLE = {long,short,close}`, the screen's `_side_of` returns `None` for `stop_update`, and `ScreenRow` is one row per symbol, latest posture only. `reconcile` additionally indexes its input as `by_symbol = {sig.symbol: sig …}` — last wins, one signal per symbol. | A level channel is required (§2 D5); it cannot ride the posture channel without forking `reconcile`'s input. The collector already _sees_ the signals, nothing downstream does.                                          |
+| F6  | Live lots are per-conid (`portfolio_source` and the fill's `position_id=str(row.conid)`) — IBKR nets per contract. Backtest `position_id`s are not portable.                                                                                                                                                                                | Level work is **symbol-scoped**; N per-lot strategy updates collapse onto the symbol's one live lot.                                                                                                                     |
+| F7  | `apply_stop_updates` is **ratchet-only** (long: sl `max`, tp `min`; short mirrored).                                                                                                                                                                                                                                          | Mirror it live — and it doubles as the safe live rule: never widen a working stop.                                                                                                                                       |
+| F8  | `DELETE /iserver/account/{accountId}/order/{orderId}` returns `orderCancelSuccess`, whose own spec text says it does not report whether the cancel "can or will ultimately be enacted".                                                                                                                                       | Every cancel is CONFIRMED by a follow-up working-orders read; fail closed.                                                                                                                                               |
+| F9  | A just-filled lot is not yet in the seeded book, so a protective child's side cannot be resolved from it.                                                                                                                                                                                                                     | The child carries its own `position_side`.                                                                                                                                                                               |
+| F10 | `singleOrderSubmissionRequest` (`openapi.spec.json:37848`, authoritative for submit): `STP`, `tif=GTC`, `auxPrice`, `parentId`, `isSingleGroup` all expressible.                                                                                                                                                              | A resting STP child is placeable. Bracket/OCA is expressible but unverifiable offline (§8).                                                                                                                              |
+| F11 | Without an intent row there is no attempt counter, so a ref built the entry way (`scope-token-attempt`) is IDENTICAL for a stop and its replacement — same key ⇒ same token ⇒ same cOID ⇒ IBKR's own dedupe swallows the replacement after the original was cancelled, leaving the lot unprotected.                           | The protective ref must be derived from `(lot, level)` so a tightened level mints a new ref while a re-send of the same level keeps the old one (§2 D2). This is the one amendment to invariant 2, protective legs only. |
 
 ## 2. Decisions
 
-### D1 — Enforcement: hybrid. Resting `STP` child for the stop + per-cycle backstop for both levels
+### D1 — Enforcement: resting `STP` child for `sl` + per-cycle backstop for both
 
 On a confirmed entry fill the adapter places **one** sibling `STP` child
-(`tif=GTC`) sized to the **confirmed filled** quantity. `tp` gets **no** resting
-order — it is enforced by the per-cycle breach backstop, reported as a price
-miss when it fires between cycles.
+(`tif=GTC`), sized to the **confirmed filled** qty. `tp` gets no resting order —
+it is enforced by the per-cycle breach backstop (reported as a price miss when it
+fires between cycles). A level tightening cancels and re-places the child (D2).
 
-Rejected:
-- **pure resting** — a resting order can fail to exist (refusal, lost session,
-  partial fill, unconfirmable cancel) and nothing would notice; that is exactly
-  "silently sent naked";
-- **pure per-cycle** — the whole inter-cycle gap is unprotected while the
-  backtest triggers intrabar (`bt/risk/pure.py::check_risk` on `tick.low/high`),
-  so it is neither equivalent nor "honoured";
-- **`tif=DAY`** — dies at every session boundary; with ~one cycle per session the
-  position is naked every session, silently;
-- **bracket/OCA pair** (entry + sl + tp via `parentId`/`isSingleGroup`) as
-  slice 1 — right mechanism in principle, but needs a multi-leg reply loop, qty
-  re-derivation after `scale_open_cohort`, and OCA semantics that are
-  **unverifiable offline**. Deferred with the two-sibling rule below.
+Rejected: **pure resting** (a child can fail to exist — refusal, lost session,
+partial fill, unconfirmable cancel — and nothing notices: exactly "silently
+naked"); **pure per-cycle** (the inter-cycle gap is unprotected while the
+backtest fires intrabar on `tick.low/high` — not equivalent, not "honoured");
+**`tif=DAY`** (naked at every session boundary, silently); **bracket/OCA** (right
+in principle, but needs a multi-leg reply loop, qty re-derivation after
+`scale_open_cohort`, and is unverifiable offline — deferred).
 
-**Two-sibling hazard, avoided by construction.** Two resting reduce orders on one
-lot means one firing leaves the other live, which then opens the opposite side.
-With **sl only** resting there is no sibling. Any resting `tp` child ships only
-together with OCA (`isSingleGroup`), after a Paper capture.
+**Two-sibling hazard.** Two resting reduce orders on one lot means the first to
+fire leaves the other live, which then opens the opposite side. With `sl` only
+resting there is no sibling; a resting `tp` ships only with `isSingleGroup` OCA,
+after a Paper capture.
 
-**Naked window.** Entry fill → child POST, inside one cycle (seconds). If the
-child POST fails, the outcome is `UNPROTECTED` → exit 3. Never silent.
+**Naked window.** Entry fill → child POST, inside one cycle. Child POST fails →
+`UNPROTECTED`, exit 3. Never silent.
 
-### D2 — Identity: extend the existing key space with a `leg` discriminator
+### D2 — A stop has no intent row: the position holds the level, the broker holds the order
 
-`IntentKey` gains `leg: IntentLeg = "entry"`. `token()` folds the leg **only when
-non-entry**, so every existing `order_ref` is byte-identical and in-flight
-adoption survives:
+Nothing about a protective order is persisted locally beyond the lot's level:
 
-```python
-identity = f"{symbol}|{action}|{position_id or ''}"            # leg == "entry" (unchanged)
-identity = f"{symbol}|{action}|{position_id or ''}|{leg}"      # protective legs only
-```
+- **Levels** were to live on `live_position.stop_loss/take_profit` — position
+  fields, never a record of their own. **That table is gone** (refactor note):
+  the level home must move to the derived book. They ride on the `ExecutionRecord`
+  the pure planner already builds (`stop_loss`/`take_profit`/`tag` sourced from
+  `result.intent`) and were to be stamped by the lot write, `ledger._lot_fields`,
+  which hard-coded them to `None` (F4) and no longer exists. A fill-less re-arm
+  would touch the same fields. `trades._apply` / `book_rows_from_executions`
+  preserve them across replays; `IbkrPortfolioSource._to_position` already maps
+  them onto `Position`.
+- **No `live_order_intent` row for a stop.** Consequences, all deliberate:
+  - no `leg` discriminator and **no PK migration** — the intent table is
+    untouched;
+  - no `attempt` counter, so the ref rule changes (below);
+  - `abandon --leg` disappears: our only stop handle is broker-side, so
+    abandoning a stop IS `cancel-stops` (ref-prefix filtered, our `order_ref`s
+    only);
+  - no stop `UNRESOLVED` state. Ambiguity is not _lost_ — it is resolved by the
+    next working-orders read. The placing cycle must then report `UNPROTECTED`
+    (exit 3), never "placed";
+  - no local provenance for a stop placement (the cycle report and the gateway
+    are the audit) and no `stuck_cycles` for it. The alarm becomes repetition:
+    every cycle that cannot confirm a stop for a levelled lot exits 3.
+- **The broker is the authority for what rests.** The re-mint guard becomes: no
+  protective POST without a successful working-orders read (invariant 1), and
+  never place a stop for a lot+kind that already has one. A read that cannot
+  answer places nothing and reports `UNPROTECTED`.
+- **REPLACE (level tightened):** read working orders → locate ours (our
+  `order_ref` prefix, matching conid, kind) → `DELETE` its `order_id` → confirm
+  absence with a second read (F8) → POST the new child. An unconfirmable cancel
+  means **do not submit** and report `UNPROTECTED`, exit 3: a live stop plus a
+  replacement is over-cover, and cancelling without replacing leaves the lot
+  naked — neither may be silent.
+- **The protective ref (the one amendment to invariant 2).** A stop's ref is
+  derived from the LOT and the LEVEL, not from a counter:
+  `scope_tag` + a token over `(symbol, "stop", conid, lot-anchored time, level)`.
+  Same lot and same level ⇒ the same ref ⇒ IBKR's dedupe protects a genuine
+  double-send; a tightened level ⇒ a new ref ⇒ the replacement is not swallowed
+  (F11). The lot-anchored time is the lot's own open/fill time — never the
+  decision bar or the wall clock, so a sibling in the batch cannot move it. The
+  exact token inputs are pinned at implementation; the requirement is _distinct
+  per (lot, level), stable for a re-send of the same (lot, level)_.
+- **Kind from the wire.** Which resting order is the stop-loss vs a future
+  take-profit limit is read off the working row (`orderType`, and the trigger
+  field once captured, §5) — never assumed from our own book.
 
-Why not a separate key space: `live_order_intent` (PK = the identity columns),
-`OPEN_STATES`, `stuck_cycles`, `abandon`, `match_working` and `resync` all work
-unchanged for any key. A plain `close` and its `stop` would otherwise share a
-prefix (same scope/symbol/close/conid) and `match_working` (max-attempt ref for a
-prefix) would alias them. The leg splits them.
+### D3 — Close guard / same-cycle flip: no new allowance
 
-- **REPLACE** (moved trail / qty change): cancel-confirmed first, then
-  `open_attempt` on the **same key** → attempt+1 → new cOID, so IBKR's cOID
-  dedupe cannot swallow it and the old attempt is gone before the new exists. An
-  unconfirmable cancel means **do not submit the replacement** → `UNRESOLVED`,
-  exit 3. (Unreachable from today's DSL per F1; kept correct anyway.)
-- **`abandon`** gains `--leg` (default `entry`). For a protective leg the warning
-  escalates: clearing our record while a GTC stop rests broker-side means the
-  next cycle mints a **second** stop → over-cover → possible flip. The message
-  names the `order_id` and demands a broker-side cancel first.
-- **A stop fill books as a `close` of the parent lot** — same conid, same sign;
-  `trades.reconcile` reduces the row to 0 and stamps `closed_at`. No change to
-  `trades.py`. `is_ours` still matches (`scope_tag-` prefix preserved). A stored
-  `tif='GTC'` makes `_day_expired` return False, so resync never wrongly expires
-  a resting stop.
-- **Levels for the backstop** live on `live_position.stop_loss/take_profit`,
-  written by us when an entry is confirmed filled, preserved across replays by
-  `replace` in `_apply`, and already mapped onto `Position` by
-  `IbkrPortfolioSource._to_position`.
+A fired stop is replayed by `fetch()` **before** `resync`/`reconcile`, so the lot
+is already closed when reconcile diffs posture and emits no close. If the fill is
+not yet visible, account net (flat) ≠ booked (+qty) + delta (0) and
+`_open_exposure_guard` **refuses** — intended: a fill we cannot see may be live.
+`_confirmed_reduce_delta` credits only this cycle's placement loop; a
+broker-initiated fill is never credited. Unchanged.
 
-### D3 — Close guard / same-cycle flip: no new allowance, no widening
+**`_cancel_protection` runs before every entry-leg close** (and every synthetic
+breach close). That is the disambiguator: with the stop cancelled and confirmed
+absent, a synthetic close cannot race a live stop; if the stop already fired, the
+close guard refuses on a flat account. An unconfirmable cancel refuses the close
+(exit 3) — a live stop plus a close would over-reduce.
 
-- The stop fill is replayed by `fetch()` **before** `resync`/`reconcile`, so the
-  lot is already closed when reconcile diffs posture → reconcile emits no close.
-- If the fill is not yet visible, account net (flat) ≠ booked (+qty) + delta (0),
-  so `_open_exposure_guard` **refuses**. Intended: a fill we cannot see may be
-  live. Unchanged.
-- `_confirmed_reduce_delta` credits only results from **this cycle's** placement
-  loop; a broker-initiated stop fill is never credited. Unchanged.
-- **`_cancel_protection` runs before every entry-leg close** (and before every
-  synthetic breach close). That is the disambiguator: with the resting stop
-  cancelled and confirmed absent, a synthetic close cannot race a live stop; if
-  the stop already fired, the close guard refuses on a flat account. An
-  unconfirmable cancel refuses the close (exit 3) — a live stop plus a close
-  would over-reduce.
-- "Intended to open but the stop fired": replay closes the lot → `cur=flat`,
-  `tgt=long` → an ordinary re-entry. Not a special case.
+"Intended to open but the stop fired": replay closes the lot → `cur=flat`,
+`tgt=long` → an ordinary re-entry, not a special case.
 
-### D4 — Order type: add `STP`; entries stay MKT, LMT entries stay refused
+### D4 — Order types: add `STP`; entries stay MKT; LMT entries still refused
 
 `src/exec/types.py`: `OrderType.STP = "STP"`. No `STP_LMT` (adds a "triggered but
-limit not hit, therefore naked" mode; gaps already diverge from the backtest).
+limit not hit, therefore naked" mode). `validate_order` becomes **kind-driven**:
+an `OrderIntent` carries its `order_type` and a `protective: bool` marker, and
+the rules are
 
-`validate_order` becomes **leg-driven**:
+| intent                 | rule                                                                                                                                               |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| entry, `MKT`           | allowed (unchanged)                                                                                                                                |
+| entry, `LMT`           | refused `UnsupportedOrderType` (carry-over unbuilt)                                                                                                |
+| entry carrying a level | allowed: the entry ticket itself **never** carries a level — the levels are placed as protective children after the entry is confirmed filled (D1) |
+| protective, `STP`      | requires `stop_loss` finite > 0, `tif` `"GTC"`, reduce side                                                                                        |
+| protective, `LMT`      | requires `take_profit` finite > 0 (unused until OCA ships)                                                                                         |
 
-| intent | rule |
-| --- | --- |
-| `leg=="entry"`, `MKT` | allowed (unchanged) |
-| `leg=="entry"`, `LMT` | **refused** `UnsupportedOrderType` (carry-over still unbuilt) |
-| `leg=="entry"` carrying a level | **refused** unless the levels are being placed as children (adapter `allow_stops`); the entry ticket itself **never** carries a level |
-| `leg=="stop"` | requires `order_type is STP`, `stop_loss` finite > 0, `tif GTC`, reduce side |
-| `leg=="take_profit"` | requires `order_type is LMT`, `take_profit` finite > 0 (unused until OCA ships) |
-
-Ticket bodies (one builder, table-driven):
+Ticket bodies, one table-driven builder (the tif is chosen by the kind — a stop
+is GTC because it must outlive the session, and with no intent row there is no
+rollover rule to satisfy):
 
 ```python
-entry:       {"conid": int, "side": "BUY"|"SELL", "quantity": float, "orderType": "MKT", "tif": "DAY", "cOID": ref}
-stop:        {"conid": int, "side": reduce_side, "quantity": float, "orderType": "STP", "price": sl, "tif": "GTC", "cOID": ref}
-take_profit: {"conid": int, "side": reduce_side, "quantity": float, "orderType": "LMT", "price": tp, "tif": "GTC", "cOID": ref}
+entry:        {"conid": int, "side": "BUY"|"SELL", "quantity": float, "orderType": "MKT", "tif": "DAY", "cOID": ref}
+stop:         {"conid": int, "side": reduce_side, "quantity": float, "orderType": "STP", "price": sl, "tif": "GTC", "cOID": ref}
+take_profit:  {"conid": int, "side": reduce_side, "quantity": float, "orderType": "LMT", "price": tp, "tif": "GTC", "cOID": ref}
 ```
 
-**Unverified without a live gateway — each pinned by a required Paper capture
-(§8), never guessed silently:**
+Pinned unverified, each by a required Paper capture (§5), never guessed silently:
+the `STP` trigger field (`price` vs `auxPrice` — the plan pins
+`_STOP_TRIGGER_FIELD = "price"`, marked unverified); `GTC` acceptance on `STP`;
+the working-orders row for a stop (its `order_ref`, `orderType`, trigger field,
+`tif`, status — this is what D2's "kind from the wire" and adoption both read);
+the `DELETE` body and post-cancel absence; whether an `STP` trip draws an
+`o354`/price-band reply (which must still abort); `outsideRTH` (left absent).
 
-- whether an `STP` trigger goes in `price` or `auxPrice` (the spec names
-  `auxPrice` for stop orders; IBKR's own API uses `price` for `STP` and
-  `auxPrice` for `STP LMT`). The plan pins `_STOP_TRIGGER_FIELD = "price"`,
-  **explicitly marked unverified**;
-- whether `tif="GTC"` is accepted for `STP` on this build;
-- the working-orders row for a stop (`orderType`, where the trigger appears,
-  whether `order_ref` is echoed) — needed for adopt/replace;
-- the `DELETE` cancel body and post-cancel absence;
-- whether an `STP` trip draws an `o354`/price-band **reply** (must still abort)
-  or the ordinary confirm;
-- `outsideRTH` default behaviour (the design leaves it absent).
+### D5 — Level updates: a separate pure step, not a second signal kind
 
-### D5 — Sim parity
+`stop_update` never reaches the live layer today (F5, F6). Plumb it as its own
+intent producer rather than another `LiveSignal` kind.
+
+1. `src/live/protect.py` gains `level_intents(config_path, book, levels) ->
+tuple[OrderIntent, ...]` (pure): for each symbol with both a level update and
+   a live lot, diff the update against the lot's persisted level and emit a
+   protective `STP` intent when (a) the lot is unlevelled and the update arms it,
+   (b) the lot has a level but nothing rests for it, or (c) the new level
+   **tightens** and a stop rests (REPLACE, D2). A level on a flat symbol is
+   dropped silently, mirroring `apply_stop_updates`' skip on no-match. The
+   ratchet gate (F7) lives here, so a wider level from a replayed bar can never
+   widen a live stop; `tp` follows the same rule (long: `min`).
+2. `SignalSource` — `run_cycle`'s EXISTING injected seam (`src/live/pipeline.py`,
+   stage `screen_signals`: `signal_source: SignalSource = live_signals`) — gains a
+   second method returning the strategy's latest `stop_update` per symbol.
+   `SignalCollector` already records every generated signal, so this exposes what
+   is recorded; no pipeline change, and the `_flush_bar` drain already keeps them
+   out of fills.
+3. `execute_cohort` concatenates: `intents = (*reconcile(signals, book, config,
+owned), *level_intents(...))` (the `diff_intents`/`execute_cohort` stage in
+   `src/live/pipeline.py`). Level intents bypass reconcile entirely.
+
+Why not a `SignalAction["stops"]` + `reconcile` step: `reconcile` consumes one
+signal per symbol (`by_symbol`, F5) and a stops signal would shadow that symbol's
+posture signal; it also reads pre-settlement posture, so a symbol that also
+closes in the same cycle would be armed and closed in one cohort. Both problems
+vanish when the level step reads the live book directly.
+
+Invariants for the step (state in its docstring):
+
+- Levels are **symbol-scoped** (F6); the strategy's `position_id` is not portable.
+- It targets lots that **already exist**. A lot filled in this same cycle is
+  `_protect`'s job (D1), so the entry/level race never arises here.
+- The level is the strategy's own advisory price off its simulated book, like
+  every other live intent field — never derived from the live entry price.
+- The protective intent's `action` stays `close`: that is what the reducing-order
+  predicates read (`order_side`, `whole_quantity`'s floor, `placement_order`,
+  `plan_result_writes`). Nothing is keyed on it, and a stop has no ledger row, so
+  a plain close and its stop cannot collide (D2).
+
+### D6 — Sim parity
 
 The sim has no resting orders and no clock between cycles, so it **cannot**
-represent the resting-stop path — say so in the module docstring. It **can**
-exercise offline end to end: intent → child minting, level persistence on the
-held book, and the shared pure breach predicate. `SimulatedBroker`:
+represent the resting-stop path — say so in the docstring. It **can** exercise
+offline end to end: level persistence on the held book, the shared pure breach
+predicate, protective minting, and the `level_intents` diff.
+`SimulatedBroker` places the synthetic child as an `OrderResult` (PLACED, message
+naming the level), persists the levels on its settled lot, reports the child from
+its own working read (the sim store IS the broker here, so "trust the broker"
+means trusting that store), and drives the same `breached_levels` → synthetic
+close. Backtest agreement for entries is unchanged (same
+`settle_cohort`/`apply_fills`).
 
-- places the synthetic stop child as an `OrderResult` (PLACED, message naming the
-  level) and forces `stop_loss`/`take_profit` onto the settled lot;
-- on the next cycle, a held book beyond the level drives the same
-  `breached_levels` → synthetic close.
-
-Backtest agreement for entries is unchanged (same `settle_cohort`/`apply_fills`).
-
-### D6 — Report / exit-code contract
+### D7 — Report / exit-code contract
 
 New `OrderOutcome.UNPROTECTED`, added to `_UNSAFE_OUTCOMES`.
 
-| event | row | exit |
-| --- | --- | --- |
-| entry filled, stop placed GTC | `order AAPL close PLACED leg=stop qty=100 @ 92.10 GTC cOID=… order_id=…` | 0 |
-| stop adopted at cycle start | `adopted … leg=stop` (`ADOPTED`) | 0 |
-| stop fired | resync `FILLED`, `close AAPL qty=100 @ 91.80 … leg=stop` | 0 |
-| stop **refused** by gateway | `order AAPL close UNPROTECTED leg=stop: stop 92.10 NOT resting (o…) — position is NAKED` | **3** |
-| stop submit ambiguous | `UNRESOLVED` | 3 |
-| SL breached, no working stop | `UNPROTECTED` row **+** synthetic close `PLACED` | **3** |
-| TP breached between cycles | close `PLACED`, `tp 105.00 breached (mark 106.2) between cycles; no resting tp; closing at market now` | 0 |
-| lot closed deliberately, stop cancelled OK | close `PLACED` + stop `UNFILLED` `stop cancelled: lot 265598 closed` | 0 |
-| close refused: cancel unconfirmable | close `UNRESOLVED` `refused close: stop 92.10 could not be cancelled-confirmed` | **3** |
-| `allow_stops=False`, intent carries a level | `REJECTED` `UnsupportedStopOrder` — and this must now be `UNPROTECTED`/exit 3, **not** today's exit 0 (F2) | **3** |
+| event                                      | row                                                                                                    | exit  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------ | ----- |
+| entry filled, stop placed GTC              | `order AAPL stop PLACED qty=100 @ 92.10 GTC cOID=… order_id=…`                                         | 0     |
+| stop found resting at cycle start          | `stop AAPL 92.10 resting (o…) cOID=…`                                                                  | 0     |
+| stop fired                                 | resync `FILLED`, `close AAPL qty=100 @ 91.80 … stop`                                                   | 0     |
+| level tightened                            | `stop AAPL 94.00 PLACED (replaces 92.10, cancelled o…, cOID=…)`                                        | 0     |
+| level widened                              | no intent (ratchet) — cycle silent                                                                     | 0     |
+| stop **refused** by gateway                | `UNPROTECTED: stop 92.10 NOT resting (…) — position is NAKED`                                          | **3** |
+| stop submit ambiguous                      | `UNPROTECTED: stop 92.10 unconfirmed; not claimed as resting`                                          | **3** |
+| lot carries a level, nothing rests         | `UNPROTECTED` **+** synthetic close `PLACED`                                                           | **3** |
+| TP breached between cycles                 | close `PLACED`, `tp 105.00 breached (mark 106.2) between cycles; no resting tp; closing at market now` | 0     |
+| lot closed deliberately, stop cancelled OK | close `PLACED` + `stop 92.10 cancelled (o…)`                                                           | 0     |
+| close refused: cancel unconfirmable        | close `UNRESOLVED` `refused close: stop 92.10 could not be cancelled-confirmed`                        | **3** |
 
-Renderer: the intent `leg` already flows through `asdict`/`_result_dict`; add
-`leg=` to the text line.
+The `UnsupportedStopOrder` refusal is deleted, not re-pointed: `validate_order`
+is kind-driven and always admits the protective bodies, so a level-carrying
+strategy can no longer be refused every cycle at exit 0 (F2). What replaces it is
+the `UNPROTECTED` row — a level that is not proven resting.
 
-### D7 — Migrations (rename, never drop)
+### D8 — No migration
 
-- `live_order_intent`: **add column `leg`** and **widen the PK to
-  `(scope, symbol, action, position_id, leg)`**. A PK change means a rebuild:
-  `_rekey_intents_for_leg` detects the 4-column PK →
-  `ALTER … RENAME TO live_order_intent_legacy_<n>` → `create_tables` rebuilds →
-  `_restore_intents` copies with literal `'entry'`. Runs **after** the existing
-  `_rekey_order_intents` (token-keyed legacy) inside `migrate()`. Old rows read
-  `leg='entry'` and **their `order_ref`s are unchanged** (D2 token rule), so
-  in-flight adoption survives.
-- `live_position`: `stop_loss`/`take_profit`/`tag` already exist → **no migration**.
-- `tif` already exists; a stop row stores `GTC`, which `_day_expired` correctly
-  never expires.
-- No new table, no `price` column: a REPLACE re-derives the trigger from the
-  lot's persisted level.
+Written pre-refactor: the plan assumed nothing in the schema changed, because
+`live_position.stop_loss/take_profit` already existed and merely started being
+populated (F4). **That premise is void** — `live_position` is gone and the level
+home is unresolved (refactor note). Whatever home the re-decision picks (e.g. an
+additive level column on `live_execution`) WILL need a live-schema change;
+`live_order_intent` stays untouched, since a stop has no row (D2). No `leg`
+column, no PK rebuild, no `tif` field, no `price` column: the resting trigger is
+read back from the broker.
 
-## 3. Types
+## 3. Types and signatures (new/changed only)
 
 ```python
 # src/exec/types.py
 class OrderType(Enum):
-    MKT = "MKT"
-    LMT = "LMT"
-    STP = "STP"          # NEW
+    MKT = "MKT"; LMT = "LMT"; STP = "STP"      # STP NEW
 
 # src/live/types.py
-IntentLeg = Literal["entry", "stop", "take_profit"]
-PROTECTIVE_LEGS: frozenset[IntentLeg] = frozenset({"stop", "take_profit"})
-
 @dataclass(frozen=True)
 class OrderIntent:
-    ...                                       # unchanged fields
-    leg: IntentLeg = "entry"                  # NEW: which leg this is
-    position_side: ActionType | None = None   # NEW: the LOT side, set on a protective child
-                                              # minted from a just-filled entry (the replayed book
-                                              # cannot show that lot yet, F6). None elsewhere.
+    ...                                        # unchanged fields
+    protective: bool = False                   # NEW: a reduce order protecting a lot (never keyed,
+                                               # never persisted; D2). Sets the stop/tp ticket shape.
+    position_side: ActionType | None = None    # NEW: the LOT side, set on a child minted from a
+                                               # just-filled entry (F9). None elsewhere.
 
 @dataclass(frozen=True)
-class LiveConfig:
-    ...                                       # unchanged fields
-    allow_stops: bool = False                 # NEW: opt-in; False reproduces today's refusal exactly
+class LevelBreach:                             # NEW
+    symbol: str; position_id: str; kind: Literal["stop", "take_profit"]
+    qty: float; level: float; mark: float
 
-@dataclass(frozen=True)
-class LevelBreach:
-    symbol: str
-    position_id: str                          # lot conid as str
-    kind: Literal["stop", "take_profit"]
-    qty: float
-    level: float
-    mark: float
+# src/live/pure_plan.py  (EXISTING planner — no new write type, no extra branch)
+ExecutionRecord.stop_loss / take_profit / tag     # NEW fields, sourced from result.intent
 
-# src/live/ports.py
-class LevelWriter(Protocol):
-    def record_levels(
-        self, scope: str, conid: int, stop_loss: float | None,
-        take_profit: float | None, tag: str,
-    ) -> None: ...
-```
+# src/live/ledger.py  (level field/column stamped on the fill; `_lot_fields` deleted)
+# ...stamps those fields onto the derived lot (home re-decided — see refactor note)
 
-## 4. Signatures
+# src/live/protect.py  (NEW — pure, no I/O)
+def protective_children(entry: OrderIntent, *, conid: int, filled_qty: float,
+                        tif: str = "GTC") -> tuple[OrderIntent, ...]: ...
+    # sl only (tp is backstop-enforced); empty when the entry carries no level;
+    # reduce side = opposite of entry.action; position_side set; qty = CONFIRMED fill.
+def breached_levels(lots: Sequence[Position],
+                    marks: Mapping[str, float] | None = None) -> tuple[LevelBreach, ...]: ...
+    # mark is the only intrabar proxy available between cycles:
+    # long low<=level / short high>=level; marks default to each lot's last_price.
+def breach_closes(breaches: tuple[LevelBreach, ...], transition: str) -> list[OrderIntent]: ...
+def level_intents(config_path: str, book: PortfolioView,
+                  levels: Sequence[TradeSignal]) -> tuple[OrderIntent, ...]: ...
+    # the level step (D5): symbol-scoped, ratchet-gated, protective STP; empty when the
+    # symbol is flat, unchanged or wider. Consumes the SignalSource method below.
+def protective_ref(scope_tag: str, *, symbol: str, conid: int, anchor: pd.Timestamp,
+                   level: float) -> str: ...
+    # the ref rule (D2, F11): distinct per (lot, level), stable for a re-send of one.
+def resting_stop(working: Sequence[WorkingOrder], *, scope_tag: str, conid: int,
+                 kind: Literal["stop", "take_profit"]) -> WorkingOrder | None: ...
+    # ours-by-ref-prefix + conid + kind, read off the wire (D2). Pure: no book, no ledger.
 
-```python
-# src/live/identity.py
-IntentKey.leg: IntentLeg = "entry"                              # NEW field, defaulted
-def token(self) -> str: ...                                     # folds leg only when != "entry"
-def intent_key(scope: str, intent: OrderIntent) -> IntentKey: ...
-
-# src/live/protect.py  (NEW: pure functions, no I/O)
-def protective_children(
-    entry: OrderIntent, *, conid: int, filled_qty: float, tif: str = "GTC"
-) -> tuple[OrderIntent, ...]:
-    """Protective child intents for a just-filled entry lot (sl only; tp is
-    backstop-enforced). Empty when the entry carries no level. Reduce side is the
-    opposite of entry.action; position_side is set; qty is the CONFIRMED fill."""
-
-def breached_levels(
-    lots: Sequence[Position], marks: Mapping[str, float] | None = None
-) -> tuple[LevelBreach, ...]:
-    """Open lots whose persisted sl/tp the current mark has crossed (pure). Marks
-    default to each lot's last_price. sl: long low<=level / short high>=level
-    (the mark is the only intrabar proxy available between cycles)."""
-
-def breach_closes(
-    breaches: tuple[LevelBreach, ...], transition: str
-) -> list[OrderIntent]:
-    """Synthetic entry-leg close intents for breached lots (pure, one per lot)."""
+# src/live/pipeline.py  (was engine.py)
+class SignalSource(Protocol):                   # EXISTING seam, gains one method
+    def __call__(self, config_path: str, max_age_days: int | None = None) -> tuple[LiveSignal, ...]: ...
+    def levels(self, config_path: str) -> tuple[TradeSignal, ...]: ...   # NEW: latest stop_update per symbol
 
 # src/live/adapters/ibkr/orders.py
-def validate_order(intent: OrderIntent, *, allow_stops: bool) -> None: ...   # leg-driven, D4
-def build_ticket(intent: OrderIntent, *, conid: int, side: OrderSide,
-                 order_ref: str) -> Ticket: ...                              # leg-driven bodies
-def protective_ref(key: IntentKey, attempt: int) -> str: ...                 # == order_ref (naming only)
+def validate_order(intent: OrderIntent) -> None: ...   # kind-driven, D4; no opt-in flag
+def build_ticket(intent: OrderIntent, *, conid: int, side: OrderSide, order_ref: str) -> Ticket: ...
+
+# src/live/adapters/ibkr/protect.py  (NEW — class-level mixin; IbkrBroker is far over the 150-LOC budget)
+async def _protect(entry, result, conid, side) -> tuple[OrderResult, ...]: ...
+async def _cancel_protection(symbol, position_id) -> Result[tuple[OrderResult, ...], FeedError]: ...
+async def _check_levels(working) -> tuple[OrderResult, ...]: ...   # reports UNPROTECTED, never places
 
 # src/data/ibkr/client.py
 async def cancel_order(self, account: str, order_id: str) -> dict[str, Any]: ...
-    """DELETE iserver/account/{account}/order/{order_id}; same error mapping as get/post."""
+    # DELETE iserver/account/{account}/order/{order_id}; same error mapping as get/post.
 
-# src/live/ledger.py  (BookStore mixin — implements LevelWriter)
-def record_levels(self, scope: str, conid: int, stop_loss: float | None,
-                  take_profit: float | None, tag: str) -> None: ...
-
-# src/live/adapters/ibkr/broker.py   (protective logic via the new mixin, see §6)
-def __init__(..., levels: LevelWriter | None = None, allow_stops: bool = False): ...
-async def place_cohort(self, intents: tuple[OrderIntent, ...]) -> Result[...]: ...   # extended
-async def _protect(self, entry: OrderIntent, result: OrderResult, conid: int,
-                   side: OrderSide) -> tuple[OrderResult, ...]: ...
-async def _cancel_protection(self, symbol: str, position_id: str) -> Result[tuple[OrderResult, ...], FeedError]: ...
-async def cancel_order(self, order_id: str) -> Result[None, FeedError]: ...
-async def _check_levels(self, working: Mapping[str, WorkingOrder]) -> tuple[OrderResult, ...]: ...
-
-# src/live/broker.py  (LiveBroker Protocol + sim)
-async def cancel(self, intent: OrderIntent) -> Result[OrderResult, FeedError]: ...   # NEW Protocol member
-# SimulatedBroker: sets levels on its held book + shares the breach predicate
-
-# src/live/reconcile.py
-def reconcile(signals, portfolio, config, owned=None) -> tuple[OrderIntent, ...]: ...   # unchanged signature
-    # NEW step: + breach_closes(breached_levels(...)) when config.allow_stops, closes-first
+# src/live/adapter.py  (LiveAdapter Protocol; sim adapter mirrors it)
+async def cancel_order(self, order_id: str) -> Result[None, FeedError]: ...   # NEW member
 ```
 
-## 5. Call graph — one cycle
+## 4. Ordered slices (each independently verifiable)
 
-Production (IBKR):
+1. **S1 — vocabulary + level persistence, zero behaviour change.** `OrderType.STP`,
+   `OrderIntent.protective`/`position_side`, the level fields on `ExecutionRecord`
+   - the fill/lot write (levels start landing on the derived lot; `_lot_fields` is
+     deleted, so the home is re-decided — refactor note), and the
+     `SignalSource.levels` method **declared but unconsumed** (additive schema if a
+     new level column is needed; see D8).
+     _Verify:_ a level round-trips through a recorded fill onto the derived lot and
+     is preserved across a replay; `live_order_intent` gains no rows for protective
+     intents; suite green.
+2. **S2 — pure layer + level step.** `src/live/protect.py` (`protective_children`,
+   `breached_levels`, `breach_closes`, `level_intents`, `protective_ref`,
+   `resting_stop`); kind-driven `validate_order`/`build_ticket`; the `_place_all`
+   concat. _Verify:_ tests on the wire ticket bodies (trigger field, `orderType`,
+   `tif`); an entry ticket still carries no level; `level_intents` tighten vs
+   widen vs flat vs no-lot; `protective_ref` distinct per level and stable for a
+   re-send; `resting_stop` picks ours and ignores a foreign scope's.
+3. **S3 — sim end to end, offline.** `SimulatedBroker` places the child, persists
+   levels, exposes the child from its own working read, enforces the shared
+   predicate, applies the REPLACE diff. _Verify:_ `ibkr live run <cfg> --adapter
+sim` (two fixtures) and `--dry-run`; assert the child row, the level
+   round-trip, the tighten/replace, the breach close.
+4. **S4 — IBKR placement.** The protect mixin, `_cancel_protection`,
+   `cancel_order`, `_check_levels`, `UNPROTECTED`. _Verify:_ respx over
+   **captured fixtures** (§5); pipeline exit-3 rows.
+5. **S5 — Paper capture → local run → rewrite the invariants (§6).** Requires a
+   live Paper session.
 
-```text
-run_cycle(config, *, source, broker, ledger, strategy_id, scope, ...) -> CycleReport
-  → source.fetch() -> Result[PortfolioSnapshot, FeedError]        # trades replay: a fired stop already closed the lot
-  → broker.seed(portfolio) -> None
-  → _resync(broker) -> tuple[tuple[OrderResult, ...], FeedError | None]
-    → broker.resync() -> Result[tuple[OrderResult, ...], FeedError]
-      → IbkrBroker._working_index() -> Result[dict[str, WorkingOrder], FeedError]
-      → IntentStore.load_open(scope) -> tuple[IntentRecord, ...]
-      → match_working(orders, prefix, prefer) -> WorkingOrder | None
-      → IbkrBroker._check_levels(working) -> tuple[OrderResult, ...]
-        → breached_levels(lots, marks) -> tuple[LevelBreach, ...]        # reports UNPROTECTED (never places)
-      → IbkrBroker._resync_status(record, now) -> bool
-      → IbkrBroker._persist_working(key, working, decision_ts) -> None
-      → IntentStore.close(key, state, order_id, now) -> None
-  → reconcile(signals, portfolio, config, owned) -> tuple[OrderIntent, ...]
-    → _plan_symbol(portfolio, sig, owned) → _close_intents(symbol, sig, lots, transition)
-    → _settled_book(portfolio, closes, config) -> PortfolioView
-    → _open_intent(sig, view, config, cur, tgt) -> OrderIntent
-    → breached_levels(...) -> tuple[LevelBreach, ...]                    # NEW
-      → breach_closes(breaches, transition) -> list[OrderIntent]         # NEW
-  → _place_all(broker, intents) -> Result[tuple[OrderResult, ...], FeedError]
-    → broker.place_cohort(intents) -> Result[...]
-      → placement_order(intents) -> tuple[OrderIntent, ...]              # closes (incl. synthetic) first
-      → IbkrBroker._place(intent, *, in_cycle_delta) -> Result[OrderResult, FeedError]
-        → _prepare_leg(intent) -> Result[tuple[OrderSide, int], FeedError]
-          → order_side(intent, position_side) -> OrderSide               # prefers intent.position_side
-          → _conid(symbol) -> int
-        → _cancel_protection(symbol, position_id) -> Result[tuple[OrderResult, ...], FeedError]   # NEW
-          → cancel_order(order_id) -> Result[None, FeedError]            # NEW client DELETE
-          → _working_index() -> Result[...]                              # confirm absence (fail closed)
-        → _pre_guard(intent, side, conid, in_cycle_delta) -> FeedError | None
-        → _working_index() -> Result[dict[str, WorkingOrder], FeedError]
-        → _resolve(intent, key, index) -> Resolution
-        → _guard_lost_predecessor(intent, key) -> Result[OrderResult, FeedError] | None
-        → _submit_new(account, intent, key, side, conid) -> Result[OrderResult, FeedError]
-          → PendingIntents.open_attempt(key, decision_ts, now) -> IntentRecord
-          → build_ticket(intent, conid, side, order_ref) -> Ticket        # MKT / STP / LMT by leg
-          → _submit(account, ticket, key, attempt, decision_ts) -> Result[str, FeedError]
-          → wait_filled(order_id, intent, ticket) -> _WaitOutcome
-      → IbkrBroker._protect(entry, result, conid, side) -> tuple[OrderResult, ...]   # NEW; only when result.ok
-        → protective_children(entry, conid, filled_qty, tif) -> tuple[OrderIntent, ...]   # STOP MINTED HERE
-        → IbkrBroker._place(child, in_cycle_delta=0.0)                    # reuses the whole guard chain
-        → LevelWriter.record_levels(scope, conid, stop_loss, take_profit, tag) -> None
-        # child refused/ambiguous ⇒ OrderOutcome.UNPROTECTED ⇒ exit 3
-```
+## 5. Test plan
 
-Tests:
+| slice | tests                                                                                                                                                                                                                                                                                                                                                | kind       | gate                                  |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------- |
+| S1    | level round-trip through the lot write; preserved on replay; no intent row for a protective intent                                                                                                                                                                                                                                                   | REGRESSION | `tmp_path` sqlite                     |
+| S2    | `validate_order` per kind; `build_ticket` bodies (MKT/STP/LMT); `protective_children` (side, confirmed qty, empty without a level); `breached_levels` long/short, sl/tp, mark == level; `level_intents` tighten/widen/flat/no-lot; `protective_ref` per-level distinct and same-level stable; `resting_stop` ours-only; `breach_closes` closes-first | REGRESSION | none                                  |
+| S3    | sim places the child; level persisted; next-cycle breach → synthetic close; REPLACE diff; `--dry-run` writes nothing (zero DDL)                                                                                                                                                                                                                      | REGRESSION | mock portfolio fixture, two snapshots |
+| S4    | `parse_working_order` on a captured **stop** row; `cancel_order` DELETE shape + post-cancel absence; `_cancel_protection` fail-closed; close refused on an unconfirmable cancel; `_check_levels` → `UNPROTECTED`; exits 0/3                                                                                                                          | REGRESSION | new captures below                    |
+| S5    | full Paper round trip                                                                                                                                                                                                                                                                                                                                | live only  | Paper account                         |
 
-```text
-reconcile(signals, portfolio, config, owned) -> tuple[OrderIntent, ...]
-  → breached_levels(lots, marks) -> tuple[LevelBreach, ...]              # fixture lot: last_price past sl
-    → breach_closes(breaches, transition) -> list[OrderIntent]           # asserts the close is entry-leg
-protective_children(entry, conid, filled_qty, tif) -> tuple[OrderIntent, ...]
-  → build_ticket(child, conid, side, order_ref) -> Ticket                # STOP body: STP/price/GTC
-validate_order(intent, allow_stops=False) -> None                        # raises UnsupportedStopOrder
-IbkrBroker._cancel_protection(symbol, position_id) -> Result[...]        # respx: DELETE + absence read
-IbkrBroker._check_levels(working) -> tuple[OrderResult, ...]             # UNPROTECTED when no stop key
-```
+**Captures required** (new; the existing fixtures are the contract model to copy):
 
-## 6. File-by-file change list
-
-| file | kind | ΔLOC |
-| --- | --- | --- |
-| `src/exec/types.py` | edit | +1 (`STP`) |
-| `src/live/types.py` | edit | +45 (`IntentLeg`, `OrderIntent.leg/position_side`, `LiveConfig.allow_stops`, `LevelBreach`) |
-| `src/live/identity.py` | edit | +30 (`IntentKey.leg`, leg-folding token, `intent_key`) |
-| `src/live/protect.py` | **NEW** (pure) | ~90 (`protective_children`, `breached_levels`, `breach_closes`) |
-| `src/live/reconcile.py` | edit | +40 (breach step, closes-first) |
-| `src/live/ports.py` | edit | +12 (`LevelWriter`) |
-| `src/live/ledger.py` | edit | +45 (`leg` column/PK, `record_levels`) |
-| `src/live/ledger_migration.py` | edit | +35 (`_rekey_intents_for_leg`, restore with `leg='entry'`) |
-| `src/live/engine.py` | edit | +2 (`UNPROTECTED` in `_UNSAFE_OUTCOMES`; see D6/F2) |
-| `src/live/broker.py` | edit | +60 (Protocol `cancel`; sim child + levels + breach) |
-| `src/live/adapters/ibkr/orders.py` | edit | +110 (leg-driven `validate_order`/`build_ticket`) |
-| `src/live/adapters/ibkr/protect.py` | **NEW** (mixin) | ~180 (`_protect`, `_cancel_protection`, `cancel_order`, `_check_levels`) |
-| `src/live/adapters/ibkr/broker.py` | edit | +30 (ctor `levels`/`allow_stops`, mixin wiring) |
-| `src/data/ibkr/client.py` | edit | +25 (`_delete`, `cancel_order`) |
-| `src/live/cli.py` | edit | +30 (`allow_stops`, `abandon --leg`, `leg=` in text, wire `levels=ledger`) |
-| `AGENTS.md` | edit | invariant rewrite (§9) |
-
-`IbkrBroker` is already near the 150-LOC class budget, so the protective logic
-goes in a **class-level mixin** `src/live/adapters/ibkr/protect.py` — the same
-precedent as the `ledger.py` mixins — rather than growing that class.
-
-## 7. Ordered slices (each independently verifiable)
-
-1. **S1 — vocabulary + persistence, zero behaviour change.** `OrderType.STP`,
-   `IntentLeg`/`leg`, `IntentKey.leg` + leg-folding token, the `leg` column and
-   PK rebuild migration, `LiveConfig.allow_stops=False`, `LevelWriter` /
-   `record_levels`. *Verify:* golden test that `order_ref` for a fixed key equals
-   today's literal; migration test on a pre-leg sqlite copy; existing suite green.
-2. **S2 — pure layer.** `src/live/protect.py`, leg-driven `validate_order` /
-   `build_ticket`, the reconcile breach step (gated on `allow_stops`). *Verify:*
-   table tests on bodies; `allow_stops=False` still raises `UnsupportedStopOrder`;
-   breach → close intent pure test.
-3. **S3 — sim end to end, offline.** `SimulatedBroker` places the child, sets
-   levels, enforces the shared predicate. *Verify:* `ibkr live run <cfg>
-   --adapter sim` (two fixtures) and `--dry-run`; assert the child row, the level
-   round-trip, the breach close.
-4. **S4 — IBKR placement, flag-gated, default OFF.** The protect mixin,
-   `_cancel_protection`, `cancel_order`, `_check_levels`, `UNPROTECTED`.
-   *Verify:* respx tests over **captured fixtures** (§8); engine exit-3 rows.
-5. **S5 — Paper capture → local run → flip the default → rewrite the invariant.**
-   Requires a live Paper session.
-
-## 8. Test plan
-
-| step | tests | kind | fixture / gate |
-| --- | --- | --- | --- |
-| S1 | `order_ref` golden equality; `IntentKey.token` leg-fold; migration: pre-leg table → rebuilt with `leg='entry'`, rows preserved, refs unchanged | REGRESSION (golden) + CHARACTERISATION (migration) | none — `tmp_path` sqlite seeded with the pre-leg DDL |
-| S2 | `validate_order` per leg; `build_ticket` bodies (MKT/STP/LMT); `protective_children` (reduce side, confirmed qty, empty without a level); `breached_levels` long/short, sl/tp, mark == level; `breach_closes` closes-first | REGRESSION | none |
-| S3 | sim places the child; level persisted on the held book; next-cycle breach → synthetic close; `--dry-run` writes nothing (zero DDL) | REGRESSION | mock portfolio fixture (two revisions) |
-| S4 | `parse_working_order` on a captured **stop** row; `cancel_order` DELETE shape + post-cancel absence; `_cancel_protection` fail-closed; close refused when the cancel is unconfirmable; `_check_levels` → `UNPROTECTED`; exit codes 0/3 | REGRESSION | **new captures** (below) |
-| S5 | full Paper round trip | live only | Paper account |
-
-**Captures required (new — the existing fixtures are the contract model to copy):**
-
-- `gateway_stop_working_orders.json` — a real `STP` we submitted, from
-  `GET /iserver/account/orders`, proving: `order_ref` echoed, `orderType` /
-  `origOrderType` spelling, **where the trigger price appears**, the `tif` value
-  for GTC, `status`.
-- `gateway_stop_submit_reply.json` — the `POST /orders` response for an `STP`,
-  proving whether it returns an `order_id` directly or an `o354`-style confirm
-  prompt (which must still abort).
+- `gateway_stop_working_orders.json` — a real `STP` we submitted, from `GET
+/iserver/account/orders`: our `order_ref` echoed, `orderType`/`origOrderType`
+  spelling, **where the trigger price appears**, the `tif` value for GTC,
+  `status`. This fixture is now load-bearing twice over — it is how we know a
+  stop rests at all (D2) and how we tell the kind from the wire.
+- `gateway_stop_submit_reply.json` — the `POST /orders` reply for an `STP`:
+  direct `order_id` or an `o354`-style confirm prompt (which must still abort).
 - `gateway_cancel_order.json` — the `DELETE /order/{id}` 200 body, plus the same
   order **absent** from a subsequent `GET /orders` (proves the confirmation rule).
-- Existing `gateway_trades.json` should be **extended** with a current-scheme ref
-  echoed after a real fill (already an open item in `todo.md`) so stop fills
-  replay/attribute correctly.
+- Extend `gateway_trades.json` with a current-scheme ref echoed after a real fill
+  (already an open item in `todo.md`) so stop fills replay/attribute correctly.
 
-Validated **only by running:** `ibkr live run <cfg> --adapter sim` and
-`--adapter sim --dry-run` (S3); `--adapter ibkr --dry-run` against a real gateway
-(the read/mint path); and S5's real Paper cycle.
+Validated **only by running:** `--adapter sim` and `--adapter sim --dry-run` (S3);
+`--adapter ibkr --dry-run` against a real gateway (read/mint path); and S5's Paper
+cycle.
 
-## 9. AGENTS.md edits (S5, on ship)
+## 6. AGENTS.md edits (S5, on ship)
 
-In § Live trading invariants, replace:
+In § Live trading invariants, replace the stop/LMT clause with:
 
-> "…the open guard may be excused only by our own already-confirmed reducing
-> fills (a same-cycle flip) — do not widen that; stop-loss/take-profit and LMT are
-> **refused**, never silently sent naked and never implied in the report; a
-> partially filled entry is not topped up."
+> …the open guard may be excused only by our own already-confirmed reducing fills
+> (a same-cycle flip) — do not widen that. **Stop-loss is honoured by a resting
+> `STP` child (`GTC`) placed only after the entry is confirmed filled, sized to
+> the confirmed fill, re-triggered on a strategy level tightening (never widened),
+> and cancelled-and-confirmed before any close of its lot. A take-profit is
+> enforced at the next cycle, never by a resting order (a second resting reduce
+> order on one lot can flip the account). An entry ticket never carries a level;
+> an LMT entry is still refused. Any level not proven resting — a refused or
+> ambiguous child, or a breach with no working stop — is reported `unprotected`
+> and exits 3, never implied.** A partially filled entry is still not topped up.
 
-with:
+Amend invariant 2 (the order ref) for protective legs: **a stop's ref is derived
+from `(lot, level)` — distinct per level so a replacement is never swallowed by
+the broker's cOID dedupe, stable for a re-send of the same level — never from a
+decision bar or the wall clock.** Amending invariant 4 (the only owner of OPEN
+state): **a protective stop is the one order whose OPEN state is the BROKER's,
+not `live_order_intent`'s — it has no row. It may be placed only after a
+successful working-orders read, never for a lot+kind that already rests, and its
+cancel is confirmed by a re-read before any replacement or close.**
 
-> "…the open guard may be excused only by our own already-confirmed reducing
-> fills (a same-cycle flip) — do not widen that. **Stop-loss is honoured by a
-> resting `STP` child (`GTC`) placed only after the entry is confirmed filled,
-> sized to the confirmed fill, and cancelled-and-confirmed before any close of
-> its lot. A take-profit is enforced at the next cycle, never by a resting order
-> (a second resting reduce order on one lot can flip the account). An entry
-> ticket never carries a level; an LMT entry is still refused. Any level not
-> proven resting — a refused/ambiguous child, or a breach with no working stop —
-> is reported `unprotected` and exits 3, never implied.** A partially filled
-> entry is still not topped up."
-
-Add a numbered invariant: **"A protective child is cancelled-and-confirmed
-before any close of its lot; an unconfirmable cancel refuses the close."**
+Add a numbered invariant: **"A protective child is cancelled-and-confirmed before
+any close of its lot; an unconfirmable cancel refuses the close."**
 
 Add to § Gateway contract: the `STP` trigger field (`price` vs `auxPrice`) and
 GTC-on-STP are **unverified pending the Paper capture**; the capture fixtures are
-the contract.
+the contract, and the working-orders row is the sole authority for a stop's
+existence and kind.
 
-Add to § Live trading commands: `ibkr live abandon --leg <entry|stop|take_profit>`
-with its escalated warning, plus a `cancel-stops` verb.
+Add to § Live trading commands: `ibkr live cancel-stops --scope <s> --yes`
+(ref-prefix filtered, our `order_ref`s only; print what will be acted on before
+acting) — which is now also how a stop is abandoned, since there is no intent row
+to clear.
+Add to § Where state lives: a protective stop has **no** row; the lot's level is
+the local trace, and the broker is the order's owner.
 
-Add to § Where state lives: the `leg` column / widened intent PK.
+## 7. Risks and rollback
 
-Add the module list note for `src/live/protect.py` and
-`src/live/adapters/ibkr/protect.py`.
+**Verifiable offline:** the protective ref rule; ticket bodies against the spec;
+the pure breach predicate and the ratchet gate; `resting_stop` attribution; the
+level round-trip; the sim end to end; cancel-before-close ordering; report/exit
+codes.
 
-## 10. Risks
-
-**Verifiable offline:** identity/migration safety (refs unchanged); ticket bodies
-against the spec; the pure breach predicate; the sim end to end;
-cancel-before-close ordering; report/exit codes; the level round-trip.
-
-**Requires a live gateway session:** the `STP` trigger field (`price` vs
-`auxPrice`); `GTC` acceptance on `STP`; the working-orders shape for a stop; the
+**Needs a live gateway session:** the `STP` trigger field; `GTC` on `STP`; the
+stop's working-orders shape (now doubling as D2's existence-and-kind check); the
 `DELETE` body and post-cancel absence; whether an `STP` draws a reply prompt;
-`outsideRTH` semantics; and — inherently — that a live stop fills during RTH gaps
-at a worse price than the backtest's level fill (a permanent, disclosed
-divergence). Also unverified: whether the gateway accepts an `STP` whose qty came
-from the fractional-rounding floor (it should: whole shares).
+`outsideRTH`; and — inherently — that a live stop fills in an RTH gap at a worse
+price than the backtest's level fill (permanent, disclosed). Also unverified: an
+`STP` whose qty came from the fractional-rounding floor.
 
-**Rollback.** `LiveConfig.allow_stops=False` is the default and reproduces
-today's refusal byte-for-byte, so S1–S4 ship dark. Turning the flag back off
-stops *new* children but **does not cancel already-resting `GTC` stops** — so the
-rollback procedure is: flip the flag **and** run
-`ibkr live cancel-stops --scope <s> --yes` (a ref-filtered, our-`order_ref`-only
-cancel; print what will be acted on before acting). The adapter-level `dry_run`
-flag remains defence in depth.
+**Accepted, disclosed losses** from D2: no local record of a stop placement (the
+report and the gateway are the audit), and no `stuck_cycles` counter to surface a
+wedged stop — the signal is repetition, since every cycle that cannot confirm a
+stop exits 3.
 
-## 11. YAGNI — not built
+**Rollback.** There is no flag to flip. To stand the edge down: `ibkr live
+cancel-stops --scope <s> --yes` (which clears the resting stops, since nothing
+local remembers them) **and** revoke the placement path (S4 revert).
+`cancel-stops` alone is not a rollback — the next cycle would arm them again. The
+adapter-level `dry_run` flag stays as defence in depth.
+
+## 8. YAGNI — not built
 
 `STP LMT`; `trailingAmt`/`trailingType`; a resting take-profit plus the OCA
-bracket (`isSingleGroup`/`parentId`); a `price` column on `live_order_intent`; a
-stop REPLACE path from the DSL (unreachable today, F1); LMT entry carry-over
-(`PLAN_LMT_ORDERS.md`); top-up of a partial entry (`todo.md` P2).
+bracket (`isSingleGroup`/`parentId`); a `price` column anywhere — the resting
+trigger is read back from the broker, never stored; LMT entry carry-over
+(`PLAN_LMT_ORDERS.md`); top-up of a partial entry (`todo.md` P2); per-lot live
+level identity (F6 makes it degenerate — one net lot per symbol).

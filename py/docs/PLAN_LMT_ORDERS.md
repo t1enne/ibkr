@@ -8,12 +8,12 @@ exists. Do not ship `LMT` without a cancel/reprice policy.").
 
 ## 0. What already exists (shipped with the shared core, phase 0)
 
-| Piece | Where | State |
-| --- | --- | --- |
-| `OrderType.MKT \| LMT`, `limit_price`, `TimeInForce.DAY \| IOC` | `src/exec/types.py` | shipped |
-| `match_price` / `match_bar` (pure candle matcher) | `src/exec/matching.py` | shipped, table-tested |
+| Piece                                                                | Where                    | State                 |
+| -------------------------------------------------------------------- | ------------------------ | --------------------- |
+| `OrderType.MKT \| LMT`, `limit_price`, `TimeInForce.DAY \| IOC`      | `src/exec/types.py`      | shipped               |
+| `match_price` / `match_bar` (pure candle matcher)                    | `src/exec/matching.py`   | shipped, table-tested |
 | `SimExchange.submit` / `cancel` / `match_bar` (staged order surface) | `src/bt/exchange/sim.py` | shipped, table-tested |
-| `FeedError.kind` `unfilled` | `src/live/types.py` | shipped |
+| `FeedError.kind` `unfilled`                                          | `src/live/types.py`      | shipped               |
 
 What is NOT shipped, and is the actual subject of this plan:
 
@@ -36,7 +36,7 @@ What is NOT shipped, and is the actual subject of this plan:
 return min(limit, open_) if low <= limit else None
 ```
 
-A bar whose open gapped *through* the limit in our favour therefore fills at the
+A bar whose open gapped _through_ the limit in our favour therefore fills at the
 **open**, which is better than the limit. This was a live contradiction: the code
 is the realistic side, and `src/exec/matching.py`'s docstring and hexagonal plan
 §2 both said the opposite ("a bar that gapped below the limit is not improved
@@ -48,14 +48,14 @@ truth (an exact-touch bar `low == limit` for a buy DOES fill, and an LMT with
 
 The honest choices, per side (buy shown; sell mirrors):
 
-| Convention | Rule | Effect |
-| --- | --- | --- |
-| **R realistic** (what the code does) | `min(limit, open)` on touch | Matches a real matching engine. A gap through the limit silently `limit − open` better than planned, so the run is flattered exactly where gaps are largest |
-| **C conservative** | fill at `limit` whenever `low <= limit` | Never overstates the edge; understates it. Diverges from live by the gap subsidy, in the safe direction |
-| **T strict-touch** | require `low < limit` (strict) | Removes the same-price-touch ambiguity about whether the queue reached us — orthogonal to R/C, can be combined |
+| Convention                           | Rule                                    | Effect                                                                                                                                                      |
+| ------------------------------------ | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **R realistic** (what the code does) | `min(limit, open)` on touch             | Matches a real matching engine. A gap through the limit silently `limit − open` better than planned, so the run is flattered exactly where gaps are largest |
+| **C conservative**                   | fill at `limit` whenever `low <= limit` | Never overstates the edge; understates it. Diverges from live by the gap subsidy, in the safe direction                                                     |
+| **T strict-touch**                   | require `low < limit` (strict)          | Removes the same-price-touch ambiguity about whether the queue reached us — orthogonal to R/C, can be combined                                              |
 
 **Recommendation:** ship **R** (one shared core means one fill semantic, and the
-live side will really fill at the open), and make the subsidy *visible* rather
+live side will really fill at the open), and make the subsidy _visible_ rather
 than assumed: report, per run, how many fills were gap-improved and the total
 `Σ(limit − fill)`. If the edge only survives with the subsidy, the run says so
 instead of hiding it. Keep **T** as a table-tested edge case, not a knob.
@@ -65,7 +65,7 @@ degree of freedom (AGENTS § Alpha research).
 Related gap math that must not be double-counted:
 
 - `fill_guard_price` / gap-through handling already exists for the next-open MKT
-  path; an LMT that fills *at* the open and a MKT that fills at the open must not
+  path; an LMT that fills _at_ the open and a MKT that fills at the open must not
   apply the guard twice.
 - Friction stays the adapter's job (`SimExchange.match_bar` applies spread /
   slippage / commission); the matcher returns the frictionless base price. An
@@ -78,7 +78,7 @@ silently: the trade not happening, the strategy's state advancing as if it had,
 and the cash cohort pretending the order is gone.
 
 **L1 — bar-scoped (`tif=DAY`), no carry-over.** The order lives in exactly one
-bar. Unfilled → the order dies there and is *reported*, never re-queued. Requires:
+bar. Unfilled → the order dies there and is _reported_, never re-queued. Requires:
 
 - a resting-order drain in the engine loop: orders submitted at the fill bar are
   matched at that bar; a `None` produces an `Unfilled` record (order ref, symbol,
@@ -89,7 +89,7 @@ bar. Unfilled → the order dies there and is *reported*, never re-queued. Requi
   `ctx.shared` bookkeeping that a `long` would have advanced stays untouched, and
   the next bar may re-emit the same intent. A re-emitted intent is fine here
   because a dropped DAY order has no identity left at the broker; `order_ref`
-  uniqueness is a *live* constraint (§4), not a backtest one;
+  uniqueness is a _live_ constraint (§4), not a backtest one;
 - cohort cash: an unfilled order consumes no cash and is not a `Scaled`/`Rejected`
   member. Because the cohort set now depends on which orders filled, `Scaled`
   becomes load-bearing in a new way — the AGENTS "results are advisory across
@@ -106,7 +106,7 @@ Needs, each an explicit decision:
    same-bar signals (new intent), so an add and a fresh open cannot both consume
    the same cash in an undetermined order.
 3. **Late-fill semantics.** The strategy learns of a fill several bars after the
-   signal; SL/TP set on the original intent must be attached at *fill* time and
+   signal; SL/TP set on the original intent must be attached at _fill_ time and
    re-based on the fill price, not on the signal bar.
 4. **Strategy state on a late fill.** The intent was emitted N bars ago; a
    cooldown/trail that already advanced must be reconciled with a fill that now
@@ -134,7 +134,7 @@ Order matters; none of this can ship before the decision it depends on.
    explicit phase-4 decision). `OrderRequest.limit_price` / `tif` must reach the
    live edge before an LMT can be sent.
 2. **Refs vs reprice.** `order_ref(scope, cycle_ts, seq)` is idempotent per cycle
-   by design, and IBKR dedupes on `cOID`. A *reprice* is a genuinely new order for
+   by design, and IBKR dedupes on `cOID`. A _reprice_ is a genuinely new order for
    the same intent, so a reprice must mint a new ref (new `cycle_ts` or a new
    `seq` keyed on intent identity) — a reprice that reuses the ref is deduped into
    silence. The cOID scheme needs a stated reprice rule before live LMT.
@@ -144,7 +144,7 @@ Order matters; none of this can ship before the decision it depends on.
    `/iserver/account/orders` remains the authority on what is working.
 4. **Cancel / modify.** IBKR cancel + modify endpoints, dry-run refusal, and the
    ambiguous-submit path already reading `/iserver/account/orders` so a working
-   order is *seen* rather than duplicated.
+   order is _seen_ rather than duplicated.
 5. **Unfilled accounting.** A DAY LMT that never fills is cancelled at the day
    boundary and reported; a partial fill is booked from `cum_fill` (never
    `size`, which is remaining).

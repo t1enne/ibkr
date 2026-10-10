@@ -11,12 +11,16 @@ from typing import cast
 import pandas as pd
 
 from src.bt.state import ActionType, PortfolioState, Position
+import pytest
+
 from src.live.divergence import (
     Divergence,
     book_from_executions,
+    book_rows_from_executions,
     guard_divergence,
 )
-from src.live.ledger import ExecutionRecord
+from src.live.ledger_base import LedgerReadError
+from src.live.types import ExecutionRecord
 
 TS = cast(pd.Timestamp, pd.Timestamp("2025-01-02T15:00:00Z"))
 
@@ -139,3 +143,47 @@ def test_book_from_executions_folds_open_and_close_to_nothing() -> None:
 
 def test_book_from_executions_of_nothing_is_empty() -> None:
     assert book_from_executions(()) == _book()
+
+
+# --- book_rows_from_executions: the IBKR executions fold --------------------
+
+
+def test_book_rows_folds_a_round_trip_to_one_closed_row() -> None:
+    """A lot's open+close leaves ONE row: qty 0, closed at the closing fill."""
+    rows = book_rows_from_executions(
+        (
+            _fill(side="BUY", qty=10.0, price=100.0, execution_id="e1"),
+            _fill(
+                side="SELL",
+                qty=10.0,
+                price=105.0,
+                execution_id="e2",
+                ts=cast("pd.Timestamp", TS + pd.Timedelta(hours=1)),
+            ),
+        )
+    )
+    (row,) = rows
+    assert row.conid == 265598
+    assert row.qty == 0.0
+    assert row.closed_at == cast("pd.Timestamp", TS + pd.Timedelta(hours=1))
+
+
+def test_book_rows_vwaps_the_opening_interval() -> None:
+    """Two extending BUYs blend the entry price; the reduce leaves it alone."""
+    rows = book_rows_from_executions(
+        (
+            _fill(side="BUY", qty=10.0, price=100.0, execution_id="e1"),
+            _fill(side="BUY", qty=10.0, price=110.0, execution_id="e2"),
+            _fill(side="SELL", qty=5.0, price=120.0, execution_id="e3"),
+        )
+    )
+    (row,) = rows
+    assert row.qty == 15.0
+    assert row.entry_price == 105.0  # (10*100 + 10*110) / 20
+    assert row.closed_at is None
+
+
+def test_book_rows_refuses_a_non_conid_lot_id() -> None:
+    """A sim lot id cannot be read as an IBKR conid: loud, never silently dropped."""
+    with pytest.raises(LedgerReadError):
+        book_rows_from_executions((_fill(position_id="AAPL_1"),))

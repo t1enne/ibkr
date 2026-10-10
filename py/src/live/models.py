@@ -1,9 +1,8 @@
-"""The six ``live_*`` peewee models — the durable live book's schema.
+"""The ``live_*`` peewee models — the durable live book's schema.
 
 Split out of :mod:`src.live.ledger` so the migration versions can build the live
-schema without importing the ledger (which imports the versions' registry back).
-BREAKS THE CYCLE: ``ledger`` -> ``ledger_migration``/``versions`` -> ``models``,
-and nothing in ``models`` imports ``ledger``.
+schema without importing the ledger. The baseline simply runs
+``create_tables(LIVE_MODELS)``; there is no legacy shape to absorb.
 
 These models stay bound to :data:`src.live.ledger_base._TEMPLATE_DB` (a
 ``SqliteDatabase(None)`` placeholder) and are rebound per INSTANCE via
@@ -24,77 +23,52 @@ from peewee import (
 
 from src.live.ledger_base import _Base
 
-#: ``live_position.source`` for the sim lot book (the human/broker-editable surface).
-SOURCE_ACCOUNT = "account"
-#: ``live_position.source`` for the fill fold (the engine-owned, append-only truth).
-SOURCE_EXECUTIONS = "executions"
-
 
 class LiveStrategy(_Base):
-    """Which config revision wrote this scope (an AUDIT row, never an ownership key)."""
+    """One row per scope: ownership, audit and the cash seed, merged.
 
-    strategy_id = TextField(primary_key=True)
-    scope = TextField(null=False, default="")
-    #: Scope segments (plan §4.1), additive: which adapter/config wrote this scope.
+    ``scope`` is the primary key — it is the ownership key, the cash seed's key
+    and the lease key all at once. ``strategy_id`` (the config hash) is an AUDIT
+    column only, never an ownership filter: a strategy-intent edit re-mints it,
+    so keying on it would orphan a live lot.
+    """
+
+    scope = TextField(primary_key=True)
+    #: The latest config hash that wrote this scope (audit only, not a key).
+    strategy_id = TextField(null=False, default="")
+    #: Scope segments, additive: which adapter/config wrote this scope.
     adapter = TextField(null=False, default="")
     config_name = TextField(null=False, default="")
     instance = TextField(null=False, default="")
-    name = TextField()
-    created_at = IntegerField()
+    name = TextField(null=False, default="")
+    #: The sizing base, set on the scope's FIRST write and never reset after.
+    initial_capital = FloatField(null=False, default=0.0)
+    created_at = IntegerField(null=False, default=0)
     last_cycle_at = IntegerField(null=True)
+    updated_at = IntegerField(null=False, default=0)
 
     class Meta:
         table_name = "live_strategy"
 
 
-class LivePosition(_Base):
-    """The ONE book table: both roles, told apart by ``source``.
-
-    ``position_id`` is TEXT because the two roles name lots differently: an IBKR
-    lot is ``str(conid)`` (what the IBKR portfolio source mints, so the re-key
-    keeps every existing row's identity), a sim lot the broker's synthetic
-    ``SYM_<ts>_<seq>`` id.
-    """
-
-    scope = TextField()
-    position_id = TextField()
-    symbol = TextField()
-    side = TextField()
-    qty = FloatField()
-    entry_price = FloatField()
-    stop_loss = FloatField(null=True)
-    take_profit = FloatField(null=True)
-    tag = TextField(default="")
-    order_ref = TextField(default="")
-    opened_at = IntegerField(null=True)
-    closed_at = IntegerField(null=True)
-    #: The entry/exit legs' fees (sim fill detail; NULL when unknown).
-    entry_commission = FloatField(null=True)
-    exit_price = FloatField(null=True)
-    exit_commission = FloatField(null=True)
-    source = TextField(null=False, default=SOURCE_ACCOUNT)
-
-    class Meta:
-        table_name = "live_position"
-        primary_key = CompositeKey("scope", "position_id")
-        indexes = ((("scope", "closed_at"), False),)
-
-
 class LiveExecution(_Base):
-    """One applied fill (the append-only fold source, keyed by ``execution_id``)."""
+    """One applied fill (the append-only fold source, keyed by ``execution_id``).
+
+    Minimal and immutable: the fold needs the lot id, the symbol, the signed side,
+    the size, the price, the cash it moved and when. It carries NO ``conid`` and
+    NO ``commission`` — the ``ExecutionRecord`` projection derives what it needs
+    and nothing reads those columns back.
+    """
 
     scope = TextField()
     execution_id = TextField()
     #: The lot this fill belongs to (``str(conid)`` for IBKR; a sim lot's id).
     position_id = TextField(default="")
-    #: Provenance-only: the real conid for an IBKR fill, a stable synthetic one
-    #: for a sim fill (which has no conid). NOT NULL in the migrated schema, so a
-    #: row that omits it is silently DROPPED by ``INSERT OR IGNORE``; never omit it.
-    conid = IntegerField(null=False)
+    #: Carried on the row itself, so reading the fold needs no ``live_position``.
+    symbol = TextField(default="")
     side = TextField()
     qty = FloatField()
     price = FloatField()
-    commission = FloatField()
     cash_delta = FloatField()
     ts = IntegerField()
 
@@ -103,28 +77,13 @@ class LiveExecution(_Base):
         primary_key = CompositeKey("scope", "execution_id")
 
 
-class LiveCash(_Base):
-    """Each scope's ``initial_capital`` (the sizing base, never the account summary)."""
-
-    scope = TextField(primary_key=True)
-    initial_capital = FloatField()
-    updated_at = IntegerField()
-
-    class Meta:
-        table_name = "live_cash"
-
-
 class LiveOrderIntent(_Base):
     """The durable owner of OPEN order state, keyed by the IDENTITY columns.
 
     The primary key is ``(scope, symbol, action, position_id)`` — the intent
     identity itself (``position_id`` is ``''`` for an open) — NOT the crc32
-    ``token``: a crc32 collision can never alias two distinct identities' rows
-    (D7). The ``token`` stays as a plain column, the bar-free cOID prefix.
-
-    ``live_sim_lot`` is NOT here: it was folded into :class:`LivePosition`
-    (``source='account'``) by ``live_0001_baseline`` and survives only as the kept
-    copy ``live_sim_lot_legacy``.
+    ``token``: a crc32 collision can never alias two distinct identities' rows.
+    The ``token`` stays as a plain column, the bar-free cOID prefix.
     """
 
     scope = TextField()
@@ -152,9 +111,7 @@ class LiveOrderIntent(_Base):
 #: ``create_tables`` builds.
 LIVE_MODELS: tuple[type[_Base], ...] = (
     LiveStrategy,
-    LivePosition,
     LiveExecution,
-    LiveCash,
     LiveOrderIntent,
 )
 
@@ -164,11 +121,7 @@ LIVE_TABLES: tuple[str, ...] = tuple(m._meta.table_name for m in LIVE_MODELS)
 __all__ = [
     "LIVE_MODELS",
     "LIVE_TABLES",
-    "SOURCE_ACCOUNT",
-    "SOURCE_EXECUTIONS",
-    "LiveCash",
     "LiveExecution",
     "LiveOrderIntent",
-    "LivePosition",
     "LiveStrategy",
 ]

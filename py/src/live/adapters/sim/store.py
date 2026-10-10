@@ -3,8 +3,8 @@
 The sim ACCOUNT book lives here, ONE JSON file keyed by scope. The engine reads
 it to build the account side of the divergence oracle; ``place_cohort`` writes it
 back so a placed fill lands in the same file an operator can hand-edit. Our OWN
-record stays the sqlite fill fold (``live_execution`` / ``live_position
-source='executions'``) — this file only ever mimics the broker's report.
+record stays the sqlite fill fold (``live_execution``) — this file only ever
+mimics the broker's report.
 
 The shape mirrors what IBKR's portfolio endpoints return, with ONE sim extension:
 each position row carries ``position_id`` (the per-lot handle the fold keys on),

@@ -1,4 +1,10 @@
-"""Tests for the per-scope sqlite book ledger (plan rev 4.1 §3)."""
+"""Tests for the per-scope sqlite book ledger.
+
+Only db-level guarantees live here: atomicity, idempotence, fail-loud reads, the
+lease, and the scope merge. The pure fold/planner logic is covered in
+``test_divergence.py``/``test_pure_plan.py``; this file exercises the store that
+applies it.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +17,7 @@ import peewee
 import pytest
 
 
-from src.bt.state import ActionType, FillEvent
+from src.bt.state import ActionType, FillEvent, PortfolioState, Position
 from src.data.db import get_connection
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
@@ -74,7 +80,7 @@ def _tables(path: Path) -> set[str]:
 
 
 def test_constructing_a_ledger_writes_no_ddl(tmp_path: Path) -> None:
-    # A --dry-run must write nothing, including no schema (plan §6 phase 3.5).
+    # A --dry-run must write nothing, including no schema.
     db = tmp_path / "fresh.sqlite"
     SqliteLedger(db)
     assert _tables(db) == set()
@@ -85,15 +91,15 @@ def test_a_write_on_an_unmigrated_file_fails_loud_and_writes_no_ddl(
 ) -> None:
     """The schema is ``ibkr db migrate``'s job: the ledger never builds one.
 
-    Pins the WHOLE post-migration-bootstrap contract. A ledger that quietly
-    created its tables on the first write would pass every other test here while
-    re-introducing the half-schema-under-a-live-order failure — so an unmigrated
-    file must raise, and must leave ``sqlite_master`` empty.
+    A ledger that quietly created its tables on the first write would pass every
+    other test here while re-introducing the half-schema-under-a-live-order
+    failure — so an unmigrated file must raise, and must leave ``sqlite_master``
+    empty.
     """
     db = tmp_path / "unmigrated.sqlite"
     ledger = SqliteLedger(db)
-    with pytest.raises(peewee.OperationalError, match="live_cash"):
-        ledger.ensure_cash("S1", 1000.0)
+    with pytest.raises(peewee.OperationalError, match="live_strategy"):
+        ledger.ensure_strategy("h", "S1", "n", 1000.0)
     assert _tables(db) == set()
 
 
@@ -102,7 +108,6 @@ def test_load_book_raises_on_a_shape_drifted_table(tmp_path: Path) -> None:
     # empty book: an empty book is "flat" downstream, i.e. re-open everything.
     db = tmp_path / "drift.sqlite"
     with get_connection(db) as con:
-        con.execute("CREATE TABLE live_position (scope TEXT, wrong INTEGER)")
         con.execute("CREATE TABLE live_execution (scope TEXT, wrong INTEGER)")
     with pytest.raises(LedgerReadError):
         SqliteLedger(db).load_book("S1")
@@ -111,7 +116,7 @@ def test_load_book_raises_on_a_shape_drifted_table(tmp_path: Path) -> None:
 def test_cash_of_raises_on_a_shape_drifted_table(tmp_path: Path) -> None:
     db = tmp_path / "drift.sqlite"
     with get_connection(db) as con:
-        con.execute("CREATE TABLE live_cash (scope TEXT, wrong INTEGER)")
+        con.execute("CREATE TABLE live_strategy (scope TEXT, wrong INTEGER)")
     with pytest.raises(LedgerReadError):
         SqliteLedger(db).cash_of("S1", 1000.0)
 
@@ -163,13 +168,7 @@ def test_the_executions_book_refuses_a_non_conid_row(ledger: SqliteLedger) -> No
     An account-role row read as a book row would read downstream as "flat" and
     re-open the position, so the projection raises rather than skips it.
     """
-    ledger.ensure_cash("S1", 1000.0)
-    with get_connection(ledger.db_path) as con:
-        con.execute(
-            "INSERT INTO live_position (scope, position_id, symbol, side, qty, "
-            "entry_price, tag, order_ref, source) VALUES "
-            "('S1', 'AAPL_1', 'AAPL', 'long', 1.0, 1.0, '', '', 'executions')"
-        )
+    ledger.record_results("S1", (_open_result("AAPL_1"),), TS)
     with pytest.raises(LedgerReadError):
         ledger.load_book("S1")
 
@@ -179,10 +178,10 @@ def test_two_ledgers_on_two_paths_do_not_retarget_each_other(tmp_path: Path) -> 
     # second SqliteLedger silently retarget the first's connection (writes landing
     # in the wrong file, or a half-created schema). Each instance owns its db now.
     a = live_ledger(tmp_path / "a.sqlite")
-    a.ensure_cash("S1", 111.0)
+    a.ensure_strategy("h", "S1", "n", 111.0)
     b = live_ledger(tmp_path / "b.sqlite")
-    b.ensure_cash("S1", 222.0)
-    a.ensure_cash("S2", 333.0)  # a still writes to its OWN file
+    b.ensure_strategy("h", "S1", "n", 222.0)
+    a.ensure_strategy("h", "S2", "n", 333.0)  # a still writes to its OWN file
 
     assert a.initial_capital_of("S1") == 111.0
     assert b.initial_capital_of("S1") == 222.0
@@ -190,16 +189,23 @@ def test_two_ledgers_on_two_paths_do_not_retarget_each_other(tmp_path: Path) -> 
     assert b.initial_capital_of("S2") == 0.0  # b never saw a's later write
 
 
-def test_prune_closed_deletes_only_old_closed(ledger: SqliteLedger) -> None:
-    old = _exec("e1", ts=OLD)
-    book, _ = reconcile("S1", (old,), StrategyBook())
-    # close it immediately so it carries closed_at == OLD
-    close = _exec("e2", side=OrderSide.SELL, ts=OLD)
-    book, _ = reconcile("S1", (old, close), StrategyBook())
-    ledger.save_book("S1", book, (old, close), 1000.0)
-    deleted = ledger.prune_closed(TS)
-    assert deleted == 1
-    assert ledger.load_book("S1").rows == ()
+def test_a_later_ensure_strategy_never_resets_the_cash_seed(
+    ledger: SqliteLedger,
+) -> None:
+    """The FIRST write seeds ``initial_capital``; a later cycle keeps it (plan §4)."""
+    ledger.ensure_strategy("h1", "S1", "first", 1000.0)
+    ledger.ensure_strategy("h2", "S1", "second", 9999.0)  # a config edit
+
+    assert ledger.initial_capital_of("S1") == 1000.0
+    (audit,) = ledger.strategies_of("S1")
+    assert audit.strategy_id == "h2" and audit.name == "second"  # audit advances
+
+
+def test_touch_cycle_stamps_the_scope_row(ledger: SqliteLedger) -> None:
+    ledger.ensure_strategy("h", "S1", "n", 1000.0)
+    ledger.touch_cycle("S1", TS)
+    (audit,) = ledger.strategies_of("S1")
+    assert audit.last_cycle_at == TS
 
 
 def _result(pid: str | None, intent: OrderIntent, *, price: float) -> OrderResult:
@@ -233,17 +239,49 @@ def _open_result(pid: str = "L1") -> OrderResult:
 
 
 def _close_result(pid: str = "L1", *, price: float = 110.0) -> OrderResult:
-    return _result(
-        None,
-        OrderIntent(
-            symbol="AAPL",
-            action=ActionType.close,
-            qty=10.0,
-            ref_price=price,
-            reason="test",
-            position_id=pid,
+    intent = OrderIntent(
+        symbol="AAPL",
+        action=ActionType.close,
+        qty=10.0,
+        ref_price=price,
+        reason="test",
+        position_id=pid,
+    )
+    # The close's leg side is the lot's MIRROR, which ``intent_to_signal`` reads
+    # off the book; build the long lot the close targets so it sells, not buys.
+    book = PortfolioState(
+        cash=0.0,
+        positions={
+            "AAPL": (
+                Position(
+                    symbol="AAPL",
+                    qty=10.0,
+                    entry_price=100.0,
+                    entry_time=TS,
+                    stop_loss=None,
+                    take_profit=None,
+                    last_price=100.0,
+                    type=ActionType.long,
+                    position_id=pid,
+                ),
+            )
+        },
+        trades=(),
+        equity_curve=(),
+        initial_capital=0.0,
+    )
+    return OrderResult(
+        intent=intent,
+        fill=FillEvent(
+            signal=intent_to_signal(intent, TS, book),
+            filled_qty=10.0,
+            executed_price=price,
+            commission=1.0,
+            slippage=0.0,
+            timestamp=TS,
         ),
-        price=price,
+        ok=True,
+        position_id=None,
     )
 
 
@@ -278,13 +316,24 @@ def test_record_results_applies_every_write_of_a_cycle_atomically(
 
 
 def test_re_running_the_same_results_changes_nothing(ledger: SqliteLedger) -> None:
-    """REPLACE/IGNORE keep a re-applied cycle idempotent (a re-run is a no-op)."""
+    """IGNORE keeps a re-applied cycle idempotent (a re-run is a no-op)."""
     results = (_open_result("L1"), _close_result("L1"))
     ledger.record_results("S1", results, TS)
     before = ledger.executions_of("S1")
     ledger.record_results("S1", results, TS)
     assert ledger.executions_of("S1") == before
     assert len(ledger.executions_of("S1")) == 2  # entry + exit, no duplicates
+
+
+def test_a_round_trip_leaves_one_closed_book_row(ledger: SqliteLedger) -> None:
+    """The derived book keeps ONE row for a round trip, at net zero and closed."""
+    ledger.record_results("S1", (_open_result("265598"),), TS)
+    assert ledger.owned_ids("S1") == frozenset({"265598"})
+    ledger.record_results("S1", (_close_result("265598"),), TS)
+
+    assert ledger.owned_ids("S1") == frozenset()
+    (row,) = ledger.load_book("S1").rows
+    assert row.qty == 0.0 and row.closed_at is not None
 
 
 # --- pending order intents (PendingIntents) ---------------------------------
@@ -343,7 +392,7 @@ def test_prune_deletes_only_closed_old_rows(ledger: SqliteLedger) -> None:
 def test_a_token_collision_cannot_alias_two_distinct_identities(
     ledger: SqliteLedger, tmp_path: Path
 ) -> None:
-    """D7: the identity columns key the table, so a crc32 collision never aliases.
+    """The identity columns key the table, so a crc32 collision never aliases.
 
     Two distinct intents whose TOKENS collide (forced here by rewriting one) stay
     separately addressable by IDENTITY — the token is a plain column, not the key
@@ -404,7 +453,7 @@ def test_pruned_terminal_record_mints_the_next_attempt_at_zero(
 
 
 def test_intent_record_roundtrips_tif_and_stuck_cycles(ledger: SqliteLedger) -> None:
-    """N1: the new columns persist and read back (tif + wedged counter)."""
+    """The columns persist and read back (tif + wedged counter)."""
     key = _key("AAPL")
     ledger.save(
         IntentRecord(

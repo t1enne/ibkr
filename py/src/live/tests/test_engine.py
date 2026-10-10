@@ -12,7 +12,7 @@ import pytest
 from src.bt.state import ActionType, FillEvent, PortfolioState, Position
 from src.data.db import get_connection
 from src.live.pure import OrderResult, intent_to_signal
-from src.live.engine import (
+from src.live.pipeline import (
     run_cycle,
 )
 from src.live.adapters.sim.adapter import SimAdapter, build_sim_adapter
@@ -208,32 +208,6 @@ def make_candle_db(path: Path, ticker: str | None, ts: pd.Timestamp | None) -> N
         )
     con.commit()
     con.close()
-
-
-def book_rows(path: Path) -> list[tuple[object, ...]]:
-    """Every ``live_position`` row for the scope (empty if the table is unwritten)."""
-    con = get_connection(path)
-    try:
-        return con.execute(
-            "SELECT position_id, closed_at FROM live_position"
-        ).fetchall()
-    except Exception:
-        return []
-    finally:
-        con.close()
-
-
-def cycle_ts(path: Path, strategy_id: str) -> object:
-    """The strategy row's ``last_cycle_at`` (None if never touched)."""
-    con = get_connection(path)
-    try:
-        row = con.execute(
-            "SELECT last_cycle_at FROM live_strategy WHERE strategy_id=?",
-            (strategy_id,),
-        ).fetchone()
-    finally:
-        con.close()
-    return row[0] if row else None
 
 
 def _source_fn(acts: tuple[tuple[SignalAction, float], ...]):

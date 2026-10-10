@@ -125,6 +125,22 @@ def execution_cash_delta(execution: Execution) -> float:
     )
 
 
+def commission_of(side: str, qty: float, price: float, cash_delta: float) -> float:
+    """The fee implied by a stored fill's signed *cash_delta* — inverse of ``_cash_delta``.
+
+    ``_cash_delta`` is ``gross - fee`` for a SELL and ``-(gross + fee)`` for a BUY,
+    so the fee is recovered by subtracting the gross on the credit side and adding
+    it back on the debit side. A fill with no commission stored round-trips to
+    ``0.0``. *side* is the stored leg side (``BUY``/``SELL``, case-insensitive);
+    any other value is treated as the debit side, matching ``_cash_delta``'s
+    non-SELL default.
+    """
+    gross = qty * price
+    if side.upper() == OrderSide.SELL.value:
+        return gross - cash_delta
+    return -(cash_delta + gross)
+
+
 def _cash_delta(side: OrderSide, qty: float, price: float, commission: float) -> float:
     """The ONE signed-cash rule: a SELL credits, a BUY debits, both net of fee."""
     gross = qty * price
@@ -134,6 +150,7 @@ def _cash_delta(side: OrderSide, qty: float, price: float, commission: float) ->
 __all__ = [
     "FIRST_ATTEMPT",
     "FillWrite",
+    "commission_of",
     "execution_cash_delta",
     "next_attempt",
     "plan_result_writes",

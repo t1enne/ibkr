@@ -24,7 +24,7 @@ from src.exec.types import FixedCommission, OrderType
 from src.live.adapters.ibkr import broker as broker_mod
 from src.live.adapters.ibkr.broker import IbkrBroker
 from src.live.pure import OrderResult
-from src.live.engine import _UNSAFE_OUTCOMES
+from src.live.report import _UNSAFE_OUTCOMES
 from src.live.identity import (
     WEDGED_CYCLES,
     OPEN_STATES,

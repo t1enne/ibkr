@@ -112,12 +112,12 @@ class StoreLot:
 class StoreSide:
     """Our durable store for one scope: audit rows, cash, lots and orders/trades.
 
-    ``db_path`` is the resolved sqlite file; ``strategy_rows`` is the audit trail
-    (oldest first) so the report can name the latest revision and its cycle.
-    ``orders`` is EVERY order intent for the scope (open and closed, newest
-    first); ``trades`` is every stored fill (oldest first). ``lots`` are the OPEN
-    lots from the fill fold (``book_from_executions``), so both the IBKR reconcile
-    book and the sim path report the same way.
+    ``db_path`` is the resolved sqlite file; ``strategy_rows`` is the scope's single
+    audit row (the merged per-scope table) so the report can name the latest
+    revision and its cycle. ``orders`` is EVERY order intent for the scope (open
+    and closed, newest first); ``trades`` is every stored fill (oldest first).
+    ``lots`` are the OPEN lots from the fill fold (``book_from_executions``), so
+    both the IBKR reconcile book and the sim path report the same way.
     """
 
     scope: str

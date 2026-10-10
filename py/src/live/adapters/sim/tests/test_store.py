@@ -28,7 +28,7 @@ from src.data.db import get_connection
 from src.live.adapters.ibkr.mapping import num, opt_str
 from src.live.adapters.sim.adapter import build_sim_adapter
 from src.live.adapters.sim.store import SimBook, SimBookStore
-from src.live.engine import run_cycle
+from src.live.pipeline import run_cycle
 from src.live.pf import read_sim_broker
 from src.live.tests.ledgers import live_ledger
 from src.live.types import LiveConfig, LiveSignal, SignalAction

@@ -463,11 +463,11 @@ working-orders read, so an order placed by any other client can never be adopted
 ### State and locking
 
 One sqlite file (`../data/live.db`, overridable via `IBKR_LIVE_DB_PATH`)
-holds `live_strategy`, `live_cash`, `live_position`, `live_execution` and
-`live_order_intent`. Migrations **rename rather than drop**, so an upgrade
-preserves history; the pre-grammar artifacts a re-key leaves behind are retired by
-`live_0002_drop_legacy_artifacts` once their rows are accounted for. A cycle holds
-an OS advisory lock next to the database
+holds `live_strategy`, `live_execution` and `live_order_intent`. There is no
+separate position/cash table: the book is DERIVED from `live_execution` (cash is
+the scope's `initial_capital` plus its `SUM(cash_delta)`). The live file is built
+by one clean baseline migration (`live_0001_baseline`) and carries no legacy shape
+to absorb. A cycle holds an OS advisory lock next to the database
 (`<db>.<scope_tag>.cycle.lock`), so two overlapping cycles cannot place off the
 same book, while two different scopes still run concurrently.
 
