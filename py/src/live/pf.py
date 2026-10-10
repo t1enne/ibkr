@@ -692,6 +692,7 @@ _STATE_ROLES: Mapping[str, Role] = {
     "unfilled": "warn",
     "unresolved": "bad",
     "rejected": "bad",
+    "foreign": "warn",
 }
 
 #: The broker's owner marker: a foreign lot on a shared account is a caution, not
@@ -699,16 +700,6 @@ _STATE_ROLES: Mapping[str, Role] = {
 _OWNER_ROLES: Mapping[str, Role] = {"ours": "good", "NOT-OURS": "warn"}
 
 
-_BROKER_POSITION_COLS = (
-    Col("symbol", role="strong"),
-    Col("id"),
-    Col("side"),
-    Col("qty", ">"),
-    Col("avg", ">"),
-    Col("last", ">"),
-    Col("mktvalue", ">"),
-    Col("owner", roles=_OWNER_ROLES),
-)
 _ORDER_COLS = (
     Col("symbol", role="strong"),
     Col("side"),
@@ -753,6 +744,11 @@ _POSITION_COLS = (
     Col("rpnl", ">", sign=True),
     Col("sl", ">"),
     Col("tp", ">"),
+    Col("acct_id"),
+    Col("acct_qty", ">"),
+    Col("acct_avg", ">"),
+    Col("mktvalue", ">"),
+    Col("owner", roles=_OWNER_ROLES),
 )
 
 
@@ -813,13 +809,14 @@ def _render_text(report: PfReport, style: Styler = PLAIN) -> str:
 
     All scopes fold into a SINGLE scopes / stats / positions table (each row
     carries its ``scope``), so a report over every scope stays the same height as
-    one over a single config. ``positions`` is the ONE table the operator reads —
-    each row is a symbol's lot, the newest order for it and the P&L its fills
-    imply, so the old lots/orders/trades trio (which repeated the same order ref
-    three times) is gone. The broker side, when read, is its own table block.
+    one over a single config. ``positions`` is the ONE table the operator reads -
+    each row is a symbol's lot, the newest order for it, the P&L its fills imply
+    and, when the broker was read, the matching ACCOUNT lot (``acct_*``/``owner``)
+    so the two books sit side by side without a second table. A broker lot no
+    scope claims is appended as its own ``foreign`` row rather than hidden.
 
     *style* is applied sparingly and only through named roles (a title, a caution,
-    a sign) — see ``src.shared.style``; the default writes no escape byte.
+    a sign) - see ``src.shared.style``; the default writes no escape byte.
     """
     blocks: list[list[str]] = [[style.role(f"as_of: {report.as_of}", "note")]]
     if report.stores:
@@ -869,11 +866,11 @@ def _table(
 
 
 def _broker_lines(broker: BrokerSide, style: Styler = PLAIN) -> list[str]:
-    """The broker block: one scalar line, then the account's positions and orders.
+    """The broker block: one scalar line, then its working orders and warnings.
 
-    The account's book is shown whole (foreign lots included) because the account
-    is shared: a position another scope or a human opened is exactly the thing this
-    block exists to reveal, so it is never folded into our merged ``positions``.
+    The account's positions are NOT repeated here - they are folded into the
+    ``positions`` table, where each store row carries its matching ``acct_*``
+    cells and any lot no scope claims appears as its own ``foreign`` row.
     """
     scalars = [f"adapter={broker.adapter}", f"source={broker.source or '-'}"]
     if broker.account:
@@ -883,26 +880,6 @@ def _broker_lines(broker: BrokerSide, style: Styler = PLAIN) -> list[str]:
     if broker.cash is not None:
         scalars.append(f"cash={broker.cash:.2f}")
     lines = [style.role("broker:", "title") + "  " + "  ".join(scalars)]
-    lines.extend(
-        _table(
-            "broker positions",
-            _BROKER_POSITION_COLS,
-            tuple(
-                (
-                    lot.symbol,
-                    lot.id,
-                    lot.side,
-                    f"{lot.qty:g}",
-                    f"{lot.avg_cost:.4f}",
-                    f"{lot.last_price:.4f}",
-                    f"{lot.market_value:.2f}",
-                    "ours" if lot.owned else "NOT-OURS",
-                )
-                for lot in broker.positions
-            ),
-            style,
-        )
-    )
     lines.extend(
         _table(
             "working orders",
@@ -978,23 +955,77 @@ def _stats_row(stats: ScopeStats) -> tuple[str, ...]:
 def _position_text_rows(
     stores: tuple[StoreSide, ...], broker: BrokerSide | None
 ) -> tuple[tuple[str, ...], ...]:
-    """Every scope's merged position rows in one table, each tagged with its scope."""
-    return tuple(
-        (
-            row.scope,
-            row.symbol,
-            row.side,
-            row.status,
-            f"{row.qty:g}",
-            _opt(row.entry),
-            _opt(row.last),
-            _money(row.unrealized),
-            f"{row.realized:.2f}",
-            _opt(row.stop_loss),
-            _opt(row.take_profit),
-        )
-        for store in stores
-        for row in position_rows(store, broker)
+    """Every scope's merged position rows, each with its matching account cells.
+
+    Store rows carry the ACCOUNT side of the same symbol (``acct_id``/``acct_qty``/
+    ``acct_avg``/``mktvalue``/``owner``) so the two books read as one table. A
+    broker lot no scope's book holds is appended as a ``foreign`` row (scope
+    ``-``), so folding the tables never hides exposure another scope or a human
+    opened on the shared account.
+    """
+    account: dict[str, list[BrokerLot]] = {}
+    for lot in broker.positions if broker is not None else ():
+        account.setdefault(lot.symbol, []).append(lot)
+    owned_ids = {lot.id for store in stores for lot in _owned_lots(store)}
+    rows: list[tuple[str, ...]] = []
+    matched: set[str] = set()
+    for store in stores:
+        for row in position_rows(store, broker):
+            lots = tuple(
+                lot for lot in account.get(row.symbol, ()) if lot.id in owned_ids
+            )
+            matched.update(lot.id for lot in lots)
+            rows.append(_position_cells(row, lots))
+    for lots in account.values():
+        for lot in lots:
+            if lot.id not in matched:
+                rows.append(_foreign_cells(lot))
+    return tuple(rows)
+
+
+def _position_cells(row: PositionRow, lots: tuple[BrokerLot, ...]) -> tuple[str, ...]:
+    """A store row plus the ACCOUNT lot(s) our book pairs it with (``-`` if none)."""
+    qty = sum(lot.qty for lot in lots)
+    avg = sum(lot.qty * lot.avg_cost for lot in lots) / qty if qty else None
+    return (
+        row.scope,
+        row.symbol,
+        row.side,
+        row.status,
+        f"{row.qty:g}",
+        _opt(row.entry),
+        _opt(row.last),
+        _money(row.unrealized),
+        f"{row.realized:.2f}",
+        _opt(row.stop_loss),
+        _opt(row.take_profit),
+        lots[0].id if lots else "-",
+        f"{qty:g}" if lots else "-",
+        _opt(avg),
+        f"{sum(lot.market_value for lot in lots):.2f}" if lots else "-",
+        "ours" if lots else "-",
+    )
+
+
+def _foreign_cells(lot: BrokerLot) -> tuple[str, ...]:
+    """A broker lot no scope claims: shown whole, its account cells the only data."""
+    return (
+        "-",
+        lot.symbol,
+        lot.side,
+        "foreign",
+        f"{lot.qty:g}",
+        _opt(lot.avg_cost),
+        _opt(lot.last_price),
+        "-",
+        "-",
+        "-",
+        "-",
+        lot.id,
+        f"{lot.qty:g}",
+        _opt(lot.avg_cost),
+        f"{lot.market_value:.2f}",
+        "ours" if lot.owned else "NOT-OURS",
     )
 
 
