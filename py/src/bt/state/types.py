@@ -33,6 +33,9 @@ class ActionType(Enum):
     short = "short"
     close = "close"
     rebalance = "rebalance"  # net delta adjustment to existing position
+    stop_update = (
+        "stop_update"  # lifecycle/level action (arm/adjust SL/TP), never a fill
+    )
 
 
 class TradeStatus(Enum):

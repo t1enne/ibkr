@@ -8,7 +8,7 @@ Multiple positions per symbol are supported (e.g. partial entries, net rebalanci
 """
 
 from dataclasses import dataclass, replace
-from typing import Dict, Optional, Tuple as TupleT
+from typing import Callable, Dict, Optional, Tuple as TupleT
 
 import math
 import pandas as pd
@@ -116,6 +116,82 @@ def apply_fill(
         return _rebalance_position(portfolio, fill)
 
     return _open_position(portfolio, fill)
+
+
+def apply_stop_updates(
+    portfolio: PortfolioState,
+    signals: tuple[TradeSignal, ...],
+) -> PortfolioState:
+    """Arm/adjust per-lot SL/TP levels from ``stop_update`` signals. Pure.
+
+    Ratchet-only, never widen: a long's stop can only move UP and its target
+    only DOWN; a short mirrors (stop only DOWN, target only UP). ``None`` on a
+    signal leg leaves that leg unchanged; a ``None`` current level takes the
+    new level outright. Levels are ABSOLUTE prices. Cash, trades and equity
+    curve are untouched -- this is a lifecycle action, never a fill.
+
+    A signal whose ``position_id`` matches no lot, or whose symbol is flat, is
+    skipped silently (never raises): a stale arming order must not corrupt the
+    book, and the strategy's level is simply not re-armed.
+    """
+    updated = portfolio
+    for signal in signals:
+        if signal.action is not ActionType.stop_update:
+            continue
+        updated = _apply_stop_update(updated, signal)
+    return updated
+
+
+def _apply_stop_update(
+    portfolio: PortfolioState, signal: TradeSignal
+) -> PortfolioState:
+    """Apply ONE ``stop_update`` signal: locate the lot, ratchet both legs."""
+    lots = portfolio.positions.get(signal.symbol, ())
+    if not lots:
+        return portfolio
+    idx = next(
+        (i for i, p in enumerate(lots) if p.position_id == signal.position_id),
+        None,
+    )
+    if idx is None:
+        return portfolio
+    pos = lots[idx]
+    is_long = pos.type == ActionType.long
+    new_sl = _ratchet_leg(
+        pos.stop_loss, signal.stop_loss, tighter=max if is_long else min
+    )
+    new_tp = _ratchet_leg(
+        pos.take_profit, signal.take_profit, tighter=min if is_long else max
+    )
+    if new_sl == pos.stop_loss and new_tp == pos.take_profit:
+        return portfolio
+    new_lot = Position(
+        symbol=pos.symbol,
+        qty=pos.qty,
+        entry_price=pos.entry_price,
+        entry_time=pos.entry_time,
+        stop_loss=new_sl,
+        take_profit=new_tp,
+        last_price=pos.last_price,
+        type=pos.type,
+        position_id=pos.position_id,
+        tag=pos.tag,
+    )
+    new_positions = dict(portfolio.positions)
+    new_positions[signal.symbol] = lots[:idx] + (new_lot,) + lots[idx + 1 :]
+    return replace(portfolio, positions=new_positions)
+
+
+def _ratchet_leg(
+    old: float | None, new: float | None, tighter: Callable[[float, float], float]
+) -> float | None:
+    """Ratchet ONE SL/TP leg: ``None`` new keeps old, ``None`` old takes new,
+    else the tighter of the two (never wider)."""
+    if new is None:
+        return old
+    if old is None:
+        return new
+    return tighter(old, new)
 
 
 def apply_fills(

@@ -78,6 +78,7 @@ from src.bt.size.pure import SizingParams, equity_of, sized_signal
 from src.bt.portfolio.pure import (
     FillRejection,
     ScaleRecord,
+    apply_stop_updates,
 )
 from src.bt.exchange.ports import FillSurface
 from src.bt.types import (
@@ -455,6 +456,10 @@ def _execute_cohort(
     fills: list[FillEvent] = []
     drained: list[str] = []
     for signal, candle in cohort:
+        if signal.action == ActionType.stop_update:
+            # Lifecycle/level action, never a fill: defensive skip — the bar
+            # drain in ``_flush_bar`` already keeps these out of a cohort.
+            continue
         if skip_next_open and signal.fill_at_next_open:
             continue
         if signal.action in (ActionType.long, ActionType.short):
@@ -579,6 +584,14 @@ def _flush_bar(
         signal_observer=signal_observer,
     )
 
+    # Drain every stop_update signal out of the pending buckets IMMEDIATELY:
+    # a level arming order must never reach ``execute_signal`` (no fill, ever).
+    # Each symbol's bucket keeps its other signals; the drained orders are
+    # applied to the portfolio AFTER this bar's Stage 7/8 risk check + mark, so
+    # a level computed on bar t is armed for bar t+1 -- never for bar t's own
+    # risk pass (no intra-bar look-ahead).
+    stop_updates, state = _drain_stop_updates(state)
+
     cohort6 = [
         (sig, candle)
         for candle in bar
@@ -607,7 +620,36 @@ def _flush_bar(
             bt.risk_config,
         )
         state = _mark_to_market(state, candle, eq_buffer)
+    if stop_updates:
+        state = merge_bt_state(
+            state,
+            dict(portfolio=apply_stop_updates(state.portfolio, stop_updates)),
+        )
     return state
+
+
+def _drain_stop_updates(
+    state: BacktestState,
+) -> tuple[tuple[TradeSignal, ...], BacktestState]:
+    """Pull every ``stop_update`` signal out of ``pending_signals``.
+
+    Returns the drained signals (flat, in bucket order) and the state with each
+    symbol's bucket reduced to its non-stop-update signals. Called once per bar
+    right after signal generation; the drained orders are applied after the
+    bar's own risk check (see ``_flush_bar``) so the level arms for the next
+    bar. Buckets that hold ONLY stop-updates disappear, matching the engine's
+    per-symbol drain semantics.
+    """
+    drained: list[TradeSignal] = []
+    pending: dict[str, tuple[TradeSignal, ...]] = {}
+    for sym, sigs in state.pending_signals.items():
+        kept = tuple(s for s in sigs if s.action is not ActionType.stop_update)
+        drained.extend(s for s in sigs if s.action is ActionType.stop_update)
+        if kept:
+            pending[sym] = kept
+    if not drained:
+        return (), state
+    return tuple(drained), merge_bt_state(state, dict(pending_signals=pending))
 
 
 def _generate_signals(

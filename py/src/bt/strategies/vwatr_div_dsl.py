@@ -12,9 +12,14 @@ Exit, in order:
 
 1. VWATR slope divergence while price is at a new high. This is the primary
    exit and it is load-bearing: turning it off lowers return AND worsens
-   drawdown and tail risk -- it is not a free early out.
-2. ``vwatr_mult`` chandelier trail off the running best close. Width is
-   load-bearing too -- widening it loses Sharpe monotonically.
+   drawdown and tail risk -- it is not a free early out. It is a STATE rule
+   (expansion decelerating), not a price level, so it stays a next-open
+   ``ctx.close``.
+2. ``vwatr_mult`` chandelier trail off the running best close, armed each bar
+   as an ABSOLUTE stop level via ``ctx.set_stops`` (ratcheted, never widened):
+   it fires INTRABAR on the next bar's low at the level (gap-adjusted), instead
+   of the old next-open close. Width is load-bearing too -- widening it loses
+   Sharpe monotonically. ``tp`` is unused on this strategy.
 
 Sizing: flat ``risk_pct`` of LIVE equity times the amplifiers, so the risk
 budget re-levers as the book compounds. Sizing off a frozen capital base
@@ -535,7 +540,9 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
 
         reason: str | None = None
 
-        # 1) slope divergence under a new high
+        # 1) slope divergence under a new high — a STATE rule (VWATR expansion
+        # decelerating against the prior window), not a price level: it remains
+        # a next-open close, and it clears the running best.
         if (
             p.decel_ratio > 0
             and px >= best
@@ -549,17 +556,21 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
             ctx.close(sym, reason=reason)
             return
 
-        # base chandelier trail
+        # 2) chandelier trail: ARM the level (ratchet-only) for the NEXT bar
+        # instead of closing at the next open. A ``set_stops`` does NOT clear
+        # ``best`` — the trail lives with the position; the armed level fires
+        # intrabar on the next bar's low, gap-adjusted. ``tp`` intentionally
+        # unused: no take-profit on this strategy.
         stop_distance = p.vwatr_mult * vwatr
-        if px <= best - stop_distance:
-            put(best=None)
-            ctx.close(
-                sym,
-                reason=(
-                    f"trail {sym}: {px:.2f} −{stop_distance:.2f} "
-                    f"({stop_distance / px:.2%}) off best {best:.2f}"
-                ),
-            )
+        ctx.set_stops(
+            sym,
+            sl=best - stop_distance,
+            reason=(
+                f"trail {sym}: arm {best - stop_distance:.2f} "
+                f"−{stop_distance:.2f} ({stop_distance / px:.2%}) "
+                f"off best {best:.2f}"
+            ),
+        )
         return
 
     # ---- entry: rising expansion + structural breakout ----
@@ -620,7 +631,16 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     )
 
     put(best=px)
-    ctx.long(sym, size=size, size_mode="equity", reason=reason)
+    # Arming the initial stop in the SAME call via ``sl`` keeps the dsl
+    # convention (fraction of the entry price, not absolute): ``stop_price`` is
+    # the sizing stop distance, so the level lands at entry − vwatr_mult*ATR.
+    ctx.long(
+        sym,
+        size=size,
+        size_mode="equity",
+        reason=reason,
+        sl=stop_price / px,
+    )
 
 
 def _shift(values: np.ndarray, bars: int) -> np.ndarray:

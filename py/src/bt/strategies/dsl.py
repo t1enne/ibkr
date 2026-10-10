@@ -495,6 +495,51 @@ class StrategyContext:
                 )
             )
 
+    def set_stops(
+        self,
+        sym: str,
+        sl: float | None = None,
+        tp: float | None = None,
+        reason: Any = "stops",
+        tag: str = "",
+    ) -> None:
+        """Arm/adjust SL/TP levels for EVERY open lot in ``sym`` (invoke-all).
+
+        Emits one ``stop_update`` ``TradeSignal`` per open lot, each targeting
+        its own ``position_id``; the portfolio layer ratchets the levels
+        (tighten-only, never widen). ``sl``/``tp`` here are ABSOLUTE PRICES —
+        unlike ``ctx.long(sl=)``, whose ``sl`` is a fraction of the entry price.
+        ``None`` for a leg leaves it unchanged. A no-op when ``sym`` is flat.
+
+        Timing: the level takes effect from the NEXT bar. The engine drains the
+        update out of the fill path and applies it AFTER the current bar's own
+        risk check, so a level computed on bar t can never stop out the position
+        on bar t itself (no intra-bar look-ahead); Stage 8 of bar t+1 then fires
+        it intrabar at the trigger (gap-adjusted).
+        """
+        lots = self._state.portfolio.positions.get(sym, ())
+        assert not self._readonly, "plot() must be read-only"
+        if not lots:
+            return
+        price = self.price(sym)
+        for pos in lots:
+            self._signals.append(
+                TradeSignal(
+                    action=ActionType.stop_update,
+                    symbol=sym,
+                    timestamp=self._candle.timestamp,
+                    price=price,
+                    qty=0.0,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    reason=reason,
+                    fill_at_next_open=False,
+                    position_side=pos.type,
+                    position_id=pos.position_id,
+                    tag=tag,
+                )
+            )
+
     def _emit(
         self,
         action: ActionType,
