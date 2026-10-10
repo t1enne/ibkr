@@ -123,6 +123,86 @@
           "account": "SIM"
         }
       ]
+    },
+    "sim_vwatr_sel35_topk5_2d734e3c": {
+      "account": "SIM",
+      "summary": {
+        "totalcashvalue": {
+          "amount": 46550.7193153267,
+          "currency": "USD"
+        }
+      },
+      "positions": [
+        {
+          "position_id": "CRWD_1791628529.139636_0",
+          "conid": 1133943819,
+          "contractDesc": "CRWD",
+          "position": 9.7943,
+          "side": "long",
+          "avgCost": 275.1737725,
+          "mktPrice": 275.1737725,
+          "currency": "USD"
+        },
+        {
+          "position_id": "DDOG_1791628529.139636_1",
+          "conid": 1576579731,
+          "contractDesc": "DDOG",
+          "position": 2.395,
+          "side": "long",
+          "avgCost": 293.40197149999995,
+          "mktPrice": 293.40197149999995,
+          "currency": "USD"
+        },
+        {
+          "position_id": "NBIS_1791628529.139636_2",
+          "conid": 2051562942,
+          "contractDesc": "NBIS",
+          "position": 0.2319,
+          "side": "long",
+          "avgCost": 221.2094995,
+          "mktPrice": 221.2094995,
+          "currency": "USD"
+        }
+      ],
+      "orders": [],
+      "trades": [
+        {
+          "execution_id": "CRWD_1791628529.139636_0:open",
+          "order_ref": "",
+          "symbol": "CRWD",
+          "conid": 1133943819,
+          "side": "B",
+          "size": 9.7943,
+          "price": 275.1737725,
+          "commission": 0.05,
+          "trade_time_r": 1791628529139,
+          "account": "SIM"
+        },
+        {
+          "execution_id": "DDOG_1791628529.139636_1:open",
+          "order_ref": "",
+          "symbol": "DDOG",
+          "conid": 1576579731,
+          "side": "B",
+          "size": 2.395,
+          "price": 293.40197149999995,
+          "commission": 0.05,
+          "trade_time_r": 1791628529139,
+          "account": "SIM"
+        },
+        {
+          "execution_id": "NBIS_1791628529.139636_2:open",
+          "order_ref": "",
+          "symbol": "NBIS",
+          "conid": 2051562942,
+          "side": "B",
+          "size": 0.2319,
+          "price": 221.2094995,
+          "commission": 0.05,
+          "trade_time_r": 1791628529139,
+          "account": "SIM"
+        }
+      ]
     }
   }
 }
