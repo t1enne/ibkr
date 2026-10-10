@@ -211,9 +211,9 @@ async def ensure_gateway_session(
         # ``login_from_env`` is a coroutine: AWAIT it. Calling ``asyncio.run`` here
         # would nest event loops inside this running loop and raise RuntimeError.
         await login_from_env(mode=mode, env_path=env_path)
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         if not await tickle_auth(client):
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
             raise GatewayStartError(
                 "Login ran but /tickle still reports unauthenticated."
             )
