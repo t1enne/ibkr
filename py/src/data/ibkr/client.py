@@ -148,6 +148,25 @@ class IbkrClient:
         """Public POST: parsed JSON or :class:`IbkrError` (one error policy)."""
         return await self._post(endpoint, json)
 
+    async def confirm(self, reply_id: str) -> Any:
+        """Confirm an o354-style reply: ``POST /iserver/reply/{reply_id}``.
+
+        The wire contract (spec §0): a stop submission returns a challenge array
+        carrying ``id``/``messageIds``; the order does not rest until this call
+        confirms it with ``{"confirmed": true}``. Same error mapping as every
+        other request.
+        """
+        return await self._post(f"iserver/reply/{reply_id}", json={"confirmed": True})
+
+    async def cancel_order(self, account: str, order_id: str) -> Any:
+        """Cancel a resting order: ``DELETE /iserver/account/{account}/order/{order_id}``.
+
+        Same error mapping as ``get``/``post``; the confirming evidence is a
+        follow-up working-orders read showing the ``order_id`` absent (never this
+        call's reply alone).
+        """
+        return await self._delete(f"iserver/account/{account}/order/{order_id}")
+
     async def _get(self, endpoint: str) -> Any:
         """GET *endpoint* and return the parsed JSON, raising :class:`IbkrError`.
 
@@ -159,22 +178,7 @@ class IbkrClient:
             response = await self._http.get(endpoint)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise IbkrError("transport", f"{endpoint}: {exc}", endpoint) from exc
-        if response.status_code == 401:
-            raise IbkrError("auth", f"{endpoint}: 401 unauthenticated", endpoint)
-        if response.status_code in _RATE_LIMIT_STATUSES:
-            raise IbkrError(
-                "rate_limit", f"{endpoint}: {response.status_code}", endpoint
-            )
-        if response.status_code >= 400:
-            raise IbkrError(
-                "transport", f"{endpoint}: {response.status_code}", endpoint
-            )
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise IbkrError(
-                "transport", f"{endpoint}: unparseable body", endpoint
-            ) from exc
+        return self._check(response, endpoint)
 
     async def _post(self, endpoint: str, json: object | None = None) -> Any:
         """POST *endpoint* (reply-confirmation style); same error mapping as GET."""
@@ -182,6 +186,23 @@ class IbkrClient:
             response = await self._http.post(endpoint, json=json)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise IbkrError("transport", f"{endpoint}: {exc}", endpoint) from exc
+        return self._check(response, endpoint)
+
+    async def _delete(self, endpoint: str) -> Any:
+        """DELETE *endpoint* (order cancellation); same error mapping as GET/POST."""
+        try:
+            response = await self._http.delete(endpoint)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise IbkrError("transport", f"{endpoint}: {exc}", endpoint) from exc
+        return self._check(response, endpoint)
+
+    @staticmethod
+    def _check(response: httpx.Response, endpoint: str) -> Any:
+        """The ONE status/JSON mapping shared by GET/POST/DELETE.
+
+        A 2xx with a non-JSON body is also a transport failure (the gateway
+        answered something we cannot read).
+        """
         if response.status_code == 401:
             raise IbkrError("auth", f"{endpoint}: 401 unauthenticated", endpoint)
         if response.status_code in _RATE_LIMIT_STATUSES:

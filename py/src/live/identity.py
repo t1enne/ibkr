@@ -95,7 +95,14 @@ def ref_is_ours(scope: str, coid: str) -> bool:
 
 @dataclass(frozen=True)
 class WorkingOrder:
-    """One order read from the broker's open-orders endpoint."""
+    """One order read from the broker's open-orders endpoint.
+
+    ``order_type`` is the wire's ``orderType``/``origOrderType`` string (the
+    SL-vs-TP discriminator for a protective leg, spec §0); it is set by the
+    parse layer, never assumed from our book. ``level`` holds the resting
+    trigger/limit (``stop_price`` for an STP, ``price`` for an LMT) once the
+    parse layer reads it — the broker is the single source of truth for levels.
+    """
 
     order_ref: str
     order_id: str
@@ -104,6 +111,8 @@ class WorkingOrder:
     side: str
     status: str
     filled_qty: float
+    order_type: str = ""
+    level: float | None = None
 
 
 class OrderOutcome(Enum):
@@ -130,6 +139,10 @@ class OrderOutcome(Enum):
     #: genuine cash exhaustion for THIS bar, re-minted next cycle at exit 0 — this
     #: recurs every cycle forever, so it is UNSAFE.
     UNFUNDED = "unfunded"
+    #: A protective bracket that is not PROVEN resting: a refused or unconfirmed
+    #: child, or a levelled lot whose wire read shows no submitted pair. The lot
+    #: is NAKED — never reported "placed", never a silent exit 0 (F2).
+    UNPROTECTED = "unprotected"
 
 
 __all__ = [

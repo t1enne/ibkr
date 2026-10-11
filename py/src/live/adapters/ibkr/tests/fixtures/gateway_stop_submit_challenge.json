@@ -1,0 +1,13 @@
+{
+  "_captured": "live Paper gateway POST /iserver/account/{acct}/orders STP submit reply, build 10.50.1a. The spec's wire contract §0: an STP submission returns 200 with this challenge array; the order does NOT rest until POST /iserver/reply/{id} with {\"confirmed\": true}. Account field replaced with a placeholder. Shape per spec §0 and §6 (id + messageIds:[\"o10331\"]); verbatim message text redacted — only the FIELD NAMES the spec pins are load-bearing.",
+  "orders": [
+    {
+      "id": "dlm_ua_6d22bc8c-aece-4ef8-9a2b-2d14306088c6",
+      "message": [
+        "You are about to submit a stop order. This is the message the operator must read before confirming (verbatim body suppressed in this capture)."
+      ],
+      "messageIds": ["o10331"],
+      "isSuppressible": true
+    }
+  ]
+}

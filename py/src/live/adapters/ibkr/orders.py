@@ -26,13 +26,14 @@ Three pure mappings live here, all table-tested and free of I/O:
 - ``status_to_fill`` / ``order_state`` / ``is_terminal`` — ``orderStatus`` →
   the shared ``Fill`` and the terminal classifier.
 
-**MKT only, and no resting stops.** ``build_ticket`` refuses an ``LMT`` intent
-outright: an unfilled live limit order has to be carried across cycles (or
-repriced), which is phase 4. It also refuses any intent that carries a
-``stop_loss``/``take_profit``: this adapter places no resting/bracket order, so
-honouring the intent is impossible and sending a naked order would silently drop
-the strategy's risk levels. The refusal is fail-closed — the caller reports a
-rejected order naming the levels rather than trading without a stop.
+**Kind-driven tickets (spec §Step 3).** An entry is ``MKT``/``DAY`` and never
+carries a level — the levels rest as protective children after the entry is
+confirmed filled, so an entry carrying SL/TP is ADMITTED (its level is grown
+into children by ``src.live.protect``, never placed on the entry ticket). An
+``LMT`` ENTRY is still refused (carry-over unbuilt); a protective ``STP``/
+``LMT`` child is admitted with its level on ``price`` and ``tif`` ``GTC``.
+A refused/unprotected level is reported ``UNPROTECTED`` (unsafe), never a
+silent naked entry.
 """
 
 from __future__ import annotations
@@ -83,11 +84,12 @@ class OrderMappingError(ValueError):
 
 
 class UnsupportedOrderType(OrderMappingError):
-    """A non-MKT order reached the live adapter; carry-over policy is phase 4."""
+    """An entry order of a non-MKT type reached the live adapter.
 
-
-class UnsupportedStopOrder(OrderMappingError):
-    """An intent carrying SL/TP reached the adapter; no resting order exists."""
+    The spec's table (SPEC_LIVE_STOPS §Step 3) refuses an LMT ENTRY (carry-over
+    unbuilt) while ADMITTING a protective ``LMT`` child — the branch is
+    ``protective`` first, so this class is only raised for entries.
+    """
 
 
 class UnknownCloseLot(OrderMappingError):
@@ -165,27 +167,73 @@ def whole_quantity(intent: OrderIntent) -> int:
 
 
 def validate_order(intent: OrderIntent) -> None:
-    """Raise when *intent* cannot become a ticket (type, stops, whole quantity).
+    """Raise when *intent* cannot become a ticket (kind-driven, spec §Step 3).
 
     Split from ``build_ticket`` so a caller can refuse an unsupported intent
     BEFORE any network round trip (the pre-flight working-orders read), and so
     the edge's cash guard bounds a quantity that has already been proven
     positive-whole. Raising ``OrderMappingError`` keeps the refusal a value at
     the edge.
+
+    The kind table (plan D4, spec §Step 3):
+
+    - entry, ``MKT``: allowed (unchanged);
+    - entry, ``LMT``: refused ``UnsupportedOrderType`` (carry-over unbuilt);
+    - entry carrying a level: allowed — the entry ticket NEVER carries a level;
+      the levels rest as protective children after the entry is confirmed filled;
+    - protective, ``STP``: requires ``stop_loss`` finite > 0 and a proven reduce
+      side;
+    - protective, ``LMT``: requires ``take_profit`` finite > 0 and a proven
+      reduce side.
+
+    ``tif`` is a builder property (a protective body is always ``GTC``, an entry
+    always ``DAY``), not an intent field: the intent cannot carry a wrong tif
+    into the ticket.
     """
-    if intent.order_type is not OrderType.MKT:
+    if intent.protective:
+        _validate_protective(intent)
+    elif intent.order_type is not OrderType.MKT:
         raise UnsupportedOrderType(
-            f"{intent.order_type.value} order for {intent.symbol} is not supported "
+            f"{intent.order_type.value} entry for {intent.symbol} is not supported "
             f"live yet: LMT carry-over lands in phase 4 (MKT only in phase 3)"
         )
-    if intent.stop_loss is not None or intent.take_profit is not None:
-        raise UnsupportedStopOrder(
-            f"{intent.symbol}: intent carries stop_loss={intent.stop_loss!r} "
-            f"take_profit={intent.take_profit!r} but the IBKR adapter places no "
-            f"resting stop (phase 4); refusing to place a naked order that would "
-            f"drop the risk levels"
-        )
     whole_quantity(intent)
+
+
+def _validate_protective(intent: OrderIntent) -> None:
+    """The protective-leg rules: a reduce child needs its level and reduce side.
+
+    The child is minted only after its entry is confirmed filled, so its reduce
+    direction must be PROVEN (``position_side`` set by the child builder). A
+    protective body with no proven reduce side is refused — never guessed.
+    """
+    if intent.action is not ActionType.close:
+        raise OrderMappingError(
+            f"{intent.symbol}: protective order must be a reduce (close) child, "
+            f"got action {intent.action.value!r}"
+        )
+    if intent.position_side is None:
+        raise OrderMappingError(
+            f"{intent.symbol}: protective order carries no proven reduce side "
+            f"(position_side unset)"
+        )
+    if intent.order_type is OrderType.STP:
+        if intent.stop_loss is None or not math.isfinite(intent.stop_loss) or intent.stop_loss <= 0:
+            raise OrderMappingError(
+                f"{intent.symbol}: protective STP requires stop_loss finite and > 0, "
+                f"got {intent.stop_loss!r}"
+            )
+    elif intent.order_type is OrderType.LMT:
+        if intent.take_profit is None or not math.isfinite(intent.take_profit) or intent.take_profit <= 0:
+            raise OrderMappingError(
+                f"{intent.symbol}: protective LMT requires take_profit finite and > 0, "
+                f"got {intent.take_profit!r}"
+            )
+    else:
+        raise UnsupportedOrderType(
+            f"{intent.order_type.value} protective order for {intent.symbol} is not "
+            f"supported live yet"
+        )
 
 
 def build_ticket(
@@ -197,29 +245,37 @@ def build_ticket(
 ) -> Ticket:
     """Pure: intent + resolved conid + resolved side -> the IBKR ticket body.
 
-    ``order_ref`` is the ``cOID`` the CALLER minted (``identity.order_ref``): a
-    bar-free key token plus an attempt, so the ticket never embeds the decision
-    bar. ``tif`` is always ``DAY``; an MKT order has no meaningful resting life
-    in this phase. Quantities are whole shares: a fractional ``qty`` is rounded
-    and flagged, never sent as-is (``whole_quantity``). The side comes from
-    ``order_side`` (the caller resolves a close's lot side from the replayed
-    book before it gets here), so this function never guesses a direction.
+    ``order_ref`` is the ``cOID`` the CALLER minted (``identity.order_ref`` or
+    ``protect.protective_ref``). ``tif`` is kind-driven (the spec's ticket
+    table, Step 3): an entry is ``DAY``, a protective child is ``GTC`` (it must
+    outlive the session; there is no rollover rule because nothing local
+    remembers it). A protective body carries the level on ``price`` — the STP
+    trigger field is ``price`` (spec §0), never ``auxPrice``. Quantities are
+    whole shares: a fractional ``qty`` is rounded and flagged, never sent as-is
+    (``whole_quantity``). The side comes from ``order_side`` (the caller
+    resolves a close's lot side from the replayed book before it gets here), so
+    this function never guesses a direction.
     """
     validate_order(intent)
     whole = whole_quantity(intent)
+    body: dict[str, object] = {
+        "conid": conid,
+        "side": side.value,
+        "quantity": float(whole),
+        "orderType": intent.order_type.value,
+        "tif": "GTC" if intent.protective else "DAY",
+        "cOID": order_ref,
+    }
+    if intent.protective:
+        body["price"] = (
+            intent.stop_loss if intent.order_type is OrderType.STP else intent.take_profit
+        )
     return Ticket(
         order_ref=order_ref,
         side=side,
         conid=conid,
         rounded=abs(intent.qty - whole) > 1e-9,
-        body={
-            "conid": conid,
-            "side": side.value,
-            "quantity": float(whole),
-            "orderType": intent.order_type.value,
-            "tif": "DAY",
-            "cOID": order_ref,
-        },
+        body=body,
     )
 
 
@@ -246,6 +302,12 @@ def parse_working_order(entry: object) -> WorkingOrder | None:
     dropped explicitly — a scope prefix can never match a row we did not place by
     construction. Every other field is best-effort: only the ref and the order id
     drive adoption, the rest is diagnostic.
+
+    ``order_type``/``level`` are read for the PROTECTIVE path (spec §0): the
+    wire's ``orderType`` is the SL-vs-TP discriminator and the resting
+    trigger/limit is ``stop_price`` (an STP) or ``price`` (an LMT) — the broker
+    is the single source of truth for levels. Both fields are carried, never
+    guessed; an unreadable level reads ``None``.
     """
     if not isinstance(entry, Mapping):
         return None
@@ -253,6 +315,8 @@ def parse_working_order(entry: object) -> WorkingOrder | None:
     order_ref = opt_str(body.get("order_ref")).strip()
     if not order_ref:
         return None
+    order_type = opt_str(body.get("orderType") or body.get("origOrderType"))
+    level = num(body.get("stop_price")) or num(body.get("price"))
     return WorkingOrder(
         order_ref=order_ref,
         order_id=canonical_order_id(body.get("orderId")),
@@ -265,6 +329,8 @@ def parse_working_order(entry: object) -> WorkingOrder | None:
             or body.get("filled_quantity")
             or body.get("cum_fill")
         ),
+        order_type=order_type,
+        level=level if level > 0 else None,
     )
 
 

@@ -29,8 +29,15 @@ import pandas as pd
 
 from src.bt.exchange import SimExchange, default_exchange
 from src.bt.state import ActionType, PortfolioState, Position
+from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
+from src.live.adapters.sim.protect import (
+    apply_bracket,
+    fire_stops,
+    resting_rows,
+)
 from src.live.adapters.sim.store import SimBook, SimBookStore, synthetic_conid
+from src.live.protect import bracket_children, child_ref
 from src.live.pure import OrderResult, sim_place_cohort
 from src.live.pure_plan import _cash_delta
 from src.live.ledger import LedgerReadError, SqliteLedger
@@ -43,8 +50,11 @@ from src.live.types import (
     exec_params_of,
 )
 
-#: One open lot's worth of a book row: ``(position_id, symbol, side, qty, entry)``.
-_BareLot = tuple[str, str, str, float, float]
+#: One open lot's worth of a book row: ``(position_id, symbol, side, qty,
+#: entry, stop_loss, take_profit)``. The levels are the ADVISORY strategy levels
+#: persisted on the broker's own lot row (the RESTING order is the broker's
+#: truth; this is only the local trace the ratchet gate reads).
+_BareLot = tuple[str, str, str, float, float, float | None, float | None]
 
 
 @dataclass(frozen=True)
@@ -154,7 +164,7 @@ def build_account_book(
     book = store.read(scope)
     lots = tuple(_bare_lot(row) for row in book.positions)
     grouped: dict[str, list[Position]] = {}
-    for position_id, symbol, side, qty, entry in lots:
+    for position_id, symbol, side, qty, entry, stop, take in lots:
         if not symbol:
             continue  # ownership-only: no book position to carry
         grouped.setdefault(symbol, []).append(
@@ -163,8 +173,8 @@ def build_account_book(
                 qty=qty,
                 entry_price=entry,
                 entry_time=as_of,
-                stop_loss=None,
-                take_profit=None,
+                stop_loss=stop,
+                take_profit=take,
                 last_price=entry,
                 type=ActionType.long if side != "short" else ActionType.short,
                 position_id=position_id,
@@ -219,20 +229,38 @@ def _bare_lot(row: object) -> _BareLot:
 
     A row with no symbol/size is skipped: it names a lot we cannot describe, and
     inventing a size would put a phantom position in the book the cycle sizes
-    against.
+    against. ``stop``/``take`` are the lot's advisory levels (``None`` when the
+    row carries none), read back so the ratchet gate never widens the resting
+    order it compares against.
     """
     if not isinstance(row, Mapping):
-        return ("", "", "", 0.0, 0.0)
+        return ("", "", "", 0.0, 0.0, None, None)
     symbol = _str(row.get("contractDesc") or row.get("symbol") or "")
     qty = _num(row.get("position"))
     price = _num(row.get("avgCost"))
     pid = _str(row.get("position_id"))
     if not symbol or qty == 0.0:
-        return (pid, "", "", 0.0, 0.0)
+        return (pid, "", "", 0.0, 0.0, None, None)
     side = _str(row.get("side"))
     if not side:
         side = "long" if qty > 0 else "short"
-    return (pid, symbol, side, abs(qty), price)
+    stop = _freq_opt(row.get("stop_loss"))
+    take = _freq_opt(row.get("take_profit"))
+    return (pid, symbol, side, abs(qty), price, stop, take)
+
+
+def _freq_opt(value: object) -> float | None:
+    """An optional finite positive price from a JSON value (``None`` otherwise)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if float(value) > 0 else None
+    if isinstance(value, str):
+        try:
+            return float(value) if float(value) > 0 else None
+        except ValueError:
+            return None
+    return None
 
 
 def _write_back(

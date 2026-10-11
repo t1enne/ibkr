@@ -23,7 +23,6 @@ from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     UnknownCloseLot,
     UnsupportedOrderType,
-    UnsupportedStopOrder,
     build_ticket,
     classify_reply,
     is_fully_filled,
@@ -34,6 +33,7 @@ from src.live.adapters.ibkr.orders import (
     placement_order,
     scale_open_cohort,
     status_to_fill,
+    validate_order,
 )
 from src.live.pure import intent_to_signal, ref_candle
 from src.live.identity import (
@@ -163,18 +163,75 @@ def test_build_ticket_rejects_lmt() -> None:
     ("stop_loss", "take_profit"),
     [(95.0, None), (None, 110.0), (95.0, 110.0)],
 )
-def test_build_ticket_refuses_an_intent_carrying_a_stop(
+def test_entry_ticket_carrying_a_level_is_admitted_but_never_carries_it(
     stop_loss: float | None, take_profit: float | None
 ) -> None:
-    # The adapter places no resting stop: refusing beats silently sending a naked
-    # order whose risk levels the report would then imply were honoured.
-    with pytest.raises(UnsupportedStopOrder, match="naked order"):
-        build_ticket(
-            _intent(stop_loss=stop_loss, take_profit=take_profit),
-            conid=1,
-            side=OrderSide.BUY,
-            order_ref=order_ref(intent_key(SCOPE, _intent())),
-        )
+    # Step 3 (spec): an entry carrying a level is ALLOWED — the levels rest as
+    # protective CHILDREN after the entry is confirmed filled, never on the
+    # entry ticket. The ticket stays MKT/DAY and body carries no ``price``.
+    ticket = build_ticket(
+        _intent(stop_loss=stop_loss, take_profit=take_profit),
+        conid=1,
+        side=OrderSide.BUY,
+        order_ref=order_ref(intent_key(SCOPE, _intent())),
+    )
+    assert ticket.body["orderType"] == "MKT"
+    assert ticket.body["tif"] == "DAY"
+    assert "price" not in ticket.body
+
+
+def test_protective_stp_ticket_is_gtc_and_carries_the_trigger_on_price() -> None:
+    # The wire contract (spec §0): an STP trigger is ``price`` (never ``auxPrice``)
+    # and the protective child rests GTC.
+    child = _intent(
+        action=ActionType.close,
+        position_id="1",
+        order_type=OrderType.STP,
+        stop_loss=92.0,
+    )
+    child = replace_intent(child, protective=True, position_side=ActionType.long)
+    ticket = build_ticket(
+        child,
+        conid=1,
+        side=OrderSide.SELL,
+        order_ref=order_ref(intent_key(SCOPE, child)),
+    )
+    assert ticket.body["orderType"] == "STP"
+    assert ticket.body["tif"] == "GTC"
+    assert ticket.body["price"] == 92.0
+
+
+def test_protective_lmt_ticket_is_gtc_and_carries_the_limit_on_price() -> None:
+    child = _intent(
+        action=ActionType.close,
+        position_id="1",
+        order_type=OrderType.LMT,
+        take_profit=108.0,
+    )
+    child = replace_intent(child, protective=True, position_side=ActionType.long)
+    ticket = build_ticket(
+        child,
+        conid=1,
+        side=OrderSide.SELL,
+        order_ref=order_ref(intent_key(SCOPE, child)),
+    )
+    assert ticket.body["orderType"] == "LMT"
+    assert ticket.body["tif"] == "GTC"
+    assert ticket.body["price"] == 108.0
+
+
+def test_protective_stp_requires_a_finite_positive_stop_level() -> None:
+    child = _intent(action=ActionType.close, position_id="1", order_type=OrderType.STP)
+    child = replace_intent(child, protective=True, position_side=ActionType.long)
+    with pytest.raises(OrderMappingError, match="stop_loss"):
+        validate_order(child)
+
+
+def test_protective_order_requires_a_proven_reduce_side() -> None:
+    child = _intent(action=ActionType.close, position_id="1", order_type=OrderType.STP, stop_loss=92.0)
+    child = replace_intent(child, protective=True)
+    with pytest.raises(OrderMappingError, match="reduce side"):
+        validate_order(child)
 
 
 # --- placement order + working-order matching -------------------------------

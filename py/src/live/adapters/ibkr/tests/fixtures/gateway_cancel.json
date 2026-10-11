@@ -1,0 +1,8 @@
+{
+  "_captured": "live Paper gateway DELETE /iserver/account/{acct}/order/{orderId} reply for a resting bracket leg, build 10.50.1a. Per spec §0, the DELETE reply alone is NOT the confirmation — a follow-up working-orders read showing the orderId absent is. Account field replaced with a placeholder.",
+  "order": {
+    "order_id": "463681097",
+    "orderCancelSuccess": true
+  },
+  "orders_after_cancel": []
+}

@@ -1,0 +1,9 @@
+{
+  "_captured": "live Paper gateway POST /iserver/reply/{id} confirm reply for an STP submit, build 10.50.1a. Confirm success carries order_id, local_order_id (= our cOID) and oca_group_id (spec §0). Account field replaced with a placeholder.",
+  "reply": {
+    "order_id": "463681097",
+    "order_not_rejected": true,
+    "local_order_id": "probe-stops-1f3a2b4c",
+    "oca_group_id": "oco-241885626"
+  }
+}

@@ -20,6 +20,7 @@ from src.bt.state import PortfolioView as PortfolioView  # re-exported live voca
 
 __all__ = [
     "BookRow",
+    "BracketIntent",
     "Execution",
     "ExecutionRecord",
     "StrategyAudit",
@@ -286,6 +287,15 @@ class OrderIntent:
     #: close, and on an open from a caller that cannot state it — the edge then
     #: refuses (fail-closed) rather than trading unbounded.
     cash_bound: float | None = None
+    #: NEW (Step 2): a reduce child protecting a lot (one leg of an OCA bracket).
+    #: Never keyed, never persisted locally, never minted by ``reconcile`` — a
+    #: child is minted only after its entry is confirmed filled, so a STOP/LMT
+    #: body is built for it and it is not confused with an entry intent.
+    protective: bool = False
+    #: NEW (Step 2): the LOT's side on a child minted from a confirmed entry
+    #: (``F9``: a just-filled lot is not yet in the seeded book, so the child
+    #: carries its own reduce side; ``None`` elsewhere).
+    position_side: ActionType | None = None
 
 
 #: Every ``FeedError.kind`` a value may carry. The ONE definition: ``FeedError``
@@ -311,6 +321,10 @@ FeedKind = Literal[
     #: or a scaled qty flooring to 0 shares) — distinct from a broker ``rejected``,
     #: which is genuine cash exhaustion for this bar and re-mints next cycle.
     "unfunded",
+    #: A protective bracket that is not PROVEN resting (refused, unconfirmed, or
+    #: absent from the wire for a levelled lot). The lot is NAKED and the cycle
+    #: must exit 3 — never a silent ``rejected``-style exit 0 (F2).
+    "unprotected",
 ]
 
 #: Every ``FeedError.kind`` a value may carry, derived from the Literal above.
@@ -352,6 +366,26 @@ def feed_error(
         symbol=symbol,
         filled_qty=filled_qty,
     )
+
+
+@dataclass(frozen=True)
+class BracketIntent:
+    """NEW (Step 2): one OCA reduce pair protecting an entry lot.
+
+    ``position_id`` is the parent lot the pair protects; ``sl``/``tp`` are
+    ABSOLUTE prices (the strategy's advisory levels); ``side`` is the reduce
+    side (opposite of the entry); ``refs`` are the identity layer's two cOIDs.
+    Can carry ONE leg (``sl=None`` or ``tp=None``) — the pair is only material
+    when both legs ride the same OCA group.
+    """
+
+    symbol: str
+    position_id: str
+    sl: float | None
+    tp: float | None
+    qty: float
+    side: ActionType
+    refs: tuple[str, str]
 
 
 @dataclass(frozen=True)

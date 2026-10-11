@@ -1221,6 +1221,10 @@ def _outcome_for_kind(kind: str) -> OrderOutcome:
         # from a genuine cash-exhaustion ``rejected``, which is re-minted next
         # cycle and stays safe.
         "unfunded": OrderOutcome.UNFUNDED,
+        # A protective bracket not proven resting: a refused/unconfirmed child or
+        # a levelled lot with no submitted pair. NAKED, and UNSAFE (F2) — never
+        # the safe ``rejected`` reading.
+        "unprotected": OrderOutcome.UNPROTECTED,
     }.get(kind, OrderOutcome.UNRESOLVED)
 
 

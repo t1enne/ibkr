@@ -76,8 +76,10 @@ class CycleReport:
 #: OPEN record nothing could settle across ``WEDGED_CYCLES`` resyncs), ``TIMEOUT``
 #: (still working at the deadline, not proven terminal), ``DIVERGENCE`` (a book
 #: disagreement refused), ``UNFUNDED`` (a STRUCTURAL cohort drop that recurs every
-#: cycle forever). A ``REJECTED`` open is genuine cash exhaustion for this bar and
-#: re-mints next cycle, so it stays safe.
+#: cycle forever), ``UNPROTECTED`` (a protective bracket is not proven resting;
+#: the lot is NAKED, and a repeated cycle repeats the exit-3 alarm). A
+#: ``REJECTED`` open is genuine cash exhaustion for this bar and re-mints next
+#: cycle, so it stays safe.
 _UNSAFE_OUTCOMES: frozenset[OrderOutcome] = frozenset(
     {
         OrderOutcome.UNRESOLVED,
@@ -85,6 +87,7 @@ _UNSAFE_OUTCOMES: frozenset[OrderOutcome] = frozenset(
         OrderOutcome.TIMEOUT,
         OrderOutcome.DIVERGENCE,
         OrderOutcome.UNFUNDED,
+        OrderOutcome.UNPROTECTED,
     }
 )
 

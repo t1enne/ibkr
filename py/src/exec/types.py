@@ -17,10 +17,11 @@ import pandas as pd
 
 
 class OrderType(Enum):
-    """How an order is priced: at the market, or at a limit."""
+    """How an order is priced: at the market, at a limit, or by a stop trigger."""
 
     MKT = "MKT"
     LMT = "LMT"
+    STP = "STP"
 
 
 class TimeInForce(Enum):
