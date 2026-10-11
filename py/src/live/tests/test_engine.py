@@ -132,6 +132,7 @@ class FakeAdapter:
         self.seeded: PortfolioState | None = None
         self.placed: list[OrderIntent] = []
         self.resynced = 0
+        self.attested = 0
         self.events: list[str] = []
         self._reject = reject
         self._open_pid = open_pid
@@ -142,6 +143,13 @@ class FakeAdapter:
     async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
         self.resynced += 1
         self.events.append("resync")
+        return Ok(())
+
+    async def attest_protection(
+        self, book: PortfolioState
+    ) -> Result[tuple[OrderResult, ...], FeedError]:
+        self.attested += 1
+        self.events.append("attest")
         return Ok(())
 
     async def place(self, book: PortfolioState, intent: OrderIntent) -> PlaceResult:

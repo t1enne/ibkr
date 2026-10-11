@@ -227,7 +227,7 @@ def test_protective_stp_requires_a_finite_positive_stop_level() -> None:
         validate_order(child)
 
 
-def test_protective_order_requires_a_proven_reduce_side() -> None:
+def test_protective_order_requires_a_proven_lot_side() -> None:
     child = _intent(
         action=ActionType.close,
         position_id="1",
@@ -235,7 +235,7 @@ def test_protective_order_requires_a_proven_reduce_side() -> None:
         stop_loss=92.0,
     )
     child = replace_intent(child, protective=True)
-    with pytest.raises(OrderMappingError, match="reduce side"):
+    with pytest.raises(OrderMappingError, match="lot side"):
         validate_order(child)
 
 

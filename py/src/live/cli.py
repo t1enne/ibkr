@@ -850,6 +850,12 @@ def _render_json(report: CycleReport, scope: str = "") -> str:
             asdict(report.placement_error) if report.placement_error else None
         ),
         "resync_error": (asdict(report.resync_error) if report.resync_error else None),
+        # A book disagreement is an exit-3 reason, so a machine consumer must be
+        # able to read WHY the cycle was unsafe from the document alone: the
+        # exit code is out-of-band and cannot name the lot.
+        "divergences": [asdict(d) for d in report.divergences],
+        # Advisory read findings flow through too (never an exit-3 reason).
+        "warnings": list(report.warnings),
         "portfolio_before": _portfolio_dict(report.portfolio_before),
     }
     return json.dumps(doc, default=_json_default, indent=2)
@@ -902,6 +908,8 @@ def _render_text(report: CycleReport, scope: str = "") -> str:
     message, which is allowed to grow; the rest stay tight.
     """
     blocks: list[list[str]] = [[f"scope: {scope}", f"as_of: {report.as_of}"]]
+    if report.warnings:
+        blocks.append([f"warning: {w}" for w in report.warnings])
     if report.divergences:
         blocks.append(_divergence_lines(report.divergences))
     blocks.append(

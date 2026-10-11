@@ -54,6 +54,11 @@ class IbkrAdapter:
     async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
         return await self.broker.resync()
 
+    async def attest_protection(
+        self, book: PortfolioState
+    ) -> Result[tuple[OrderResult, ...], FeedError]:
+        return await self.broker.attest_protection(book)
+
     async def place(
         self, book: PortfolioState, intent: OrderIntent
     ) -> Result[OrderResult, FeedError]:

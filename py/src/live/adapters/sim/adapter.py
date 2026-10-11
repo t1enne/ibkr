@@ -34,10 +34,11 @@ from src.exec.types import OrderSide
 from src.live.adapters.sim.protect import (
     _order_id_of,
     apply_bracket,
+    attest_protection,
     fire_stops,
 )
 from src.live.adapters.sim.store import SimBook, SimBookStore, synthetic_conid
-from src.live.protect import bracket_children
+from src.live.protect import ProtectionTarget, bracket_children
 from src.live.pure import OrderResult, sim_place_cohort
 from src.live.pure_plan import _cash_delta
 from src.live.ledger import LedgerReadError, SqliteLedger
@@ -55,6 +56,10 @@ from src.live.types import (
 #: persisted on the broker's own lot row (the RESTING order is the broker's
 #: truth; this is only the local trace the ratchet gate reads).
 _BareLot = tuple[str, str, str, float, float, float | None, float | None]
+
+
+#: Absolute quantity below which a lot is flat for the backstop's target list.
+_FLAT_QTY_EPS = 1e-9
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,37 @@ class SimAdapter:
         )
         if results:
             self.store.write(self.scope, updated)
+        return Ok(results)
+
+    async def attest_protection(
+        self, book: PortfolioState
+    ) -> Result[tuple[OrderResult, ...], FeedError]:
+        """The sim per-cycle backstop: report every naked lot, write nothing (item 2).
+
+        Feeds the SAME shared builders the IBKR edge uses (``ProtectionTarget`` +
+        ``unprotected_targets``) into the sim broker's own working-orders read, so
+        the rule cannot fork: a lone ``sl`` counts as protection on both edges,
+        and a lot resting nothing is ``UNPROTECTED`` (exit 3). Attest-only.
+        """
+        targets = tuple(
+            ProtectionTarget(
+                conid=synthetic_conid(lot.symbol),
+                symbol=lot.symbol,
+                position_id=str(lot.position_id),
+                qty=lot.qty,
+            )
+            for lots in book.positions.values()
+            for lot in lots
+            if lot.qty > _FLAT_QTY_EPS and lot.position_id
+        )
+        if not targets:
+            return Ok(())
+        results = await attest_protection(
+            self.store.read(self.scope),
+            targets,
+            scope_tag=scope_tag(self.scope),
+            log=self.log,
+        )
         return Ok(results)
 
     async def place(

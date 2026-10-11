@@ -20,13 +20,17 @@ import pandas as pd
 from src.bt.state import ActionType, PortfolioState, Position, TradeSignal
 from src.exec.refs import scope_tag
 from src.exec.types import OrderType
-from src.live.identity import WorkingOrder
+from src.live.identity import OrderOutcome, WorkingOrder
 from src.live.protect import (
+    ProtectionTarget,
     bracket_children,
     kind_of,
     level_bracket_intents,
     protective_ref,
     resting_bracket,
+    resting_legs,
+    unprotected_results,
+    unprotected_targets,
 )
 from src.live.types import OrderIntent
 
@@ -59,15 +63,16 @@ def _entry(
 # --- bracket_children -------------------------------------------------------
 
 
-def test_bracket_children_pair_reduce_side_and_confirmed_qty() -> None:
+def test_bracket_children_carry_the_lot_side_and_the_confirmed_qty() -> None:
     children = bracket_children(_entry(), conid=CONID, filled_qty=8.0)
     assert len(children) == 2
     stop, take = children
     assert stop.order_type is OrderType.STP and take.order_type is OrderType.LMT
     assert stop.protective and take.protective
-    # Reduce side is the entry's mirror; both legs carry the same side.
-    assert stop.position_side is ActionType.short
-    assert take.position_side is ActionType.short
+    # The child carries the LOT side (the ONE meaning of position_side, the same
+    # one order_side gives it) — never an inverted reduce side; both legs agree.
+    assert stop.position_side is ActionType.long
+    assert take.position_side is ActionType.long
     # Qty is the CONFIRMED fill (entry planned 10, filled 8) — never the ask.
     assert stop.qty == 8.0 and take.qty == 8.0
     # The child carries its own level, so the resting trigger is on the ticket.
@@ -84,12 +89,12 @@ def test_bracket_children_sl_only_mints_one_stop_leg() -> None:
     assert children[0].order_type is OrderType.STP
 
 
-def test_bracket_children_short_entry_reduces_by_buying() -> None:
+def test_bracket_children_short_entry_carries_the_short_lot_side() -> None:
     stop, take = bracket_children(
         _entry(action=ActionType.short), conid=CONID, filled_qty=8.0
     )
-    assert stop.position_side is ActionType.long
-    assert take.position_side is ActionType.long
+    assert stop.position_side is ActionType.short
+    assert take.position_side is ActionType.short
 
 
 # --- protective_ref ---------------------------------------------------------
@@ -209,6 +214,103 @@ def test_resting_bracket_none_for_an_inactive_leg() -> None:
     sl, tp = _real_bracket()
     tp = replace(tp, status="Inactive")
     assert resting_bracket((sl, tp), scope_tag=TAG, conid=CONID) is None
+
+
+# --- resting_legs (item 4: a lone leg IS protection) ------------------------
+
+
+def test_resting_legs_lone_sl_is_protection() -> None:
+    # REGRESSION: a stop-only strategy (vwatr_div_dsl) rests ONE leg. The pair
+    # reader refuses it, but the leg-count-agnostic reader must NOT — otherwise
+    # the lot reports NAKED forever and a replace re-places a duplicate.
+    sl, _ = _real_bracket()
+    legs = resting_legs((sl,), scope_tag=TAG, conid=CONID)
+    assert [kind_of(leg) for leg in legs] == ["stop"]
+
+
+def test_resting_legs_lone_take_is_protection() -> None:
+    _, tp = _real_bracket()
+    legs = resting_legs((tp,), scope_tag=TAG, conid=CONID)
+    assert [kind_of(leg) for leg in legs] == ["take_profit"]
+
+
+def test_resting_legs_reads_both_legs_of_a_pair() -> None:
+    legs = resting_legs(_real_bracket(), scope_tag=TAG, conid=CONID)
+    assert {kind_of(leg) for leg in legs} == {"stop", "take_profit"}
+
+
+def test_resting_legs_empty_for_a_foreign_scope_or_conid() -> None:
+    # Ownership is by exact prefix + conid: another scope's leg (or a leg on
+    # another conid) is NEVER our protection.
+    legs = _real_bracket()
+    assert resting_legs(legs, scope_tag=scope_tag("other_scope"), conid=CONID) == ()
+    assert resting_legs(legs, scope_tag=TAG, conid=CONID + 1) == ()
+
+
+def test_resting_legs_empty_when_not_submitted() -> None:
+    # The §0 failed-confirm row (``Inactive``/``Pending Submit``) is NOT resting.
+    sl, tp = _real_bracket()
+    inactive = (replace(sl, status="Inactive"), replace(tp, status="Pending Submit"))
+    assert resting_legs(inactive, scope_tag=TAG, conid=CONID) == ()
+
+
+def test_resting_legs_empty_when_sides_disagree() -> None:
+    # Two legs reducing opposite directions are two strangers sharing a prefix,
+    # so NOTHING is claimed resting for the conid (fail closed, invariant 5).
+    sl, tp = _real_bracket()
+    assert resting_legs((sl, replace(tp, side="BUY")), scope_tag=TAG, conid=CONID) == ()
+
+
+def test_resting_legs_ignores_a_row_with_no_readable_kind() -> None:
+    # A row whose ``orderType`` names neither a stop nor a limit is not a
+    # protective leg — it must not be counted as cover.
+    sl, _ = _real_bracket()
+    unknown = replace(sl, order_type="TRAIL")
+    assert resting_legs((unknown,), scope_tag=TAG, conid=CONID) == ()
+
+
+# --- unprotected_targets / unprotected_results (item 2 backstop) ------------
+
+
+def test_backstop_reports_only_the_lots_resting_no_leg() -> None:
+    # REGRESSION: this is the missing caller. A lot resting our leg is proven
+    # covered and is NOT reported; a lot resting nothing is naked.
+    sl, _ = _real_bracket()
+    covered = ProtectionTarget(
+        conid=CONID, symbol="AAPL", position_id="265598", qty=8.0
+    )
+    naked = ProtectionTarget(conid=CONID + 1, symbol="MSFT", position_id="999", qty=3.0)
+    missing = unprotected_targets((sl,), scope_tag=TAG, targets=(covered, naked))
+    assert missing == (naked,)
+
+
+def test_backstop_does_not_flag_a_lot_resting_a_lone_sl() -> None:
+    # The strategy-agnostic requirement: the pass must be a no-op for the
+    # current strategies, whose entries carry a stop and rest a lone ``sl``.
+    sl, _ = _real_bracket()
+    target = ProtectionTarget(conid=CONID, symbol="AAPL", position_id="265598", qty=8.0)
+    assert unprotected_targets((sl,), scope_tag=TAG, targets=(target,)) == ()
+
+
+def test_backstop_reports_every_target_when_nothing_rests() -> None:
+    targets = (
+        ProtectionTarget(conid=CONID, symbol="AAPL", position_id="265598", qty=8.0),
+        ProtectionTarget(conid=CONID + 1, symbol="MSFT", position_id="999", qty=3.0),
+    )
+    assert unprotected_targets((), scope_tag=TAG, targets=targets) == targets
+
+
+def test_unprotected_results_are_unsafe_and_never_claimed_placed() -> None:
+    target = ProtectionTarget(conid=CONID, symbol="AAPL", position_id="265598", qty=8.0)
+    (row,) = unprotected_results((target,), reason="no leg rests")
+    assert row.ok is False
+    assert row.outcome is OrderOutcome.UNPROTECTED
+    assert row.error_kind == "unprotected"
+    assert row.intent.position_id == "265598"
+    # The report alone must make a cycle unsafe (exit 3) — see report.is_unsafe.
+    from src.live.report import _UNSAFE_OUTCOMES
+
+    assert row.outcome in _UNSAFE_OUTCOMES
 
 
 # --- level_bracket_intents --------------------------------------------------

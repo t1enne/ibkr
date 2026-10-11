@@ -52,6 +52,11 @@ class CycleReport:
     #: the account lacks lands here — the operator resolves it, the engine never
     #: silently re-sizes onto the account's number.
     divergences: tuple[Divergence, ...] = ()
+    #: Advisory findings the broker read reported (a malformed feed row, a scope
+    #: book that disagrees with the account's own net). NEVER unsafe: a shared
+    #: account legitimately moves a conid this scope does not own, so a warning
+    #: must not fail a cycle — it is for the operator's eyes, not the exit code.
+    warnings: tuple[str, ...] = ()
 
     def is_unsafe(self) -> bool:
         """Whether this cycle failed to safely do its job (the exit-code predicate).
@@ -98,14 +103,21 @@ def unsafe_outcomes(report: CycleReport) -> tuple[str, ...]:
     Derived from the report, never a fixed list, so the ``--allow-unsafe`` stderr
     note cannot claim something the cycle did not do: the cohort-level
     ``placement_error``/``resync_error`` kinds first (each prefixed so a kind
-    cannot be mistaken for an order outcome), then every distinct unsafe order
-    outcome present. Empty exactly when :meth:`CycleReport.is_unsafe` is False.
+    cannot be mistaken for an order outcome), then every disagreement the
+    divergence oracle found (named by lot, so the operator knows WHICH book to
+    reconcile), then every distinct unsafe order outcome present. Empty exactly
+    when :meth:`CycleReport.is_unsafe` is False.
     """
     named: list[str] = []
     if report.placement_error is not None:
         named.append(f"placement_error:{report.placement_error.kind}")
     if report.resync_error is not None:
         named.append(f"resync_error:{report.resync_error.kind}")
+    for divergence in report.divergences:
+        named.append(
+            f"divergence:{divergence.symbol}:{divergence.position_id or '-'}"
+            f":{divergence.kind}"
+        )
     for result in report.results:
         if result.outcome in _UNSAFE_OUTCOMES and result.outcome.value not in named:
             named.append(result.outcome.value)

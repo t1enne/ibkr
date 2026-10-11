@@ -138,11 +138,11 @@ async def test_lmt_intent_is_refused_without_submitting() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_protective_child_without_a_proven_reduce_side_is_refused() -> None:
+async def test_protective_child_without_a_proven_lot_side_is_refused() -> None:
     # SPEC step 3 (D4): an ENTRY carrying levels is admitted (the levels rest as
     # protective children after the entry is confirmed filled — never on the
     # entry ticket). What stays refused pre-flight is a PROTECTIVE child whose
-    # reduce side is unproven (F9: a just-filled lot is not in the seeded book,
+    # LOT side is unproven (F9: a just-filled lot is not in the seeded book,
     # so the child carries its own ``position_side``; a child without one must
     # never be sent with a guessed direction).
     intent = OrderIntent(
@@ -160,7 +160,7 @@ async def test_protective_child_without_a_proven_reduce_side_is_refused() -> Non
     error = failure(await broker().place(intent))
 
     assert error.kind == "rejected"
-    assert "reduce side" in error.message
+    assert "lot side" in error.message
     assert len(respx.calls) == 0
 
 

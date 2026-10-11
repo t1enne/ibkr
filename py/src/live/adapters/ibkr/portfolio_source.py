@@ -9,6 +9,11 @@ exactly the executions whose ``cOID`` carries its ``scope_tag`` prefix, applied
 to the durable rows in sqlite (``trades.reconcile``); a position no scope owns is
 IGNORED BY DESIGN — not our book, not a mismatch, never traded.
 
+The account's own net is still READ for the conids this scope holds, and a
+disagreement is reported as a WARNING (never a refusal — see
+``_account_mismatch_warnings``). ``guard_divergence`` cannot do this job here:
+it compares the fill fold against a book built from the SAME rows.
+
 Cash and equity for a scope are derived from that scope's OWN executions (its
 config ``initial_capital`` advanced by its fills and commissions), never read
 from the summary. The summary is read for display context only.
@@ -17,7 +22,7 @@ from the summary. The summary is read for display context only.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 
@@ -62,9 +67,10 @@ def build_snapshot(
 ) -> IbkrBook:
     """Pure: our open book rows + derived cash -> ``PortfolioSnapshot``.
 
-    ``positions`` is used ONLY for per-conid marks (``mktPrice``); it is never a
-    book input and a position we do not own produces no warning. ``cash`` is the
-    scope's own (derived) number, not the account summary's.
+        ``marks`` come from ``positions`` (per-conid ``mktPrice``); the account's own
+        net is additionally compared against our book for the conids we hold, and a
+    disagreement joins ``warnings``. ``cash`` is the scope's own (derived) number,
+        not the account summary's.
     """
     grouped: dict[str, list[Position]] = {}
     for row in rows:
@@ -80,10 +86,44 @@ def build_snapshot(
         equity_curve=(),
         initial_capital=initial_capital,
     )
+    found = warnings + _account_mismatch_warnings(rows, positions)
     return IbkrBook(
-        snapshot=PortfolioSnapshot(portfolio=portfolio, as_of=as_of),
-        warnings=tuple(warnings),
+        snapshot=PortfolioSnapshot(portfolio=portfolio, as_of=as_of, warnings=found),
+        warnings=found,
     )
+
+
+#: Signed-quantity difference below which our book and the account's net agree.
+#: The account nets fractional sizes, so a small float difference is not news.
+_QTY_EPS = 1e-6
+
+
+def _account_mismatch_warnings(
+    rows: tuple[BookRow, ...], positions: tuple[IbkrPosition, ...]
+) -> tuple[str, ...]:
+    """Warn where the account's net on a conid WE hold differs from our book.
+
+    A WARNING, never a refusal: one account is shared by several scopes and by
+    manual trades, so the account net may legitimately carry exposure this scope
+    does not own — and a conid absent from the positions read means the account's
+    net is zero, which for a lot we hold is a real disagreement. The operator
+    reconciles; this scope's own fill fold stays the sizing authority.
+    """
+    nets = {p.conid: p.qty for p in positions}
+    found: list[str] = []
+    for row in rows:
+        if not row.is_open:
+            continue
+        ours = row.qty if row.side == "long" else -row.qty
+        account = nets.get(row.conid, 0.0)
+        if abs(ours - account) <= _QTY_EPS:
+            continue
+        found.append(
+            f"account/our-book mismatch on {row.symbol or row.conid} (conid "
+            f"{row.conid}): ours {ours:+g}, account {account:+g}; another scope "
+            f"or a manual fill can share this conid"
+        )
+    return tuple(found)
 
 
 def _to_position(row: BookRow, mkt_price: float, as_of: pd.Timestamp) -> Position:
@@ -189,8 +229,12 @@ class IbkrPortfolioSource:
             position_warnings + execution_warnings,
             as_of,
         )
-        for warning in summary_warnings + reconcile_warnings + built.warnings:
+        warnings = summary_warnings + reconcile_warnings + built.warnings
+        for warning in warnings:
             logger.warning("ibkr read: %s", warning)
+        # Carry every finding on the snapshot so the operator's report shows
+        # them, not just the log line (advisory, never an unsafe condition).
+        snapshot = replace(built.snapshot, warnings=warnings)
         logger.info(
             "ibkr read scope=%s: cash %.2f derived from our own executions "
             "(account summary net_liquidation %.2f is display-only)",
@@ -198,7 +242,7 @@ class IbkrPortfolioSource:
             cash,
             summary.net_liquidation,
         )
-        return Ok(built.snapshot)
+        return Ok(snapshot)
 
 
 __all__ = [

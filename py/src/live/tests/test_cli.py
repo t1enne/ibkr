@@ -255,6 +255,21 @@ def test_allow_unsafe_emits_a_note_naming_the_suppressed_outcome(
     assert OrderOutcome.TIMEOUT.value not in out.stderr
 
 
+def test_allow_unsafe_names_a_divergence_in_the_suppression_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A book disagreement is an exit-3 reason; forcing exit 0 must still name it.
+
+    ``unsafe_outcomes`` derived its list from placement/resync errors and order
+    outcomes only, so a divergence-only cycle run with ``--allow-unsafe`` printed
+    an EMPTY suppressed-outcomes list — silencing exactly the alert the oracle
+    exists to raise.
+    """
+    out = _invoke_run(tmp_path, monkeypatch, _divergent_report(), "--allow-unsafe")
+    assert out.exit_code == 0, out.output
+    assert "divergence:AAPL:L1:qty_mismatch" in out.stderr
+
+
 def test_is_unsafe_predicate_covers_errors_and_outcomes() -> None:
     assert not _report().is_unsafe()
     assert (
@@ -264,6 +279,11 @@ def test_is_unsafe_predicate_covers_errors_and_outcomes() -> None:
     assert replace(
         _report(), placement_error=FeedError(kind="transport", message="x")
     ).is_unsafe()
+    # Advisory warnings are never unsafe (item 8 policy: a shared account can
+    # move a conid this scope does not own, so it must not fail a cycle).
+    assert (
+        replace(_report(), warnings=("account/our-book mismatch",)).is_unsafe() is False
+    )
 
 
 # --- dry-run: writes nothing, takes no lease (durability INV-6) --------------
@@ -290,6 +310,11 @@ class _FakeAdapter:
         return Ok(PortfolioSnapshot(book, TS))
 
     async def resync(self):
+        from src.live.result import Ok
+
+        return Ok(())
+
+    async def attest_protection(self, book):
         from src.live.result import Ok
 
         return Ok(())
@@ -521,8 +546,9 @@ def test_sim_adapter_refuses_to_place_on_a_dry_run() -> None:
     assert cast("FeedError", placed.error).kind == "auth"
 
 
-def test_a_divergence_makes_the_cycle_unsafe() -> None:
-    report = replace(
+def _divergent_report() -> CycleReport:
+    """A report whose ONLY unsafe reason is a book disagreement."""
+    return replace(
         _report(),
         divergences=(
             Divergence(
@@ -534,4 +560,22 @@ def test_a_divergence_makes_the_cycle_unsafe() -> None:
             ),
         ),
     )
-    assert report.is_unsafe()
+
+
+def test_a_divergence_makes_the_cycle_unsafe() -> None:
+    assert _divergent_report().is_unsafe()
+
+
+def test_the_json_report_carries_the_divergence_that_caused_exit_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alerting document must name the disagreement, not only the exit code.
+
+    The exit code is out-of-band and cannot name the lot, so a machine consumer
+    of ``--format json`` saw an unsafe cycle with no readable reason at all.
+    """
+    out = _invoke_run(tmp_path, monkeypatch, _divergent_report(), "-F", "json")
+    assert out.exit_code == 3, out.output
+    doc = json.loads(out.output)
+    assert [d["symbol"] for d in doc["divergences"]] == ["AAPL"]
+    assert doc["divergences"][0]["kind"] == "qty_mismatch"

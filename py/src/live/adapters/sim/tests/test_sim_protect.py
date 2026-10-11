@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -31,9 +32,14 @@ from src.live.adapters.sim.adapter import (
     build_account_book,
     build_sim_adapter,
 )
-from src.live.adapters.sim.protect import apply_bracket, resting_rows
+from src.live.adapters.sim.protect import (
+    apply_bracket,
+    resting_rows,
+    sim_resting_legs,
+)
 from src.live.adapters.sim.store import SimBook, SimBookStore, synthetic_conid
 from src.live.identity import OrderOutcome
+from src.live.protect import kind_of
 from src.live.ledger import SqliteLedger
 from src.live.pure import OrderResult
 from src.live.result import Err, Ok
@@ -63,7 +69,7 @@ def _child(
     *,
     kind: str,
     level: float,
-    position_side: ActionType = ActionType.short,
+    position_side: ActionType = ActionType.long,
     qty: float = 10.0,
 ) -> OrderIntent:
     return OrderIntent(
@@ -262,8 +268,8 @@ async def test_a_breached_short_stop_fires_and_debits_cash() -> None:
         ),
     )
     children = (
-        _child(kind="stop", level=128.0, position_side=ActionType.long),
-        _child(kind="take_profit", level=80.0, position_side=ActionType.long),
+        _child(kind="stop", level=128.0, position_side=ActionType.short),
+        _child(kind="take_profit", level=80.0, position_side=ActionType.short),
     )
     results, resting = apply_bracket(
         book, children, scope_tag=TAG, conid=CONID, anchor=TS, log=_NO_LOG
@@ -309,7 +315,41 @@ def test_replace_cancels_both_legs_then_rests_the_new_pair() -> None:
     assert len(replaced.orders) == 2  # never a leftover half-bracket
 
 
+def test_replace_of_a_lone_sl_replaces_that_one_leg() -> None:
+    """REGRESSION (item 4): a stop-only lot's lone leg is REPLACEd, never
+    duplicated — a pair-only reader would submit a second leg on top of it."""
+    resting = _lone_sl_book()
+    old = sim_resting_legs(resting, scope_tag=TAG, conid=CONID)
+    assert [kind_of(leg) for leg in old] == ["stop"]
+
+    tightened = (_child(kind="stop", level=94.0),)
+    results, replaced = apply_bracket(
+        resting, tightened, scope_tag=TAG, conid=CONID, anchor=TS, log=_NO_LOG
+    )
+    assert len(results) == 1
+    new = sim_resting_legs(replaced, scope_tag=TAG, conid=CONID)
+    assert [kind_of(leg) for leg in new] == ["stop"]
+    assert new[0].level == 94.0
+    assert new[0].order_ref != old[0].order_ref
+    assert len(replaced.orders) == 1  # the old leg was cancelled first
+
+
 # --- a fired stop advances OUR durable fold (no repeat DIVERGENCE) -----------
+
+
+def _lone_sl_book(mark: float = 100.0) -> SimBook:
+    """The broker's view for a STOP-ONLY lot: parent long lot + ONE resting ``sl``."""
+    book = _long_lot_book(mark=mark)
+    results, resting = apply_bracket(
+        book,
+        (_child(kind="stop", level=92.0),),
+        scope_tag=TAG,
+        conid=CONID,
+        anchor=TS,
+        log=_NO_LOG,
+    )
+    assert len(results) == 1
+    return resting
 
 
 def _make_candle_db(path: Path, ts: pd.Timestamp) -> None:
@@ -439,3 +479,87 @@ async def test_dry_run_places_no_pair_and_writes_no_json(tmp_path: Path) -> None
     book = store.read(SCOPE)
     assert book.orders == ()
     assert not (tmp_path / "sim.json").exists()  # and writes no JSON at all
+
+
+# --- item 2: the per-cycle naked-lot backstop (sim parity) -------------------
+
+
+@pytest.mark.asyncio
+async def test_backstop_reports_a_lot_resting_nothing_as_unprotected(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: a lot whose bracket was lost after the entry cycle used to
+    pass a HOLD cycle as a clean exit 0 — the backstop must report it."""
+    _make_candle_db(tmp_path / "c.sqlite", TS)
+    ledger = live_ledger(tmp_path / "l.sqlite")
+    store = SimBookStore(tmp_path / "sim.json")
+    adapter = _adapter(ledger, store)
+
+    await run_cycle(
+        _config(),
+        adapter,
+        ledger=ledger,
+        strategy_id="S1",
+        scope=SCOPE,
+        config_path="x.json",
+        now=TS,
+        db_path=tmp_path / "c.sqlite",
+        signal_source=_long_source,
+        max_age_days=0,
+    )
+    assert resting_rows(store.read(SCOPE), scope_tag=TAG, conid=CONID) is not None
+
+    # The bracket vanishes broker-side (an external cancel / rejected fire).
+    book = store.read(SCOPE)
+    store.write(SCOPE, replace(book, orders=()))
+
+    second = await run_cycle(
+        _config(),
+        _adapter(ledger, store),
+        ledger=ledger,
+        strategy_id="S1",
+        scope=SCOPE,
+        config_path="x.json",
+        now=TS,
+        db_path=tmp_path / "c.sqlite",
+        signal_source=_long_source,
+        max_age_days=0,
+    )
+
+    assert second.is_unsafe()
+    assert any(r.outcome is OrderOutcome.UNPROTECTED for r in second.results)
+
+
+@pytest.mark.asyncio
+async def test_backstop_silent_for_a_lot_resting_a_lone_sl(tmp_path: Path) -> None:
+    """REGRESSION (item 4 x item 2): a stop-only lot's lone leg IS proof.
+
+    A pair-only reader would flag this lot naked forever.
+    """
+    ledger = live_ledger(tmp_path / "l.sqlite")
+    store = SimBookStore(tmp_path / "sim.json")
+    adapter = _adapter(ledger, store)
+    store.write(SCOPE, _lone_sl_book())
+
+    attested = await adapter.attest_protection(
+        build_account_book(store, ledger, SCOPE, _config())
+    )
+
+    assert isinstance(attested, Ok)
+    assert cast("tuple[OrderResult, ...]", attested.value) == ()
+
+
+@pytest.mark.asyncio
+async def test_backstop_places_nothing_in_the_sim_store(tmp_path: Path) -> None:
+    """The backstop must never write to the broker: it ATTESTS, it does not arm."""
+    ledger = live_ledger(tmp_path / "l.sqlite")
+    store = SimBookStore(tmp_path / "sim.json")
+    adapter = _adapter(ledger, store)
+    store.write(SCOPE, _long_lot_book())  # a bare lot, NO leg resting
+
+    attested = await adapter.attest_protection(
+        build_account_book(store, ledger, SCOPE, _config())
+    )
+
+    assert isinstance(attested, Ok)
+    assert store.read(SCOPE).orders == ()  # nothing was armed by the pass

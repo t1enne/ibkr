@@ -181,10 +181,10 @@ def validate_order(intent: OrderIntent) -> None:
     - entry, ``LMT``: refused ``UnsupportedOrderType`` (carry-over unbuilt);
     - entry carrying a level: allowed — the entry ticket NEVER carries a level;
       the levels rest as protective children after the entry is confirmed filled;
-    - protective, ``STP``: requires ``stop_loss`` finite > 0 and a proven reduce
-      side;
-    - protective, ``LMT``: requires ``take_profit`` finite > 0 and a proven
-      reduce side.
+    - protective, ``STP``: requires ``stop_loss`` finite > 0 and a proven lot
+      side (the side of the lot being protected);
+    - protective, ``LMT``: requires ``take_profit`` finite > 0 and a proven lot
+      side.
 
     ``tif`` is a builder property (a protective body is always ``GTC``, an entry
     always ``DAY``), not an intent field: the intent cannot carry a wrong tif
@@ -201,11 +201,12 @@ def validate_order(intent: OrderIntent) -> None:
 
 
 def _validate_protective(intent: OrderIntent) -> None:
-    """The protective-leg rules: a reduce child needs its level and reduce side.
+    """The protective-leg rules: a reduce child needs its level and its LOT side.
 
-    The child is minted only after its entry is confirmed filled, so its reduce
-    direction must be PROVEN (``position_side`` set by the child builder). A
-    protective body with no proven reduce side is refused — never guessed.
+    The child is minted only after its entry is confirmed filled, so the
+    direction must be PROVEN (``position_side`` set by the child builder, and
+    meaning the LOT's side — the one meaning the field carries anywhere). A
+    protective body with no proven lot side is refused — never guessed.
     """
     if intent.action is not ActionType.close:
         raise OrderMappingError(
@@ -214,7 +215,7 @@ def _validate_protective(intent: OrderIntent) -> None:
         )
     if intent.position_side is None:
         raise OrderMappingError(
-            f"{intent.symbol}: protective order carries no proven reduce side "
+            f"{intent.symbol}: protective order carries no proven lot side "
             f"(position_side unset)"
         )
     if intent.order_type is OrderType.STP:

@@ -15,7 +15,11 @@ import respx
 from src.data.ibkr.client import IbkrClient
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
-from src.live.adapters.ibkr.portfolio_source import IbkrPortfolioSource
+from src.live.adapters.ibkr.mapping import IbkrPosition
+from src.live.adapters.ibkr.portfolio_source import (
+    IbkrPortfolioSource,
+    build_snapshot,
+)
 from src.live.adapters.ibkr.trades import BookRow, Execution, StrategyBook, reconcile
 from src.live.ledger import SqliteLedger
 
@@ -40,6 +44,68 @@ def _row() -> BookRow:
     book, _ = reconcile(SCOPE, (ex,), StrategyBook())
     (row,) = book.rows
     return row
+
+
+def test_build_snapshot_warns_on_a_conid_we_hold_mismatching_the_account_net() -> None:
+    """The account's own net is the read-only truth for a conid we hold.
+
+    A disagreement is a WARNING, not a divergence: a shared account can carry a
+    conid this scope does not own, so it must never fail a cycle. (Item 8: the
+    fold-vs-own-rows oracle cannot see this, only the /positions net can.)
+    """
+    row = _row()  # AAPL conid 1, long 10 -> ours +10
+    book = build_snapshot(
+        (row,),
+        marks={1: 100.0},
+        cash=10000.0,
+        initial_capital=50000.0,
+        positions=(
+            IbkrPosition(
+                account="DU1", conid=1, symbol="AAPL", qty=4.0, avg_cost=100.0
+            ),
+        ),
+        warnings=(),
+        as_of=AS_OF,
+    )
+    assert any(
+        "conid 1" in w and "ours +10" in w and "account +4" in w for w in book.warnings
+    )
+
+
+def test_build_snapshot_stays_silent_when_the_account_net_agrees() -> None:
+    row = _row()  # ours +10
+    book = build_snapshot(
+        (row,),
+        marks={1: 100.0},
+        cash=10000.0,
+        initial_capital=50000.0,
+        positions=(
+            IbkrPosition(
+                account="DU1", conid=1, symbol="AAPL", qty=10.0, avg_cost=100.0
+            ),
+        ),
+        warnings=(),
+        as_of=AS_OF,
+    )
+    assert book.warnings == ()
+
+
+def test_build_snapshot_ignores_a_position_no_scope_owns() -> None:
+    row = _row()  # ours conid 1
+    book = build_snapshot(
+        (row,),
+        marks={1: 100.0},
+        cash=10000.0,
+        initial_capital=50000.0,
+        positions=(
+            IbkrPosition(
+                account="DU1", conid=99, symbol="GOOG", qty=20.0, avg_cost=500.0
+            ),
+        ),
+        warnings=(),
+        as_of=AS_OF,
+    )
+    assert book.warnings == ()
 
 
 @respx.mock

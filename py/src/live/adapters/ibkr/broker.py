@@ -43,7 +43,13 @@ from typing import cast
 import pandas as pd
 from ib_rest_api_client.models import SecdefSearchResponseItem
 
-from src.bt.state import ActionType, ExecutionParams, FillEvent, PortfolioState
+from src.bt.state import (
+    ActionType,
+    ExecutionParams,
+    FillEvent,
+    PortfolioState,
+    Position,
+)
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import search_contracts
 from src.data.types import SymbolSchema
@@ -72,7 +78,7 @@ from src.live.adapters.ibkr.orders import (
 from src.live.adapters.ibkr.protect import BracketProtectionMixin
 from src.live.adapters.ibkr.trades import Execution
 from src.exec.refs import scope_tag
-from src.live.protect import resting_bracket
+from src.live.protect import ProtectionTarget, resting_legs
 from src.live.pure import OrderResult, position_side_of, trade_signal
 from src.live.identity import (
     IntentKey,
@@ -86,7 +92,13 @@ from src.live.identity import (
 from src.live.ledger_base import LedgerReadError
 from src.live.ports import BookExposure
 from src.live.result import Err, Ok, Result
-from src.live.types import FeedError, OrderIntent, PortfolioView, feed_error
+from src.live.types import (
+    FLAT_QTY_EPS,
+    FeedError,
+    OrderIntent,
+    PortfolioView,
+    feed_error,
+)
 
 #: How many order-reply messages we will confirm for one ticket before giving up.
 #: A real confirmation needs one round trip; more than a couple is a broker that
@@ -278,8 +290,37 @@ class IbkrBroker(BracketProtectionMixin):
         is decided from the broker's reads inside :meth:`place` (working orders
         first, then the executions sweep, with the account positions in the
         exposure guard), so a cycle-start pass has nothing local to resolve.
+
+        The protective backstop is NOT here but in :meth:`attest_protection`: it
+        needs the cycle's book, which this signature does not carry.
         """
         return Ok(())
+
+    async def attest_protection(
+        self, book: PortfolioState
+    ) -> Result[tuple[OrderResult, ...], FeedError]:
+        """The per-cycle naked-lot backstop over *book*'s open lots (§4.2, D1).
+
+        Builds one target per OPEN lot the scope's own book carries (its
+        ``position_id`` IS the conid on this edge) and hands them to the mixin's
+        attestation, which reads the working orders once and reports
+        ``UNPROTECTED`` for every lot resting no protective leg of ours.
+
+        Scope-clean by construction: only lots in OUR book are checked, so a
+        conid another scope or a human holds is never touched. Attest-only — no
+        order is placed, cancelled or amended. Empty book ⇒ no read at all.
+        """
+        targets = tuple(
+            ProtectionTarget(
+                conid=int(str(lot.position_id)),
+                symbol=lot.symbol,
+                position_id=str(lot.position_id),
+                qty=lot.qty,
+            )
+            for lot in _open_lots(book)
+            if lot.position_id
+        )
+        return Ok(await self._attest_protection(targets))
 
     async def place(self, intent: OrderIntent) -> Result[OrderResult, FeedError]:
         """Submit or ADOPT one MKT order and settle its outcome.
@@ -448,7 +489,7 @@ class IbkrBroker(BracketProtectionMixin):
             return (
                 _failed(
                     intent,
-                    f"protect {intent.symbol}: child carries no reduce side",
+                    f"protect {intent.symbol}: child carries no lot side",
                     kind="unprotected",
                 ),
             )
@@ -558,11 +599,13 @@ class IbkrBroker(BracketProtectionMixin):
     async def _cancel_pair_before_close(
         self, intent: OrderIntent
     ) -> tuple[OrderResult, ...] | None:
-        """Cancel-and-confirm the lot's pair before its close (invariant 6).
+        """Cancel-and-confirm every protective leg before the lot's close (inv. 6).
 
         ``None`` when there is nothing to cancel (or the cancel confirmed): the
         close proceeds. An unconfirmable cancel returns the UNPROTECTED rows
-        that REFUSE the close — a live pair plus a close would over-reduce.
+        that REFUSE the close — a live leg plus a close would over-reduce. Any
+        leg count is cancelled, so a stop-only strategy's lone ``sl`` is not
+        left leaning on a lot being closed (item 4).
         """
         working = await self._working_index()
         if isinstance(working, Err):
@@ -570,19 +613,19 @@ class IbkrBroker(BracketProtectionMixin):
                 _failed(
                     intent,
                     "refused close: pre-cancel working-orders read failed; "
-                    "cannot prove the pair state",
+                    "cannot prove the leg state",
                     kind="unprotected",
                 ),
             )
         conid = await self._conid(intent.symbol)
-        resting = resting_bracket(
+        resting = resting_legs(
             tuple(working.value.values()),
             scope_tag=scope_tag(self._scope),
             conid=conid,
         )
-        if resting is None:
+        if not resting:
             return None
-        cancelled = await self._cancel_pair(intent.symbol, resting)
+        cancelled = await self._cancel_legs(intent.symbol, resting)
         if isinstance(cancelled, Err):
             error = cast("FeedError", cancelled.error)
             self._log(f"close {intent.symbol} refused: {error.message}")
@@ -627,7 +670,7 @@ class IbkrBroker(BracketProtectionMixin):
                     f"gone is unknown",
                 )
             )
-        if order_id in working.value:
+        if order_id in {o.order_id for o in working.value.values()}:
             return Err(
                 feed_error(
                     "unprotected",
@@ -1484,6 +1527,16 @@ def _confirmed_reduce_delta(
     if filled is None or lot_side is None:
         return 0.0
     return -filled if lot_side is ActionType.long else filled
+
+
+def _open_lots(book: PortfolioState) -> tuple[Position, ...]:
+    """Every OPEN lot the book carries (a flat/negligible lot is not a target)."""
+    return tuple(
+        lot
+        for lots in book.positions.values()
+        for lot in lots
+        if lot.qty > FLAT_QTY_EPS
+    )
 
 
 def _failed(

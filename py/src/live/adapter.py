@@ -83,6 +83,21 @@ class LiveAdapter(Protocol):
 
     async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]: ...
 
+    async def attest_protection(
+        self, book: PortfolioState
+    ) -> Result[tuple[OrderResult, ...], FeedError]:
+        """The per-cycle backstop: report every OPEN lot of *book* resting no leg.
+
+        ATTEST-ONLY — it never places, cancels or amends, so it cannot be the
+        thing that submits an order (a protective POST is ``place_cohort``'s
+        job). It reads the backend's working-orders surface once and returns an
+        ``UNPROTECTED`` row per lot with no protective leg of ours resting;
+        ``UNPROTECTED`` is in the unsafe set, so the cycle exits 3 rather than
+        passing a naked lot as clean (spec §4.2). A failed read is reported for
+        every target — ambiguity is never clean — and no POST follows it.
+        """
+        ...
+
     async def place(
         self, book: PortfolioState, intent: OrderIntent
     ) -> Result[OrderResult, FeedError]: ...

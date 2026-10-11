@@ -38,16 +38,28 @@ from src.live.adapters.sim.store import SimBook, synthetic_conid
 from src.live.identity import OrderOutcome, WorkingOrder
 from src.live.pure import OrderResult, ref_candle, trade_signal
 from src.live.pure_plan import _cash_delta
-from src.live.protect import child_ref, kind_of, resting_bracket
+from src.live.protect import (
+    ProtectionTarget,
+    child_ref,
+    kind_of,
+    resting_bracket,
+    resting_legs,
+    unprotected_results,
+    unprotected_targets,
+)
 from src.live.types import OrderIntent
 
 #: The flat-net epsilon for the breach check (mirrors the close guard's).
 _FLAT_EPS = 1e-9
 
 
-def wire_side(reduce_action: ActionType) -> str:
-    """The wire BUY/SELL of a reduce leg: reducing a long sells, a short buys."""
-    return "BUY" if reduce_action is ActionType.long else "SELL"
+def wire_side(lot_action: ActionType) -> str:
+    """The wire BUY/SELL of a reduce leg, from the LOT side it protects.
+
+    One meaning, shared with the IBKR edge's ``_wire_side`` (parity, never
+    forked): reducing a long lot SELLs, a short lot BUYs.
+    """
+    return "SELL" if lot_action is ActionType.long else "BUY"
 
 
 def _leg_level(child: OrderIntent) -> float:
@@ -73,6 +85,7 @@ def leg_row(
     ``status`` ``Submitted`` means resting, ``timeInForce`` ``GTC``. Field names
     are the spec's, never invented.
     """
+    assert child.position_side is not None
     level = _leg_level(child)
     return {
         "acct": "SIM",
@@ -81,7 +94,7 @@ def leg_row(
         "conid": conid,
         "conidex": str(conid),
         "ticker": child.symbol,
-        "side": wire_side(cast("ActionType", child.position_side)),
+        "side": wire_side(child.position_side),
         "remainingQuantity": child.qty,
         "filledQuantity": 0.0,
         "totalSize": child.qty,
@@ -103,14 +116,55 @@ def leg_row(
 def resting_rows(
     book: SimBook, *, scope_tag: str, conid: int
 ) -> tuple[WorkingOrder, WorkingOrder] | None:
-    """Our resting pair in the SIM broker's own working-orders read, or ``None``.
+    """Our resting PAIR in the SIM broker's own working-orders read, or ``None``.
 
     Reads the store through the SAME shared ``resting_bracket`` rule the IBKR
     edge uses (parity, never a forked read): the broker is the single source of
-    truth for what rests.
+    truth for what rests. This is the PAIR view — a flow that must act on
+    whatever rests (replace, cancel, the naked-lot backstop) uses
+    :func:`sim_resting_legs` instead, so a lone ``sl`` is never invisible.
     """
-    parsed = tuple(w for w in (_to_working(r) for r in book.orders) if w is not None)
-    return resting_bracket(parsed, scope_tag=scope_tag, conid=conid)
+    return resting_bracket(_working_rows(book), scope_tag=scope_tag, conid=conid)
+
+
+def sim_resting_legs(
+    book: SimBook, *, scope_tag: str, conid: int
+) -> tuple[WorkingOrder, ...]:
+    """OUR resting protective legs in the sim broker's read — any count (item 4)."""
+    return resting_legs(_working_rows(book), scope_tag=scope_tag, conid=conid)
+
+
+async def attest_protection(
+    book: SimBook,
+    targets: Sequence[ProtectionTarget],
+    *,
+    scope_tag: str,
+    log: Callable[[str], None],
+) -> tuple[OrderResult, ...]:
+    """The sim broker's own per-cycle naked-lot backstop (spec §4.2, item 2).
+
+    Same shared rule as the IBKR edge (``unprotected_targets`` over
+    ``resting_legs``), never a fork: the sim store IS the working-orders read
+    here, so parity is by construction. Attest-only — it writes nothing to the
+    store and places nothing.
+    """
+    naked = unprotected_targets(
+        _working_rows(book), scope_tag=scope_tag, targets=targets
+    )
+    for target in naked:
+        log(
+            f"UNPROTECTED {target.symbol} (conid {target.conid}): no Submitted "
+            f"protective leg of ours rests; the lot is NAKED"
+        )
+    return unprotected_results(
+        naked,
+        reason="no Submitted protective leg of ours rests; the lot is NAKED",
+    )
+
+
+def _working_rows(book: SimBook) -> tuple[WorkingOrder, ...]:
+    """The sim store parsed through the SHARED gateway row parser (parity)."""
+    return tuple(w for w in (_to_working(r) for r in book.orders) if w is not None)
 
 
 def _to_working(row: object) -> WorkingOrder | None:
@@ -140,8 +194,8 @@ def apply_bracket(
     construction, so a replace always proceeds).
     """
     rows: list[dict[str, object]] = [dict(r) for r in book.orders]
-    old = resting_rows(book, scope_tag=scope_tag, conid=conid)
-    if old is not None:
+    old = sim_resting_legs(book, scope_tag=scope_tag, conid=conid)
+    if old:
         for leg in old:
             log(
                 f"replacing {leg.order_ref} (order {leg.order_id}): "
@@ -299,7 +353,11 @@ def fire_stops(
 
 
 def _is_sibling(row: Mapping[str, object], fired: WorkingOrder, scope_tag: str) -> bool:
-    """Whether *row* is the OTHER leg of *fired*'s bracket (same conid, ours)."""
+    """Whether *row* is the OTHER resting leg of *fired*'s bracket (same conid, ours).
+
+    Every count is covered: an OCA sibling of a fired leg can be the only other
+    leg a stop-only strategy armed, or one of two.
+    """
     w = _to_working(row)
     if w is None or w.order_id == fired.order_id:
         return False
@@ -415,8 +473,10 @@ def _str(value: object, default: str = "") -> str:
 __all__ = [
     "_order_id_of",
     "apply_bracket",
+    "attest_protection",
     "fire_stops",
     "leg_row",
     "resting_rows",
+    "sim_resting_legs",
     "wire_side",
 ]

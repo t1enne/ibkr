@@ -5,13 +5,21 @@ wire contract (SPEC_LIVE_STOPS §3). The resting order is the BROKER's; nothing
 here persists a level, stamps a column or keeps an intent row.
 
 - :func:`bracket_children` — the OCA pair for an entry (empty without a level;
-  reduce side is the entry's opposite, qty is the confirmed fill). The entry
-  ticket never carries a level (spec §Step 3).
+  the child carries the LOT side as ``position_side``, exactly like every other
+  intent, and the edge derives the wire reduce side from it; qty is the confirmed
+  fill). The entry ticket never carries a level (spec §Step 3).
 - :func:`protective_ref` — distinct per ``(lot, level)``, stable for a re-send
   of the same pair, anchored on the lot's OWN open/fill time (never the decision
   bar, never the clock).
-- :func:`resting_bracket` — ours-by-prefix + conid + side on the wire, kind read
-  off ``orderType``; ``None`` when either leg is missing or foreign.
+- :func:`resting_legs` — OUR resting protective legs on a conid, ANY count
+  (0..n), ours-by-prefix + conid + ``Submitted`` + known kind, all agreeing on
+  the wire side. A lone ``sl`` is protection, so a strategy arming only a stop
+  is never read as naked (item 4).
+- :func:`resting_bracket` — the PAIR view of the same rule; ``None`` when either
+  leg is missing or foreign. Only for flows that genuinely need a full pair.
+- :func:`unprotected_targets` — the pure per-cycle backstop (spec §4.2): every
+  open lot with NO resting leg of ours is reported, so a bracket rejected or
+  cancelled after the entry cycle is never silently naked (item 2).
 - :func:`level_bracket_intents` — arm / tighten->REPLACE / ratchet-never-widen /
   flat-drops-silently against the book's advisory levels. The WIRE comparison
   (resting level vs the new one) belongs to the edge (Step 5): this layer
@@ -23,13 +31,15 @@ from __future__ import annotations
 import math
 import zlib
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import pandas as pd
 
 from src.bt.state import ActionType, PortfolioView, Position, TradeSignal
 from src.exec.types import OrderType
-from src.live.identity import WorkingOrder
+from src.live.identity import OrderOutcome, WorkingOrder
+from src.live.pure import OrderResult
 from src.live.types import FLAT_QTY_EPS, OrderIntent, synthetic_conid
 
 #: Absolute ``stop_loss``/``take_profit`` must be strictly above zero.
@@ -42,6 +52,9 @@ StopKind = "stop"
 TakeKind = "take_profit"
 LevelKind = Literal["stop", "take_profit"]
 _LEVEL_KINDS: frozenset[str] = frozenset({StopKind, TakeKind})
+
+#: The wire's "resting" status (spec §0) — the ONLY proof a level rests.
+_RESTING = "SUBMITTED"
 
 
 def _finite_positive(level: float | None) -> bool:
@@ -62,8 +75,11 @@ def bracket_children(
     both in the reduce direction of the lot (the entry action's opposite), both
     sized to the CONFIRMED fill (never the planned qty, never topped up), each
     carrying its own ref minted from the lot's own time. ``position_side`` is
-    the entry's side. An entry with neither level yields ``()`` — nothing to
-    protect.
+    the entry's side — the LOT's side, the ONE meaning the field has anywhere
+    (``order_side``, ``position_side_of``, ``is_buy_fill`` all read it that
+    way); the wire's reduce BUY/SELL is derived from it at the edge, never
+    carried as a second, inverted meaning. An entry with neither level yields
+    ``()`` — nothing to protect.
     """
     stop, take = entry.stop_loss, entry.take_profit
     if stop is None and take is None:
@@ -83,7 +99,6 @@ def bracket_children(
         f"{filled_qty!r}"
     )
     anchored = _lot_time(entry)
-    reduce_side = _reduce_side(entry.action)
     children: list[OrderIntent] = []
     if stop is not None:
         children.append(
@@ -95,7 +110,6 @@ def bracket_children(
                 tif=tif,
                 conid=conid,
                 filled_qty=filled_qty,
-                reduce_side=reduce_side,
                 anchor=anchored,
             )
         )
@@ -109,7 +123,6 @@ def bracket_children(
                 tif=tif,
                 conid=conid,
                 filled_qty=filled_qty,
-                reduce_side=reduce_side,
                 anchor=anchored,
             )
         )
@@ -125,10 +138,9 @@ def _child(
     tif: str,
     conid: int,
     filled_qty: float,
-    reduce_side: ActionType,
     anchor: pd.Timestamp,
 ) -> OrderIntent:
-    """ONE protective child: reduce side, confirmed qty, kind-shaped ref."""
+    """ONE protective child: LOT side, confirmed qty, kind-shaped ref."""
     pid = entry.position_id if entry.position_id is not None else str(conid)
     return OrderIntent(
         symbol=entry.symbol,
@@ -143,14 +155,8 @@ def _child(
         decision_ts=entry.decision_ts,
         order_type=order_type,
         protective=True,
-        position_side=reduce_side,
+        position_side=entry.action,
     )
-
-
-def _reduce_side(entry_action: ActionType) -> ActionType:
-    """The side a reduce leg of an entry trades: a long exits via a short, a
-    short via a long."""
-    return ActionType.short if entry_action is ActionType.long else ActionType.long
 
 
 def _lot_time(entry: OrderIntent) -> pd.Timestamp:
@@ -222,36 +228,127 @@ def child_ref(
     )
 
 
+@dataclass(frozen=True)
+class ProtectionTarget:
+    """One OPEN lot a cycle must find a resting protective leg for (item 2).
+
+    ``conid`` is the wire handle both the book's lot id and the working read key
+    on; ``symbol``/``position_id``/``qty`` only shape the report row a naked lot
+    emits.
+    """
+
+    conid: int
+    symbol: str
+    position_id: str
+    qty: float
+
+
+def resting_legs(
+    working: Sequence[WorkingOrder],
+    *,
+    scope_tag: str,
+    conid: int,
+) -> tuple[WorkingOrder, ...]:
+    """OUR resting protective legs on *conid* — any count, side-consistent.
+
+    Ours means the ref carries our ``scope_tag`` prefix and the row is on
+    ``conid``. RESTING means the wire status reads ``Submitted`` (spec §0) — an
+    ``Inactive``/``Pending Submit`` leg from a failed confirm is NOT protection,
+    and a row whose kind is unreadable off ``orderType`` is not a leg at all.
+
+    Returns 0..n legs: a strategy that arms ONLY a stop rests a lone ``sl``, and
+    that IS protection (never a permanent NAKED report). Every returned leg
+    agrees on the wire ``side`` — two legs reducing opposite directions are two
+    strangers sharing a prefix, so NOTHING is claimed resting for that conid.
+    """
+    ours = [
+        o
+        for o in working
+        if _is_ours(o.order_ref, scope_tag)
+        and o.conid == conid
+        and o.status.strip().upper() == _RESTING
+        and kind_of(o) in _LEVEL_KINDS
+    ]
+    if not ours:
+        return ()
+    if len({o.side for o in ours}) > 1:
+        return ()
+    return tuple(ours)
+
+
 def resting_bracket(
     working: Sequence[WorkingOrder],
     *,
     scope_tag: str,
     conid: int,
 ) -> tuple[WorkingOrder, WorkingOrder] | None:
-    """Our resting OCA pair on *conid*: ``(stop, take_profit)`` or ``None``.
+    """Our resting OCA PAIR on *conid*: ``(stop, take_profit)`` or ``None``.
 
-    Ours means the ref carries our ``scope_tag`` prefix and the row is on
-    ``conid``. Kind is read off the wire's ``orderType`` (set by the parser),
-    never assumed from our book, so an STP resting under another scope's
-    bracket is foreign. Both legs must agree on the reduce side (the wire's
-    ``side``), or the "pair" is two strangers that happen to share a prefix.
-    ``None`` when either leg is missing or foreign — a lot whose bracket is
-    incomplete is NOT covered (the caller reports ``UNPROTECTED``, never
-    "placed").
+    The pair-specific view of :func:`resting_legs` — one rule, two readers. Kind
+    is read off the wire's ``orderType``, never assumed from our book, and both
+    legs must agree on the reduce side. ``None`` when either leg is missing or
+    foreign: a flow that genuinely needs a FULL pair treats an incomplete
+    bracket as no bracket. A lone leg is still protection — use
+    :func:`resting_legs` wherever one leg suffices.
     """
-    # Only rows that are actually RESTING count (spec §0: ``status``/
-    # ``order_ccp_status`` "Submitted" means resting) — an ``Inactive``/
-    # ``Pending Submit`` leg from a failed confirm is NOT protection.
-    ours = [o for o in working if _is_ours(o.order_ref, scope_tag) and o.conid == conid]
-    resting = [o for o in ours if o.status.strip().upper() == "SUBMITTED"]
-    stops = [o for o in resting if kind_of(o) == StopKind]
-    takes = [o for o in resting if kind_of(o) == TakeKind]
+    legs = resting_legs(working, scope_tag=scope_tag, conid=conid)
+    stops = [o for o in legs if kind_of(o) == StopKind]
+    takes = [o for o in legs if kind_of(o) == TakeKind]
     if not stops or not takes:
         return None
-    stop, take = stops[0], takes[0]
-    if stop.side != take.side:
-        return None
-    return (stop, take)
+    return (stops[0], takes[0])
+
+
+def unprotected_targets(
+    working: Sequence[WorkingOrder],
+    *,
+    scope_tag: str,
+    targets: Sequence[ProtectionTarget],
+) -> tuple[ProtectionTarget, ...]:
+    """The targets with NO Submitted protective leg of ours on the wire.
+
+    The pure core of the per-cycle backstop (spec §4.2 "missing ⇒ naked,
+    loudly"): a target ABSENT from the returned tuple is proven protected by
+    :func:`resting_legs`; anything else is a naked lot the caller reports
+    ``UNPROTECTED`` (exit 3). One read, any leg count — a lone ``sl`` counts.
+    """
+    return tuple(
+        target
+        for target in targets
+        if not resting_legs(working, scope_tag=scope_tag, conid=target.conid)
+    )
+
+
+def unprotected_results(
+    targets: Sequence[ProtectionTarget], *, reason: str
+) -> tuple[OrderResult, ...]:
+    """The ``UNPROTECTED`` report rows for naked *targets* (both edges, parity).
+
+    The outcome is ``UNPROTECTED`` — in the unsafe set, so the cycle exits 3 —
+    and never a ``rejected`` (a refusal an operator answers by re-placing). The
+    synthetic intent exists only to shape the report row; nothing is placed.
+    """
+    return tuple(
+        OrderResult(
+            intent=OrderIntent(
+                symbol=target.symbol,
+                action=ActionType.close,
+                qty=target.qty,
+                ref_price=0.0,
+                reason=f"re-arm: {reason}",
+                position_id=target.position_id,
+                protective=True,
+            ),
+            fill=None,
+            ok=False,
+            message=f"{target.symbol} (conid {target.conid}): {reason}",
+            position_id=target.position_id,
+            outcome=OrderOutcome.UNPROTECTED,
+            error_kind="unprotected",
+            filled_qty=0.0,
+        )
+        for target in targets
+    )
 
 
 def kind_of(order: WorkingOrder) -> str:
@@ -407,10 +504,14 @@ def _lot_conid(symbol: str, lot: Position) -> int:
 
 
 __all__ = [
+    "ProtectionTarget",
     "bracket_children",
     "child_ref",
     "kind_of",
     "level_bracket_intents",
     "protective_ref",
     "resting_bracket",
+    "resting_legs",
+    "unprotected_results",
+    "unprotected_targets",
 ]

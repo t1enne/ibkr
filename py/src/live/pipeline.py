@@ -27,11 +27,16 @@ from src.live.divergence import Divergence, book_from_executions, guard_divergen
 from src.live.freshness import StaleDataError, assert_data_fresh
 from src.live.ledger import ExecutionRecord
 from src.live.pure import OrderResult
+from src.live.protect import (
+    ProtectionTarget,
+    unprotected_results,
+)
 from src.live.reconcile import reconcile
 from src.live.report import CycleReport
 from src.live.result import Err, Ok, Result
 from src.live.signals import live_signals
 from src.live.types import (
+    FLAT_QTY_EPS,
     FeedError,
     LiveConfig,
     LiveSignal,
@@ -114,12 +119,16 @@ async def run_cycle(
         assert_data_fresh(config.symbols, max_age_days, now_ts, db_path)
         pf = await read_portfolio(adapter)
         signals = screen_signals(config_path, max_age_days, signal_source)
+        # The backstop attests the state as READ: it runs BEFORE the resync, whose
+        # own protective action (a sim stop firing) legitimately retires a lot
+        # within this cycle and would otherwise look like a lot left naked.
+        attested = await _attest(adapter, pf.portfolio, dry_run)
         resync_results, resync_error = await _resync(adapter, dry_run)
         divergences = _divergences(ledger, scope, pf.portfolio)
         owned = ledger.owned_ids(scope) if adapter.owns_book else None
         intents = diff_intents(signals, pf.portfolio, config, owned)
         placed = await execute_cohort(adapter, pf.portfolio, intents, dry_run)
-        results, placement_error = _merge(resync_results, placed)
+        results, placement_error = _merge(resync_results + attested, placed)
         if not dry_run:
             _persist(ledger, adapter, scope, results, strategy_id, now_ts)
         await adapter.close()
@@ -132,6 +141,7 @@ async def run_cycle(
         placement_error=placement_error,
         resync_error=resync_error,
         divergences=divergences,
+        warnings=pf.warnings,
     )
 
 
@@ -197,6 +207,55 @@ def _persist(
     """
     _record(ledger, adapter, scope, results, now_ts)
     ledger.touch_cycle(scope, now_ts)
+
+
+async def _attest(
+    adapter: LiveAdapter, book: PortfolioState, dry_run: bool
+) -> tuple[OrderResult, ...]:
+    """The per-cycle naked-lot backstop: attest protection, report, never place.
+
+    Spec §4.2 "missing ⇒ naked, loudly". Runs on the book the cycle READ, BEFORE
+    the cycle-start resync: a lot a resync's own protective action retires (a sim
+    stop firing) is protection WORKING, not a naked lot. A bracket lost after its
+    entry cycle (rejected, cancelled externally, a fired-partial) has no such
+    in-cycle explanation, so it still reaches the unsafe set and exits 3 instead
+    of passing a HOLD cycle as a clean exit 0. The pass only READS: an adapter
+    that cannot prove a lot is protected reports ``UNPROTECTED`` for it —
+    ambiguity is never clean, and no POST follows a failed read (invariant 1).
+
+    A cohort-level ``Err`` is reported the same way the resync's is: non-fatal to
+    the cycle, but it must reach the report rather than vanish, so a backend that
+    cannot be read never reads as "all lots protected".
+    """
+    if dry_run:
+        return ()
+    attested = await adapter.attest_protection(book)
+    if isinstance(attested, Ok):
+        return cast("tuple[OrderResult, ...]", attested.value)
+    error = attested.error
+    return unprotected_results(
+        _targets_of(book),
+        reason=f"protection could not be attested ({error.kind}): {error.message}",
+    )
+
+
+def _targets_of(book: PortfolioState) -> tuple[ProtectionTarget, ...]:
+    """Every OPEN lot of *book* as an attestation target (the adapter's own view).
+
+    ``position_id`` is the wire handle on BOTH edges (the conid on ibkr, the lot
+    id on sim), so the report row can name the lot without a second lookup.
+    """
+    return tuple(
+        ProtectionTarget(
+            conid=int(lot.position_id) if str(lot.position_id).isdigit() else 0,
+            symbol=lot.symbol,
+            position_id=str(lot.position_id),
+            qty=lot.qty,
+        )
+        for lots in book.positions.values()
+        for lot in lots
+        if lot.qty > FLAT_QTY_EPS and lot.position_id
+    )
 
 
 def _lease(

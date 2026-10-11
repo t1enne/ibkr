@@ -222,10 +222,16 @@ class PortfolioSnapshot:
     ``apply_fill`` / ``apply_fills`` / ``equity_of`` apply unchanged to a live
     book. ``as_of`` is the only live-only addition. ``trades`` /
     ``equity_curve`` may be empty on a live read.
+
+    ``warnings`` are advisory read findings the operator should see (a malformed
+    feed row, a scope book that disagrees with the account's own net). They are
+    NEVER an unsafe condition: a shared account legitimately moves a conid that
+    this scope does not own, so a warning must not fail a cycle.
     """
 
     portfolio: PortfolioState
     as_of: pd.Timestamp
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -294,7 +300,9 @@ class OrderIntent:
     protective: bool = False
     #: NEW (Step 2): the LOT's side on a child minted from a confirmed entry
     #: (``F9``: a just-filled lot is not yet in the seeded book, so the child
-    #: carries its own reduce side; ``None`` elsewhere).
+    #: carries the side itself; ``None`` elsewhere). ONE meaning: the side of the
+    #: lot being acted on (``order_side``/``is_buy_fill`` read it the same way);
+    #: the wire's reduce BUY/SELL is derived from it, never carried inverted.
     position_side: ActionType | None = None
 
 
