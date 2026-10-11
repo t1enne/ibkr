@@ -309,6 +309,11 @@ class _FakeAdapter:
             results.append(cast("OrderResult", placed.value))
         return Ok(tuple(results))
 
+    async def cancel_order(self, order_id: str):
+        from src.live.result import Ok
+
+        return Ok(None)
+
     async def close(self):
         from src.live.result import Ok
 

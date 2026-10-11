@@ -66,6 +66,9 @@ class IbkrAdapter:
         self.broker.seed(book)
         return await self.broker.place_cohort(intents)
 
+    async def cancel_order(self, order_id: str) -> Result[None, FeedError]:
+        return await self.broker.cancel_order(order_id)
+
     async def close(self) -> Result[None, FeedError]:
         return await self.broker.close()
 

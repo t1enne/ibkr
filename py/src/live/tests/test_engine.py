@@ -175,6 +175,10 @@ class FakeAdapter:
             results.append(cast("OrderResult", placed.value))
         return Ok(tuple(results))
 
+    async def cancel_order(self, order_id: str) -> Result[None, FeedError]:
+        self.events.append("cancel_order")
+        return Ok(None)
+
     async def close(self) -> Ok[None, FeedError]:
         return Ok(None)
 

@@ -69,7 +69,10 @@ from src.live.adapters.ibkr.orders import (
     validate_order,
     whole_quantity,
 )
+from src.live.adapters.ibkr.protect import BracketProtectionMixin
 from src.live.adapters.ibkr.trades import Execution
+from src.exec.refs import scope_tag
+from src.live.protect import resting_bracket
 from src.live.pure import OrderResult, position_side_of, trade_signal
 from src.live.identity import (
     IntentKey,
@@ -211,11 +214,15 @@ async def _default_conid_lookup(ticker: str) -> int:
     return int(conid)
 
 
-class IbkrBroker:
+class IbkrBroker(BracketProtectionMixin):
     """``LiveBroker`` over the gateway: MKT orders, reply loop, bounded fill wait.
 
     ``dry_run`` is the defence-in-depth flag: a broker built for a dry run places
     nothing, so a missing CLI guard cannot turn into a real order.
+
+    Protective brackets (spec Steps 4–5) are added by :class:`BracketProtectionMixin`:
+    a confirmed entry fill places + confirms the OCA pair in the same cycle; a
+    close cancels-and-confirms the pair first; a level tighten REPLACEs both legs.
     """
 
     def __init__(
@@ -308,11 +315,7 @@ class IbkrBroker:
                     symbol=intent.symbol,
                 )
             )
-        account = (
-            self._account
-            or self._client.account
-            or await self._client.resolve_account()
-        )
+        account = await self._account_id()
         prepared = await self._prepare_leg(intent)
         if isinstance(prepared, Err):
             return Err(cast("FeedError", prepared.error))
@@ -386,6 +389,17 @@ class IbkrBroker:
                 self._log(message)
                 results.append(_failed(intent, message))
                 continue
+            if intent.protective:
+                results.extend(await self._route_protective(intent))
+                continue
+            if intent.action is ActionType.close:
+                # Invariant 6: a protected lot's bracket is cancelled-and-
+                # confirmed BEFORE its close; an unconfirmable cancel refuses.
+                refusals = await self._cancel_pair_before_close(intent)
+                if refusals is not None:
+                    results.extend(refusals)
+                    close_failed = True
+                    continue
             placed = await self._place(
                 scaled.get(ident, intent), in_cycle_delta=in_cycle_delta
             )
@@ -402,13 +416,218 @@ class IbkrBroker:
                 in_cycle_delta += _confirmed_reduce_delta(
                     intent, placed.value, position_side_of(self._book, intent)
                 )
+                if (
+                    placed.value.ok
+                    and placed.value.fill is not None
+                    and intent.action
+                    in (
+                        ActionType.long,
+                        ActionType.short,
+                    )
+                ):
+                    results.extend(
+                        await self._protect_after_fill(
+                            intent, placed.value, in_cycle_delta
+                        )
+                    )
             if intent.action is ActionType.close and not results[-1].ok:
                 close_failed = True
         return Ok(tuple(results))
 
+    async def _route_protective(self, intent: OrderIntent) -> tuple[OrderResult, ...]:
+        """One protective intent (a level arm/tighten): place or REPLACE the pair.
+
+        The mixin decides from the working read: a resting pair is REPLACEd
+        (cancel both, confirm absent, submit new); nothing resting is a fresh
+        arm. The refs anchor on the LOT's own time (the intent's ``decision_ts``
+        is the lot's open time for a level update). Any failure is a single
+        ``UNPROTECTED`` row — never a silent naked lot.
+        """
+        conid = await self._conid(intent.symbol)
+        if intent.position_side is None:
+            return (
+                _failed(
+                    intent,
+                    f"protect {intent.symbol}: child carries no reduce side",
+                    kind="unprotected",
+                ),
+            )
+        placed = await self._replace_bracket(intent.symbol, (intent,), conid=conid)
+        if isinstance(placed, Err):
+            error = cast("FeedError", placed.error)
+            self._log(f"UNPROTECTED {intent.symbol}: {error.message}")
+            return (
+                _failed(
+                    intent,
+                    error.message,
+                    kind=error.kind,
+                ),
+            )
+        return tuple(placed.value)
+
+    async def _protect_after_fill(
+        self,
+        intent: OrderIntent,
+        result: OrderResult,
+        in_cycle_delta: float,
+    ) -> tuple[OrderResult, ...]:
+        """Place the OCA pair for a confirmed entry fill; a failure is NAKED.
+
+        Spec §4.1: the pair is placed INSIDE the entry cycle right after the
+        entry is confirmed filled. The refs anchor on the fill's own timestamp
+        (the lot's open/fill time — never the decision bar or the clock). If the
+        bracket cannot be proven resting, the lot is NAKED: report UNPROTECTED
+        (exit 3, F2) and close it at market rather than leave it exposed.
+        """
+        if intent.stop_loss is None and intent.take_profit is None:
+            return ()
+        fill = result.fill
+        if fill is None:
+            return ()
+        conid = await self._conid(intent.symbol)
+        placed = await self._place_bracket(
+            intent,
+            filled_qty=result.filled_qty
+            if result.filled_qty is not None
+            else fill.filled_qty,
+            conid=conid,
+            fill_ts=fill.timestamp,
+        )
+        if isinstance(placed, Err):
+            error = cast("FeedError", placed.error)
+            self._log(f"UNPROTECTED {intent.symbol}: {error.message}")
+            unprotected = _failed(
+                intent,
+                error.message,
+                kind="unprotected",
+            )
+        else:
+            return tuple(placed.value)
+        closed = await self._synthetic_close(
+            intent,
+            result=result,
+            conid=conid,
+            in_cycle_delta=in_cycle_delta,
+        )
+        if isinstance(closed, Err):
+            close_error = cast("FeedError", closed.error)
+            self._log(
+                f"synthetic close of naked {intent.symbol} failed: "
+                f"{close_error.message}"
+            )
+            return (unprotected,)
+        return (unprotected, closed.value)
+
+    async def _synthetic_close(
+        self,
+        intent: OrderIntent,
+        *,
+        result: OrderResult,
+        conid: int,
+        in_cycle_delta: float,
+    ) -> Result[OrderResult, FeedError]:
+        """Close a NAKED lot at market (spec §4.2): the protective response to a
+        bracket that cannot be proven resting."""
+        fill = result.fill
+        if fill is None:
+            return Err(
+                feed_error(
+                    "unprotected",
+                    f"synthetic close {intent.symbol}: no fill to close",
+                    intent.symbol,
+                )
+            )
+        close = OrderIntent(
+            symbol=intent.symbol,
+            action=ActionType.close,
+            qty=result.filled_qty if result.filled_qty is not None else fill.filled_qty,
+            ref_price=fill.executed_price,
+            reason="synthetic close: bracket not proven resting",
+            position_id=str(conid),
+            decision_ts=fill.timestamp,
+        )
+        return await self._place(close, in_cycle_delta=in_cycle_delta)
+
+    async def _cancel_pair_before_close(
+        self, intent: OrderIntent
+    ) -> tuple[OrderResult, ...] | None:
+        """Cancel-and-confirm the lot's pair before its close (invariant 6).
+
+        ``None`` when there is nothing to cancel (or the cancel confirmed): the
+        close proceeds. An unconfirmable cancel returns the UNPROTECTED rows
+        that REFUSE the close — a live pair plus a close would over-reduce.
+        """
+        working = await self._working_index()
+        if isinstance(working, Err):
+            return (
+                _failed(
+                    intent,
+                    "refused close: pre-cancel working-orders read failed; "
+                    "cannot prove the pair state",
+                    kind="unprotected",
+                ),
+            )
+        conid = await self._conid(intent.symbol)
+        resting = resting_bracket(
+            tuple(working.value.values()),
+            scope_tag=scope_tag(self._scope),
+            conid=conid,
+        )
+        if resting is None:
+            return None
+        cancelled = await self._cancel_pair(intent.symbol, resting)
+        if isinstance(cancelled, Err):
+            error = cast("FeedError", cancelled.error)
+            self._log(f"close {intent.symbol} refused: {error.message}")
+            return (
+                _failed(
+                    intent,
+                    f"refused close: {error.message}",
+                    kind="unprotected",
+                ),
+            )
+        return None
+
     async def close(self) -> Result[None, FeedError]:
         """Close the HTTP client (its pool outlives nothing once the cycle ends)."""
         await self._client.aclose()
+        return Ok(None)
+
+    async def cancel_order(self, order_id: str) -> Result[None, FeedError]:
+        """Cancel ONE resting order, confirmed by a follow-up working read.
+
+        The DELETE reply alone is never the confirmation (spec §0/F8): the
+        confirming evidence is the read showing the ``orderId`` absent. An
+        unreadable or still-present read is ``UNPROTECTED`` (the caller must not
+        resubmit or close on top of a possibly-live order).
+        """
+        account = await self._account_id()
+        try:
+            await self._client.cancel_order(account, order_id)
+        except IbkrError as exc:
+            return Err(
+                feed_error(
+                    "unprotected",
+                    f"cancel {order_id} errored ({exc.kind}): {exc}",
+                )
+            )
+        working = await self._working_index()
+        if isinstance(working, Err):
+            return Err(
+                feed_error(
+                    "unprotected",
+                    f"cancel {order_id}: absence re-read failed; whether it is "
+                    f"gone is unknown",
+                )
+            )
+        if order_id in working.value:
+            return Err(
+                feed_error(
+                    "unprotected",
+                    f"cancel {order_id}: still on the working read; cannot prove "
+                    f"it is gone",
+                )
+            )
         return Ok(None)
 
     async def wait_filled(
@@ -482,6 +701,18 @@ class IbkrBroker:
         conid = await self._conid_lookup(symbol)
         self._conid_cache[symbol] = conid
         return conid
+
+    async def _account_id(self) -> str:
+        """The account id any POST/DELETE targets: explicit, then session, then read.
+
+        Never a guess: an account the client cannot name is resolved from the
+        gateway's own account list (an ``auth`` failure, not a default).
+        """
+        return (
+            self._account
+            or self._client.account
+            or await self._client.resolve_account()
+        )
 
     async def _working_index(self) -> Result[dict[str, WorkingOrder], FeedError]:
         """Every WORKING, joinable order of ours keyed by ``cOID``, or ``Err``.
