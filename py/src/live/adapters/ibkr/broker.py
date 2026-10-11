@@ -503,6 +503,13 @@ class IbkrBroker(BracketProtectionMixin):
             )
         else:
             return tuple(placed.value)
+        # The pair may still have RESTED (an unparseable confirm reply is not
+        # proof it did not). Cancel-confirm it BEFORE the market close so a live
+        # reduce order cannot race the close and over-reduce (invariant 6). An
+        # unconfirmable cancel refuses the close, never risks double-cover.
+        refused = await self._cancel_pair_before_close(intent)
+        if refused is not None:
+            return (unprotected, *refused)
         closed = await self._synthetic_close(
             intent,
             result=result,

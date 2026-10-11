@@ -548,6 +548,13 @@ def classify_reply(payload: object) -> ReplyOutcome:
     body = _first(payload)
     if body is None:
         return ReplyOutcome(kind="abort", message="empty order submission response")
+    # The captured confirm reply (spec §0/§6 gateway_stop_submit_confirmed.json)
+    # wraps the payload under ``"reply"``; unwrap it once so a wrapped reply
+    # reaches ``success`` instead of aborting as unknown (reviewer C1).
+    if body.get("order_id") is None and body.get("id") is None:
+        nested = body.get("reply")
+        if isinstance(nested, Mapping):
+            body = cast("Mapping[str, object]", nested)
     error = body.get("error")
     if error is not None:
         return ReplyOutcome(kind="abort", message=opt_str(error))

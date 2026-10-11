@@ -359,16 +359,9 @@ def live_pf(
         return
     try:
         report = (
-            _all_scopes_report(
-                ledger,
-                adapter,
-            )
+            _all_scopes_report(ledger, adapter)
             if config_path is None
-            else _config_report(
-                ledger,
-                config_path,
-                adapter,
-            )
+            else _config_report(ledger, config_path, adapter)
         )
     except (SessionNotReady, ValueError, LedgerReadError) as exc:
         raise click.ClickException(str(exc)) from exc

@@ -18,6 +18,7 @@ else is pure.
 """
 
 from __future__ import annotations
+import asyncio
 
 import json
 from collections.abc import Iterable, Mapping
@@ -264,12 +265,15 @@ async def read_ibkr_broker(
     anything; when it fails the read still proceeds, cached, and says so in
     ``warnings``.
     """
-    summary, summary_warnings = parse_summary(
-        await client.portfolio_summary(account), account
+    summary_res, refresh_warnings, orders_res = await asyncio.gather(
+        client.portfolio_summary(account),
+        _discard_position_cache(client, account),
+        client.open_orders(),
     )
-    refresh_warnings = await _discard_position_cache(client, account)
+    summary, summary_warnings = parse_summary(summary_res, account)
     positions, position_warnings = parse_positions(await client.positions_all(account))
-    working = _working_orders(await client.open_orders())
+    working = _working_orders(orders_res)
+
     return BrokerSide(
         adapter="ibkr",
         source=client.base_url,

@@ -179,7 +179,8 @@ class BracketProtectionMixin(_BracketHost):
                 )
             )
         self._log(
-            f"protect {symbol} pair resting ({verify[0].order_id}/{verify[1].order_id})"
+            f"protect {symbol} bracket resting: "
+            + ", ".join(f"{kind_of(v)}={v.order_id}" for v in verify)
         )
         return Ok(self._resting_results(children, verify))
 
@@ -375,7 +376,7 @@ class BracketProtectionMixin(_BracketHost):
 
     async def _re_read_resting(
         self, symbol: str, conid: int, refs: tuple[str, ...]
-    ) -> tuple[WorkingOrder, WorkingOrder] | None:
+    ) -> tuple[WorkingOrder, ...] | None:
         """Re-read the working orders until BOTH refs read ``Submitted``.
 
         Bounded retry (``_BRACKET_VERIFY_RETRIES``) with the broker's poll
@@ -394,7 +395,9 @@ class BracketProtectionMixin(_BracketHost):
                 if o.order_ref in refs and o.status.strip().upper() == _SUBMITTED
             ]
             if len(ours) == len(refs):
-                return (ours[0], ours[1])
+                # One leg or many: return exactly the matched legs, never index
+                # a pair position that a lone-leg bracket does not have (M1).
+                return tuple(ours)
             await self._sleep(self._poll_interval_s)
         self._log(
             f"protect {symbol}: pair not re-read as Submitted after "
@@ -405,12 +408,12 @@ class BracketProtectionMixin(_BracketHost):
     def _resting_results(
         self,
         children: tuple[OrderIntent, ...],
-        pair: tuple[WorkingOrder, WorkingOrder],
+        pair: Sequence[WorkingOrder],
     ) -> tuple[OrderResult, ...]:
-        """The PLACED results for a resting pair, one per CHILD (kind-matched).
+        """The PLACED results for the resting legs, one per CHILD (kind-matched).
 
-        ``resting_bracket`` always returns (stop, take); a lone ``sl`` child maps
-        to the stop leg only, never a strict zip off-by-one.
+        Kind-matched, so a lone ``sl`` child maps to the stop leg only and a pair
+        maps to both — never a strict zip off-by-one.
         """
         by_kind = {kind_of(leg): leg for leg in pair}
         return tuple(
