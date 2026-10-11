@@ -15,11 +15,9 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.state import ActionType
 from src.data.db import get_connection
 from src.exec.refs import scope_tag
 from src.live.cli import _config_report, load_live_config
-from src.live.identity import IntentKey, IntentRecord, IntentState, order_ref
 from src.live.ledger import ExecutionRecord, SqliteLedger
 from src.live.pf import (
     BrokerLot,
@@ -107,7 +105,6 @@ def _fill(
 def _side(
     lots: tuple[StoreLot, ...] = (),
     trades: tuple[ExecutionRecord, ...] = (),
-    orders: tuple = (),
     cash: float = 50000.0,
 ) -> StoreSide:
     """A store side built by hand, so the P&L math is exercised without a ledger."""
@@ -118,7 +115,6 @@ def _side(
         cash=cash,
         initial_capital=50000.0,
         lots=lots,
-        orders=orders,
         trades=trades,
     )
 
@@ -186,17 +182,6 @@ def test_stats_totals_realized_when_nothing_is_open() -> None:
 # --- (c) divergence: the report's whole reason to exist -----------------------
 
 
-def _record(key: IntentKey) -> IntentRecord:
-    return IntentRecord(
-        key=key,
-        state=IntentState.PENDING,
-        attempt=0,
-        order_ref=order_ref(key, 0),
-        order_id=None,
-        decision_ts=TS,
-    )
-
-
 def _broker() -> BrokerSide:
     """The broker side of a report fixture: one owned lot, one the store lacks."""
     return BrokerSide(
@@ -216,10 +201,7 @@ def _broker() -> BrokerSide:
 
 
 def _store(scope: str = "S1") -> StoreSide:
-    """Our store side of a report fixture: one open lot, one order, one fill."""
-    key = IntentKey(
-        scope=scope, symbol="AAPL", action=ActionType.long, position_id=None
-    )
+    """Our store side of a report fixture: one open lot, one fill."""
     return StoreSide(
         scope=scope,
         db_path="/tmp/l.sqlite",
@@ -227,7 +209,6 @@ def _store(scope: str = "S1") -> StoreSide:
         cash=50000.0,
         initial_capital=50000.0,
         lots=(StoreLot("AAPL_1", "AAPL", "long", 10.0, 100.0, None, None, "", "r1"),),
-        orders=(_record(key),),
         trades=(
             ExecutionRecord(
                 scope=scope,

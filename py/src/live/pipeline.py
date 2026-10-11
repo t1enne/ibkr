@@ -63,8 +63,9 @@ class CycleLedger(Protocol):
     concurrently; two cycles on one scope do not). ``executions_of`` is our
     fill-derived book, the divergence guard's "ours" side. ``owned_ids`` scopes
     a close to the lots the scope is recorded as owning. ``record_results`` is the
-    ONE write point for placement outcomes, and ``touch_cycle``/``prune`` are the
-    audit + housekeeping writes.
+    ONE write point for placement outcomes, and ``touch_cycle`` is the audit
+    stamp. There is no intents housekeeping: no durable open-order store exists
+    to prune.
     """
 
     def cycle_lease(self, scope: str = "") -> AbstractContextManager[None]: ...
@@ -78,13 +79,6 @@ class CycleLedger(Protocol):
     def record_results(
         self, scope: str, results: tuple[OrderResult, ...], now: pd.Timestamp
     ) -> None: ...
-
-    def prune(self, before: pd.Timestamp) -> int: ...
-
-
-#: A closed intent record older than this is housekeeping noise; OPEN records
-#: are never pruned (they still own state).
-_INTENT_RETENTION_DAYS = 90
 
 
 async def run_cycle(
@@ -191,16 +185,14 @@ def _persist(
     strategy_id: str,
     now_ts: pd.Timestamp,
 ) -> None:
-    """The cycle's durable writes, in order: results, audit stamp, housekeeping.
+    """The cycle's durable writes, in order: results, audit stamp.
 
     Skipped entirely on a dry run (the caller never reaches here), so a read-only
-    cycle leaves the store byte-identical.
+    cycle leaves the store byte-identical. No open-order housekeeping: the
+    broker's reads are the only open-state owner.
     """
     _record(ledger, adapter, scope, placed, now_ts)
     ledger.touch_cycle(scope, now_ts)
-    ledger.prune(
-        cast("pd.Timestamp", now_ts - pd.Timedelta(days=_INTENT_RETENTION_DAYS))
-    )
 
 
 def _lease(

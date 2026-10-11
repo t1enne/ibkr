@@ -1,4 +1,4 @@
-"""Pure tests for the write planner (``plan_result_writes`` / ``next_attempt``).
+"""Pure tests for the write planner (``plan_result_writes``).
 
 No sqlite: every assertion is about the VALUES a cycle's results imply — which
 fill rows and the cash signs on them. ``src/live/tests/test_ledger.py`` keeps
@@ -18,13 +18,11 @@ import pandas as pd
 
 from src.bt.state import ActionType, FillEvent
 from src.exec.types import OrderSide
-from src.live.identity import IntentKey, IntentRecord, IntentState
 from src.live.pure import OrderResult, intent_to_signal
 from src.live.pure_plan import (
     FillWrite,
     _cash_delta,
     commission_of,
-    next_attempt,
     plan_result_writes,
 )
 from src.live.types import OrderIntent
@@ -170,28 +168,6 @@ def test_a_short_close_emits_the_mirror_exit_fill() -> None:
 def test_all_writes_carry_the_scope() -> None:
     writes = plan_result_writes("S1", (_open("L1"), _close("L1")), TS)
     assert writes and {w.record.scope for w in writes} == {"S1"}
-
-
-# --- next_attempt -----------------------------------------------------------
-
-
-def _record(attempt: int) -> IntentRecord:
-    return IntentRecord(
-        key=IntentKey(
-            scope="S1", symbol="AAPL", action=ActionType.long, position_id=None
-        ),
-        state=IntentState.WORKING,
-        attempt=attempt,
-        order_ref="r",
-        order_id=None,
-        decision_ts=None,
-    )
-
-
-def test_next_attempt_starts_at_zero_and_never_reuses_one() -> None:
-    assert next_attempt(None) == 0
-    assert next_attempt(_record(0)) == 1
-    assert next_attempt(_record(7)) == 8
 
 
 # --- commission_of: the inverse of the signed-cash rule ---------------------

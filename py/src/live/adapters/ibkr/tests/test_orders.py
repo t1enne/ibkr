@@ -41,7 +41,6 @@ from src.live.identity import (
     intent_key,
     order_ref,
     ref_is_ours,
-    ref_matches_key,
     ref_prefix,
 )
 from src.live.types import OrderIntent
@@ -108,32 +107,29 @@ def test_close_without_a_lot_side_is_an_error() -> None:
 # --- ticket body ------------------------------------------------------------
 
 
-def test_ref_is_bar_free_and_keyed_on_the_intent() -> None:
-    # INV-2: the cOID is a pure function of (scope, symbol, action, position_id).
-    # It never embeds the decision bar, so a re-run on a LATER bar re-mints the
-    # SAME ref and the working-order pre-flight adopts it instead of duplicating.
+def test_ref_is_pure_and_keyed_on_the_intent() -> None:
+    # INV-2: the cOID is a pure function of (scope, symbol, action, position_id)
+    # with NO attempt tail. It never embeds the decision bar, so a re-run on a
+    # LATER bar mints the SAME ref; the working-order pre-flight adopts it and
+    # IBKR's own cOID dedupe absorbs a duplicate send instead of duplicating.
     early = _intent()
     late = replace_intent(_intent(), decision_ts=CYCLE_TS)
     assert intent_key(SCOPE, early) == intent_key(SCOPE, late)
-    assert order_ref(intent_key(SCOPE, early), 0) == order_ref(
-        intent_key(SCOPE, late), 0
-    )
+    assert order_ref(intent_key(SCOPE, early)) == order_ref(intent_key(SCOPE, late))
     # A different intent (different symbol) mints a different ref.
-    assert order_ref(intent_key(SCOPE, _intent("MSFT")), 0) != order_ref(
-        intent_key(SCOPE, early), 0
+    assert order_ref(intent_key(SCOPE, _intent("MSFT"))) != order_ref(
+        intent_key(SCOPE, early)
     )
-    # A different attempt on the SAME key mints a different ref (so IBKR's own
-    # dedupe cannot swallow a legitimate re-send).
+    # The ref is the whole attribution: prefix and ref coincide (no attempt tail).
     key = intent_key(SCOPE, early)
-    assert order_ref(key, 0) != order_ref(key, 1)
-    assert ref_prefix(key) == order_ref(key, 0)[:-2]
+    assert ref_prefix(key) == order_ref(key)
 
 
 def test_build_ticket_close_floors_the_quantity() -> None:
     # A reducing order must never round UP: a 1.6-share close sends 1 share, not
     # 2 (2 would flip the 1.6 long into a 0.4 short — finding 2).
     intent = _intent(action=ActionType.close, position_id="55", qty=1.6)
-    ref = order_ref(intent_key(SCOPE, intent), 0)
+    ref = order_ref(intent_key(SCOPE, intent))
     ticket = build_ticket(
         intent, conid=1, side=order_side(intent, ActionType.long), order_ref=ref
     )
@@ -149,7 +145,7 @@ def test_build_ticket_close_that_floors_to_zero_is_refused() -> None:
             intent,
             conid=1,
             side=order_side(intent, ActionType.long),
-            order_ref=order_ref(intent_key(SCOPE, intent), 0),
+            order_ref=order_ref(intent_key(SCOPE, intent)),
         )
 
 
@@ -159,7 +155,7 @@ def test_build_ticket_rejects_lmt() -> None:
             _intent(order_type=OrderType.LMT),
             conid=1,
             side=OrderSide.BUY,
-            order_ref=order_ref(intent_key(SCOPE, _intent()), 0),
+            order_ref=order_ref(intent_key(SCOPE, _intent())),
         )
 
 
@@ -177,7 +173,7 @@ def test_build_ticket_refuses_an_intent_carrying_a_stop(
             _intent(stop_loss=stop_loss, take_profit=take_profit),
             conid=1,
             side=OrderSide.BUY,
-            order_ref=order_ref(intent_key(SCOPE, _intent()), 0),
+            order_ref=order_ref(intent_key(SCOPE, _intent())),
         )
 
 
@@ -216,15 +212,15 @@ def test_captured_ours_row_is_matched_and_foreign_rows_are_never_adopted() -> No
     prefix = ref_prefix(key)
     rows = _captured_working_orders()
     ours = dict(rows[0])
-    ours["order_ref"] = order_ref(key, 0)
+    ours["order_ref"] = order_ref(key)
     parsed: list[WorkingOrder] = []
     for row in (ours, *rows[1:]):
         row_parsed = parse_working_order(row)
         if row_parsed is not None:
             parsed.append(row_parsed)
-    assert [p.order_ref for p in parsed] == [order_ref(key, 0)]  # foreign rows dropped
+    assert [p.order_ref for p in parsed] == [order_ref(key)]  # foreign rows dropped
     match = match_working(parsed, prefix)
-    assert match is not None and match.order_ref == order_ref(key, 0)
+    assert match is not None and match.order_ref == order_ref(key)
 
 
 # --- reply classification ---------------------------------------------------
@@ -444,35 +440,34 @@ def _working(order_ref: str, order_id: str, filled_qty: float = 0.0) -> WorkingO
     )
 
 
-def test_match_working_prefers_the_stored_ref_then_the_highest_attempt() -> None:
-    """D6: with two of our orders live, adoption never regresses to an older attempt.
+def test_match_working_prefers_the_exact_ref_else_the_first_match() -> None:
+    """``prefer`` (the exact pure ref) wins over a longer legacy ref sharing the prefix.
 
-    Without a stored ref to prefer, the HIGHEST attempt wins (``1`` here, so the
-    durable attempt does not regress one -> zero); with the record's own
-    ``order_ref`` still working, that exact ref wins so the ticket is built from
-    the same order.
+    The pure ref IS the prefix, so a key names at most one working order in a
+    steady state. An order carrying a legacy attempt tail (a ref minted by the
+    OLD scheme, ``prefix-attempt``) still shares the prefix, so ``prefer`` is what
+    lets the caller pick the exact pure ref; without it the first match is
+    returned deterministically.
     """
     key = intent_key(SCOPE, _intent())
     prefix = ref_prefix(key)
-    stale = _working(order_ref(key, 0), order_id="0")
-    live_new = _working(order_ref(key, 1), order_id="1")
-    by_attempt = match_working((stale, live_new), prefix)
-    assert by_attempt is not None and by_attempt.order_id == "1"
-    by_prefer = match_working((stale, live_new), prefix, prefer=stale.order_ref)
-    assert by_prefer is not None and by_prefer.order_id == "0"
+    legacy = _working(f"{prefix}-0", order_id="0")  # an older attempt-tail ref
+    exact = _working(order_ref(key), order_id="1")
+    by_prefer = match_working((legacy, exact), prefix, prefer=order_ref(key))
+    assert by_prefer is not None and by_prefer.order_id == "1"
+    plain = match_working((legacy, exact), prefix)
+    assert plain is not None and plain.order_id == "0"  # first entry wins
 
 
-def test_ref_is_ours_and_ref_matches_key_attribute_the_bar_free_ref() -> None:
-    """Ownership helpers: the scope segment and the key token, never a bar."""
+def test_ref_is_ours_attributes_only_this_scope_s_pure_ref() -> None:
+    """Ownership: the whole scope tag, never a bar, and never another scope's ref."""
     key = intent_key(SCOPE, _intent("AAPL"))
-    ref = order_ref(key, 3)
+    ref = order_ref(key)
     assert ref_is_ours(SCOPE, ref)
-    assert ref_matches_key(SCOPE, key, ref)
     # A different key (same scope) shares the scope segment but not the token.
     other = intent_key(SCOPE, _intent("MSFT"))
     assert ref_is_ours(SCOPE, ref)
-    assert not ref_matches_key(SCOPE, other, ref)
+    assert not ref.rsplit("-", 1)[-1] == order_ref(other).rsplit("-", 1)[-1]
     # A foreign scope's ref is not ours even with the same token shape.
-    foreign = order_ref(intent_key("other_scope", _intent("AAPL")), 0)
+    foreign = order_ref(intent_key("other_scope", _intent("AAPL")))
     assert not ref_is_ours(SCOPE, foreign)
-    assert not ref_matches_key(SCOPE, key, foreign)

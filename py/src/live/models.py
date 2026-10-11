@@ -77,42 +77,13 @@ class LiveExecution(_Base):
         primary_key = CompositeKey("scope", "execution_id")
 
 
-class LiveOrderIntent(_Base):
-    """The durable owner of OPEN order state, keyed by the IDENTITY columns.
-
-    The primary key is ``(scope, symbol, action, position_id)`` — the intent
-    identity itself (``position_id`` is ``''`` for an open) — NOT the crc32
-    ``token``: a crc32 collision can never alias two distinct identities' rows.
-    The ``token`` stays as a plain column, the bar-free cOID prefix.
-    """
-
-    scope = TextField()
-    token = TextField()
-    symbol = TextField()
-    action = TextField()
-    position_id = TextField(default="")
-    state = TextField()
-    attempt = IntegerField()
-    order_ref = TextField()
-    order_id = TextField(null=True)
-    decision_ts = IntegerField(null=True)
-    #: The time-in-force the order was placed with (see ``identity.DEFAULT_TIF``).
-    tif = TextField(default="DAY")
-    #: Consecutive resyncs this OPEN record stayed unresolved (wedged-key alarm).
-    stuck_cycles = IntegerField(default=0)
-    updated_at = IntegerField()
-
-    class Meta:
-        table_name = "live_order_intent"
-        primary_key = CompositeKey("scope", "symbol", "action", "position_id")
-
-
 #: Every live model, in one place: the ``bind_ctx`` group AND the list
-#: ``create_tables`` builds.
+#: ``create_tables`` builds. There is no ``live_order_intent`` model: a
+#: protective/entry order's open state is the broker's, never a local row (the
+#: union of the orders read + positions read is the authority).
 LIVE_MODELS: tuple[type[_Base], ...] = (
     LiveStrategy,
     LiveExecution,
-    LiveOrderIntent,
 )
 
 #: The live TABLES, in the order the migration runner reports them.
@@ -122,6 +93,5 @@ __all__ = [
     "LIVE_MODELS",
     "LIVE_TABLES",
     "LiveExecution",
-    "LiveOrderIntent",
     "LiveStrategy",
 ]

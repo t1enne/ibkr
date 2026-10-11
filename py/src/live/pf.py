@@ -27,7 +27,6 @@ from typing import cast
 import pandas as pd
 
 from src.bt.cmds._shared import _json_default
-from src.bt.state import ActionType
 from src.shared.style import PLAIN, Role, Styler
 from src.bt.table import Col, Table, render
 from src.data.ibkr.client import IbkrClient, IbkrError
@@ -40,7 +39,7 @@ from src.live.adapters.ibkr.mapping import (
     parse_summary,
 )
 from src.live.adapters.ibkr.orders import parse_working_order
-from src.live.identity import IntentRecord, WorkingOrder
+from src.live.identity import WorkingOrder
 from src.live.adapters.sim.store import SimBookStore
 from src.live.divergence import book_from_executions
 from src.live.ledger import ExecutionRecord, SqliteLedger, StrategyAudit
@@ -110,14 +109,15 @@ class StoreLot:
 
 @dataclass(frozen=True)
 class StoreSide:
-    """Our durable store for one scope: audit rows, cash, lots and orders/trades.
+    """Our durable store for one scope: audit rows, cash, lots and fills.
 
     ``db_path`` is the resolved sqlite file; ``strategy_rows`` is the scope's single
     audit row (the merged per-scope table) so the report can name the latest
-    revision and its cycle. ``orders`` is EVERY order intent for the scope (open
-    and closed, newest first); ``trades`` is every stored fill (oldest first).
-    ``lots`` are the OPEN lots from the fill fold (``book_from_executions``), so
-    both the IBKR reconcile book and the sim path report the same way.
+    revision and its cycle. ``lots`` are the OPEN lots from the fill fold
+    (``book_from_executions``) — there is no durable open-order store to read, so
+    the fill fold and the broker reads are the whole picture; ``trades`` is every
+    stored fill (oldest first). Both the IBKR reconcile book and the sim path
+    report the same way.
     """
 
     scope: str
@@ -126,7 +126,6 @@ class StoreSide:
     cash: float
     initial_capital: float
     lots: tuple[StoreLot, ...]
-    orders: tuple[IntentRecord, ...]
     trades: tuple[ExecutionRecord, ...]
 
 
@@ -181,7 +180,6 @@ def read_store(
         cash=ledger.cash_of(scope, initial_capital),
         initial_capital=ledger.initial_capital_of(scope) or initial_capital,
         lots=open_lots,
-        orders=ledger.intents_of(scope),
         trades=executions,
     )
 
@@ -358,13 +356,14 @@ _EMPTY_FLOWS = _Flows(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 @dataclass(frozen=True)
 class PositionRow:
-    """One symbol's whole lifecycle in a scope: its lot, its order and its P&L.
+    """One symbol's whole lifecycle in a scope: its lot and its P&L.
 
-    The merged view that replaces the separate lots/orders/trades tables: the open
-    position (``qty``/``entry``/``stop_loss``/``take_profit``), the newest order
-    intent for the symbol (``status``/``order_id``/``order_ref``) and the P&L the
-    stored fills imply. A symbol that never filled (a rejected or unfilled intent)
-    or whose lot is already gone (closed) is still a row, so nothing is dropped.
+    The merged view over the fill fold: the open position
+    (``qty``/``entry``/``stop_loss``/``take_profit``) and the P&L the stored
+    fills imply. ``status`` is derived from the book and fills alone (``open``
+    with a live lot, ``closed`` when the fills net to zero) — there is no
+    durable order-intent state to render. A closed symbol whose fills exist is
+    still a row, so realized P&L is never dropped.
 
     ``unrealized`` is BROKER-MARKED: it is ``None`` when no mark for that symbol
     was read, never a guess re-derived from our own fills. ``realized`` is the
@@ -414,14 +413,13 @@ class ScopeStats:
 def position_rows(
     store: StoreSide, broker: BrokerSide | None = None
 ) -> tuple[PositionRow, ...]:
-    """Every symbol *store* touched, merged into one row (broker marks optional).
+    """Every symbol *store* traded, merged into one row (broker marks optional).
 
-    The symbol set is the UNION of the open lots, the order intents and the
-    stored fills, so a symbol only one of the three names is not lost. *broker*
-    is read for last prices only.
+    The symbol set is the UNION of the open lots and the stored fills — the fill
+    fold is the only durable record, so a symbol with no fill has no row. There
+    is no order-intent table to read. *broker* is read for last prices only.
     """
     views, symbols = _open_views(store, broker)
-    intents = _intents_by_symbol(store.orders)
     flows = _flows(store.trades)
     marks = _marks(broker)
     return tuple(
@@ -429,7 +427,6 @@ def position_rows(
             store.scope,
             symbol,
             views.get(symbol),
-            intents.get(symbol),
             flows.get(symbol, _EMPTY_FLOWS),
             marks.get(symbol),
         )
@@ -474,18 +471,14 @@ def _open_views(
 ) -> tuple[dict[str, _LotView], list[str]]:
     """Open exposure per symbol, plus the deterministic list of symbols to show.
 
-    Our book rows become views (collapsed per symbol). A symbol our book already
-    covers is never re-added from the broker (the two adapters key lots
-    differently).
+    Our book rows become views (collapsed per symbol); every stored fill names a
+    symbol too. A symbol our book already covers is never re-added from the
+    broker (the two adapters key lots differently).
     """
     views = {
         symbol: _lot_view(lots) for symbol, lots in _lots_by_symbol(store.lots).items()
     }
-    symbols = sorted(
-        set(views)
-        | {trade.symbol or "-" for trade in store.trades}
-        | {record.key.symbol for record in store.orders}
-    )
+    symbols = sorted(set(views) | {trade.symbol or "-" for trade in store.trades})
     return views, symbols
 
 
@@ -521,14 +514,6 @@ def _first[T](values: Iterable[T | None]) -> T | None:
     return next((value for value in values if value is not None), None)
 
 
-def _intents_by_symbol(orders: tuple[IntentRecord, ...]) -> dict[str, IntentRecord]:
-    """The NEWEST intent per symbol (``intents_of`` already returns newest first)."""
-    newest: dict[str, IntentRecord] = {}
-    for record in orders:
-        newest.setdefault(record.key.symbol, record)
-    return newest
-
-
 def _flows(trades: tuple[ExecutionRecord, ...]) -> dict[str, _Flows]:
     """Aggregate one scope's stored fills by symbol, buys and sells kept apart."""
     flows: dict[str, _Flows] = {}
@@ -561,19 +546,18 @@ def _position_row(
     scope: str,
     symbol: str,
     view: _LotView | None,
-    intent: IntentRecord | None,
     flow: _Flows,
     mark: float | None,
 ) -> PositionRow:
-    """One merged row: the lot view when open, else the fill/order trail."""
+    """One merged row: the lot view when open, else the fill trail."""
     qty = view.qty if view is not None else abs(flow.net)
-    side = _side(view, flow, intent)
+    side = _side(view, flow)
     entry = view.entry if view is not None else _avg_entry(flow)
     return PositionRow(
         scope=scope,
         symbol=symbol,
         side=side,
-        status="open" if view is not None else _status(intent, flow),
+        status="open" if view is not None else _status(flow),
         qty=qty,
         entry=entry,
         last=mark if mark is not None else (None if qty else _avg_exit(flow)),
@@ -603,13 +587,11 @@ def _realized(flow: _Flows, side: str, qty: float, entry: float | None) -> float
     return flow.cash + direction * qty * entry + entry_comm * share
 
 
-def _side(view: _LotView | None, flow: _Flows, intent: IntentRecord | None) -> str:
-    """``long``/``short``: the open lot's own side, else the fills', else the ORDER's.
+def _side(view: _LotView | None, flow: _Flows) -> str:
+    """``long``/``short``: the open lot's own side, else the fills'.
 
-    With no lot and no fill there is no exposure to read a side off, so the newest
-    intent's action names it — a pending long OPEN is LONG, not "not a buy". A
-    close (or no intent at all) leaves the side BLANK: an unprovable side is never
-    defaulted to a short.
+    With no lot and no fill there is no exposure to read a side off, so the side
+    is BLANK: an unprovable side is never defaulted.
     """
     if view is not None:
         return view.side
@@ -617,23 +599,16 @@ def _side(view: _LotView | None, flow: _Flows, intent: IntentRecord | None) -> s
         return _LONG if flow.net > 0 else _SHORT
     if flow.buy_qty or flow.sell_qty:
         return _LONG if flow.buy_qty else _SHORT
-    if intent is not None:
-        if intent.key.action is ActionType.long:
-            return _LONG
-        if intent.key.action is ActionType.short:
-            return _SHORT
     return ""
 
 
-def _status(intent: IntentRecord | None, flow: _Flows) -> str:
-    """A row with no lot: the newest intent's state, else open/closed on the fills.
+def _status(flow: _Flows) -> str:
+    """A row with no lot: ``open``/``closed`` on the fills alone.
 
     A ``closed`` row means our fills net to zero and the book holds no lot; a
-    ``filled`` row with a non-zero ``qty`` is an open position our book lost — the
-    state names the ORDER, the ``qty`` column names the exposure.
+    non-zero ``qty`` with no lot is an open position our book lost — the fill
+    trail is the only durable record.
     """
-    if intent is not None:
-        return intent.state.value
     return "closed" if flow.net == 0.0 else "open"
 
 
@@ -680,18 +655,13 @@ def render_pf(report: PfReport, fmt: str, style: Styler = PLAIN) -> str:
     return _render_text(report, style)
 
 
-#: The colour of each merged-position state — deliberately sparing: only a state
-#: that needs acting on (a wedged order, a refusal) is coloured loudly, and an
-#: ordinary open lot or a clean fill stays quiet.
+#: The colour of each merged-position state — deliberately sparing: an ordinary
+#: open lot is strong, a closed row is quiet, a broker lot no scope claims is a
+#: caution. There is no durable order state to colour: statuses derive from the
+#: fill fold alone (``open``/``closed``), plus the broker's ``foreign`` rows.
 _STATE_ROLES: Mapping[str, Role] = {
     "open": "strong",
     "closed": "dim",
-    "filled": "good",
-    "working": "warn",
-    "pending": "warn",
-    "unfilled": "warn",
-    "unresolved": "bad",
-    "rejected": "bad",
     "foreign": "warn",
 }
 
@@ -783,24 +753,7 @@ def _store_dict(store: StoreSide) -> dict[str, object]:
         "cash": store.cash,
         "initial_capital": store.initial_capital,
         "lots": [asdict(lot) for lot in store.lots],
-        "orders": [_intent_dict(record) for record in store.orders],
         "trades": [asdict(trade) for trade in store.trades],
-    }
-
-
-def _intent_dict(record: IntentRecord) -> dict[str, object]:
-    """A compact order view: identity, state, ref and the stuck counter."""
-    return {
-        "symbol": record.key.symbol,
-        "action": record.key.action.value,
-        "position_id": record.key.position_id,
-        "state": record.state.value,
-        "attempt": record.attempt,
-        "order_ref": record.order_ref,
-        "order_id": record.order_id,
-        "tif": record.tif,
-        "stuck_cycles": record.stuck_cycles,
-        "decision_ts": record.decision_ts,
     }
 
 

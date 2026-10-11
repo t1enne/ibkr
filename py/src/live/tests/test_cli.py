@@ -30,14 +30,7 @@ from src.live.cli import (
 )
 from src.live.divergence import Divergence
 from src.live.report import CycleReport
-from src.live.identity import (
-    IntentKey,
-    IntentRecord,
-    IntentState,
-    OrderOutcome,
-    order_ref,
-)
-from src.live.ledger import SqliteLedger
+from src.live.identity import OrderOutcome
 from src.live.tests.ledgers import live_ledger
 from src.live.types import (
     FeedError,
@@ -521,53 +514,6 @@ def test_sim_adapter_refuses_to_place_on_a_dry_run() -> None:
     placed = asyncio.run(adapter.place(flat, _intent()))
     assert isinstance(placed, Err)
     assert cast("FeedError", placed.error).kind == "auth"
-
-
-# --- N1: the operator escape for a wedged key --------------------------------
-
-
-def _wedged_ledger(tmp_path: Path) -> tuple[SqliteLedger, IntentKey]:
-    ledger = live_ledger(tmp_path / "abandon.sqlite")
-    key = IntentKey(
-        scope="momentum", symbol="AAPL", action=ActionType.long, position_id=None
-    )
-    ledger.save(
-        IntentRecord(
-            key=key,
-            state=IntentState.WORKING,
-            attempt=0,
-            order_ref=order_ref(key, 0),
-            order_id="97932",
-            decision_ts=TS,
-        )
-    )
-    return ledger, key
-
-
-def test_abandon_clears_a_wedged_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The escape verb settles a wedged OPEN key terminal so the next cycle re-mints."""
-    ledger, key = _wedged_ledger(tmp_path)
-    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: ledger)
-
-    out = CliRunner().invoke(
-        live_group,
-        [
-            "abandon",
-            "--scope",
-            "momentum",
-            "--symbol",
-            "AAPL",
-            "--action",
-            "long",
-            "--yes",
-        ],
-    )
-
-    assert out.exit_code == 0, out.output
-    record = ledger.load(key)
-    assert record is not None and record.state is IntentState.UNFILLED
 
 
 def test_a_divergence_makes_the_cycle_unsafe() -> None:

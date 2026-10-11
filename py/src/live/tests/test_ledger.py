@@ -8,7 +8,6 @@ applies it.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -22,12 +21,6 @@ from src.data.db import get_connection
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution, StrategyBook, reconcile
-from src.live.identity import (
-    IntentKey,
-    IntentRecord,
-    IntentState,
-    order_ref,
-)
 from src.live import ledger as ledger_module
 from src.live.ledger import (
     LedgerReadError,
@@ -37,6 +30,8 @@ from src.live.lease import CycleInProgressError
 from src.live.tests.ledgers import live_ledger
 from src.live.pure import OrderResult, intent_to_signal
 from src.live.types import ExecutionRecord, OrderIntent
+
+pytestmark = pytest.mark.db
 
 TS = cast("pd.Timestamp", pd.Timestamp("2024-06-03T15:00:00Z"))
 OLD = cast("pd.Timestamp", pd.Timestamp("2020-01-01T15:00:00Z"))
@@ -334,139 +329,3 @@ def test_a_round_trip_leaves_one_closed_book_row(ledger: SqliteLedger) -> None:
     assert ledger.owned_ids("S1") == frozenset()
     (row,) = ledger.load_book("S1").rows
     assert row.qty == 0.0 and row.closed_at is not None
-
-
-# --- pending order intents (PendingIntents) ---------------------------------
-
-
-def _key(
-    symbol: str = "AAPL",
-    action: ActionType = ActionType.long,
-    pid: str | None = None,
-) -> IntentKey:
-    return IntentKey(scope="S1", symbol=symbol, action=action, position_id=pid)
-
-
-def test_open_attempt_bumps_after_the_prior_record(ledger: SqliteLedger) -> None:
-    key = _key()
-    first = ledger.open_attempt(key, TS, TS)
-    assert first.attempt == 0 and first.state is IntentState.PENDING
-    assert first.order_ref == order_ref(key, 0)
-    second = ledger.open_attempt(key, TS, TS)
-    assert second.attempt == 1
-    assert second.order_ref != first.order_ref  # a NEW cOID for the new attempt
-
-
-def test_close_and_load_open_round_trip(ledger: SqliteLedger) -> None:
-    key = _key()
-    ledger.open_attempt(key, TS, TS)
-    ledger.close(key, IntentState.WORKING, "97932", TS)
-    record = ledger.load(key)
-    assert record is not None
-    assert record.state is IntentState.WORKING and record.order_id == "97932"
-    assert ledger.load_open("S1") == (record,)
-
-
-def test_close_unresolved_keeps_a_known_order_id(ledger: SqliteLedger) -> None:
-    key = _key()
-    ledger.open_attempt(key, TS, TS)
-    ledger.close(key, IntentState.WORKING, "97932", TS)
-    ledger.close(key, IntentState.UNRESOLVED, None, TS)
-    record = ledger.load(key)
-    assert record is not None
-    assert record.state is IntentState.UNRESOLVED and record.order_id == "97932"
-
-
-def test_prune_deletes_only_closed_old_rows(ledger: SqliteLedger) -> None:
-    filled = _key("AAPL")
-    open_key = _key("MSFT")
-    ledger.open_attempt(filled, OLD, OLD)
-    ledger.close(filled, IntentState.FILLED, "1", OLD)
-    ledger.open_attempt(open_key, OLD, OLD)
-    # A cutoff after the closed row but the OPEN row is never pruned.
-    assert ledger.prune(TS) == 1
-    assert ledger.load(filled) is None
-    assert ledger.load(open_key) is not None
-
-
-def test_a_token_collision_cannot_alias_two_distinct_identities(
-    ledger: SqliteLedger, tmp_path: Path
-) -> None:
-    """The identity columns key the table, so a crc32 collision never aliases.
-
-    Two distinct intents whose TOKENS collide (forced here by rewriting one) stay
-    separately addressable by IDENTITY — the token is a plain column, not the key
-    — so a write for A can never overwrite B's ROW. This is a ROW-level guarantee
-    ONLY: the broker still attributes a working order by the token-keyed ref
-    prefix, so two colliding keys share a prefix there and their orders can still
-    be bridged at the broker layer.
-    """
-    key = _key("AAPL")
-    foreign = replace(key, symbol="MSFT")
-    ledger.save(
-        IntentRecord(
-            key=key,
-            state=IntentState.WORKING,
-            attempt=0,
-            order_ref=order_ref(key, 0),
-            order_id="1",
-            decision_ts=None,
-        )
-    )
-    ledger.save(
-        IntentRecord(
-            key=foreign,
-            state=IntentState.WORKING,
-            attempt=0,
-            order_ref=order_ref(foreign, 0),
-            order_id="2",
-            decision_ts=None,
-        )
-    )
-    with get_connection(tmp_path / "ledger.sqlite") as con:  # force a collision
-        con.execute(
-            "UPDATE live_order_intent SET token=? WHERE symbol='AAPL'",
-            (foreign.token(),),
-        )
-    first = ledger.load(key)
-    second = ledger.load(foreign)
-    assert first is not None and second is not None
-    assert (first.order_id, second.order_id) == ("1", "2")  # neither aliased
-    assert ledger.load_open("S1") == (first, second)
-
-
-pytestmark = pytest.mark.db
-
-
-def test_pruned_terminal_record_mints_the_next_attempt_at_zero(
-    ledger: SqliteLedger,
-) -> None:
-    """A pruned CLOSED row is gone, so the next attempt restarts the counter."""
-    key = _key("AAPL")
-    ledger.open_attempt(key, OLD, OLD)
-    ledger.close(key, IntentState.FILLED, "1", OLD)
-    assert ledger.prune(TS) == 1
-    assert ledger.load(key) is None
-    # The counter restarts at 0 once the prior row is pruned (fresh cOID reuse).
-    record = ledger.open_attempt(key, TS, TS)
-    assert record.attempt == 0
-
-
-def test_intent_record_roundtrips_tif_and_stuck_cycles(ledger: SqliteLedger) -> None:
-    """The columns persist and read back (tif + wedged counter)."""
-    key = _key("AAPL")
-    ledger.save(
-        IntentRecord(
-            key=key,
-            state=IntentState.WORKING,
-            attempt=0,
-            order_ref=order_ref(key, 0),
-            order_id="1",
-            decision_ts=TS,
-            tif="GTC",
-            stuck_cycles=2,
-        )
-    )
-    record = ledger.load(key)
-    assert record is not None
-    assert (record.tif, record.stuck_cycles) == ("GTC", 2)

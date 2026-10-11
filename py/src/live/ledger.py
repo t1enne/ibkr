@@ -2,10 +2,12 @@
 
 Our own fills are the ONE durable record. ``live_execution`` is the append-only
 fold source, keyed ``(scope, execution_id)`` so re-applying a window is a no-op;
-``live_strategy`` carries each scope's ownership, audit and ``initial_capital``;
-``live_order_intent`` is the durable owner of OPEN order state. Per-scope cash is
-derived from the scope's own executions (never read from the account summary — N
-strategies share one account).
+``live_strategy`` carries each scope's ownership, audit and ``initial_capital``.
+There is NO durable open-order store: the broker is the single source of truth for
+whether an order exists (its orders read + positions read cover every order we
+placed), so an open is decided by a read, never a remembered row. Per-scope cash
+is derived from the scope's own executions (never read from the account summary —
+N strategies share one account).
 
 The simulator's ACCOUNT book lives OUTSIDE sqlite (a JSON file,
 ``src.live.adapters.sim.store``) so an operator can hand-edit it to create a
@@ -19,9 +21,9 @@ rather than building a half-schema under a live order.
 ``strategy_id`` (the config hash) survives on ``live_strategy`` as an AUDIT
 column only — never an ownership filter. Ownership is the ``scope`` (the cOID
 prefix). ``SqliteLedger`` is the seam implementing the live Protocols; its
-per-domain methods live in their own mixins (``MetadataStore``, ``BookStore``,
-``IntentStore``) so each class stays small. Shared plumbing (the template
-binding, the base model, the epoch codec) is in ``ledger_base``.
+per-domain methods live in their own mixins (``MetadataStore``, ``BookStore``)
+so each class stays small. Shared plumbing (the template binding, the base model,
+the epoch codec) is in ``ledger_base``.
 
 The value shapes (``ExecutionRecord``/``StrategyAudit``) live in
 :mod:`src.live.types` and the money/decision code (the write planner
@@ -45,18 +47,10 @@ import pandas as pd
 import peewee
 from peewee import SqliteDatabase, fn
 
-from src.bt.state import ActionType
 from src.db.path import resolve_live_db_path
 from src.exec.refs import scope_tag
 
 from src.live.types import Execution, StrategyBook
-from src.live.identity import (
-    OPEN_STATES,
-    IntentKey,
-    IntentRecord,
-    IntentState,
-    order_ref,
-)
 from src.live.lease import file_lease
 from src.live.ledger_base import (
     _is_missing_table,
@@ -68,14 +62,12 @@ from src.live.ledger_base import (
 from src.live.models import (
     LIVE_MODELS,
     LiveExecution,
-    LiveOrderIntent,
     LiveStrategy,
 )
 from src.live.pure import OrderResult
 from src.live.pure_plan import (
     commission_of,
     execution_cash_delta,
-    next_attempt,
     plan_result_writes,
 )
 from src.live.types import ExecutionRecord, StrategyAudit
@@ -95,13 +87,6 @@ logger = logging.getLogger(__name__)
 _MODELS = LIVE_MODELS
 
 _T = TypeVar("_T")
-
-#: The terminal (closed) intent states ``prune`` is allowed to delete.
-_CLOSED_INTENTS = [
-    IntentState.FILLED.value,
-    IntentState.UNFILLED.value,
-    IntentState.REJECTED.value,
-]
 
 
 def _read(db: SqliteDatabase, query: Callable[[], _T], default: _T) -> _T:
@@ -128,12 +113,12 @@ class MetadataStore(_SqliteOps):
         """Every scope the store knows about, sorted (empty when unwritten).
 
         The union of the tables that carry a ``scope`` column, so a scope whose
-        strategy row was never written but which holds fills or intents is still
-        reported. A genuinely missing table contributes nothing; any other read
-        failure raises ``LedgerReadError``.
+        strategy row was never written but which holds fills is still reported. A
+        genuinely missing table contributes nothing; any other read failure raises
+        ``LedgerReadError``.
         """
         found: set[str] = set()
-        for model in (LiveStrategy, LiveExecution, LiveOrderIntent):
+        for model in (LiveStrategy, LiveExecution):
             rows = _read(
                 self._database,
                 lambda m=model: m.select(m.scope).distinct().execute(),
@@ -443,140 +428,7 @@ def _insert_execution(record: ExecutionRecord) -> None:
     ).on_conflict("IGNORE").execute()
 
 
-class IntentStore(_SqliteOps):
-    """Ledger mixin: the durable owner of OPEN order state (``live_order_intent``).
-
-    Reads tolerate a missing table (empty), like ``load_book``. A missing table on
-    a WRITE is not tolerated: the ledger writes no DDL (``ibkr db migrate`` owns
-    the schema), so an unmigrated file fails loud. The identity columns
-    (scope/symbol/action/position_id) are the primary key, so two intents whose
-    crc32 tokens collide stay separately addressable by IDENTITY.
-    """
-
-    def load(self, key: IntentKey) -> IntentRecord | None:
-        """The durable record for *key*, or ``None`` when unwritten."""
-        row = _read(
-            self._database,
-            lambda: LiveOrderIntent.get_or_none(self._intent_predicate(key)),
-            None,
-        )
-        return None if row is None else _model_to_intent(row)
-
-    def load_open(self, scope: str) -> tuple[IntentRecord, ...]:
-        """Every OPEN record for *scope* (empty if unwritten)."""
-        states = [s.value for s in OPEN_STATES]
-        rows = _read(
-            self._database,
-            lambda: (
-                LiveOrderIntent.select()
-                .where(
-                    (LiveOrderIntent.scope == scope) & (LiveOrderIntent.state << states)
-                )
-                .execute()
-            ),
-            (),
-        )
-        return tuple(_model_to_intent(row) for row in rows)
-
-    def intents_of(self, scope: str) -> tuple[IntentRecord, ...]:
-        """Every stored order intent for *scope*, newest first (empty if unwritten).
-
-        Unlike :meth:`load_open`, not restricted to OPEN states: the full audit
-        trail (filled / unfilled / rejected included) is what the report shows.
-        A missing table reads as empty; a genuine read failure raises.
-        """
-        rows = _read(
-            self._database,
-            lambda: (
-                LiveOrderIntent.select()
-                .where(LiveOrderIntent.scope == scope)
-                .order_by(LiveOrderIntent.updated_at.desc())
-                .execute()
-            ),
-            (),
-        )
-        return tuple(_model_to_intent(row) for row in rows)
-
-    def save(self, record: IntentRecord) -> None:
-        """Upsert *record* keyed on its identity columns.
-
-        The identity columns are the primary key, so a crc32 token collision can
-        never overwrite a foreign identity's row — two colliding keys simply
-        coexist under distinct identities.
-        """
-        with self._write():
-            LiveOrderIntent.insert(**_intent_fields(record)).on_conflict(
-                "REPLACE"
-            ).execute()
-
-    def open_attempt(
-        self, key: IntentKey, decision_ts: pd.Timestamp | None, now: pd.Timestamp
-    ) -> IntentRecord:
-        """Mint the next attempt for *key* and persist it PENDING.
-
-        The attempt bumps past any prior stored record, so a legitimate re-send
-        (a close re-closed after a partial fill) gets a NEW cOID and IBKR's own
-        dedupe cannot swallow it.
-        """
-        existing = self.load(key)
-        attempt = next_attempt(existing)
-        record = IntentRecord(
-            key=key,
-            state=IntentState.PENDING,
-            attempt=attempt,
-            order_ref=order_ref(key, attempt),
-            order_id=None,
-            decision_ts=decision_ts,
-        )
-        self.save(record)
-        return record
-
-    def close(
-        self,
-        key: IntentKey,
-        state: IntentState,
-        order_id: str | None,
-        now: pd.Timestamp,
-    ) -> None:
-        """Stamp *state* (and *order_id* when known) on *key*'s record.
-
-        The stored ``order_id`` is only overwritten when a new one is supplied,
-        so an UNRESOLVED transition does not erase a known id. Keyed on the
-        identity columns (never the token), so a token collision cannot touch a
-        foreign row.
-        """
-        fields: dict[str, object] = {"state": state.value, "updated_at": _ms(now)}
-        if order_id is not None:
-            fields["order_id"] = order_id
-        with self._write():
-            LiveOrderIntent.update(**fields).where(
-                self._intent_predicate(key)
-            ).execute()
-
-    @staticmethod
-    def _intent_predicate(key: IntentKey):
-        """The peewee WHERE identifying one intent row (identity columns)."""
-        return (
-            (LiveOrderIntent.scope == key.scope)
-            & (LiveOrderIntent.symbol == key.symbol)
-            & (LiveOrderIntent.action == key.action.value)
-            & (LiveOrderIntent.position_id == (key.position_id or ""))
-        )
-
-    def prune(self, before: pd.Timestamp) -> int:
-        """Delete CLOSED intent rows older than *before*; return the count."""
-        with self._write():
-            return (
-                LiveOrderIntent.delete()
-                .where(
-                    (LiveOrderIntent.state << _CLOSED_INTENTS)
-                    & (LiveOrderIntent.updated_at < _ms(before))
-                )
-                .execute()
-            )
-
-
-class SqliteLedger(MetadataStore, BookStore, CashStore, IntentStore):
+class SqliteLedger(MetadataStore, BookStore, CashStore):
     """peewee-backed per-scope book. One database per ledger, bound on init.
 
     The ledger writes NO DDL, ever: construction writes nothing (a ``--dry-run``
@@ -635,30 +487,6 @@ def config_hash(config: Mapping[str, object]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _intent_fields(record: IntentRecord) -> dict[str, object]:
-    now = pd.Timestamp.now()
-    return {
-        "scope": record.key.scope,
-        "token": record.key.token(),
-        "symbol": record.key.symbol,
-        "action": record.key.action.value,
-        #: ``''`` (never SQL NULL) is the ``position_id`` stored for an open, so
-        #: the identity primary key stays total (a NULL would defeat its
-        #: uniqueness enforcement on SQLite).
-        "position_id": record.key.position_id or "",
-        "state": record.state.value,
-        "attempt": record.attempt,
-        "order_ref": record.order_ref,
-        "order_id": record.order_id,
-        "decision_ts": (
-            _ms(record.decision_ts) if record.decision_ts is not None else None
-        ),
-        "tif": record.tif,
-        "stuck_cycles": record.stuck_cycles,
-        "updated_at": _ms(now),
-    }
-
-
 def _audit_of(row: LiveStrategy) -> StrategyAudit:
     return StrategyAudit(
         strategy_id=cast("str", row.strategy_id),
@@ -666,26 +494,6 @@ def _audit_of(row: LiveStrategy) -> StrategyAudit:
         name=cast("str", row.name),
         created_at=_ts(cast("int | None", row.created_at)),
         last_cycle_at=_ts(cast("int | None", row.last_cycle_at)),
-    )
-
-
-def _model_to_intent(row: LiveOrderIntent) -> IntentRecord:
-    return IntentRecord(
-        key=IntentKey(
-            scope=cast("str", row.scope),
-            symbol=cast("str", row.symbol),
-            action=ActionType(cast("str", row.action)),
-            #: ``''`` round-trips to ``None``: an open's row stores ``''`` but the
-            #: in-memory key keeps ``position_id=None`` for equality with callers.
-            position_id=cast("str | None", row.position_id) or None,
-        ),
-        state=IntentState(cast("str", row.state)),
-        attempt=int(cast("int", row.attempt)),
-        order_ref=cast("str", row.order_ref),
-        order_id=cast("str | None", row.order_id),
-        decision_ts=_ts(cast("int | None", row.decision_ts)),
-        tif=cast("str", row.tif),
-        stuck_cycles=int(cast("int", row.stuck_cycles)),
     )
 
 

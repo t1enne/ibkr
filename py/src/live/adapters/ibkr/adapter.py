@@ -99,7 +99,6 @@ def build_ibkr_adapter(
         broker=IbkrBroker(
             client,
             scope=scope,
-            intents=ledger,
             params=exec_params_of(cfg),
             exposure=ledger,
             dry_run=dry_run,

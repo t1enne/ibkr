@@ -21,7 +21,6 @@ import pandas as pd
 
 from src.bt.state import ActionType
 from src.exec.types import OrderSide
-from src.live.identity import IntentRecord
 from src.live.pure import OrderResult
 from src.live.types import ExecutionRecord
 
@@ -36,22 +35,6 @@ class FillWrite:
     """Insert one derived fill, keyed so a re-plan is a no-op."""
 
     record: ExecutionRecord
-
-
-#: The attempt of the FIRST order an intent ever places. A re-send bumps past the
-#: stored attempt, so a fresh key (or a pruned row) restarts here.
-FIRST_ATTEMPT = 0
-
-
-def next_attempt(existing: IntentRecord | None) -> int:
-    """The attempt the next order for an intent mints: one past the stored record.
-
-    Pure, so "a re-send never reuses an attempt" (and therefore never reuses a
-    cOID) is testable without a store. ``None`` is a key with no stored record —
-    an unwritten intent, or one whose terminal row was pruned — which starts over
-    at :data:`FIRST_ATTEMPT`.
-    """
-    return FIRST_ATTEMPT if existing is None else existing.attempt + 1
 
 
 def plan_result_writes(
@@ -148,10 +131,8 @@ def _cash_delta(side: OrderSide, qty: float, price: float, commission: float) ->
 
 
 __all__ = [
-    "FIRST_ATTEMPT",
     "FillWrite",
     "commission_of",
     "execution_cash_delta",
-    "next_attempt",
     "plan_result_writes",
 ]
