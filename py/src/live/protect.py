@@ -150,9 +150,7 @@ def _child(
 def _reduce_side(entry_action: ActionType) -> ActionType:
     """The side a reduce leg of an entry trades: a long exits via a short, a
     short via a long."""
-    return (
-        ActionType.short if entry_action is ActionType.long else ActionType.long
-    )
+    return ActionType.short if entry_action is ActionType.long else ActionType.long
 
 
 def _lot_time(entry: OrderIntent) -> pd.Timestamp:
@@ -316,11 +314,7 @@ def level_bracket_intents(
             continue  # equal/wider: ratchet, silent
         entry = _level_entry(signal, lot)
         conid = _lot_conid(signal.symbol, lot)
-        out.extend(
-            bracket_children(
-                entry, conid=conid, filled_qty=lot.qty, tif="GTC"
-            )
-        )
+        out.extend(bracket_children(entry, conid=conid, filled_qty=lot.qty, tif="GTC"))
     return tuple(out)
 
 
@@ -408,7 +402,7 @@ def _lot_conid(symbol: str, lot: Position) -> int:
     """
     try:
         return int(str(lot.position_id))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return synthetic_conid(symbol)
 
 

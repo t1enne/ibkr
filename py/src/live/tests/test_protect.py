@@ -16,7 +16,6 @@ from dataclasses import replace
 from typing import cast
 
 import pandas as pd
-import pytest
 
 from src.bt.state import ActionType, PortfolioState, Position, TradeSignal
 from src.exec.refs import scope_tag
@@ -99,10 +98,18 @@ def test_bracket_children_short_entry_reduces_by_buying() -> None:
 def test_protective_ref_distinct_per_level_stable_per_resend() -> None:
     # Same (lot, level) mints the same ref; a tightened level mints a NEW ref so
     # a REPLACE is never swallowed by the broker's cOID dedupe (F11).
-    a = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0)
-    a2 = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0)
-    b = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=90.0)
-    tp = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="take_profit", level=108.0)
+    a = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0
+    )
+    a2 = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0
+    )
+    b = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=90.0
+    )
+    tp = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="take_profit", level=108.0
+    )
     assert a == a2  # re-send of the same level: stable
     assert a != b  # tightened stop: distinct
     assert a != tp  # distinct per kind
@@ -113,36 +120,56 @@ def test_protective_ref_distinct_per_level_stable_per_resend() -> None:
 def test_protective_ref_is_lot_anchored_not_clock_or_bar() -> None:
     # A different lot (its own fill time) must mint a different ref; the wall
     # clock and the decision bar must NEVER enter the identity.
-    other_lot = TS + pd.Timedelta(minutes=5)
-    a = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0)
-    b = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=other_lot, kind="stop", level=92.0)
+    other_lot = cast("pd.Timestamp", TS + pd.Timedelta(minutes=5))
+    a = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0
+    )
+    b = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=other_lot, kind="stop", level=92.0
+    )
     assert a != b
     # Same lot, re-sent an hour later (a re-send after a crash): still the same ref.
-    resend = protective_ref(TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0)
+    resend = protective_ref(
+        TAG, symbol="AAPL", conid=CONID, anchor=TS, kind="stop", level=92.0
+    )
     assert a == resend
 
 
 # --- resting_bracket --------------------------------------------------------
 
 
+def _pop_str(kwargs: dict[str, object], key: str, default: str) -> str:
+    return str(kwargs.pop(key, default))
+
+
+def _pop_float(kwargs: dict[str, object], key: str, default: float) -> float:
+    value = kwargs.pop(key, None)
+    return float(cast("float", value)) if value is not None else default
+
+
 def _working(ref: str, *args: object, **kwargs: object) -> WorkingOrder:
+    k: dict[str, object] = dict(kwargs)
     return WorkingOrder(
         order_ref=str(ref),
-        order_id=str(kwargs.pop("order_id", "1")),
-        conid=int(kwargs.pop("conid", CONID)),
-        symbol=str(kwargs.pop("symbol", "AAPL")),
-        side=str(kwargs.pop("side", "SELL")),
-        status=str(kwargs.pop("status", "Submitted")),
-        filled_qty=float(kwargs.pop("filled_qty", 0.0)),
-        order_type=str(kwargs.pop("order_type", "")),
-        level=cast("float | None", kwargs.pop("level", None)),
+        order_id=_pop_str(k, "order_id", "1"),
+        conid=int(_pop_str(k, "conid", str(CONID))),
+        symbol=_pop_str(k, "symbol", "AAPL"),
+        side=_pop_str(k, "side", "SELL"),
+        status=_pop_str(k, "status", "Submitted"),
+        filled_qty=_pop_float(k, "filled_qty", 0.0),
+        order_type=_pop_str(k, "order_type", ""),
+        level=cast("float | None", k.pop("level", None)),
     )
 
 
 def _real_bracket() -> tuple[WorkingOrder, WorkingOrder]:
     """The two legs of the captured ``gateway_bracket_working.json``."""
-    sl = _working(f"{TAG}-11111111", order_id="463681097", order_type="Stop", level=92.10)
-    tp = _working(f"{TAG}-22222222", order_id="463681098", order_type="Limit", level=108.0)
+    sl = _working(
+        f"{TAG}-11111111", order_id="463681097", order_type="Stop", level=92.10
+    )
+    tp = _working(
+        f"{TAG}-22222222", order_id="463681098", order_type="Limit", level=108.0
+    )
     return sl, tp
 
 
@@ -238,9 +265,15 @@ def test_level_intents_empty_for_a_flat_symbol() -> None:
 def test_level_intents_refuse_a_widening_level_ratchet_never_widens() -> None:
     lot = _lot()
     lot = Position(
-        symbol=lot.symbol, qty=lot.qty, entry_price=100.0, entry_time=TS,
-        stop_loss=92.0, take_profit=108.0, last_price=100.0,
-        type=ActionType.long, position_id=lot.position_id,
+        symbol=lot.symbol,
+        qty=lot.qty,
+        entry_price=100.0,
+        entry_time=TS,
+        stop_loss=92.0,
+        take_profit=108.0,
+        last_price=100.0,
+        type=ActionType.long,
+        position_id=lot.position_id,
     )
     # A LONG's stop may only move UP (tighter); 90.0 is a widening -> silent.
     assert level_bracket_intents("cfg.json", _view(lot), (_update(90.0, 108.0),)) == ()
@@ -249,9 +282,15 @@ def test_level_intents_refuse_a_widening_level_ratchet_never_widens() -> None:
 def test_level_intents_emit_a_tightening_level() -> None:
     lot = _lot()
     lot = Position(
-        symbol=lot.symbol, qty=lot.qty, entry_price=100.0, entry_time=TS,
-        stop_loss=92.0, take_profit=108.0, last_price=100.0,
-        type=ActionType.long, position_id=lot.position_id,
+        symbol=lot.symbol,
+        qty=lot.qty,
+        entry_price=100.0,
+        entry_time=TS,
+        stop_loss=92.0,
+        take_profit=108.0,
+        last_price=100.0,
+        type=ActionType.long,
+        position_id=lot.position_id,
     )
     intents = level_bracket_intents("cfg.json", _view(lot), (_update(95.0, 108.0),))
     assert intents

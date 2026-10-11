@@ -32,12 +32,12 @@ from src.bt.state import ActionType, PortfolioState, Position
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
 from src.live.adapters.sim.protect import (
+    _order_id_of,
     apply_bracket,
     fire_stops,
-    resting_rows,
 )
 from src.live.adapters.sim.store import SimBook, SimBookStore, synthetic_conid
-from src.live.protect import bracket_children, child_ref
+from src.live.protect import bracket_children
 from src.live.pure import OrderResult, sim_place_cohort
 from src.live.pure_plan import _cash_delta
 from src.live.ledger import LedgerReadError, SqliteLedger
@@ -95,8 +95,26 @@ class SimAdapter:
         )
 
     async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]:
-        """Nothing to reconcile: a sim fill is settled in the cycle that placed it."""
-        return Ok(())
+        """Fire the sim broker's own resting stops whose level the mark has breached.
+
+        The sim's (coarse) stand-in for the resting-stop clock: a stop fires only
+        when a cycle observes a mark past its level (see ``sim.protect``). The
+        fired fill is booked into the account book by the broker itself — lot
+        reduced, cash moved by the shared signed rule, trade appended, OCA sibling
+        cancelled — and the result is REPORTED so the cycle records the close.
+        """
+        book = self.store.read(self.scope)
+        results, updated = fire_stops(
+            book,
+            scope_tag=scope_tag(self.scope),
+            params=exec_params_of(self.config),
+            exchange=self.exchange,
+            seed_cash=self.ledger.cash_of(self.scope, self.config.initial_capital),
+            log=self.log,
+        )
+        if results:
+            self.store.write(self.scope, updated)
+        return Ok(results)
 
     async def place(
         self, book: PortfolioState, intent: OrderIntent
@@ -126,9 +144,11 @@ class SimAdapter:
             )
         if not intents:
             return Ok(())
+        protective = tuple(i for i in intents if i.protective)
+        entries = tuple(i for i in intents if not i.protective)
         _settled, results = sim_place_cohort(
             book,
-            intents,
+            entries,
             exec_params_of(self.config),
             self.exchange,
             self.log,
@@ -143,11 +163,110 @@ class SimAdapter:
             self.log(
                 f"close {pid}: no account row to reduce; cash and trade not booked"
             )
-        return Ok(results)
+        protected = self._place_protection(results, protective)
+        return Ok(results + protected)
 
     async def close(self) -> Result[None, FeedError]:
         """Nothing to tear down: no session, no held book."""
         return Ok(None)
+
+    async def cancel_order(self, order_id: str) -> Result[None, FeedError]:
+        """Cancel one of OUR resting legs in the sim broker, confirming by re-read.
+
+        The sim store confirms by construction (a removal is immediately visible
+        to the next ``resting_rows`` read), so the confirming evidence is the
+        re-read showing the ``orderId`` absent — the same rule the IBKR edge
+        follows (a ``DELETE`` reply alone is never the confirmation).
+        """
+        book = self.store.read(self.scope)
+        remaining = tuple(r for r in book.orders if _order_id_of(r) != order_id)
+        if len(remaining) == len(book.orders):
+            return Err(
+                FeedError(
+                    kind="unresolved",
+                    message=(
+                        f"cancel {order_id}: order not found in the sim broker's "
+                        f"working read; whether it was cancelled is unknown"
+                    ),
+                )
+            )
+        self.store.write(self.scope, replace(book, orders=remaining))
+        return Ok(None)
+
+    def _place_protection(
+        self, results: tuple[OrderResult, ...], protective: tuple[OrderIntent, ...]
+    ) -> tuple[OrderResult, ...]:
+        """Place the OCA pair for each confirmed entry, plus any level update.
+
+        The pair is minted from the CONFIRMED fill (never the planned qty) with
+        its ref anchored on the lot's own fill time, and written into the sim
+        broker's working-orders surface — so ``resting_rows`` reads it back and
+        the REPLACE diff sees it. Protective intents that arrive already minted
+        (a level tighten from ``level_bracket_intents``) are placed the same way,
+        anchored on the lot's own ``decision_ts``.
+        """
+        book = self.store.read(self.scope)
+        placed: list[OrderResult] = []
+        for result in results:
+            if (
+                not result.ok
+                or result.fill is None
+                or result.fill.signal.action is ActionType.close
+            ):
+                continue
+            intent = result.intent
+            children = bracket_children(
+                intent,
+                conid=synthetic_conid(intent.symbol),
+                filled_qty=result.fill.filled_qty,
+            )
+            if not children:
+                continue
+            placed.extend(
+                self._apply_pair(
+                    book,
+                    children,
+                    anchor=result.fill.timestamp,
+                )
+            )
+            book = self.store.read(self.scope)
+        for intent in protective:
+            if intent.position_side is None:
+                continue
+            anchor = (
+                intent.decision_ts
+                if intent.decision_ts is not None
+                else cast("pd.Timestamp", pd.Timestamp(0))
+            )
+            placed.extend(
+                self._apply_pair(
+                    book,
+                    (intent,),
+                    anchor=anchor,
+                )
+            )
+            book = self.store.read(self.scope)
+        return tuple(placed)
+
+    def _apply_pair(
+        self,
+        book: SimBook,
+        children: tuple[OrderIntent, ...],
+        *,
+        anchor: pd.Timestamp,
+    ) -> tuple[OrderResult, ...]:
+        """Write ONE OCA pair (or a lone leg) into the sim working-orders surface."""
+        symbol = children[0].symbol
+        results, updated = apply_bracket(
+            book,
+            children,
+            scope_tag=scope_tag(self.scope),
+            conid=synthetic_conid(symbol),
+            anchor=anchor,
+            log=self.log,
+        )
+        self.store.write(self.scope, updated)
+        return results
 
 
 def build_account_book(

@@ -218,13 +218,21 @@ def _validate_protective(intent: OrderIntent) -> None:
             f"(position_side unset)"
         )
     if intent.order_type is OrderType.STP:
-        if intent.stop_loss is None or not math.isfinite(intent.stop_loss) or intent.stop_loss <= 0:
+        if (
+            intent.stop_loss is None
+            or not math.isfinite(intent.stop_loss)
+            or intent.stop_loss <= 0
+        ):
             raise OrderMappingError(
                 f"{intent.symbol}: protective STP requires stop_loss finite and > 0, "
                 f"got {intent.stop_loss!r}"
             )
     elif intent.order_type is OrderType.LMT:
-        if intent.take_profit is None or not math.isfinite(intent.take_profit) or intent.take_profit <= 0:
+        if (
+            intent.take_profit is None
+            or not math.isfinite(intent.take_profit)
+            or intent.take_profit <= 0
+        ):
             raise OrderMappingError(
                 f"{intent.symbol}: protective LMT requires take_profit finite and > 0, "
                 f"got {intent.take_profit!r}"
@@ -268,7 +276,9 @@ def build_ticket(
     }
     if intent.protective:
         body["price"] = (
-            intent.stop_loss if intent.order_type is OrderType.STP else intent.take_profit
+            intent.stop_loss
+            if intent.order_type is OrderType.STP
+            else intent.take_profit
         )
     return Ticket(
         order_ref=order_ref,

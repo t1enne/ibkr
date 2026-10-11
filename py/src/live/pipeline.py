@@ -121,7 +121,7 @@ async def run_cycle(
         placed = await execute_cohort(adapter, pf.portfolio, intents, dry_run)
         results, placement_error = _merge(resync_results, placed)
         if not dry_run:
-            _persist(ledger, adapter, scope, placed, strategy_id, now_ts)
+            _persist(ledger, adapter, scope, results, strategy_id, now_ts)
         await adapter.close()
     return CycleReport(
         as_of=now_ts,
@@ -181,17 +181,21 @@ def _persist(
     ledger: CycleLedger,
     adapter: LiveAdapter,
     scope: str,
-    placed: Result[tuple[OrderResult, ...], FeedError],
+    results: tuple[OrderResult, ...],
     strategy_id: str,
     now_ts: pd.Timestamp,
 ) -> None:
     """The cycle's durable writes, in order: results, audit stamp.
 
-    Skipped entirely on a dry run (the caller never reaches here), so a read-only
-    cycle leaves the store byte-identical. No open-order housekeeping: the
-    broker's reads are the only open-state owner.
+    ``results`` is the CYCLE's full result set (resync-fired fills first, then
+    placement), so a sim broker's fired stop is recorded against our fold too —
+    on the sim path the account book and ``live_execution`` must advance
+    together or the next cycle's divergence oracle would scream at a stop it
+    never saw booked. Skipped entirely on a dry run (the caller never reaches
+    here), so a read-only cycle leaves the store byte-identical. No open-order
+    housekeeping: the broker's reads are the only open-state owner.
     """
-    _record(ledger, adapter, scope, placed, now_ts)
+    _record(ledger, adapter, scope, results, now_ts)
     ledger.touch_cycle(scope, now_ts)
 
 
@@ -242,20 +246,21 @@ def _record(
     ledger: CycleLedger,
     adapter: LiveAdapter,
     scope: str,
-    placed: Result[tuple[OrderResult, ...], FeedError],
+    results: tuple[OrderResult, ...],
     now_ts: pd.Timestamp,
 ) -> None:
-    """Record this cycle's placement results — only when the scope owns the book.
+    """Record the cycle's result set — only when the scope owns the book.
 
     An IBKR scope's book advances from the broker's own execution stream (the
     broker persists it), so recording placement results there would double-book;
     the sim account book has no such stream, so its results ARE the book's next
-    state. A cohort-level ``Err`` records nothing: the orders' true state is
-    unknown, and a recorded row would read as settled.
+    state. A cohort-level placement error is handled by the CALLER: the merged
+    ``results`` then carries only the resync-fired fills (each a known fill),
+    never an unknown placement row.
     """
-    if not adapter.owns_book or isinstance(placed, Err):
+    if not adapter.owns_book:
         return
-    ledger.record_results(scope, tuple(placed.value), now_ts)
+    ledger.record_results(scope, results, now_ts)
 
 
 def _merge(

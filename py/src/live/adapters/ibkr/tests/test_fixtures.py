@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -30,8 +31,9 @@ BASE = "https://localhost:5000/v1/api/"
 ACCOUNT = "DU452563"
 
 
-def _load(name: str) -> object:
-    return json.loads((_FIXTURES / name).read_text())
+def _load(name: str) -> dict[str, object]:
+    raw = json.loads((_FIXTURES / name).read_text())
+    return cast("dict[str, object]", raw)
 
 
 def test_stop_submit_challenge_fixture_classifies_as_confirm() -> None:
@@ -51,9 +53,17 @@ def test_stop_submit_confirmed_fixture_classifies_as_success() -> None:
     assert outcome.order_id == "463681097"
 
 
+def _rows(body: dict[str, object], key: str) -> list[dict[str, object]]:
+    return [
+        cast("dict[str, object]", r)
+        for r in cast("list[object]", body[key])
+        if isinstance(r, dict)
+    ]
+
+
 def test_bracket_working_fixture_parses_both_legs_with_wire_names() -> None:
     body = _load("gateway_bracket_working.json")
-    rows = body["orders"]
+    rows = _rows(body, "orders")
     stop = parse_working_order(rows[0])
     take = parse_working_order(rows[1])
     foreign = parse_working_order(rows[2])
@@ -72,8 +82,9 @@ def test_bracket_working_fixture_parses_both_legs_with_wire_names() -> None:
 
 def test_cancel_fixture_carries_order_id_and_absence_proof_shape() -> None:
     body = _load("gateway_cancel.json")
-    assert body["order"]["order_id"] == "463681097"
-    assert body["order"]["orderCancelSuccess"] is True
+    order = cast("dict[str, object]", body["order"])
+    assert order["order_id"] == "463681097"
+    assert order["orderCancelSuccess"] is True
     # The confirming evidence is the follow-up read (order absent), not the reply.
     assert body["orders_after_cancel"] == []
 

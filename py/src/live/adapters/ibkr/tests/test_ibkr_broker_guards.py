@@ -138,24 +138,29 @@ async def test_lmt_intent_is_refused_without_submitting() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_stop_carrying_open_is_refused_without_submitting() -> None:
-    # No resting stop exists on this adapter: an open that carries a stop must be
-    # refused, not sent naked with the levels silently dropped from the report.
+async def test_protective_child_without_a_proven_reduce_side_is_refused() -> None:
+    # SPEC step 3 (D4): an ENTRY carrying levels is admitted (the levels rest as
+    # protective children after the entry is confirmed filled — never on the
+    # entry ticket). What stays refused pre-flight is a PROTECTIVE child whose
+    # reduce side is unproven (F9: a just-filled lot is not in the seeded book,
+    # so the child carries its own ``position_side``; a child without one must
+    # never be sent with a guessed direction).
     intent = OrderIntent(
         symbol="AAPL",
-        action=ActionType.long,
+        action=ActionType.close,
         qty=1.0,
-        ref_price=100.0,
-        reason="open long (flat->long)",
+        ref_price=95.0,
+        reason="protect AAPL stop",
         stop_loss=95.0,
-        take_profit=110.0,
+        order_type=OrderType.STP,
+        protective=True,
+        position_side=None,
     )
 
     error = failure(await broker().place(intent))
 
     assert error.kind == "rejected"
-    assert "naked order" in error.message
-    assert "95.0" in error.message and "110.0" in error.message
+    assert "reduce side" in error.message
     assert len(respx.calls) == 0
 
 

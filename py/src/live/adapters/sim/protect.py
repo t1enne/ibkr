@@ -36,7 +36,7 @@ from src.exec.types import OrderSide, OrderType
 from src.live.adapters.ibkr.orders import parse_working_order
 from src.live.adapters.sim.store import SimBook, synthetic_conid
 from src.live.identity import OrderOutcome, WorkingOrder
-from src.live.pure import OrderResult, trade_signal
+from src.live.pure import OrderResult, ref_candle, trade_signal
 from src.live.pure_plan import _cash_delta
 from src.live.protect import child_ref, kind_of, resting_bracket
 from src.live.types import OrderIntent
@@ -109,15 +109,19 @@ def resting_rows(
     edge uses (parity, never a forked read): the broker is the single source of
     truth for what rests.
     """
-    parsed = tuple(
-        w for w in (_to_working(r) for r in book.orders) if w is not None
-    )
+    parsed = tuple(w for w in (_to_working(r) for r in book.orders) if w is not None)
     return resting_bracket(parsed, scope_tag=scope_tag, conid=conid)
 
 
 def _to_working(row: object) -> WorkingOrder | None:
     """The shared parser over a sim-order row (they ARE the gateway's shape)."""
     return parse_working_order(row)
+
+
+def _order_id_of(row: Mapping[str, object]) -> str:
+    """The order id a sim order row carries (``orderId`` on the wire shape)."""
+    value = row.get("orderId")
+    return str(value) if value is not None else ""
 
 
 def apply_bracket(
@@ -209,7 +213,7 @@ def fire_stops(
     orders = [dict(r) for r in book.orders]
     cash_delta = 0.0
     results: list[OrderResult] = []
-    for row in orders:
+    for row in [r for r in orders if _to_working(r) is not None]:
         w = _to_working(row)
         if w is None or not w.order_ref.startswith(f"{scope_tag}-"):
             continue
@@ -221,25 +225,29 @@ def fire_stops(
         lot = _lot_row(positions, w)
         if lot is None:
             continue
-        if not _breached(lot["mark"], level, lot["long"]):
+        if not _breached(cast("float", lot["mark"]), level, cast("bool", lot["long"])):
             continue
         intent = _stop_intent(w, lot)
         at = pd.Timestamp.now(tz="UTC")
+        # The fired stop is a CLOSE the sim prices at the observed mark. The
+        # signal is built DIRECTLY (never via ``intent_to_signal``): a fired stop
+        # reduces a lot whose row this very pass zeroes, so re-resolving the side
+        # from the book would read ``None`` and settle a short cover as a SELL.
         fill = exchange.execute_signal(
             trade_signal(
                 symbol=intent.symbol,
                 action=ActionType.close,
-                price=lot["mark"],
+                price=cast("float", lot["mark"]),
                 qty=intent.qty,
                 ts=at,
                 reason="stop fired",
-                position_id=lot["position_id"],
+                position_id=cast("str", lot["position_id"]),
                 stop_loss=level,
                 position_side=(
-                    ActionType.long if lot["long"] else ActionType.short
+                    ActionType.long if cast("bool", lot["long"]) else ActionType.short
                 ),
             ),
-            ref_candle(lot["mark"], intent.symbol, at),
+            ref_candle(cast("float", lot["mark"]), intent.symbol, at),
             params,
         )
         # The OCA sibling is cancelled FIRST (invariant 6: nothing races the
@@ -247,17 +255,20 @@ def fire_stops(
         orders = [r for r in orders if not _is_sibling(r, w, scope_tag)]
         row["status"] = "Cancelled"
         row["order_ccp_status"] = "Cancelled"
-        row["filledQuantity"] = lot["qty"]
+        row["filledQuantity"] = cast("float", lot["qty"])
         row["remainingQuantity"] = 0.0
         orders = [row if r.get("orderId") == w.order_id else r for r in orders]
         _apply_stop_fill(positions, trades, lot, fill)
-        side = OrderSide.SELL if lot["long"] else OrderSide.BUY
+        # The ONE signed-cash rule (``pure_plan._cash_delta``): a long lot's
+        # stop is a SELL and CREDITS cash (net of fee), a short's cover BUYS and
+        # DEBITS. Same rule the entries' ``_write_back`` uses — never forked.
+        side = OrderSide.SELL if cast("bool", lot["long"]) else OrderSide.BUY
         cash_delta += _cash_delta(
             side, fill.filled_qty, fill.executed_price, fill.commission
         )
         message = (
             f"stop {intent.symbol} FIRED qty={fill.filled_qty:g} "
-            f"@ {lot['mark']:g} (level {level:g}); sibling cancelled"
+            f"@ {cast('float', lot['mark']):g} (level {level:g}); sibling cancelled"
         )
         log(message)
         results.append(
@@ -266,7 +277,7 @@ def fire_stops(
                 fill=fill,
                 ok=True,
                 message=message,
-                position_id=lot["position_id"],
+                position_id=cast("str", lot["position_id"]),
                 filled_qty=fill.filled_qty,
             )
         )
@@ -287,9 +298,7 @@ def fire_stops(
     )
 
 
-def _is_sibling(
-    row: Mapping[str, object], fired: WorkingOrder, scope_tag: str
-) -> bool:
+def _is_sibling(row: Mapping[str, object], fired: WorkingOrder, scope_tag: str) -> bool:
     """Whether *row* is the OTHER leg of *fired*'s bracket (same conid, ours)."""
     w = _to_working(row)
     if w is None or w.order_id == fired.order_id:
@@ -359,9 +368,7 @@ def _apply_stop_fill(
                 "execution_id": f"{pid}:stop",
                 "order_ref": "",
                 "symbol": fill.signal.symbol,
-                "conid": _num(row.get("conid")) or synthetic_conid(
-                    fill.signal.symbol
-                ),
+                "conid": _num(row.get("conid")) or synthetic_conid(fill.signal.symbol),
                 "side": "S" if cast("bool", lot["long"]) else "B",
                 "size": fill.filled_qty,
                 "price": fill.executed_price,
@@ -405,4 +412,11 @@ def _str(value: object, default: str = "") -> str:
     )
 
 
-__all__ = ["apply_bracket", "fire_stops", "leg_row", "resting_rows", "wire_side"]
+__all__ = [
+    "_order_id_of",
+    "apply_bracket",
+    "fire_stops",
+    "leg_row",
+    "resting_rows",
+    "wire_side",
+]
