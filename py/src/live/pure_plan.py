@@ -28,7 +28,7 @@ from src.live.types import ExecutionRecord
 if TYPE_CHECKING:
     # Type-only: ``src.live.adapters.ibkr`` imports this package's siblings, so a
     # runtime import here would close a cycle.
-    from src.live.adapters.ibkr.trades import Execution
+    from src.live.types import Execution
 
 
 @dataclass(frozen=True)

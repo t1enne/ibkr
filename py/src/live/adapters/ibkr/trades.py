@@ -8,6 +8,12 @@ the broker's ``order_id``, ``size``, ``price``, ``commission`` and
 rows plus the confirmation window and returns the advanced book, so the caller
 (an edge) owns the sqlite read/write.
 
+The book VOCABULARY — ``Execution`` / ``BookRow`` / ``StrategyBook`` / ``is_ours``
+— lives in ``src.live.types``: the durable book layer (``ledger``,
+``divergence``) folds and reads it without depending on one adapter package.
+This module is the IBKR-specific remainder: parse that window into ``Execution``
+objects (``mapping``) and fold them into the scope's book.
+
 Rules (plan §3):
 
 - **Ours** = the execution's ``order_ref`` scope segment equals ``scope_tag(scope)``
@@ -29,85 +35,11 @@ Pure: no I/O, no clock. Input order does not matter (executions are applied in
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
-import pandas as pd
-
-from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
-
-#: Absolute quantity below which a net position is considered flat (float noise).
-_EPS = 1e-9
-
-
-@dataclass(frozen=True)
-class Execution:
-    """One broker execution: a single fill of a single order."""
-
-    execution_id: str
-    order_id: str
-    order_ref: str
-    conid: int
-    symbol: str
-    side: OrderSide
-    qty: float
-    price: float
-    commission: float
-    ts: pd.Timestamp
-    #: IBKR's per-execution reported account net (position) after this fill.
-    #: Diagnostics only — the book is advanced by our own fills, never by it.
-    account_position: float | None = None
-
-
-@dataclass(frozen=True)
-class BookRow:
-    """One scope-owned position keyed by conid; a closed one keeps ``closed_at``.
-
-    ``qty`` is absolute; the side lives on ``side``. Re-apply protection is the
-    ``StrategyBook.applied`` execution-id set, not anything on the row.
-    """
-
-    scope: str
-    conid: int
-    symbol: str
-    side: str  # "long" | "short"
-    qty: float
-    entry_price: float
-    opened_at: pd.Timestamp | None
-    closed_at: pd.Timestamp | None
-    stop_loss: float | None
-    take_profit: float | None
-    tag: str
-    order_ref: str
-
-    @property
-    def is_open(self) -> bool:
-        return self.closed_at is None and self.qty > _EPS
-
-
-@dataclass(frozen=True)
-class StrategyBook:
-    """The durable rows for one scope plus the applied-execution watermark set.
-
-    ``applied`` (execution ids already folded in) is what makes re-applying the
-    trades window a no-op; it is stored per scope so two scopes never share a
-    watermark.
-    """
-
-    rows: tuple[BookRow, ...] = ()
-    applied: frozenset[str] = frozenset()
-
-
-def is_ours(scope: str, execution: Execution) -> bool:
-    """Ownership: the ref's scope segment equals ``scope_tag(scope)`` exactly.
-
-    A ref is ``{scope_tag}-{token}-{attempt}`` and neither the token nor the
-    attempt contains a ``-``, so the scope segment is the ref minus its last two
-    segments. An exact match (not a prefix) keeps scope ``momentum`` from
-    claiming refs minted by ``momentum-v2`` / ``momentum-2``, and the
-    non-collapsing tag keeps ``momentum_v2`` from claiming ``momentum-v2``'s.
-    """
-    return execution.order_ref.rsplit("-", 2)[0] == scope_tag(scope)
+from src.live.types import BookRow, Execution, StrategyBook, is_ours
+from src.live.types import FLAT_QTY_EPS as _EPS
 
 
 def _signed(execution: Execution) -> float:
@@ -239,6 +171,8 @@ def reconcile(
 
 
 __all__ = [
+    # Re-exported from ``src.live.types``: the book vocabulary lives there, and
+    # keeping it importable here spares every IBKR-side caller a second import.
     "BookRow",
     "Execution",
     "StrategyBook",

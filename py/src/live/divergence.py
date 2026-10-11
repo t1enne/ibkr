@@ -33,9 +33,8 @@ from typing import Literal, cast
 import pandas as pd
 
 from src.bt.state import ActionType, PortfolioState, Position
-from src.live.adapters.ibkr.trades import BookRow
 from src.live.ledger_base import LedgerReadError
-from src.live.types import ExecutionRecord
+from src.live.types import BookRow, ExecutionRecord
 
 #: Signed-quantity difference below which two books count as the same lot size.
 #: Loose enough to absorb float summation noise over a long fill history; tight

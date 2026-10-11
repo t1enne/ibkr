@@ -49,7 +49,7 @@ from src.bt.state import ActionType
 from src.db.path import resolve_live_db_path
 from src.exec.refs import scope_tag
 
-from src.live.adapters.ibkr.trades import Execution, StrategyBook
+from src.live.types import Execution, StrategyBook
 from src.live.identity import (
     OPEN_STATES,
     IntentKey,

@@ -287,6 +287,27 @@ def estimate_open_commission(
     )
 
 
+def cohort_cash_scale(requested: float, budget: float) -> Optional[float]:
+    """The ONE shared pre-execution cash scale for a multi-open cohort.
+
+    ``requested`` is the cohort's friction-adjusted notional and ``budget`` the
+    cash left after its commission reserve. Returns the factor every open's qty
+    is multiplied by, or ``None`` when nothing must be scaled: a cohort that
+    already fits, a NaN/unpriced side, or a budget at or below zero. The
+    below-zero case is deliberately UNSCALED here — the cohort stays at plan
+    size so each open is refused individually by the genuine cash-exhaustion
+    guard (a re-mintable rejection), never silently reduced to nothing.
+
+    Live edges call this too (``adapters.ibkr.orders.scale_open_cohort``) so the
+    scale decision cannot drift from the backtest's; the whole-share floor on a
+    scaled qty is the live-only tail that stays at the edge.
+    """
+    if requested <= 0 or budget <= 0:
+        return None
+    scale = min(1.0, budget / requested)
+    return None if scale >= 1.0 else scale
+
+
 def _scale_opens(
     portfolio: PortfolioState, opens: tuple[FillEvent, ...], model: CommissionModel
 ) -> tuple[tuple[FillEvent, ...], Optional[ScaleRecord]]:
@@ -314,10 +335,8 @@ def _scale_opens(
     budget = portfolio.cash - commission
     # ``budget / requested`` is NaN when either side is NaN; ``min(1.0, nan)``
     # keeps 1.0, so a NaN cohort falls through to the unscaled return below.
-    if requested <= 0 or budget <= 0:
-        return opens, None
-    scale = min(1.0, budget / requested)
-    if scale >= 1.0:
+    scale = cohort_cash_scale(requested, budget)
+    if scale is None:
         return opens, None
     scaled = tuple(
         replace(

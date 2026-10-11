@@ -11,7 +11,8 @@ import pandas as pd
 import pytest
 
 from src.bt.exchange import execute_signal
-from src.bt.state import ActionType, ExecutionParams
+from src.bt.portfolio.pure import _scale_opens
+from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.exec.types import (
     FixedCommission,
     OrderSide,
@@ -375,6 +376,60 @@ def _probe_fills(
         )
         for sym in symbols
     )
+
+
+def _bound_portfolio(cash: float) -> PortfolioState:
+    """A flat book holding exactly the cohort's shared cash bound."""
+    return PortfolioState(
+        cash=cash,
+        positions={},
+        trades=(),
+        equity_curve=(),
+        initial_capital=cash,
+    )
+
+
+def test_live_scale_matches_the_backtest_rule() -> None:
+    """Parity: the live edge and ``_scale_opens`` take ONE scale decision.
+
+    Same cohort, same cash bound, same priced fills — the live factor, the
+    requested notional and the budget must equal the backtest's, so a live
+    over-cash cohort can never be scaled more (or less) than the same cohort in
+    a backtest.
+    """
+    symbols = ("AAPL", "MSFT")
+    bound = 15000.0
+    fills = _probe_fills(symbols, 100.0, bound, _FLAT_PARAMS)
+    _, record = _scale_opens(
+        _bound_portfolio(bound), fills, _FLAT_PARAMS.commission_model
+    )
+    plan = scale_open_cohort(
+        tuple(_open(s, 100.0, 100.0, bound) for s in symbols), _FLAT_PARAMS
+    )
+    assert record is not None and plan.scale is not None
+    assert plan.scale.scale == pytest.approx(record.scale)
+    assert plan.scale.requested == pytest.approx(record.requested)
+    assert plan.scale.budget == pytest.approx(record.budget)
+
+
+def test_under_funded_cohort_is_unscaled_on_both_paths() -> None:
+    """A budget at/below the commission reserve scales NOTHING on either side.
+
+    The backtest leaves the cohort at plan size (each open then refuses on
+    genuine cash exhaustion); the live edge must match, not rescale every qty
+    to zero and drop the cohort as ``unfunded`` — an unsafe classification for
+    what is really a re-mintable rejection.
+    """
+    params = ExecutionParams(
+        spread_bps=0.0, slippage_bps=0.0, commission_model=FixedCommission(1.0)
+    )
+    intents = (_open("AAPL", 100.0, 100.0, 1.0), _open("MSFT", 100.0, 100.0, 1.0))
+    fills = _probe_fills(("AAPL", "MSFT"), 100.0, 1.0, params)
+    scaled, record = _scale_opens(_bound_portfolio(1.0), fills, params.commission_model)
+    plan = scale_open_cohort(intents, params)
+    assert record is None and scaled == fills
+    assert plan.scale is None and plan.dropped == ()
+    assert plan.intents == intents
 
 
 def _working(order_ref: str, order_id: str, filled_qty: float = 0.0) -> WorkingOrder:

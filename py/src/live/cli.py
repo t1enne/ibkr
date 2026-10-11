@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Literal, TextIO, cast
+from typing import Any, Literal, TextIO, cast, get_args
 
 import click
 import pandas as pd
@@ -73,7 +73,10 @@ _SIZE_MODES = frozenset({"equity", "cash", "fixed"})
 #: The keys ``StrategyConfig`` itself defines — everything else is a live-only key.
 _STRATEGY_FIELDS = frozenset(f.name for f in fields(StrategyConfig))
 #: Adapters ``--adapter`` accepts. Phase 2 ships ``ibkr`` read-only.
-_ADAPTERS = ("sim", "ibkr")
+_ADAPTERS = get_args(AdapterName)
+#: The same vocabulary, DERIVED from its ONE definition (``scope.AdapterName``):
+#: a second literal list would let a name be accepted by one layer and rejected
+#: by another.
 
 #: A sleep seam so a watch loop's cadence is injectable in tests (never slept
 #: through the wall clock). ``time.sleep`` is the production default.

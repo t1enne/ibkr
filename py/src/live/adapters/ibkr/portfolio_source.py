@@ -32,7 +32,13 @@ from src.live.adapters.ibkr.mapping import (
 from src.live.adapters.ibkr.trades import BookRow, reconcile
 from src.live.ledger import SqliteLedger, execution_cash_delta
 from src.live.result import Err, Ok, Result
-from src.live.types import FeedError, PortfolioSnapshot, feed_error
+from src.live.types import (
+    Execution,
+    FeedError,
+    PortfolioSnapshot,
+    StrategyBook,
+    feed_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +110,8 @@ class IbkrPortfolioSource:
     """``PortfolioSource`` over the gateway: summary (display) + our scope book.
 
     The book advances from the trades window via ``trades.reconcile`` and is
-    persisted to the scope's sqlite rows. A dry run persists nothing.
+    persisted to the scope's sqlite rows (``_persist_advanced_book``). A dry run
+    persists nothing.
     """
 
     owns_book = False
@@ -128,8 +135,26 @@ class IbkrPortfolioSource:
         self._dry_run = dry_run
         self._now = now
 
+    def _persist_advanced_book(
+        self, advanced: StrategyBook, executions: tuple[Execution, ...]
+    ) -> None:
+        """Fold this window's fills into the DURABLE book — the one write in a read.
+
+        ``read_book`` is therefore not side-effect-free (``LiveAdapter.read_book``
+        documents the seam's contract): the advanced rows, the execution rows and
+        the scope's cash all move together. A dry run writes nothing, which the
+        caller then compensates for in memory.
+        """
+        if self._dry_run:
+            return
+        self._ledger.save_book(self._scope, advanced, executions, self._initial_capital)
+
     async def fetch(self) -> Result[PortfolioSnapshot, FeedError]:
-        """Read summary/positions/trades; advance + persist the scope's book."""
+        """Read summary/positions/trades; ADVANCE + persist the scope's book.
+
+        The persist is a real write despite the read-shaped name — see
+        ``LiveAdapter.read_book`` for why the seam's contract says so.
+        """
         try:
             summary_raw = await self._client.portfolio_summary(self._account)
             positions_raw = await self._client.positions_all(self._account)
@@ -144,10 +169,7 @@ class IbkrPortfolioSource:
         book = self._ledger.load_book(self._scope)
         advanced, reconcile_warnings = reconcile(self._scope, executions, book)
         new_ids = advanced.applied - book.applied
-        if not self._dry_run:
-            self._ledger.save_book(
-                self._scope, advanced, executions, self._initial_capital
-            )
+        self._persist_advanced_book(advanced, executions)
 
         seed = self._ledger.initial_capital_of(self._scope) or self._initial_capital
         cash = self._ledger.cash_of(self._scope, self._initial_capital)

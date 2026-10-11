@@ -28,7 +28,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 #: The operator settings file (read at import, like the sqlite paths).
 CONFIG_PATH = Path(os.environ.get(_CONFIG_PATH_ENV) or _ROOT / "config.toml")
 
-#: Adapters a live run may name.
+#: Adapters a live run may name. The runtime vocabulary LITERAL cannot be
+#: imported here — this module is a leaf (imports nothing from ``src.*``, by
+#: design) — so it is duplicated ONCE and pinned by a test against the ONE
+#: typing definition, ``src.live.scope.AdapterName``.
 _ADAPTERS = ("ibkr", "sim")
 
 #: Used when the file, the table or the key is absent — the file is an override

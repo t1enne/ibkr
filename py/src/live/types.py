@@ -18,10 +18,19 @@ import pandas as pd
 from src.bt.state import ActionType, ExecutionParams, PortfolioState
 from src.bt.state import PortfolioView as PortfolioView  # re-exported live vocabulary
 
-__all__ = ["ExecutionRecord", "StrategyAudit", "synthetic_conid"]
+__all__ = [
+    "BookRow",
+    "Execution",
+    "ExecutionRecord",
+    "StrategyAudit",
+    "StrategyBook",
+    "is_ours",
+    "synthetic_conid",
+]
 from src.bt.state.factories import build_commission_model, create_execution_params
 from src.config import live_adapter
-from src.exec.types import OrderType
+from src.exec.refs import scope_tag
+from src.exec.types import OrderSide, OrderType
 
 if TYPE_CHECKING:
     # Type-only: ``scope`` imports ``LiveConfig`` from here, so a runtime import
@@ -95,6 +104,84 @@ class ExecutionRecord:
 #: broker's own per-execution number (exact); ``modelled`` is the sim
 #: ``CommissionModel`` approximation.
 CostSource = Literal["broker_executions", "modelled"]
+
+
+#: Absolute quantity below which a book lot is considered flat (float noise).
+FLAT_QTY_EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class Execution:
+    """One broker execution: a single fill of a single order.
+
+    Broker-agnostic by construction — an IBKR trade row or a sim fill parse into
+    this shape, so the durable book layer never depends on one adapter package.
+    """
+
+    execution_id: str
+    order_id: str
+    order_ref: str
+    conid: int
+    symbol: str
+    side: OrderSide
+    qty: float
+    price: float
+    commission: float
+    ts: pd.Timestamp
+    #: The broker's per-execution reported account net (position) after this
+    #: fill. Diagnostics only — the book is advanced by OUR fills, never by it.
+    account_position: float | None = None
+
+
+@dataclass(frozen=True)
+class BookRow:
+    """One scope-owned position keyed by conid; a closed one keeps ``closed_at``.
+
+    ``qty`` is absolute; the side lives on ``side``. Re-apply protection is the
+    ``StrategyBook.applied`` execution-id set, not anything on the row.
+    """
+
+    scope: str
+    conid: int
+    symbol: str
+    side: str  # "long" | "short"
+    qty: float
+    entry_price: float
+    opened_at: pd.Timestamp | None
+    closed_at: pd.Timestamp | None
+    stop_loss: float | None
+    take_profit: float | None
+    tag: str
+    order_ref: str
+
+    @property
+    def is_open(self) -> bool:
+        return self.closed_at is None and self.qty > FLAT_QTY_EPS
+
+
+@dataclass(frozen=True)
+class StrategyBook:
+    """The durable rows for one scope plus the applied-execution watermark set.
+
+    ``applied`` (execution ids already folded in) is what makes re-applying the
+    trades window a no-op; it is stored per scope so two scopes never share a
+    watermark.
+    """
+
+    rows: tuple[BookRow, ...] = ()
+    applied: frozenset[str] = frozenset()
+
+
+def is_ours(scope: str, execution: Execution) -> bool:
+    """Ownership: the ref's scope segment equals ``scope_tag(scope)`` exactly.
+
+    A ref is ``{scope_tag}-{token}-{attempt}`` and neither the token nor the
+    attempt contains a ``-``, so the scope segment is the ref minus its last two
+    segments. An exact match (not a prefix) keeps scope ``momentum`` from
+    claiming refs minted by ``momentum-v2`` / ``momentum-2``, and the
+    non-collapsing tag keeps ``momentum_v2`` from claiming ``momentum-v2``'s.
+    """
+    return execution.order_ref.rsplit("-", 2)[0] == scope_tag(scope)
 
 
 @dataclass(frozen=True)

@@ -1,10 +1,21 @@
 """The ONE adapter seam: ``LiveAdapter`` plus its name resolution and dispatch.
 
 ``PortfolioSource`` + ``LiveBroker`` were two seams describing one thing — the
-backend a cycle trades through. They collapse here. Both adapters are STATELESS:
-the fetched book travels as a PARAMETER into ``place``/``place_cohort`` and the
-settled book leaves as the RETURNED results, so nothing mutable lives on the
-object. The durable book is sqlite (``live_execution`` + ``live_strategy``).
+backend a cycle trades through. They collapse here. An adapter holds NO state
+across cycles: the fetched book travels as a PARAMETER into
+``place``/``place_cohort`` and the settled book leaves as the RETURNED results,
+so nothing mutable outlives one cycle. The durable book is sqlite
+(``live_execution`` + ``live_strategy``).
+
+Two honest qualifications, both load-bearing:
+
+- ``read_book`` is not a pure read (see ``LiveAdapter.read_book``): an adapter
+  whose book is derived from the backend's execution stream persists the
+  advanced rows during the read.
+- The ibkr broker keeps a per-cycle ``_book``/``_conid_cache`` seeded from the
+  fetched book. It is correct because the instance is built per cycle, but
+  "stateless" describes the NET effect, not the object — a long-lived instance
+  must not be reused across cycles.
 
 ``run_cycle`` depends only on this Protocol; the concrete adapters live in
 ``adapters/sim`` and ``adapters/ibkr`` and are reached through
@@ -14,7 +25,7 @@ object. The durable book is sqlite (``live_execution`` + ``live_strategy``).
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Protocol, cast
+from typing import Protocol, cast, get_args
 
 from src.bt.state import PortfolioState
 from src.config import live_adapter
@@ -27,8 +38,13 @@ from src.live.result import Result
 from src.live.scope import AdapterName
 from src.live.types import FeedError, LiveConfig, OrderIntent, PortfolioSnapshot
 
-#: Every adapter name a scope may name, in one place (the validator's domain).
-_ADAPTER_NAMES: tuple[str, ...] = ("ibkr", "sim")
+#: Every adapter name a scope may name — DERIVED from the ONE typing definition
+#: (``src.live.scope.AdapterName``), never a second literal list that can drift.
+_ADAPTER_NAMES: tuple[str, ...] = get_args(AdapterName)
+
+#: Key absent from both sources (as opposed to a key present with value ``None``,
+#: which is a bad value, not an absent one).
+_ABSENT: object = object()
 
 
 class LiveAdapter(Protocol):
@@ -39,7 +55,13 @@ class LiveAdapter(Protocol):
     recorded as owning are closable; ``False``: the book ALREADY holds only this
     scope's lots, so every lot in it is ours).
 
-    ``read_book`` builds a fresh snapshot per call — never a cache. ``place`` and
+    ``read_book`` builds a fresh snapshot per call — never a cache. It is the
+    cycle's BOOK ADVANCE, not a pure read: an adapter whose book is DERIVED from
+    the backend's own execution stream (ibkr) folds that window into the scope's
+    durable rows and PERSISTS them here, so a caller must not replay it as
+    though it were side-effect-free (safe to repeat — the applied-execution
+    watermark makes a re-fold a no-op — but not free). ``dry_run`` MUST suppress
+    that write; the dry-run contract is asserted per adapter. ``place`` and
     ``place_cohort`` are pure over ``(book, intents)`` plus edge I/O, and RETURN
     their results rather than storing a settled book: the engine records them.
     ``resync`` reconciles the backend's durable OPEN-order state at cycle start
@@ -55,7 +77,9 @@ class LiveAdapter(Protocol):
     @property
     def owns_book(self) -> bool: ...
 
-    async def read_book(self) -> Result[PortfolioSnapshot, FeedError]: ...
+    async def read_book(self) -> Result[PortfolioSnapshot, FeedError]:
+        """The cycle's book advance; an ADVANCING adapter persists rows here."""
+        ...
 
     async def resync(self) -> Result[tuple[OrderResult, ...], FeedError]: ...
 
@@ -82,13 +106,21 @@ def resolve_adapter_name(
     top-level first, then ``strategy_params`` — then ``config.toml``'s
     ``[live] adapter`` (see :func:`src.config.live_adapter`). An unknown winner
     is a config error (``ValueError``), never a silent fallback to the default:
-    a typo'd adapter must not trade on the wrong side.
+    a typo'd adapter must not trade on the wrong side. An explicit ``null`` for
+    ``adapter``/``broker`` is a bad VALUE, not an unset key, and raises too.
     """
     winner: object = cli_flag
     if winner is None:
+        # ``_first_named`` returns ``_ABSENT`` when NO key is present and the
+        # key's own value (possibly ``None``) when one is.
         winner = _first_named(raw, params, ("adapter", "broker"))
-    if winner is None:
-        return cast("AdapterName", live_adapter())
+        if winner is _ABSENT:
+            return cast("AdapterName", live_adapter())
+        if winner is None:
+            raise ValueError(
+                f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got None "
+                "(an explicit null is a bad value, not an unset key)"
+            )
     if winner not in _ADAPTER_NAMES:
         raise ValueError(
             f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got {winner!r}"
@@ -121,17 +153,19 @@ def _first_named(
     raw: Mapping[str, object],
     params: Mapping[str, object],
     keys: tuple[str, ...],
-) -> object | None:
+) -> object:
     """The first value for the first of *keys* present, top-level before params.
 
     Key order is the precedence (``adapter`` before the back-compat ``broker``);
     within a key, the flat/top-level position wins over ``strategy_params``.
+    Returns :data:`_ABSENT` when no key is present anywhere — distinct from a key
+    present with a ``None`` value, which is a bad value the caller must reject.
     """
     for key in keys:
         for source in (raw, params):
             if key in source:
                 return source[key]
-    return None
+    return _ABSENT
 
 
 __all__ = ["LiveAdapter", "resolve_adapter", "resolve_adapter_name"]

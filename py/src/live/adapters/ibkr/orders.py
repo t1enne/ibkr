@@ -13,9 +13,10 @@ Three pure mappings live here, all table-tested and free of I/O:
   is keyed on the intent, never the batch position.
 - ``scale_open_cohort`` — the backtest's ONE shared cash scale applied to a live
   over-cash OPEN cohort (whole-share floor). It reserves the cohort's estimated
-  commission and requests at the friction-adjusted (executed) price, mirroring
-  ``src.bt.portfolio.pure._scale_opens`` exactly so the live scale never exceeds
-  the backtest's.
+  commission and requests at the friction-adjusted (executed) price, and takes
+  its scale decision from the SAME ``src.bt.portfolio.pure.cohort_cash_scale``
+  the backtest's ``_scale_opens`` calls, so the live scale can never exceed the
+  backtest's nor classify an over-cash cohort differently.
 - ``classify_reply`` — the reply-confirmation vocabulary: an order ticket's
   response is either a success carrying an ``order_id``, a reply message that must
   be *confirmed* through ``POST /iserver/reply/{replyId}``, or a refusal to abort
@@ -45,7 +46,11 @@ from typing import Literal, cast
 import pandas as pd
 
 from src.bt.exchange import execute_signal
-from src.bt.portfolio.pure import ScaleRecord, estimate_open_commission
+from src.bt.portfolio.pure import (
+    ScaleRecord,
+    cohort_cash_scale,
+    estimate_open_commission,
+)
 from src.bt.state import ActionType, ExecutionParams, FillEvent
 from src.exec.types import Fill, OrderSide, OrderState, OrderType
 from src.live.adapters.ibkr.mapping import canonical_order_id, num, opt_str
@@ -331,12 +336,15 @@ def scale_open_cohort(
     ``budget`` is the shared cash MINUS the cohort's estimated commission under
     the config's model. Subtracting the reserve is what keeps the live scale from
     exceeding the backtest's and stops the cohort deploying cash the commission
-    still needs. A budget at or below the reserve scales to zero, so the opens
-    are dropped (rejected) rather than sent. Two live-only consequences of orders
-    being whole shares: a scaled qty is FLOORED to whole shares (round-to-nearest
-    could resize it back UP past the budget), and one that floors to 0 shares is
-    DROPPED rather than sent as a 0-share order. An unprovable budget (opens
-    disagreeing on their bound) fails closed — every open is dropped, none sent.
+    still needs. A budget at or below the reserve returns NO scale (the shared
+    ``cohort_cash_scale`` decision), so the opens stay at plan size and the
+    per-intent cash guard refuses them individually as ``rejected`` — a
+    re-mintable outcome, never a silently scale-to-zero drop. Two live-only
+    consequences of orders being whole shares: a scaled qty is FLOORED to whole
+    shares (round-to-nearest could resize it back UP past the budget), and one
+    that floors to 0 shares is DROPPED rather than sent as a 0-share order. An
+    unprovable budget (opens disagreeing on their bound) fails closed — every
+    open is dropped, none sent.
     """
     opens = tuple(i for i in intents if i.action in (ActionType.long, ActionType.short))
     if len(opens) <= 1:
@@ -350,10 +358,11 @@ def scale_open_cohort(
         )
     commission, requested = _cohort_cost(opens, params)
     budget = cash - commission
-    if requested <= 0.0:
-        return CohortPlan(intents=intents, scale=None, dropped=())
-    scale = max(0.0, min(1.0, budget / requested))
-    if scale >= 1.0:
+    # The SHARED decision (backtest parity, never re-derived here): an
+    # under-funded budget yields no scale, so the opens stay at plan size for
+    # the per-intent cash guard to refuse individually.
+    scale = cohort_cash_scale(requested, budget)
+    if scale is None:
         return CohortPlan(intents=intents, scale=None, dropped=())
     scaled, dropped, members = _apply_scale(opens, scale)
     if not members:

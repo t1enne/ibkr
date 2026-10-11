@@ -68,8 +68,11 @@ class SimAdapter:
     async def read_book(self) -> Result[PortfolioSnapshot, FeedError]:
         """The scope's account book from JSON: its lots + its derived cash.
 
-        An unreadable store is an ``Err`` (refuse rather than trade a book we
-        cannot read); a never-written scope reads as a flat funded book.
+        Side-effect-free: the sim book IS the durable row set, so a read only
+        projects it. An advancing book is the ibkr adapter's shape, not this
+        one (see ``LiveAdapter.read_book``). An unreadable store is an ``Err``
+        (refuse rather than trade a book we cannot read); a never-written scope
+        reads as a flat funded book.
         """
         try:
             portfolio = build_account_book(
