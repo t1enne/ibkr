@@ -93,7 +93,7 @@ process. Use the kernel primitive the lease already relies on.
   `exit_code`. A freed lock makes the row `exited`/`stale` regardless of the file.
 - **`stop` never SIGTERMs a live bot.** It writes a stop flag the loop consumes at
   its sleep point, then awaits exit, so no cycle is killed between placement and
-  `_persist` (§5.8). Escalation is manual; a forced signal is still gated on
+  `_persist` (step 7). Escalation is manual; a forced signal is still gated on
   lock-held + cmdline match.
 - **Logs:** `<runtime>/<scope_tag>.log`. `RuntimeDir` resolves file-relative (never
   `os.getcwd()`) and is env-overridable for tests.
@@ -143,9 +143,12 @@ bar=bars[0])`, wrapped in bot-owned `asyncio.wait_for` (`download` has no
 5. One cycle via `run_once(cfg, …)` (§3); its lease is taken inside, `bot` takes
    none. A down gateway is just a failing cycle here — exit 1, retried; `bot` does
    not look.
-6. Map the exit code into the pid record and the log.
-7. Sleep `interval` via an injected `SleepFn`; repeat. The stop flag is checked
-   here and only here, so no live cycle is interrupted.
+6. Map the exit code into the pid record **and** the log, EVERY cycle — not
+   only at exit — so `status` sees a live bot's most recent outcome.
+7. Sleep `interval` via an injected `SleepFn`, in short chunks; repeat. The stop
+   flag is checked between chunks, never mid-cycle, so no live cycle is
+   interrupted between placement and `_persist` (step 7) and `stop`'s bounded
+   await can still observe the exit.
 
 Exit 1 (transient stale/gateway) retries up to a bounded count then exits; exit 2
 and 3 stop the bot immediately. **One bot's exit never aborts its siblings.**
@@ -162,9 +165,10 @@ and 3 stop the bot immediately. **One bot's exit never aborts its siblings.**
 | 3        | unsafe cycle             | exit 3 (needs an operator) |
 
 `start` exits 0 once every child claimed its scope, else 1; 2 on usage. `status`
-exits the most severe **live** bot's code in the same vocabulary, so 3 reads "a
-live bot reports an unsafe cycle"; a wedged or exited bot is surfaced by the
-table, not a new code.
+exits the most severe code a still-**live** bot reports in the same vocabulary.
+In practice only `1` persists there: `2`/`3` exit the bot, so a bot is "live"
+with one only for the instant before it drops its lock and reads `exited` — an
+unsafe (3) or usage (2) bot is surfaced by the table, not by a lasting code.
 
 ---
 

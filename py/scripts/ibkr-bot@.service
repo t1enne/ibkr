@@ -1,0 +1,55 @@
+# Template systemd unit — one `ibkr bot` per strategy config (plan §8 M3).
+#
+# Contract, deliberate:
+# - THIS UNIT ONLY STARTS A BOT. Restart=no: the bot does not supervise itself
+#   and systemd must not resurrect it. A bot that reaches the transient-retry
+#   bound exits 1 on purpose; bringing it back is the SCHEDULER's job — a cron
+#   or timer line re-running the idempotent `ibkr bot start <config>` (a live
+#   scope is reported "already live", never respawned). See docs/OPERATOR_BOT.md.
+# - The gateway is NOT here. `bot` never starts, probes or supervises it;
+#   keeping a gateway reachable is operator work, out of band. A down gateway
+#   shows up as the normal exit-1 retry path.
+# - NEVER add --allow-unsafe. It exists for report-consuming callers only and
+#   must not appear in any scheduled or unit run.
+# - Stop is a CLEAN request. ExecStop runs `ibkr bot stop` (stop flag, then
+#   bounded await) — never a signal. KillMode=process: the resident bot is a
+#   detached child (`start_new_session=True`), so the only process systemd may
+#   signal is the long-dead `bot start` main PID — the live bot is left alone
+#   to finish its cycle and read the flag. If stop reports "still live",
+#   escalate out of band; the unit is failed, the bot is not killed.
+# - Type=oneshot + RemainAfterExit=yes: `bot start` spawns and returns; the
+#   unit stays active while the detached bot runs.
+# - TimeoutStopSec only needs to exceed `bot stop`'s bounded wait; nothing is
+#   killed at the deadline (KillMode=process).
+#
+# Install (replace EVERY /path/to/ibkr/py — WorkingDirectory, ExecStart and
+# ExecStop; a missed ExecStop path leaves `systemctl stop` unable to run
+# `bot stop`, and with KillMode=process nothing else stops the bot):
+#   sudo cp scripts/ibkr-bot@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ibkr-bot@<config-basename>.json
+#
+# Start the bot for strats/pass/vwatr_hv_trendamp15.json with
+# BOT_CONFIG_DIR=strats/pass and instance vwatr_hv_trendamp15.json.
+# Per-instance overrides (e.g. a config in another directory):
+#   sudo systemctl edit ibkr-bot@<config-basename>.json
+#   Environment=BOT_CONFIG_DIR=/absolute/path/to/configs
+
+[Unit]
+Description=IBKR unattended bot (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/path/to/ibkr/py
+Environment=BOT_CONFIG_DIR=strats/pass
+ExecStart=/path/to/ibkr/py/.venv/bin/ibkr bot start "${BOT_CONFIG_DIR}/%i"
+ExecStop=/path/to/ibkr/py/.venv/bin/ibkr bot stop "${BOT_CONFIG_DIR}/%i"
+KillMode=process
+Restart=no
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

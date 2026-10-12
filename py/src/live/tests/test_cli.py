@@ -138,8 +138,8 @@ def _invoke_run(
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
         return report
 
-    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
-    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    monkeypatch.setattr("src.live.run_once.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.run_once.run_cycle", fake_cycle)
     path = write_config(tmp_path)
     return CliRunner().invoke(live_group, ["run", path, *extra])
 
@@ -459,8 +459,10 @@ def test_dry_run_leaves_every_row_count_unchanged(
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
         return _report()
 
-    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: live_ledger(db))
-    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    monkeypatch.setattr(
+        "src.live.run_once.SqliteLedger", lambda *a, **k: live_ledger(db)
+    )
+    monkeypatch.setattr("src.live.run_once.run_cycle", fake_cycle)
     path = write_config(tmp_path, adapter="sim")
     out = CliRunner().invoke(live_group, ["run", path, "--dry-run"])
     assert out.exit_code == 0, out.output
@@ -501,18 +503,18 @@ def test_ibkr_dry_run_adapter_still_refuses_to_place(
         def prune(self, *a: object, **k: object) -> int:
             return 0
 
-    monkeypatch.setattr("src.live.cli.IbkrGateway", _Gateway)
-    monkeypatch.setattr("src.live.cli.IbkrClient", lambda *a, **k: object())
+    monkeypatch.setattr("src.live.run_once.IbkrGateway", _Gateway)
+    monkeypatch.setattr("src.live.run_once.IbkrClient", lambda *a, **k: object())
     monkeypatch.setattr(
         "src.live.adapters.ibkr.adapter.IbkrPortfolioSource", lambda *a, **k: object()
     )
-    monkeypatch.setattr("src.live.cli.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.run_once.SqliteLedger", lambda *a, **k: FakeLedger())
 
     async def fake_cycle(*a: object, **k: object) -> CycleReport:
         seen["adapter"] = a[1]
         return _report()
 
-    monkeypatch.setattr("src.live.cli.run_cycle", fake_cycle)
+    monkeypatch.setattr("src.live.run_once.run_cycle", fake_cycle)
     path = write_config(tmp_path, broker="ibkr")
     out = CliRunner().invoke(
         live_group, ["run", path, "--dry-run", "--adapter", "ibkr"]

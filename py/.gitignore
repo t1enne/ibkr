@@ -10,3 +10,6 @@ wheels/
 .venv
 *.html
 .env
+
+# Unattended bot runtime artifacts (logs)
+runtime/

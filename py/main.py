@@ -12,6 +12,7 @@ Pipe composition:
 import click
 
 from src.bt.cli import bt_group
+from src.bot.cli import bot_group
 from src.data.cli import data_group
 from src.db.cli import db_group
 from src.gw.cli import gw_group
@@ -28,6 +29,7 @@ main.add_command(data_group)
 main.add_command(bt_group)
 main.add_command(research_cmd)
 main.add_command(live_group)
+main.add_command(bot_group)
 main.add_command(gw_group)
 main.add_command(db_group)
 
