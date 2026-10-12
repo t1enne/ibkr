@@ -301,10 +301,18 @@ class IbkrBroker(BracketProtectionMixin):
     ) -> Result[tuple[OrderResult, ...], FeedError]:
         """The per-cycle naked-lot backstop over *book*'s open lots (§4.2, D1).
 
-        Builds one target per OPEN lot the scope's own book carries (its
-        ``position_id`` IS the conid on this edge) and hands them to the mixin's
-        attestation, which reads the working orders once and reports
-        ``UNPROTECTED`` for every lot resting no protective leg of ours.
+        Builds one target per OPEN lot the scope's own book carries whose
+        advisory level says it SHOULD rest a bracket (its ``position_id`` IS the
+        conid on this edge), then hands them to the mixin's attestation, which
+        reads the working orders once and reports ``UNPROTECTED`` for every lot
+        resting no protective leg of ours.
+
+        The level gate is what separates a NAKED lot from one the strategy never
+        armed: a lot with neither ``stop_loss`` nor ``take_profit`` was opened
+        unprotected by design and is NOT a target — flagging it would be a
+        permanent false alarm. On this edge the levels arrive ``None`` (item 5
+        of the pending list has not landed the read-side level), so the backstop
+        is inert here until the advisory level rides the lot read.
 
         Scope-clean by construction: only lots in OUR book are checked, so a
         conid another scope or a human holds is never touched. Attest-only — no
@@ -319,6 +327,7 @@ class IbkrBroker(BracketProtectionMixin):
             )
             for lot in _open_lots(book)
             if lot.position_id
+            and (lot.stop_loss is not None or lot.take_profit is not None)
         )
         return Ok(await self._attest_protection(targets))
 
@@ -487,24 +496,32 @@ class IbkrBroker(BracketProtectionMixin):
         conid = await self._conid(intent.symbol)
         if intent.position_side is None:
             return (
-                _failed(
-                    intent,
-                    f"protect {intent.symbol}: child carries no lot side",
-                    kind="unprotected",
+                self._unprotected_row(
+                    intent, f"protect {intent.symbol}: child carries no lot side"
                 ),
             )
         placed = await self._replace_bracket(intent.symbol, (intent,), conid=conid)
         if isinstance(placed, Err):
             error = cast("FeedError", placed.error)
-            self._log(f"UNPROTECTED {intent.symbol}: {error.message}")
-            return (
-                _failed(
-                    intent,
-                    error.message,
-                    kind=error.kind,
-                ),
-            )
+            return (self._unprotected_row(intent, error.message, kind=error.kind),)
         return tuple(placed.value)
+
+    def _unprotected_row(
+        self,
+        intent: OrderIntent,
+        message: str,
+        *,
+        kind: str = "unprotected",
+    ) -> OrderResult:
+        """Log a failed protective leg to stderr and shape its UNPROTECTED row.
+
+        The ONE place a naked lot becomes a report row: the diagnostic goes out
+        immediately and the outcome is ``UNPROTECTED`` (in the unsafe set, so the
+        cycle exits 3) — never a silent naked lot. *kind* may be a transport
+        kind, which still maps to an unsafe outcome.
+        """
+        self._log(f"UNPROTECTED {intent.symbol}: {message}")
+        return _failed(intent, message, kind=kind)
 
     async def _protect_after_fill(
         self,
@@ -536,12 +553,7 @@ class IbkrBroker(BracketProtectionMixin):
         )
         if isinstance(placed, Err):
             error = cast("FeedError", placed.error)
-            self._log(f"UNPROTECTED {intent.symbol}: {error.message}")
-            unprotected = _failed(
-                intent,
-                error.message,
-                kind="unprotected",
-            )
+            unprotected = self._unprotected_row(intent, error.message)
         else:
             return tuple(placed.value)
         # The pair may still have RESTED (an unparseable confirm reply is not

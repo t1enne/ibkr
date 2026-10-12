@@ -91,13 +91,22 @@ def test_build_snapshot_stays_silent_when_the_account_net_agrees() -> None:
 
 
 def test_build_snapshot_ignores_a_position_no_scope_owns() -> None:
-    row = _row()  # ours conid 1
+    """A conid only the account holds (another scope/a human) is never a mismatch.
+
+    Our AAPL conid agrees with the account, so the ONLY foreign row is GOOG —
+    ignored by design: this scope's book is the sizing authority, a position we
+    do not own is not our disagreement to alarm on.
+    """
+    row = _row()  # ours AAPL conid 1, +10
     book = build_snapshot(
         (row,),
         marks={1: 100.0},
         cash=10000.0,
         initial_capital=50000.0,
         positions=(
+            IbkrPosition(
+                account="DU1", conid=1, symbol="AAPL", qty=10.0, avg_cost=100.0
+            ),
             IbkrPosition(
                 account="DU1", conid=99, symbol="GOOG", qty=20.0, avg_cost=500.0
             ),

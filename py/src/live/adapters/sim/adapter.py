@@ -129,7 +129,12 @@ class SimAdapter:
         Feeds the SAME shared builders the IBKR edge uses (``ProtectionTarget`` +
         ``unprotected_targets``) into the sim broker's own working-orders read, so
         the rule cannot fork: a lone ``sl`` counts as protection on both edges,
-        and a lot resting nothing is ``UNPROTECTED`` (exit 3). Attest-only.
+        and a level-carrying lot resting nothing is ``UNPROTECTED`` (exit 3).
+        Attest-only.
+
+        The level gate mirrors the IBKR edge: only a lot the strategy armed (an
+        advisory ``stop_loss``/``take_profit`` carried on the book) is a target,
+        so a lot opened without a stop is never a permanent false alarm.
         """
         targets = tuple(
             ProtectionTarget(
@@ -140,7 +145,9 @@ class SimAdapter:
             )
             for lots in book.positions.values()
             for lot in lots
-            if lot.qty > _FLAT_QTY_EPS and lot.position_id
+            if lot.qty > _FLAT_QTY_EPS
+            and lot.position_id
+            and (lot.stop_loss is not None or lot.take_profit is not None)
         )
         if not targets:
             return Ok(())
@@ -456,7 +463,17 @@ def _write_back(
         # A close's direction is the lot's MIRROR (long->Sell, short->Buy), which
         # the intent action alone cannot tell; the account row carries the side.
         side = _side_of(result.intent.action) if opens else _close_leg(positions, pid)
-        if not _apply_fill(positions, pid, sym, qty, price, side, opens):
+        if not _apply_fill(
+            positions,
+            pid,
+            sym,
+            qty,
+            price,
+            side,
+            opens,
+            result.intent.stop_loss,
+            result.intent.take_profit,
+        ):
             skipped.append(pid)
             continue
         trades.append(
@@ -500,14 +517,17 @@ def _apply_fill(
     price: float,
     side: str,
     opens: bool,
+    stop: float | None = None,
+    take: float | None = None,
 ) -> bool:
     """Apply one fill's position-row change; ``False`` when a close reduced nothing.
 
-    An open upserts the lot; a close reduces it and reports whether a row was
+    An open upserts the lot (stamping the entry's ADVISORY levels, the sim
+    broker's lot-row record); a close reduces it and reports whether a row was
     actually hit (a close on an already-missing account row must not book cash).
     """
     if opens:
-        _upsert_position(positions, pid, sym, qty, price, side)
+        _upsert_position(positions, pid, sym, qty, price, side, stop, take)
         return True
     return _reduce_position(positions, pid, qty, side)
 
@@ -574,13 +594,17 @@ def _upsert_position(
     qty: float,
     price: float,
     leg_side: str,
+    stop: float | None = None,
+    take: float | None = None,
 ) -> None:
     """Upsert the open position row by ``position_id`` (side, marks, cash price).
 
     ``qty`` is the fill's ABSOLUTE size and ``leg_side`` its BUY/SELL direction,
     so a short open is stored as a NEGATIVE ``position`` with ``side='short'``
     (IBKR's sign convention) — a positive one would read back as a long and make
-    an unedited short book report a false divergence.
+    an unedited short book report a false divergence. ``stop``/``take`` are the
+    entry's ADVISORY levels, stamped on the lot row so a later backstop can tell
+    a lot meant to be protected from one opened unprotected by design.
     """
     signed = qty if leg_side == "BUY" else -qty
     fields: dict[str, object] = {
@@ -592,6 +616,10 @@ def _upsert_position(
         "mktPrice": price,
         "currency": "USD",
     }
+    if stop is not None:
+        fields["stop_loss"] = stop
+    if take is not None:
+        fields["take_profit"] = take
     for row in positions:
         if row.get("position_id") == pid:
             row.update(fields)

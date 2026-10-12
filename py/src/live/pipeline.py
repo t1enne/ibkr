@@ -240,10 +240,12 @@ async def _attest(
 
 
 def _targets_of(book: PortfolioState) -> tuple[ProtectionTarget, ...]:
-    """Every OPEN lot of *book* as an attestation target (the adapter's own view).
+    """Every OPEN level-carrying lot of *book* as an attestation target.
 
     ``position_id`` is the wire handle on BOTH edges (the conid on ibkr, the lot
-    id on sim), so the report row can name the lot without a second lookup.
+    id on sim), so the report row can name the lot without a second lookup. Only
+    a lot whose advisory level says it SHOULD rest a bracket is a target: a lot
+    opened without a stop is unprotected by design, never "unprotected".
     """
     return tuple(
         ProtectionTarget(
@@ -254,7 +256,9 @@ def _targets_of(book: PortfolioState) -> tuple[ProtectionTarget, ...]:
         )
         for lots in book.positions.values()
         for lot in lots
-        if lot.qty > FLAT_QTY_EPS and lot.position_id
+        if lot.qty > FLAT_QTY_EPS
+        and lot.position_id
+        and (lot.stop_loss is not None or lot.take_profit is not None)
     )
 
 

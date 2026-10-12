@@ -21,6 +21,7 @@ a cosmetic change.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -241,8 +242,15 @@ def _target(*, conid: int = _CONID, symbol: str = "AAPL") -> ProtectionTarget:
 
 
 def _lot_book(*, conid: int = _CONID, symbol: str = "AAPL") -> PortfolioState:
-    """A scope book holding ONE open lot whose ``position_id`` IS the conid."""
-    return long_lot(position_id=str(conid))
+    """A scope book holding ONE open, ARMED lot (its ``position_id`` IS the conid).
+
+    The advisory ``stop_loss`` is what makes the lot a backstop target: a lot
+    the strategy opened without a stop is unprotected by design, never NAKED.
+    The item-5 read path is what will populate this level on the IBKR edge.
+    """
+    p = long_lot(position_id=str(conid))
+    (position,) = p.positions["AAPL"]
+    return replace(p, positions={symbol: (replace(position, stop_loss=95.0),)})
 
 
 @respx.mock
