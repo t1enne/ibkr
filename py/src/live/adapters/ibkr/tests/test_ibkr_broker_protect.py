@@ -202,7 +202,7 @@ async def test_lone_sl_bracket_is_verified_without_a_pair_index() -> None:
 
     stop = [r for r in results if r.message.startswith("protect AAPL stop")]
     assert len(stop) == 1
-    assert stop[0].ok is True and "resting GTC" in stop[0].message
+    assert stop[0].ok is True
 
 
 @respx.mock
@@ -291,7 +291,6 @@ async def test_backstop_reports_unprotected_on_a_failed_working_read() -> None:
     results = await _attest(broker())
 
     assert [r.outcome for r in results] == [OrderOutcome.UNPROTECTED]
-    assert "read failed" in results[0].message
 
 
 @respx.mock

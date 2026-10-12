@@ -38,6 +38,21 @@ TABLE_COLS = [
     "signals",
 ]
 
+#: Column order for the ``--trades`` table (the run's executed fills): entry and
+#: exit stamps make an unclosed lot visible (blank exit fields), the engine's
+#: final-bar flatten included.
+TRADE_COLS = [
+    "symbol",
+    "position",
+    "qty",
+    "entry_time",
+    "entry_price",
+    "exit_time",
+    "exit_price",
+    "pnl",
+    "close_reason",
+]
+
 
 @click.command(name="screen")
 @click.argument("strategy_file", type=click.Path(exists=True, dir_okay=False))
@@ -47,7 +62,7 @@ TABLE_COLS = [
     type=int,
     default=None,
     show_default=False,
-    help="Trailing history to load in days (default: driver's WARMUP_DAYS). "
+    help="Trailing history to load in days (default: the config's warmup). "
     "A screen only needs enough bars to warm the strategy + display indicators, "
     "never the config's multi-year backtest span.",
 )
@@ -69,11 +84,19 @@ TABLE_COLS = [
     help="Output format: text (ranked table) or json (machine-readable intent "
     "for a live trading system; actionable long/short/close signals only).",
 )
+@click.option(
+    "--trades",
+    "trades",
+    is_flag=True,
+    default=False,
+    help="Include the run's executed trades (open -> close); default off.",
+)
 def screen(
     strategy_file: str,
     warmup: int | None,
     max_age: int,
     fmt: str,
+    trades: bool,
 ) -> None:
     """Run a strategy and surface its current-bar intent (opens AND closes).
 
@@ -99,20 +122,26 @@ def screen(
     payload. The screen runs the real engine, so these are its fills — the
     final-bar ``_finalize`` flatten included, not strategy intent.
     """
+    from src.bt.output import trade_json
     from src.bt.screen.run_strategy import (
         render_screen_json,
         run_screen_from_strategy,
+        trade_table_row,
     )
 
     run = run_screen_from_strategy(
         strategy_file,
         max_age_days=max_age or None,
+        include_trades=trades,
+        warmup_days=warmup,
     )
 
     if fmt == "json":
         payload: dict[str, object] = dict(
             render_screen_json(run, strategy=strategy_file)
         )
+        if trades:
+            payload["trades"] = [trade_json(t) for t in run.trades]
         click.echo(json.dumps(payload, indent=2, default=_json_default))
         return
 
@@ -122,6 +151,17 @@ def screen(
     else:
         for line in render_from_dicts(TABLE_COLS, table_rows, align="<"):
             click.echo(line)
+    if trades:
+        _echo_trades([trade_table_row(t) for t in run.trades])
+
+
+def _echo_trades(rows: list[dict[str, str]]) -> None:
+    """Print the executed-trade table under the intent table (nothing if empty)."""
+    if not rows:
+        return
+    click.echo()
+    for line in render_from_dicts(TRADE_COLS, rows, align="<"):
+        click.echo(line)
 
 
 def _ticket_row(r: "ScreenRow") -> dict[str, str]:

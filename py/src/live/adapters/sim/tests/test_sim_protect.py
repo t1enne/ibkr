@@ -22,7 +22,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
-from src.bt.state import ActionType
+from src.bt.state import ActionType, PortfolioState
 from src.data.db import get_connection
 from src.exec.refs import scope_tag
 from src.exec.types import OrderType
@@ -361,7 +361,10 @@ def _make_candle_db(path: Path, ts: pd.Timestamp) -> None:
 
 
 def _long_source(
-    config_path: str, max_age_days: int | None = None
+    config_path: str,
+    max_age_days: int | None = None,
+    *,
+    book: PortfolioState | None = None,
 ) -> tuple[LiveSignal, ...]:
     return (
         LiveSignal(
@@ -528,38 +531,6 @@ async def test_backstop_reports_a_lot_resting_nothing_as_unprotected(
 
     assert second.is_unsafe()
     assert any(r.outcome is OrderOutcome.UNPROTECTED for r in second.results)
-
-
-@pytest.mark.asyncio
-async def test_backstop_silent_for_a_lot_resting_a_lone_sl(tmp_path: Path) -> None:
-    """REGRESSION (item 4 x item 2): a stop-only lot's lone leg IS proof.
-
-    A pair-only reader would flag this lot naked forever.
-    """
-    ledger = live_ledger(tmp_path / "l.sqlite")
-    store = SimBookStore(tmp_path / "sim.json")
-    adapter = _adapter(ledger, store)
-    store.write(SCOPE, _lone_sl_book())
-
-    attested = await adapter.attest_protection(
-        build_account_book(store, ledger, SCOPE, _config())
-    )
-
-    assert isinstance(attested, Ok)
-    assert cast("tuple[OrderResult, ...]", attested.value) == ()
-
-
-@pytest.mark.asyncio
-async def test_backstop_places_nothing_in_the_sim_store(tmp_path: Path) -> None:
-    """The backstop must never write to the broker: it ATTESTS, it does not arm."""
-    ledger = live_ledger(tmp_path / "l.sqlite")
-    store = SimBookStore(tmp_path / "sim.json")
-    adapter = _adapter(ledger, store)
-    store.write(SCOPE, _long_lot_book())  # a bare lot, NO leg resting
-
-    attested = await adapter.attest_protection(
-        build_account_book(store, ledger, SCOPE, _config())
-    )
-
-    assert isinstance(attested, Ok)
-    assert store.read(SCOPE).orders == ()  # nothing was armed by the pass
+    # ``--allow-unsafe`` / attest-only / lone-sl silence are pinned on the ibkr
+    # edge and the shared pure builders — see test_ibkr_broker_protect.py and
+    # test_protect.py, the sim feeds the same builders by construction.

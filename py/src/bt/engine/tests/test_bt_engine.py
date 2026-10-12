@@ -1,10 +1,18 @@
 """Tests for backtest engine — critical paths only."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import cast
+
 import pandas as pd
-from src.bt.engine.backtest import Backtest, run_backtest, candle_generator
+from src.bt.engine.backtest import Backtest, run_backtest, candle_generator, run
 from src.bt.exchange import default_exchange
 from src.bt.risk.handlers import default_risk_handler
+from src.bt.state import (
+    ActionType,
+    BacktestState,
+    Position,
+    create_initial_backtest_state,
+)
 from src.bt.types import StrategyConfig
 from src.bt.strategies.dsl import StrategyContext, strategy
 
@@ -116,3 +124,66 @@ def test_run_backtest_rejects_plain_strategy_mod():
             default_risk_handler(),
             strategy_mod=cl,
         )
+
+
+# --- initial_state seeding -------------------------------------------------
+
+
+@strategy(bars="1d")
+def _exit_when_holding(ctx: StrategyContext):
+    """A held-lot exit: ``ctx.close`` is a NO-OP on a flat book, so this emits
+    only while a lot is open — the rule a screen's short window cannot reach
+    unless the book is seeded."""
+    ctx.close(ctx.candle.symbol, reason="exit")
+
+
+def _seeded_state(qty: float = 10.0) -> BacktestState:
+    """A state already holding one AAPL lot, as a live book would be."""
+    state = create_initial_backtest_state(
+        symbols=["AAPL"],
+        initial_capital=10000.0,
+        start_timestamp=cast(pd.Timestamp, pd.Timestamp("2025-01-01")),
+    )
+    lot = Position(
+        symbol="AAPL",
+        qty=qty,
+        entry_price=100.0,
+        entry_time=cast(pd.Timestamp, pd.Timestamp("2024-06-03")),
+        stop_loss=None,
+        take_profit=None,
+        last_price=102.0,
+        type=ActionType.long,
+        position_id="AAPL_old",
+    )
+    portfolio = replace(state.portfolio, positions={"AAPL": (lot,)})
+    return replace(state, portfolio=portfolio)
+
+
+def test_run_seeded_state_lets_a_held_lot_exit():
+    # The regression: without the seed the strategy never sees the lot it holds,
+    # so its exit rule never fires and the position is left open forever.
+    cfg = _cfg(["AAPL"])
+    observed: list = []
+    run(
+        Backtest(cfg),
+        _daily_df(["AAPL"]),
+        _FixtureMod(_exit_when_holding),
+        signal_observer=observed.append,
+        initial_state=_seeded_state(),
+    )
+    assert [s.action for s in observed] == [ActionType.close]
+    assert observed[0].position_id == "AAPL_old"
+
+
+def test_run_without_a_seed_never_sees_the_held_lot():
+    # The shape of the bug: a flat-seeded run over the same feed emits nothing,
+    # so nothing downstream can learn the lot must be closed.
+    cfg = _cfg(["AAPL"])
+    observed: list = []
+    run(
+        Backtest(cfg),
+        _daily_df(["AAPL"]),
+        _FixtureMod(_exit_when_holding),
+        signal_observer=observed.append,
+    )
+    assert observed == []

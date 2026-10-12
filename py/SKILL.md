@@ -601,6 +601,15 @@ resulting posture against the live book. There is no backtest replay: the
 strategy is the only source of intent, and everything downstream (sizing, cash
 boundedness, order identity) belongs to `src/live`.
 
+The screen run is a SHORT trailing window, so its strategy starts flat inside
+it — a lot entered before the window head would be invisible, and an exit
+conditioned on holding it would never fire. The live cycle therefore seeds the
+run (`run_screen_from_strategy(..., initial_state=...)`) with the book it just
+READ: the strategy sees the lots live actually holds (their entries, their
+advisory SL/TP) and its own exit rules fire against them, so a multi-year
+position can finally produce a close. CLI `bt screen` is unseeded for now — a
+standalone screen is posture-only, with no book to carry in.
+
 When authoring, that means the live edge acts on **posture only** — `long`,
 `short`, `flat`, plus an explicit `qty` when the strategy sizes itself. It places
 market DAY orders, and an intent carrying stop-loss or take-profit is **refused**

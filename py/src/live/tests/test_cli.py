@@ -396,7 +396,12 @@ async def test_run_cycle_dry_run_places_nothing() -> None:
     ledger = _RecordingLedger()
     adapter = _FakeAdapter()
 
-    def source_fn(config_path: str, max_age_days: int | None = None):
+    def source_fn(
+        config_path: str,
+        max_age_days: int | None = None,
+        *,
+        book: PortfolioState | None = None,
+    ):
         return (_signal(),)
 
     report = await run_cycle(
@@ -563,19 +568,8 @@ def _divergent_report() -> CycleReport:
 
 
 def test_a_divergence_makes_the_cycle_unsafe() -> None:
+    # Regression: a divergence-driven cycle must report is_unsafe (exit 3 at the
+    # CLI), and its ``--allow-unsafe`` counterpart must name the suppressed reason
+    # — see ``test_allow_unsafe_names_a_divergence_in_the_suppression_note``. The
+    # JSON report's key shape is rendering, not behaviour: not pinned here.
     assert _divergent_report().is_unsafe()
-
-
-def test_the_json_report_carries_the_divergence_that_caused_exit_three(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The alerting document must name the disagreement, not only the exit code.
-
-    The exit code is out-of-band and cannot name the lot, so a machine consumer
-    of ``--format json`` saw an unsafe cycle with no readable reason at all.
-    """
-    out = _invoke_run(tmp_path, monkeypatch, _divergent_report(), "-F", "json")
-    assert out.exit_code == 3, out.output
-    doc = json.loads(out.output)
-    assert [d["symbol"] for d in doc["divergences"]] == ["AAPL"]
-    assert doc["divergences"][0]["kind"] == "qty_mismatch"

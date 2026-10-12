@@ -1015,6 +1015,7 @@ def run(
     signal_observer: Optional[Callable] = None,
     fundamentals: Any = None,
     *,
+    initial_state: Optional[BacktestState] = None,
     evaluation_clock_check: bool = True,
 ) -> BacktestResults:
     """Convenience function for running backtest with defaults.
@@ -1026,6 +1027,11 @@ def run(
     ``load_fundamentals``); it is attached to the CandleStore so decorated
     strategies reach it via ``ctx.fundamentals``. Typed ``Any`` on purpose:
     the engine never imports the concrete DSL context.
+
+    ``initial_state`` seeds the run with a book that already holds lots (e.g. a
+    live book) instead of the config's empty one, so a strategy that gates its
+    exit on being in the position can still emit that exit. ``None`` (default)
+    mints the usual empty state.
 
     ``evaluation_clock_check`` opts out of the tail-symbol clock-coverage
     assertion — the screen driver passes ``False`` because its trailing
@@ -1083,5 +1089,6 @@ def run(
         strategy_state=strategy_state,
         fundamentals=fundamentals,
         signal_observer=signal_observer,
+        initial_state=initial_state,
     )
     return results

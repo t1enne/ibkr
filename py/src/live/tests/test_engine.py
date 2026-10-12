@@ -223,7 +223,12 @@ def make_candle_db(path: Path, ticker: str | None, ts: pd.Timestamp | None) -> N
 
 
 def _source_fn(acts: tuple[tuple[SignalAction, float], ...]):
-    def _f(path: str, max_age: int | None = None) -> tuple[LiveSignal, ...]:
+    def _f(
+        path: str,
+        max_age: int | None = None,
+        *,
+        book: PortfolioState | None = None,
+    ) -> tuple[LiveSignal, ...]:
         return tuple(signal(a, q) for a, q in acts)
 
     return _f

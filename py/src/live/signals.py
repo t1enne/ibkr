@@ -16,18 +16,28 @@ flat book is a no-op.
 row, which deletes exactly the rows a close is derived from. We call the driver
 with ``max_age_days=None`` (all rows) and apply the age filter locally, on the
 ``long``/``short``/``close`` actions, so a stale close is still filtered.
+
+**Why the book is passed in.** The driver's window is short (a warm-up tail), so
+the strategy starts flat inside it and a lot entered earlier is invisible — an
+exit conditioned on holding that lot would never fire. ``book`` seeds the run's
+portfolio with the lots the live book actually holds, so the strategy's own exit
+rule can be evaluated against them. It is the book the CYCLE read (the account's
+truth), never a re-derivation.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pandas as pd
 
 from src.bt import load_strategy
 from src.bt.screen import ScreenRow, run_screen_from_strategy
-from src.bt.state import BacktestState
+from src.bt.state import BacktestState, PortfolioState, create_initial_backtest_state
+from src.bt.types import StrategyConfig
 from src.live.types import LiveSignal, SignalAction
+from src.utils import parse_timestamp
 
 #: Actions that carry an order decision (never emitted as ``flat``).
 ACTIONABLE: frozenset[SignalAction] = frozenset({"long", "short", "close"})
@@ -36,6 +46,8 @@ ACTIONABLE: frozenset[SignalAction] = frozenset({"long", "short", "close"})
 def live_signals(
     config_path: str,
     max_age_days: int | None = None,
+    *,
+    book: PortfolioState | None = None,
 ) -> tuple[LiveSignal, ...]:
     """Run the strategy-as-screen and project its actionable rows.
 
@@ -48,12 +60,19 @@ def live_signals(
     ``<= 0`` is dropped. The row's executable fields (``qty``, ``stop_loss``,
     ``take_profit``, ``tag``) are carried through verbatim, so a strategy that
     sizes its own opens (``ctx.long(..., size=)``) keeps that sizing on the live
-    path; ``position_id`` is not (see ``_to_live_signal``). Pure mapping; the
-    only I/O is the screen run.
+    path; ``position_id`` is not (see ``_to_live_signal``). ``book`` (the live
+    book, when the caller has one) seeds the run so the strategy sees the lots
+    it already holds (see module docstring). Pure mapping; the only I/O is the
+    screen run.
     """
-    screen = run_screen_from_strategy(config_path, max_age_days=None)
+    config = load_strategy(config_path)
+    screen = run_screen_from_strategy(
+        config_path,
+        max_age_days=None,
+        initial_state=None if book is None else _seed_state(book, config),
+    )
     rows, state = screen.rows, screen.state
-    base_iv = load_strategy(config_path).bars[0]
+    base_iv = config.bars[0]
     out: list[LiveSignal] = []
     for row in rows:
         if not _is_fresh(row, max_age_days):
@@ -66,6 +85,22 @@ def live_signals(
             continue
         out.append(_to_live_signal(row, action, price))
     return tuple(out)
+
+
+def _seed_state(book: PortfolioState, config: StrategyConfig) -> BacktestState:
+    """Engine state holding *book*'s lots, so the strategy sees its own posture.
+
+    Built from the config's capital/window knobs and then given the book's
+    portfolio outright: the lots, their entry prices and their cash ARE the
+    book's, so no engine default leaks into what the strategy reads.
+    """
+    state = create_initial_backtest_state(
+        symbols=list(config.symbols),
+        initial_capital=config.initial_capital,
+        start_timestamp=parse_timestamp(config.trading_start),
+        rolling_window_size=config.rolling_window_size,
+    )
+    return replace(state, portfolio=book)
 
 
 def _action_of(row: ScreenRow) -> SignalAction | None:

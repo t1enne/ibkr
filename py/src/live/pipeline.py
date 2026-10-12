@@ -54,10 +54,19 @@ class PortfolioFetchError(RuntimeError):
 
 
 class SignalSource(Protocol):
-    """The screen bridge: config path -> actionable signals (injectable)."""
+    """The screen bridge: config path -> actionable signals (injectable).
+
+    ``book`` is the live book the cycle READ; the bridge seeds the strategy run
+    with it so a lot entered before the screen's short window is still visible
+    to the strategy's own exit rule (see ``src.live.signals``).
+    """
 
     def __call__(
-        self, config_path: str, max_age_days: int | None = None
+        self,
+        config_path: str,
+        max_age_days: int | None = None,
+        *,
+        book: PortfolioState | None = None,
     ) -> tuple[LiveSignal, ...]: ...
 
 
@@ -118,7 +127,7 @@ async def run_cycle(
         # broker read (pure DB check, no I/O on the adapter).
         assert_data_fresh(config.symbols, max_age_days, now_ts, db_path)
         pf = await read_portfolio(adapter)
-        signals = screen_signals(config_path, max_age_days, signal_source)
+        signals = screen_signals(config_path, max_age_days, signal_source, pf.portfolio)
         # The backstop attests the state as READ: it runs BEFORE the resync, whose
         # own protective action (a sim stop firing) legitimately retires a lot
         # within this cycle and would otherwise look like a lot left naked.
@@ -157,12 +166,18 @@ def screen_signals(
     config_path: str | None,
     max_age_days: int,
     source: SignalSource,
+    book: PortfolioState,
 ) -> tuple[LiveSignal, ...]:
-    """The screen's actionable signals for *config_path* (the config path is required)."""
+    """The screen's actionable signals for *config_path* (the config path is required).
+
+    *book* is the book the cycle just read — the screen seeds the strategy run
+    with it (never a re-derivation), so the strategy's exit rules see the lots
+    live actually holds.
+    """
     assert config_path is not None, (
         "run_cycle requires config_path for the screen bridge"
     )
-    return source(config_path, max_age_days)
+    return source(config_path, max_age_days, book=book)
 
 
 def diff_intents(

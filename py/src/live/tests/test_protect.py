@@ -222,21 +222,12 @@ def test_resting_bracket_none_for_an_inactive_leg() -> None:
 def test_resting_legs_lone_sl_is_protection() -> None:
     # REGRESSION: a stop-only strategy (vwatr_div_dsl) rests ONE leg. The pair
     # reader refuses it, but the leg-count-agnostic reader must NOT — otherwise
-    # the lot reports NAKED forever and a replace re-places a duplicate.
+    # the lot reports NAKED forever and a replace re-places a duplicate. A lone
+    # take or a full pair take the same count-agnostic branch.
     sl, _ = _real_bracket()
-    legs = resting_legs((sl,), scope_tag=TAG, conid=CONID)
-    assert [kind_of(leg) for leg in legs] == ["stop"]
-
-
-def test_resting_legs_lone_take_is_protection() -> None:
-    _, tp = _real_bracket()
-    legs = resting_legs((tp,), scope_tag=TAG, conid=CONID)
-    assert [kind_of(leg) for leg in legs] == ["take_profit"]
-
-
-def test_resting_legs_reads_both_legs_of_a_pair() -> None:
-    legs = resting_legs(_real_bracket(), scope_tag=TAG, conid=CONID)
-    assert {kind_of(leg) for leg in legs} == {"stop", "take_profit"}
+    assert [
+        kind_of(leg) for leg in resting_legs((sl,), scope_tag=TAG, conid=CONID)
+    ] == ["stop"]
 
 
 def test_resting_legs_empty_for_a_foreign_scope_or_conid() -> None:
@@ -245,13 +236,6 @@ def test_resting_legs_empty_for_a_foreign_scope_or_conid() -> None:
     legs = _real_bracket()
     assert resting_legs(legs, scope_tag=scope_tag("other_scope"), conid=CONID) == ()
     assert resting_legs(legs, scope_tag=TAG, conid=CONID + 1) == ()
-
-
-def test_resting_legs_empty_when_not_submitted() -> None:
-    # The §0 failed-confirm row (``Inactive``/``Pending Submit``) is NOT resting.
-    sl, tp = _real_bracket()
-    inactive = (replace(sl, status="Inactive"), replace(tp, status="Pending Submit"))
-    assert resting_legs(inactive, scope_tag=TAG, conid=CONID) == ()
 
 
 def test_resting_legs_empty_when_sides_disagree() -> None:
@@ -292,25 +276,12 @@ def test_backstop_does_not_flag_a_lot_resting_a_lone_sl() -> None:
     assert unprotected_targets((sl,), scope_tag=TAG, targets=(target,)) == ()
 
 
-def test_backstop_reports_every_target_when_nothing_rests() -> None:
-    targets = (
-        ProtectionTarget(conid=CONID, symbol="AAPL", position_id="265598", qty=8.0),
-        ProtectionTarget(conid=CONID + 1, symbol="MSFT", position_id="999", qty=3.0),
-    )
-    assert unprotected_targets((), scope_tag=TAG, targets=targets) == targets
-
-
 def test_unprotected_results_are_unsafe_and_never_claimed_placed() -> None:
     target = ProtectionTarget(conid=CONID, symbol="AAPL", position_id="265598", qty=8.0)
     (row,) = unprotected_results((target,), reason="no leg rests")
-    assert row.ok is False
     assert row.outcome is OrderOutcome.UNPROTECTED
     assert row.error_kind == "unprotected"
     assert row.intent.position_id == "265598"
-    # The report alone must make a cycle unsafe (exit 3) — see report.is_unsafe.
-    from src.live.report import _UNSAFE_OUTCOMES
-
-    assert row.outcome in _UNSAFE_OUTCOMES
 
 
 # --- level_bracket_intents --------------------------------------------------

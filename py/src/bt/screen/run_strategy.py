@@ -109,15 +109,29 @@ def run_screen_from_strategy(
     config_path: str,
     posture: Posture = Posture(),
     max_age_days: int | None = None,
+    *,
+    initial_state: BacktestState | None = None,
+    include_trades: bool = False,
+    warmup_days: int | None = None,
 ) -> ScreenRun:
     """Score a universe by running its strategy through the real engine.
 
     Runs over a **trailing warm-up window ending at the newest available data**
     (not the config's multi-year backtest span — a screen only needs enough
-    history to compute the latest-bar decision). ``warmup_days`` bounds the
-    lookback; the decision bar is always the last bar present in the feed, so
-    the reported posture is current tape, never the config's (possibly stale)
-    ``trading_end``.
+    history to compute the latest-bar decision). ``warmup_days`` overrides the
+    config's ``warmup`` span; the decision bar is always the last bar present in
+    the feed, so the reported posture is current tape, never the config's
+    (possibly stale) ``trading_end``.
+
+    ``initial_state`` seeds the engine's book (see ``src.bt.engine.run``). The
+    window is short, so the strategy starts FLAT inside it: a lot opened before
+    the window head is invisible, and an exit rule conditioned on holding that
+    lot never fires. Passing a state whose portfolio carries the real lots (the
+    live book) restores the posture the strategy is actually in.
+
+    ``include_trades`` (default off) carries the run's executed fills on
+    ``ScreenRun.trades``. The final-bar ``_finalize`` flatten is among them, so
+    they are the engine's realized book, not strategy intent.
 
     Returns a ``ScreenRun``: ranked rows carry the per-symbol posture plus the
     executable fields of its setting signal, ``state`` is the engine's
@@ -129,8 +143,10 @@ def run_screen_from_strategy(
     # Calendar span, not bar count: the trailing window is a real date range on
     # the constant ``1d`` grid, so ``parse_warmup``'s ``days`` is the unit for
     # date subtraction (``bars`` would be 5/7 of it and under-load history).
-    warmup_span = parse_warmup(cfg.warmup, "1d")
-    warm_start = cast(pd.Timestamp, data_end - pd.Timedelta(days=warmup_span.days))
+    days = (
+        warmup_days if warmup_days is not None else parse_warmup(cfg.warmup, "1d").days
+    )
+    warm_start = cast(pd.Timestamp, data_end - pd.Timedelta(days=days))
 
     # A screen does not trade and has no IS/OOS split: it runs over a trailing
     # warm-up window ending at the newest data bar and treats the WHOLE tail as
@@ -154,6 +170,7 @@ def run_screen_from_strategy(
         df,
         strat_mod=strat_mod,
         signal_observer=collector.on_signal,
+        initial_state=initial_state,
         # A screen's trailing window starts trading exactly at the first loaded
         # bar, so the tail-symbol clock-coverage assertion (a truncation guard
         # for full-history backtests) is a false positive here. Generate signals
@@ -169,9 +186,13 @@ def run_screen_from_strategy(
     rows = _project(collector, tuple(config.symbols), posture, latest)
     rows = _filter_recent(rows, max_age_days)
     # The observer feed is pure intent; the engine's own book is the trade log.
-    # Flat after ``_finalize`` (see module docstring) — carried as executed fills.
+    # Flat after ``_finalize`` (see module docstring) — carried as executed fills
+    # only when the caller asked for them.
     return ScreenRun(
-        rows=rows, state=final, config=config, trades=tuple(results.pf.trades)
+        rows=rows,
+        state=final,
+        config=config,
+        trades=tuple(results.pf.trades) if include_trades else (),
     )
 
 

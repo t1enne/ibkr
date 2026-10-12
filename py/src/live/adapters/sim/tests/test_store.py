@@ -24,6 +24,7 @@ from typing import cast
 import pandas as pd
 import pytest
 
+from src.bt.state import PortfolioState
 from src.data.db import get_connection
 from src.live.adapters.ibkr.mapping import num, opt_str
 from src.live.adapters.sim.adapter import build_sim_adapter
@@ -59,7 +60,12 @@ def _make_candle_db(path: Path, ticker: str | None, ts: pd.Timestamp | None) -> 
 
 
 def _source_fn(acts: tuple[tuple[SignalAction, float], ...]):
-    def _f(path: str, max_age: int | None = None) -> tuple[LiveSignal, ...]:
+    def _f(
+        path: str,
+        max_age: int | None = None,
+        *,
+        book: PortfolioState | None = None,
+    ) -> tuple[LiveSignal, ...]:
         return tuple(
             LiveSignal(
                 symbol="AAPL",
