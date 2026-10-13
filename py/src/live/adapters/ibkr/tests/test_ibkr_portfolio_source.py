@@ -32,7 +32,7 @@ def _row() -> BookRow:
     ex = Execution(
         execution_id="e1",
         order_id="o1",
-        order_ref=f"{scope_tag(SCOPE)}-20240102T093000-000",
+        order_ref=f"{scope_tag(SCOPE)}-1a2b3c4d",  # 2-part live ref
         conid=1,
         symbol="AAPL",
         side=OrderSide.BUY,
@@ -100,7 +100,7 @@ async def test_fetch_dry_run_writes_nothing(tmp_path: Path) -> None:
             {
                 "execution_id": "e1",
                 "order_id": "o1",
-                "order_ref": f"{scope_tag(SCOPE)}-20240102T093000-000",
+                "order_ref": f"{scope_tag(SCOPE)}-1a2b3c4d",  # 2-part live ref
                 "conid": 1,
                 "symbol": "AAPL",
                 "side": "B",

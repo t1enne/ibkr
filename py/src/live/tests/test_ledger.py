@@ -55,7 +55,7 @@ def _exec(
     return Execution(
         execution_id=execution_id,
         order_id="o" + execution_id,
-        order_ref=f"{scope_tag(scope)}-20240603T150000-000",
+        order_ref=f"{scope_tag(scope)}-1a2b3c4d",  # 2-part live ref, no attempt tail
         conid=conid,
         symbol="AAPL",
         side=side,
