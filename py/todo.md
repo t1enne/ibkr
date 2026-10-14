@@ -42,6 +42,29 @@ hand-built mock for a contract-shaped response.
   error naming the symbol, or fail config validation when a qty=0-emitting
   strategy has no resolvable `size`.
 
+### [ ] D21 — deterministic-ref re-mint block: a closed key can't re-open for ~7 days
+
+- **Where:** `src/live/adapters/ibkr/broker.py` `_sweep_key_fill` (the pre-mint
+  executions-window sweep, ~line 1046).
+- **Problem:** the live ref is pure-deterministic — `order_ref = scope_tag-token`
+  with `token = crc32(symbol|action|position_id)` (`identity.py`), no attempt
+  counter. Before minting an open, `_sweep_key_fill` refuses a key whose ref
+  already appears in the gateway's ~7-day trades window, on the theory that a
+  predecessor already filled for this key. But the sweep has no book awareness:
+  it can't tell a *lost* fill (a duplicate-open hazard) from a key that already
+  OPENED, FLATTED, and is now legitimately re-entering. Reproduced live: a ZS
+  open booked + closed (net 0 in `live_execution`), then re-intro open refused
+  `unresolved` every cycle until the historical fill ages out of the window
+  (~7 days).
+- **Effect:** any open→close→reopen of the same `(symbol, action)` within the
+  trades window is silently blocked; the strategy falls behind the market.
+- **Fix sketch:** skip the re-mint block when `net_exposure(conid)` plus the
+  in-cycle delta is ~flat AND the matched fill's lot is already fully booked and
+  closed in the ledger (the guard's real job is only to stop re-opening a lot
+  that may still be open). Needs a book-aware read in the edge (extend
+  `BookExposure` or pass the ledger context), plus a regression test for
+  lost-fill-still-open vs closed-and-reopen.
+
 ### [ ] D10 — per-symbol staleness is ungated: one fresh symbol masks a dead one
 
 - **Where:** `src/live/freshness.py` (`assert_data_fresh`), and the
