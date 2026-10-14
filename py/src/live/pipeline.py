@@ -108,6 +108,7 @@ async def run_cycle(
     db_path: str | Path | None = None,
     now: pd.Timestamp | None = None,
     signal_source: SignalSource = live_signals,
+    allow_oth: bool = False,
 ) -> CycleReport:
     """One full batch pass. Not a loop; the caller drives cadence.
 
@@ -120,6 +121,8 @@ async def run_cycle(
     OWNERSHIP key the book is keyed by and the lease is taken for.
     ``dry_run=True`` takes no lease and writes nothing at all, so the next cycle
     recomputes the same intents (see :func:`_lease`/:func:`_persist`).
+    ``allow_oth`` when true, the broker is allowed to auto-confirm BUY/SELL MKT
+    orders placed outside trading hours. Default (false) rejects them.
     """
     now_ts = now if now is not None else pd.Timestamp.now(tz="UTC")
     with _lease(ledger, scope, dry_run):

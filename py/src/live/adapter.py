@@ -154,16 +154,21 @@ def resolve_adapter(
     log: Callable[[str], None],
     *,
     client: IbkrClient | None = None,
+    allow_oth: bool = False,
 ) -> LiveAdapter:
     """Build the adapter *adapter_name* names. No mutation, no shared state.
 
     ``dry_run`` is threaded into BOTH factories as defence in depth: an adapter
     built for a read-only cycle places nothing, so a missing CLI guard cannot
     become a real order. ``client`` is the ibkr gateway client, unused by sim.
+    ``allow_oth`` when true, the broker may auto-confirm orders placed outside
+    trading hours.
     """
     if adapter_name == "sim":
         return build_sim_adapter(cfg, scope, ledger, dry_run, log)
-    return build_ibkr_adapter(cfg, scope, ledger, client, dry_run, log)
+    return build_ibkr_adapter(
+        cfg, scope, ledger, client, dry_run, log, allow_oth=allow_oth
+    )
 
 
 def _first_named(

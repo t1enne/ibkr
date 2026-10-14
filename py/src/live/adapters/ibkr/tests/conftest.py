@@ -138,6 +138,7 @@ async def _no_sleep(_seconds: float) -> None:
 def broker(
     *,
     dry_run: bool = False,
+    allow_oth: bool = False,
     timeout_s: float = 0.0,
     monotonic: Callable[[], float] | None = None,
     now: Callable[[], pd.Timestamp] | None = None,
@@ -158,6 +159,7 @@ def broker(
         account=ACCOUNT,
         exposure=exposure if exposure is not None else FakeExposure(),
         dry_run=dry_run,
+        allow_oth=allow_oth,
         conid_lookup=_conid,
         poll_interval_s=0.0,
         timeout_s=timeout_s,

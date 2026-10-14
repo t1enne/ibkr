@@ -71,6 +71,7 @@ def run_once(
     fmt: str = "text",
     adapter: str | None = None,
     allow_unsafe: bool = False,
+    allow_oth: bool = False,
 ) -> int:
     """Run ONE live cycle for *config_path*; return its machine exit code.
 
@@ -78,6 +79,8 @@ def run_once(
     something the operator cannot see. Transient failures propagate as the typed
     exceptions ``live_run`` translates — the caller retries (bot §5) or fails a
     cron line. ``allow_unsafe`` forces ``0`` for an unsafe cycle.
+    ``allow_oth`` when true, the broker may auto-confirm orders placed outside
+    trading hours. Default (false) rejects them.
     """
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
@@ -92,7 +95,9 @@ def run_once(
     ledger = SqliteLedger()
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
         ledger.ensure_strategy(strategy_id, scope, strategy.name, cfg.initial_capital)
-    backend, gateway = _build_backend(cfg, resolved, scope, ledger, dry_run)
+    backend, gateway = _build_backend(
+        cfg, resolved, scope, ledger, dry_run, allow_oth=allow_oth
+    )
     # Plan §7.3: label which source produced this run's costs. A resolved IBKR run
     # books the broker's exact per-execution commission but still SIZES on the sim
     # model — the report states both, so the mix is never ambiguous.
@@ -137,6 +142,7 @@ def _build_backend(
     scope: str,
     ledger: SqliteLedger,
     dry_run: bool,
+    allow_oth: bool = False,
 ) -> tuple[LiveAdapter, IbkrGateway | None]:
     """The adapter plus the IBKR gateway whose client it shares (or ``None``).
 
@@ -150,7 +156,14 @@ def _build_backend(
         gateway = IbkrGateway(IbkrClient())
         client = gateway.client
     adapter = resolve_adapter(
-        cfg, resolved, scope, ledger, dry_run, _stderr_log, client=client
+        cfg,
+        resolved,
+        scope,
+        ledger,
+        dry_run,
+        _stderr_log,
+        client=client,
+        allow_oth=allow_oth,
     )
     return adapter, gateway
 

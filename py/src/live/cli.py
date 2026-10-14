@@ -104,6 +104,14 @@ def live_group() -> None:
         "see it."
     ),
 )
+@click.option(
+    "--allow-oth",
+    is_flag=True,
+    help=(
+        "Allow placing BUY/SELL MKT orders outside NYSE trading hours "
+        "(Mon-Fri 9:30-16:00 ET). Default: refuse and warn."
+    ),
+)
 def live_run(
     config_path: str,
     dry_run: bool,
@@ -111,6 +119,7 @@ def live_run(
     fmt: str,
     adapter: str | None,
     allow_unsafe: bool,
+    allow_oth: bool,
 ) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
     try:
@@ -121,6 +130,7 @@ def live_run(
             fmt=fmt,
             adapter=adapter,
             allow_unsafe=allow_unsafe,
+            allow_oth=allow_oth,
         )
     except (
         ValueError,

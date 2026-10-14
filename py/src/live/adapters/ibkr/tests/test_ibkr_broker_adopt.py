@@ -101,7 +101,7 @@ async def test_ambiguous_submit_adopts_a_working_order() -> None:
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=filled_status()))
 
-    placed = ok_result(await broker().place(intent))
+    placed = ok_result(await broker(allow_oth=True).place(intent))
 
     assert placed.ok and placed.position_id == str(CONID)
 
@@ -128,7 +128,7 @@ async def test_confirm_post_adopts_when_a_working_order_appears() -> None:
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=filled_status()))
 
-    placed = ok_result(await broker().place(intent))
+    placed = ok_result(await broker(allow_oth=True).place(intent))
 
     assert placed.ok
     assert not confirm.called  # the working order was adopted, not re-confirmed
@@ -158,7 +158,7 @@ async def test_reply_loop_overflow_adopts_a_live_order() -> None:
     )
     respx.get(STATUS).mock(return_value=httpx.Response(200, json=filled_status()))
 
-    placed = ok_result(await broker().place(intent))
+    placed = ok_result(await broker(allow_oth=True).place(intent))
 
     assert placed.ok and placed.position_id == str(CONID)
 
