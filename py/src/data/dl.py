@@ -13,7 +13,6 @@ symbol list is resolved once and feeds both passes.
 from __future__ import annotations
 
 import asyncio
-import sys
 from datetime import date, datetime
 from typing import Optional
 
@@ -24,6 +23,8 @@ from src.data.fundamentals.dl import download as download_fundamentals
 from src.data.ibkr.candles import candles_batch
 from src.data.symbols import resolve_symbols
 from src.data.types import ISymbol, ProgressFn, SyncResult
+from src.shared.runtime_log import info as _log_info
+from src.shared.runtime_log import step as _log_step
 
 
 # ── Download orchestration ─────────────────────────────────────
@@ -56,15 +57,15 @@ def _report(
     failed: list[str],
     not_found: list[str],
 ) -> None:
-    """Print final summary line to stderr."""
+    """Print final summary line."""
     parts = []
     if updated:
-        parts.append(f"Updated: {len(updated)}")
+        parts.append(f"updated: {len(updated)}")
     if failed:
-        parts.append(f"Failed: {len(failed)} ({', '.join(failed)})")
+        parts.append(f"failed: {len(failed)} ({', '.join(failed)})")
     if not_found:
-        parts.append(f"Not found: {len(not_found)} ({', '.join(not_found)})")
-    click.echo("  " + ", ".join(parts), err=True)
+        parts.append(f"not found: {len(not_found)} ({', '.join(not_found)})")
+    _log_info(", ".join(parts))
 
 
 async def download(
@@ -111,21 +112,15 @@ async def download(
     if not symbols:
         raise ValueError(f"No symbols resolved for tickers: {tickers}")
 
-    with click.progressbar(
-        symbols,
-        label="candles",
-        item_show_func=lambda s: s.ticker if s else "",
-        width=40,
-        file=sys.stderr,
-    ) as pb:
-        for sym in pb:
-            if on_progress:
-                on_progress(f"Fetching {sym.ticker}...", 0, 1)
-            fetched = await _get_candles([sym], from_date, to_date, bar=bar)
-            if sym.conid in fetched:
-                updated.append(sym.ticker)
-            else:
-                failed.append(sym.ticker)
+    _log_info(f"resolved {len(symbols)}/{len(tickers)} symbols")
+
+    for i, sym in enumerate(symbols, 1):
+        _log_step(i, len(symbols), sym.ticker)
+        fetched = await _get_candles([sym], from_date, to_date, bar=bar)
+        if sym.conid in fetched:
+            updated.append(sym.ticker)
+        else:
+            failed.append(sym.ticker)
 
     _report(updated, failed, not_found)
 

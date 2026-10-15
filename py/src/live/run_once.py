@@ -28,6 +28,7 @@ from src.data.ibkr.client import IbkrClient
 from src.data.ibkr.gateway import IbkrGateway
 from src.live.adapter import LiveAdapter, resolve_adapter, resolve_adapter_name
 from src.live.divergence import Divergence
+from src.live.console import console_log
 from src.live.ledger import SqliteLedger, config_hash
 from src.live.pipeline import run_cycle
 from src.live.pure import OrderResult
@@ -40,6 +41,7 @@ from src.live.scope import (
     scope_of,
 )
 from src.live.types import CostProvenance, LiveConfig, cost_provenance
+from src.shared.runtime_log import info as _log_info
 
 #: Sizing modes the shared ``SizingParams`` layer accepts.
 SizeMode = Literal["equity", "cash", "fixed"]
@@ -53,14 +55,7 @@ _ADAPTERS = get_args(AdapterName)
 _UNSAFE_EXIT_CODE = 3
 
 
-def _stderr_log(message: str) -> None:
-    """Route the IBKR edge's diagnostics to stderr, never the report's stdout.
-
-    A scaled cohort and a cash-refused open are operator notices: they belong in
-    the cron log beside the run, not interleaved with the report the next
-    consumer parses off stdout.
-    """
-    click.echo(message, err=True)
+_stderr_log = console_log
 
 
 def run_once(
@@ -115,6 +110,7 @@ def run_once(
         cost=cost,
     )
     click.echo(render_report(report, fmt, scope))
+    _log_info(f"cycle exit {_exit_code(report, allow_unsafe)}")
     return _exit_code(report, allow_unsafe)
 
 
@@ -129,10 +125,7 @@ def _exit_code(report: CycleReport, allow_unsafe: bool) -> int:
         return 0
     if not allow_unsafe:
         return _UNSAFE_EXIT_CODE
-    _stderr_log(
-        f"--allow-unsafe: exit 0 forced for an UNSAFE cycle; suppressed "
-        f"outcomes: {', '.join(unsafe_outcomes(report))}"
-    )
+    _stderr_log(f"allow-unsafe suppressed: {', '.join(unsafe_outcomes(report))}")
     return 0
 
 

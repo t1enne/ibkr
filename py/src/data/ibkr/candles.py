@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from datetime import datetime, timedelta, date, timezone
 from typing import Callable, Optional, cast
 
@@ -14,9 +13,12 @@ from .shared import get_contract_info
 from .rate_limiter import with_retry
 from src.data.types import CandleDict
 from src.data.xcal import is_non_trading_day
-
-logger = logging.getLogger(__name__)
-
+from src.shared.runtime_log import (
+    error as _log_error,
+    gap_table as _log_gap_table,
+    info as _log_info,
+    warn as _log_warn,
+)
 
 # Maximum number of candles per API request
 MAX_CANDLES_PER_REQUEST = 1000
@@ -336,22 +338,8 @@ async def _fetch_candles_iterative(
         days_to_fetch = max(1, delta.days + (1 if delta.seconds > 0 else 0))
 
         if delta.days > MAX_PERIOD_DAYS:
-            logger.info(
-                "Range %s → %s exceeds %sd max, chunking (this request: %sd)",
-                from_datetime,
-                current_to,
-                MAX_PERIOD_DAYS,
-                days_to_fetch,
-            )
+            _log_info(f"range {from_datetime}→{current_to}>{MAX_PERIOD_DAYS}d chunks")
         days_to_fetch = min(days_to_fetch, MAX_PERIOD_DAYS)
-
-        logger.info(
-            "Getting candles for %s for %sd, from %s, to %s",
-            ticker,
-            days_to_fetch,
-            from_datetime,
-            current_to,
-        )
 
         resp = await get_iserver_marketdata_history.asyncio_detailed(
             client=default_client().rest,
@@ -368,12 +356,7 @@ async def _fetch_candles_iterative(
             # the same window after backing off, rather than aborting the whole
             # multi-year backfill over a transient burst.
             delay = min(delay * 2.0, CHUNK_DELAY_MAX_S)
-            logger.warning(
-                "%s: rate-limited (503), throttling to %ss delay and retrying window %s",
-                ticker,
-                delay,
-                current_to,
-            )
+            _log_warn(f"{ticker} 503 throttled to {delay}s, retry window {current_to}")
             await asyncio.sleep(delay)
             continue
 
@@ -382,13 +365,7 @@ async def _fetch_candles_iterative(
             or not isinstance(r, IserverHistoryBidAskResponse)
             or not r.data
         ):
-            body = resp.content.decode(errors="replace")[:200]
-            logger.error(
-                "Unexpected response for %s: status=%s, body=%r",
-                ticker,
-                resp.status_code,
-                body,
-            )
+            _log_error(f"{ticker} bad response status={resp.status_code}")
             raise Exception(f"Unexpected response: status={resp.status_code}")
 
         # Success — gently decay the delay back toward the base.
@@ -397,7 +374,7 @@ async def _fetch_candles_iterative(
 
         sorted_data = sorted(r.data, key=lambda x: x.t)
         if not sorted_data or not sorted_data[0].t:
-            logger.info("No more data available for %s", ticker)
+            _log_info(f"{ticker}: no more data")
             break
 
         oldest_ts = cast(int, sorted_data[0].t)
@@ -426,12 +403,7 @@ async def _fetch_candles_iterative(
             accumulated_data = new_candles + accumulated_data
 
         oldest_datetime = timestamp_to_datetime(oldest_ts)
-        logger.info(
-            "Got %s candles for %s, oldest: %s",
-            len(sorted_data),
-            ticker,
-            oldest_datetime,
-        )
+        _log_info(f"{ticker} got {len(sorted_data)} candles, oldest {oldest_datetime}")
 
         # We've reached or passed the from_datetime boundary
         if oldest_datetime <= from_datetime:
@@ -489,13 +461,9 @@ async def candles(
         gaps = _merge_and_sort_gaps(gaps)
 
     if not gaps:
-        logger.info(
-            "No gaps to fetch for %s: data already exists for full range", ticker
-        )
         return
 
-    logger.debug("dl %s/%s from=%s to=%s", ticker, conid, gaps[0][0], gaps[-1][1])
-    logger.info("Fetching %s gap(s) for %s/%s: %s", len(gaps), ticker, conid, gaps)
+    _log_info(f"{ticker} {len(gaps)} gap(s) {gaps[0][0]}→{gaps[-1][1]}")
 
     def _write_chunk(chunk: list[CandleDict]) -> None:
         # Write each chunk as it arrives so a multi-year backfill never buffers
@@ -503,7 +471,7 @@ async def candles(
         try:
             _chunked_insert(chunk, batch_size=500)
         except Exception:
-            logger.exception("Bulk insert failed for %s", ticker)
+            _log_error(f"bulk insert failed for {ticker}")
             raise
 
     for gap_start, gap_end in gaps:
@@ -520,9 +488,21 @@ async def candles(
     remaining = _merge_and_sort_gaps(remaining + internal_remaining)
 
     if remaining:
-        logger.warning(
-            "%s still has %d gap(s) after fetch: %s", ticker, len(remaining), remaining
-        )
+        _gap_rows.append((ticker, str(len(remaining)), _gap_range(remaining)))
+
+
+def _gap_range(gaps: list[tuple[datetime, datetime]]) -> str:
+    """Short range string for a gap list, e.g. "2026-10-13→2026-10-15"."""
+    if not gaps:
+        return "-"
+    start = gaps[0][0].strftime("%Y-%m-%d")
+    end = gaps[-1][1].strftime("%Y-%m-%d")
+    return f"{start}→{end}"
+
+
+# Module-level accumulator: ``candles()`` appends post-fetch gaps here;
+# ``candles_batch()`` emits ONE gap summary table and clears it.
+_gap_rows: list[tuple[str, str, str]] = []
 
 
 async def candles_batch(
@@ -545,6 +525,9 @@ async def candles_batch(
         List of conids that were successfully fetched
     """
 
+    global _gap_rows
+    _gap_rows = []
+
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def fetch_with_limit(c: int) -> int | None:
@@ -553,8 +536,14 @@ async def candles_batch(
                 await candles(c, from_datetime, to_datetime, bar)
                 return c
         except Exception as e:
-            logger.error("Failed to fetch candles for conid %s: %s", c, e)
+            _log_error(f"failed to fetch conid {c}: {e}")
             return None
 
     results = await asyncio.gather(*[fetch_with_limit(c) for c in conids])
+
+    # ONE gap summary table instead of 200 individual lines
+    if _gap_rows:
+        _log_gap_table("remaining gaps", _gap_rows)
+        _gap_rows = []
+
     return [r for r in results if r is not None]

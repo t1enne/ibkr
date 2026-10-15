@@ -248,7 +248,7 @@ def test_allow_unsafe_emits_a_note_naming_the_suppressed_outcome(
     )
     out = _invoke_run(tmp_path, monkeypatch, report, "--allow-unsafe")
     assert out.exit_code == 0, out.output
-    assert "--allow-unsafe" in out.stderr
+    assert "allow-unsafe suppressed" in out.stderr
     assert OrderOutcome.UNFUNDED.value in out.stderr
     assert OrderOutcome.DIVERGENCE.value in out.stderr
     # A healthy outcome the cycle did not produce must NOT be named.
