@@ -30,7 +30,6 @@ __all__ = [
 ]
 from src.bt.state.factories import build_commission_model, create_execution_params
 from src.config import live_adapter
-from src.exec.refs import scope_tag
 from src.exec.types import OrderSide, OrderType
 
 if TYPE_CHECKING:
@@ -176,13 +175,21 @@ class StrategyBook:
 def is_ours(scope: str, execution: Execution) -> bool:
     """Ownership: the ref's scope segment equals ``scope_tag(scope)`` exactly.
 
-    A ref is ``{scope_tag}-{token}-{attempt}`` and neither the token nor the
-    attempt contains a ``-``, so the scope segment is the ref minus its last two
-    segments. An exact match (not a prefix) keeps scope ``momentum`` from
-    claiming refs minted by ``momentum-v2`` / ``momentum-2``, and the
-    non-collapsing tag keeps ``momentum_v2`` from claiming ``momentum-v2``'s.
+    Delegates to :func:`identity.ref_is_ours` — the SINGLE ownership predicate
+    the broker adoption and the pf report also use — so the trades attribution
+    (this book-advancing seam) can never drift from the identity layer that
+    mints the refs. The live ref is ``{scope_tag}-{token}`` (no attempt tail),
+    the token is dashless, so an exact match on the whole tag keeps scope
+    ``momentum`` from claiming refs minted by ``momentum-v2`` / ``momentum-2``,
+    and the non-collapsing tag keeps ``momentum_v2`` from claiming
+    ``momentum-v2``'s.
+
+    The import is deferred to call time: ``identity`` imports ``OrderIntent``
+    from this module, so a top-level import here would close a cycle.
     """
-    return execution.order_ref.rsplit("-", 2)[0] == scope_tag(scope)
+    from src.live.identity import ref_is_ours
+
+    return ref_is_ours(scope, execution.order_ref)
 
 
 @dataclass(frozen=True)

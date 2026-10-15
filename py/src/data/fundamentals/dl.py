@@ -12,11 +12,13 @@ counts (pure-ish, HTTP + DB edges only), the caller renders them.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import click
 import pandas as pd
 
 from src.data.fundamentals.normalize import sec_payload_to_rows
@@ -71,6 +73,9 @@ async def download(
 ) -> tuple[DownloadRecap, ...]:
     """Fetch and persist fundamentals for ``symbols``; returns per-symbol recap.
 
+    Shows a progress bar on stderr then prints a final
+    Updated: N, Failed: M, Not found: K summary.
+
     A symbol SEC has no CIK for (ETF, non-US registrant) or whose payload errors
     is reported with ``rows=0`` rather than aborting the batch — a mixed
     universe should still download the issuers that exist.
@@ -79,29 +84,66 @@ async def download(
     rows are skipped at the DB, so the recap matches what a read would find.
     """
     bootstrap()
+
+    updated: list[str] = []
+    failed: list[str] = []
+    not_found: list[str] = []
+
     payloads = await download_fundamentals(symbols, cache=cache, refresh=refresh)
-    recaps: list[DownloadRecap] = []
-    for symbol in symbols:
-        ticker = symbol.upper()
-        payload = payloads.get(ticker)
-        if payload is None:
-            recaps.append(DownloadRecap(ticker, 0, 0, None, None))
-            continue
-        rows = _window(sec_payload_to_rows(ticker, payload), from_date, to_date)
-        # Report what the insert actually wrote, not what the payload contained:
-        # a re-run of unchanged filings is a no-op, and the recap is the only
-        # place that is visible to the operator.
-        written = insert_fundamentals(rows)
-        recaps.append(
-            DownloadRecap(
-                symbol=ticker,
-                rows=written,
-                periods=len({r.period_end for r in rows}),
-                first_filed=min((r.filed for r in rows), default=None),
-                last_filed=max((r.filed for r in rows), default=None),
-            )
-        )
+
+    with click.progressbar(
+        symbols,
+        label="fundamentals",
+        item_show_func=lambda s: s.upper() if s else "",
+        width=40,
+        file=sys.stderr,
+    ) as pb:
+        recaps: list[DownloadRecap] = []
+        for symbol in pb:
+            ticker = symbol.upper()
+            payload = payloads.get(ticker)
+            if payload is None:
+                not_found.append(ticker)
+                recaps.append(DownloadRecap(ticker, 0, 0, None, None))
+                continue
+            try:
+                rows = _window(sec_payload_to_rows(ticker, payload), from_date, to_date)
+                written = insert_fundamentals(rows)
+                if written:
+                    updated.append(ticker)
+                else:
+                    not_found.append(ticker)
+                recaps.append(
+                    DownloadRecap(
+                        symbol=ticker,
+                        rows=written,
+                        periods=len({r.period_end for r in rows}),
+                        first_filed=min((r.filed for r in rows), default=None),
+                        last_filed=max((r.filed for r in rows), default=None),
+                    )
+                )
+            except Exception:
+                failed.append(ticker)
+                recaps.append(DownloadRecap(ticker, 0, 0, None, None))
+
+    _report(updated, failed, not_found)
     return tuple(recaps)
+
+
+def _report(
+    updated: list[str],
+    failed: list[str],
+    not_found: list[str],
+) -> None:
+    """Print final summary line to stderr."""
+    parts = []
+    if updated:
+        parts.append(f"Updated: {len(updated)}")
+    if failed:
+        parts.append(f"Failed: {len(failed)} ({', '.join(failed)})")
+    if not_found:
+        parts.append(f"Not found: {len(not_found)} ({', '.join(not_found)})")
+    click.echo("  " + ", ".join(parts), err=True)
 
 
 def _recap_line(recap: DownloadRecap) -> str:

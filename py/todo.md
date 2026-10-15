@@ -42,6 +42,29 @@ hand-built mock for a contract-shaped response.
   error naming the symbol, or fail config validation when a qty=0-emitting
   strategy has no resolvable `size`.
 
+### [ ] D21 — deterministic-ref re-mint block: a closed key can't re-open for ~7 days
+
+- **Where:** `src/live/adapters/ibkr/broker.py` `_sweep_key_fill` (the pre-mint
+  executions-window sweep, ~line 1046).
+- **Problem:** the live ref is pure-deterministic — `order_ref = scope_tag-token`
+  with `token = crc32(symbol|action|position_id)` (`identity.py`), no attempt
+  counter. Before minting an open, `_sweep_key_fill` refuses a key whose ref
+  already appears in the gateway's ~7-day trades window, on the theory that a
+  predecessor already filled for this key. But the sweep has no book awareness:
+  it can't tell a *lost* fill (a duplicate-open hazard) from a key that already
+  OPENED, FLATTED, and is now legitimately re-entering. Reproduced live: a ZS
+  open booked + closed (net 0 in `live_execution`), then re-intro open refused
+  `unresolved` every cycle until the historical fill ages out of the window
+  (~7 days).
+- **Effect:** any open→close→reopen of the same `(symbol, action)` within the
+  trades window is silently blocked; the strategy falls behind the market.
+- **Fix sketch:** skip the re-mint block when `net_exposure(conid)` plus the
+  in-cycle delta is ~flat AND the matched fill's lot is already fully booked and
+  closed in the ledger (the guard's real job is only to stop re-opening a lot
+  that may still be open). Needs a book-aware read in the edge (extend
+  `BookExposure` or pass the ledger context), plus a regression test for
+  lost-fill-still-open vs closed-and-reopen.
+
 ### [ ] D10 — per-symbol staleness is ungated: one fresh symbol masks a dead one
 
 - **Where:** `src/live/freshness.py` (`assert_data_fresh`), and the
@@ -172,6 +195,8 @@ Either state the bound or keep the counter monotonic independently of retention.
 
 ### [ ] D14 — data ingestion is not wired to the live path; the freshness default is far too loose
 
+**Status (M3): closed for `ibkr bot`, open for `live run` and D10.**
+
 - **Where:** `src/live/freshness.py` (`assert_data_fresh` only READS the DB);
   `src/live/cli.py` (`--max-age` default `5` days).
 - **Problem:** nothing in the live path downloads bars. If cron does not run
@@ -179,8 +204,18 @@ Either state the bound or keep the counter monotonic independently of retention.
   `5`-day default is far looser than any bar cadence — a daily strategy trading a
   5-day-old bar passes the gate. Undocumented operational dependency, and it blunts
   D10's gate further.
-- **Fix sketch:** document the `data dl` prerequisite in the run/cron unit (see P2
-  `No scheduling artifact`) and set `--max-age` to the strategy's bar cadence.
+- **Closed by `bot` (M3):** the bot syncs before EVERY cycle through the same
+  `data dl` primitive, wrapped in a bot-owned timeout (`--no-sync` opts out;
+  `src/bot/sync.py`), and its `--max-age` default is 2x the strategy's bar
+  cadence clamped `>= 1` (`derive_cadence`, `src/bot/loop.py`) — a weekend
+  cannot trip it and `<= 0` can never silently disable the gate. Documented in
+  `docs/OPERATOR_BOT.md`.
+- **Still open:**
+  - `live run`'s own `--max-age` default is unchanged and it downloads nothing;
+    a manually scheduled `live run` still needs a preceding `data dl` (see P2
+    `No scheduling artifact`).
+  - D10's per-symbol staleness gate is inherited, not closed: the bot uses the
+    same universe-`MAX(timestamp)` gate as `live run`.
 
 ### [ ] D15 — scope cash is derived from our own executions; a missed fill is unreconciled and two scopes can over-allocate
 
@@ -326,10 +361,18 @@ or a read-only snapshot.
 
 ### [ ] No scheduling artifact, and the exit code is undocumented for cron
 
-There is no cron/systemd unit in the repo (`scripts/` holds `streamline_cycle.py`,
-`login_ibkr.py`, `fetch_macro_fred.py`, `get_ticker_range.py`). Add a documented
-cron example that relies on the exit codes: **0** ok, **1** config/stale/gateway
-(`ClickException`), **2** usage, **3** unsafe cycle. Say plainly that
+**Status (M3): `bot` now has one; `live run` still does not.**
+
+`scripts/ibkr-bot@.service` covers the unattended bots: a systemd template
+running `ibkr bot start <config>` with `Restart=no` (the scheduler re-runs
+idempotent `start`; a live scope is reported, never respawned), a clean
+`ExecStop` via `ibkr bot stop`, no `--allow-unsafe`, and the gateway kept out
+(cf. `docs/OPERATOR_BOT.md`, which documents the exit-code vocabulary and
+alert rules: **0** ok, **1** config/stale/gateway, **2** usage, **3** unsafe).
+
+`live run` still has no cron example: nothing runs a one-shot live cycle
+unattended having run a `data dl` first (D14's remaining half). Add a documented
+cron line that relies on the same exit codes and says plainly that
 `--allow-unsafe` must NOT appear in it.
 
 ### [ ] Capture a filled-order fixture

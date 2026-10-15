@@ -247,7 +247,9 @@ candle GROUP BY ticker ORDER BY ticker`.
 ## Live trading (`src/live`)
 
 One-shot reconcile cycles over the **same strategy JSON** the backtester loads.
-There is no daemon — you schedule it. Open work: `todo.md`.
+There is no daemon — you schedule it. `ibkr bot` is the deliberate exception:
+resident unattended bots per config (operator contract in
+`docs/OPERATOR_BOT.md`); everything else stays scheduled. Open work: `todo.md`.
 
 ```bash
 uv run ibkr live run strats/pass/<cfg>.json --adapter sim --dry-run  # places/writes nothing

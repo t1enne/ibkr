@@ -16,7 +16,7 @@ node_modules
 
 gateway
 ibkr.db
-ibkr.db-*$
+ibkr.db-*
 # The durable live book. Position state, not source — never commit it.
 live.db
 live.db-*

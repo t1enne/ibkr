@@ -246,6 +246,7 @@ class IbkrBroker(BracketProtectionMixin):
         account: str | None = None,
         exposure: BookExposure | None = None,
         dry_run: bool = False,
+        allow_oth: bool = False,
         conid_lookup: ConidLookup | None = None,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
@@ -260,6 +261,7 @@ class IbkrBroker(BracketProtectionMixin):
         self._account = account
         self._exposure = exposure
         self._dry_run = dry_run
+        self._allow_oth = allow_oth
         self._conid_lookup = (
             conid_lookup if conid_lookup is not None else _default_conid_lookup
         )
@@ -1152,12 +1154,32 @@ class IbkrBroker(BracketProtectionMixin):
     async def _reply_loop(
         self, response: object, ticket: Ticket, key: IntentKey
     ) -> Result[str, FeedError]:
-        """Classify the submission response, confirming ordinary replies only."""
+        """Classify the submission response, confirming ordinary replies only.
+
+        A confirm reply from the broker outside trading hours is treated as a
+        rejection unless ``allow_oth`` is set: the broker prompts for
+        confirmation when an order would trade outside regular market hours,
+        and the default (no flag) refuses to auto-confirm.
+        """
         confirmations = 0
         while True:
             outcome = classify_reply(response)
             if outcome.kind != "confirm":
                 return await self._settle_reply(outcome, ticket, confirmations)
+            # The broker returned a confirm reply (e.g. OTH prompt). If the
+            # operator did not opt in, refuse to auto-confirm — the order is
+            # rejected rather than placed behind their back.
+            if not self._allow_oth:
+                return Err(
+                    FeedError(
+                        kind="rejected",
+                        message=(
+                            f"order {ticket.order_ref} not placed: broker requires "
+                            f"confirmation (likely outside trading hours); "
+                            f"set --allow-oth to auto-confirm: {outcome.message}"
+                        ),
+                    )
+                )
             confirmations += 1
             if confirmations > MAX_REPLIES:
                 return await self._settle_ambiguous(

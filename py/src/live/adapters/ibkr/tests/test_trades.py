@@ -16,9 +16,9 @@ from src.live.identity import ref_is_ours
 SCOPE = "momentum"
 
 
-def _ref(scope: str, ts: str = "20240102T093000", seq: int = 0) -> str:
-    """A ref minted by *scope* (its non-collapsing ``scope_tag`` prefix)."""
-    return f"{scope_tag(scope)}-{ts}-{seq:03d}"
+def _ref(scope: str, seq: int = 0) -> str:
+    """A 2-part live ref minted by *scope*: ``scope_tag-<hex>`` (no attempt tail)."""
+    return f"{scope_tag(scope)}-{seq:02x}"
 
 
 def _exec(
@@ -48,29 +48,25 @@ def _exec(
     )
 
 
-def test_is_ours_attributes_the_new_bar_free_ref() -> None:
-    # cOID = scope_tag-token-attempt. The token and attempt are dashless, so
-    # rsplit("-", 2)[0] yields the whole tag (dashes included) and attribution
-    # is unaffected by the identity change.
+def test_is_ours_attributes_the_bar_free_ref() -> None:
+    # cOID = {scope_tag}-{token}; the live identity layer mints NO attempt tail.
+    # is_ours delegates to identity.ref_is_ours, so a real 2-part ref is ours.
+    ref = f"{scope_tag(SCOPE)}-ffb76999"
+    assert ref.rsplit("-", 1)[0] == scope_tag(SCOPE)  # dashless token -> tag exact
+    assert is_ours(SCOPE, _exec("o", side=OrderSide.BUY, qty=1, price=1, ref=ref))
+    # A sibling scope with the same slug but a different hash owns a different ref.
+    other = f"{scope_tag('momentum-v2')}-1a2b3c4d"
     assert is_ours(
-        SCOPE,
-        _exec(
-            "o",
-            side=OrderSide.BUY,
-            qty=1,
-            price=1,
-            ref=f"{scope_tag(SCOPE)}-ffb76999-00",
-        ),
+        "momentum-v2", _exec("o", side=OrderSide.BUY, qty=1, price=1, ref=other)
     )
-    dashed = _exec(
-        "o",
-        side=OrderSide.BUY,
-        qty=1,
-        price=1,
-        ref=f"{scope_tag('momentum-v2')}-1a2b3c4d-01",
+    assert not is_ours(
+        "momentum", _exec("o", side=OrderSide.BUY, qty=1, price=1, ref=other)
     )
-    assert is_ours("momentum-v2", dashed)
-    assert not is_ours("momentum", dashed)
+    # A ref carrying the OLD attempt tail is NOT a live 2-part ref.
+    legacy = _exec(
+        "o", side=OrderSide.BUY, qty=1, price=1, ref=f"{scope_tag(SCOPE)}-ffb76999-00"
+    )
+    assert not is_ours(SCOPE, legacy)
 
 
 def test_round_trip_leaves_one_closed_row_not_two_lots() -> None:

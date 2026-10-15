@@ -85,6 +85,7 @@ def build_ibkr_adapter(
     client: IbkrClient | None,
     dry_run: bool,
     log: Callable[[str], None],
+    allow_oth: bool = False,
 ) -> IbkrAdapter:
     """Wire the ibkr read + routing edges for one cycle (see ``resolve_adapter``).
 
@@ -92,6 +93,8 @@ def build_ibkr_adapter(
     it, and a missing client is a wiring bug rather than a runtime condition.
     ``dry_run`` reaches BOTH wrapped edges, so neither can place even if the
     caller's guard were dropped.
+    ``allow_oth`` when true, the broker may auto-confirm orders placed outside
+    trading hours.
     """
     if client is None:
         raise ValueError("the ibkr adapter requires a gateway client")
@@ -111,6 +114,7 @@ def build_ibkr_adapter(
             exposure=ledger,
             dry_run=dry_run,
             log=log,
+            allow_oth=allow_oth,
         ),
     )
 
