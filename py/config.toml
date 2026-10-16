@@ -6,3 +6,19 @@
 # The adapter a live run/`live pf` uses when neither `--adapter` nor the
 # strategy config names one. One of "ibkr" | "sim".
 adapter = "ibkr"
+
+[bot]
+# Defaults for `ibkr bot start` flags. Every key is optional — omit for code
+# defaults (one-bar cadence, ×2 max-age, 1 retry, sync enabled).
+
+# Cadence in seconds. When unset: one bar of the config's `bars[0]`.
+# interval = 3600
+
+# Staleness gate in days. When unset: 2x cadence, clamped >= 1.
+# max_age = 2
+
+# Transient cycles to retry before exiting.
+# retries = 3
+
+# Set true to skip the pre-cycle candle sync.
+# no_sync = false

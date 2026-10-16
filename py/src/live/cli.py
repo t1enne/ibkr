@@ -17,7 +17,7 @@ from typing import TextIO, cast, get_args
 import click
 import pandas as pd
 
-from src.config import live_adapter
+from src.config import read_bot_config, live_adapter
 from src.live.adapter import resolve_adapter_name
 from src.shared.style import COLOR, PLAIN, Styler
 from src.data.ibkr.client import IbkrClient, IbkrError
@@ -83,7 +83,13 @@ def live_group() -> None:
 @click.command("run")
 @click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--dry-run", is_flag=True, help="Reconcile + report; place nothing.")
-@click.option("--max-age", "-a", type=int, default=5, show_default=True)
+@click.option(
+    "--max-age",
+    "-a",
+    type=int,
+    default=None,
+    help="Staleness gate in days. Default: ``[bot] max_age`` in config.toml, then 5.",
+)
 @click.option(
     "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
 )
@@ -115,18 +121,20 @@ def live_group() -> None:
 def live_run(
     config_path: str,
     dry_run: bool,
-    max_age: int,
+    max_age: int | None,
     fmt: str,
     adapter: str | None,
     allow_unsafe: bool,
     allow_oth: bool,
 ) -> None:
     """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
+    bot_cfg = read_bot_config()
+    resolved_max_age = max_age if max_age is not None else bot_cfg.max_age
     try:
         code = run_once(
             config_path,
             dry_run=dry_run,
-            max_age_days=max_age,
+            max_age_days=resolved_max_age if resolved_max_age is not None else 5,
             fmt=fmt,
             adapter=adapter,
             allow_unsafe=allow_unsafe,

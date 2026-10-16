@@ -19,6 +19,7 @@ from typing import get_args
 
 import click
 
+from src.config import BotConfig, read_bot_config
 from src.db.path import resolve_live_db_path
 from src.live.adapter import resolve_adapter_name
 from src.live.lease import CycleInProgressError
@@ -127,7 +128,8 @@ def bot_start(
 
     Idempotent: a scope that is already live is reported, never respawned.
     """
-    options = _bot_options(interval, max_age, no_sync, retries)
+    cfg = read_bot_config()
+    options = _merge_bot_options(interval, max_age, no_sync, retries, cfg, BotOptions())
     registry = _build_registry()
     spawner = _build_spawner()
     outcomes: list[StartOutcome] = []
@@ -256,7 +258,9 @@ def bot_run_child(
     """
     cfg, scope, _ = load_scope(config_path, adapter)
     registry = _build_registry()
-    options = _bot_options(interval, max_age, no_sync, retries)
+    options = _merge_bot_options(
+        interval, max_age, no_sync, retries, read_bot_config(), BotOptions()
+    )
     try:
         code = run_loop(
             str(Path(config_path).resolve()),
@@ -373,18 +377,32 @@ def start_one(
         return StartOutcome(config_path, scope, False, False, str(exc))
 
 
-def _bot_options(
+def _merge_bot_options(
     interval: int | None,
     max_age: int | None,
     no_sync: bool,
     retries: int | None,
+    cfg: BotConfig,
+    default: BotOptions,
 ) -> BotOptions:
-    """The child's cadence/retry knobs, with the retry default applied."""
+    """CLI flag > config.toml [bot] > code default, one level."""
     return BotOptions(
-        interval=interval,
-        max_age=max_age,
-        no_sync=no_sync,
-        retries=retries if retries is not None else BotOptions().retries,
+        interval=interval
+        if interval is not None
+        else cfg.interval
+        if cfg.interval is not None
+        else default.interval,
+        max_age=max_age
+        if max_age is not None
+        else cfg.max_age
+        if cfg.max_age is not None
+        else default.max_age,
+        no_sync=no_sync or cfg.no_sync or False,
+        retries=retries
+        if retries is not None
+        else cfg.retries
+        if cfg.retries is not None
+        else default.retries,
     )
 
 

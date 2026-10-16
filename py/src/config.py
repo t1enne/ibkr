@@ -16,8 +16,10 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import cast as _cast
+
 
 #: Overrides the settings file. Tests set this.
 _CONFIG_PATH_ENV = "IBKR_CONFIG_PATH"
@@ -50,17 +52,61 @@ def live_adapter() -> str:
         raise ValueError(
             f"live.adapter must be one of {sorted(_ADAPTERS)}, got {value!r}"
         )
-    return cast("str", value)
+    return _cast("str", value)
 
 
 def _table(name: str) -> Mapping[str, object]:
     """The ``[name]`` table of :data:`CONFIG_PATH`, or ``{}`` when absent."""
     try:
         with CONFIG_PATH.open("rb") as handle:
-            parsed = cast("Mapping[str, object]", tomllib.load(handle))
+            parsed = _cast("Mapping[str, object]", tomllib.load(handle))
     except FileNotFoundError:
         return {}
     table = parsed.get(name, {})
     if not isinstance(table, dict):
         raise ValueError(f"[{name}] must be a table in {CONFIG_PATH}")
-    return cast("Mapping[str, object]", table)
+    return _cast("Mapping[str, object]", table)
+
+
+@dataclass(frozen=True)
+class BotConfig:
+    """``[bot]`` section values, all optional. ``None`` = absent from file.
+
+    Entrypoint code merges this with CLI flags + code defaults.
+    """
+
+    interval: int | None = None  # cadence seconds
+    max_age: int | None = None  # staleness days
+    retries: int | None = None  # transient retry count
+    no_sync: bool | None = None  # skip pre-cycle candle sync
+
+
+def read_bot_config() -> BotConfig:
+    """Parse the ``[bot]`` TOML table into a :class:`BotConfig`.
+
+    Missing file, missing table, and missing keys all produce the default
+    (``None``-filled) config — the file is an override surface, not a
+    requirement. Bad types or invalid values raise eagerly so a typo cannot
+    silently pass a wrong cadence or a stale tail.
+    """
+    raw = _table("bot")
+    interval: object | None = raw.get("interval")
+    max_age: object | None = raw.get("max_age")
+    retries: object | None = raw.get("retries")
+    no_sync: object | None = raw.get("no_sync")
+
+    if interval is not None and (not isinstance(interval, int) or interval <= 0):
+        raise ValueError(f"bot.interval must be a positive integer, got {interval!r}")
+    if max_age is not None and (not isinstance(max_age, int) or max_age <= 0):
+        raise ValueError(f"bot.max_age must be a positive integer, got {max_age!r}")
+    if retries is not None and (not isinstance(retries, int) or retries < 0):
+        raise ValueError(f"bot.retries must be a non-negative integer, got {retries!r}")
+    if no_sync is not None and not isinstance(no_sync, bool):
+        raise ValueError(f"bot.no_sync must be true/false, got {no_sync!r}")
+
+    return BotConfig(
+        interval=interval,
+        max_age=max_age,
+        retries=retries,
+        no_sync=no_sync,
+    )
