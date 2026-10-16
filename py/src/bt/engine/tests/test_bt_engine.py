@@ -187,3 +187,76 @@ def test_run_without_a_seed_never_sees_the_held_lot():
         signal_observer=observed.append,
     )
     assert observed == []
+
+
+# --- candle_generator bar count correctness --------------------------------
+
+
+def _hourly_df(symbols: list[str], days: int = 1) -> pd.DataFrame:
+    hours_per_day = [f"{h:02d}:00" for h in range(14, 22)]
+    stamps = []
+    for d in range(days):
+        for h in hours_per_day:
+            stamps.append(f"2025-01-{6 + d:02d} {h}")
+    idx = pd.to_datetime(stamps)
+    n = len(idx)
+    data: dict = {}
+    for sym in symbols:
+        data.update(
+            {
+                (sym, "open"): [100] * n,
+                (sym, "high"): [105] * n,
+                (sym, "low"): [95] * n,
+                (sym, "close"): [102] * n,
+                (sym, "volume"): [1000] * n,
+            }
+        )
+    df = pd.DataFrame(data, index=idx)
+    df.columns = pd.MultiIndex.from_tuples(df.columns)
+    return df
+
+
+def _cfg_1h(symbols):
+    return StrategyConfig(
+        name="test",
+        strategy_type="momentum_compression_breakout_dsl",
+        symbols=symbols,
+        initial_capital=10000.0,
+        commission=0.5,
+        warmup="0d",
+        trading_start="2025-01-06",
+        trading_end="2025-12-31",
+        bars=["1h"],
+        strategy_params={},
+    )
+
+
+def _cfg_1h_4h(symbols):
+    return StrategyConfig(
+        name="test",
+        strategy_type="momentum_compression_breakout_dsl",
+        symbols=symbols,
+        initial_capital=10000.0,
+        commission=0.5,
+        warmup="0d",
+        trading_start="2025-01-06",
+        trading_end="2025-12-31",
+        bars=["1h", "4h"],
+        strategy_params={},
+    )
+
+
+def test_candle_generator_1h_matches_input_row_count():
+    df = _hourly_df(["SPY"], days=3)
+    bt = Backtest(_cfg_1h(["SPY"]))
+    base = [c for c in candle_generator(df, bt.config) if c.interval == "1h"]
+    assert len(base) == len(df)
+
+
+def test_candle_generator_4h_emits_two_per_full_day():
+    n_days = 5
+    df = _hourly_df(["SPY"], days=n_days)
+    bt = Backtest(_cfg_1h_4h(["SPY"]))
+    candles = list(candle_generator(df, bt.config))
+    htf = [c for c in candles if c.interval == "4h"]
+    assert len(htf) == n_days * 2
