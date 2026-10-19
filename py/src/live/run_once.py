@@ -26,7 +26,7 @@ from src.bt.types import StrategyConfig
 from src.config import live_adapter
 from src.data.ibkr.client import IbkrClient
 from src.data.ibkr.gateway import IbkrGateway
-from src.live.adapter import LiveAdapter, resolve_adapter, resolve_adapter_name
+from src.live.adapter import LiveAdapter, resolve_adapter_name, resolve_adapter
 from src.live.divergence import Divergence
 from src.live.console import console_log
 from src.live.ledger import SqliteLedger, config_hash
@@ -79,7 +79,7 @@ def run_once(
     """
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
-    resolved = resolve_adapter_name(adapter, raw, cfg.strategy_params)
+    resolved = resolve_adapter_name(adapter, cfg)
     # Audit key vs ownership key (plan §1.4): the config hash identifies the
     # revision that wrote the scope; the scope keys the book, the cOID prefix and
     # the lease. The scope is minted ONCE here from the ORIGINAL raw config, never
@@ -309,7 +309,7 @@ def load_live_config(path: str) -> LiveConfig:
         size_mode=size_mode,
         size=size,
         max_symbol_allocation=alloc,
-        adapter=resolve_adapter_name(None, raw, params),
+        adapter=cast("AdapterName", live_adapter()),
         broker=cast("Literal['sim', 'ibkr']", raw_broker),
         config_name=strategy.name,
     )

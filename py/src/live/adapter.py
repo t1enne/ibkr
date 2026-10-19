@@ -24,11 +24,10 @@ Two honest qualifications, both load-bearing:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Protocol, cast, get_args
 
 from src.bt.state import PortfolioState
-from src.config import live_adapter
 from src.data.ibkr.client import IbkrClient
 from src.live.adapters.ibkr.adapter import build_ibkr_adapter
 from src.live.adapters.sim.adapter import build_sim_adapter
@@ -41,10 +40,6 @@ from src.live.types import FeedError, LiveConfig, OrderIntent, PortfolioSnapshot
 #: Every adapter name a scope may name — DERIVED from the ONE typing definition
 #: (``src.live.scope.AdapterName``), never a second literal list that can drift.
 _ADAPTER_NAMES: tuple[str, ...] = get_args(AdapterName)
-
-#: Key absent from both sources (as opposed to a key present with value ``None``,
-#: which is a bad value, not an absent one).
-_ABSENT: object = object()
 
 
 class LiveAdapter(Protocol):
@@ -113,36 +108,22 @@ class LiveAdapter(Protocol):
 
 def resolve_adapter_name(
     cli_flag: str | None,
-    raw: Mapping[str, object],
-    params: Mapping[str, object],
+    cfg: LiveConfig,
 ) -> AdapterName:
-    """Which adapter this run uses, by precedence (plan §2.2).
+    """Which adapter this run uses: CLI ``--adapter`` or ``cfg.adapter``.
 
-    CLI ``--adapter`` (an explicitly passed flag) wins, then the config's
-    ``adapter`` key, then the back-compat ``broker`` key — each scanned
-    top-level first, then ``strategy_params`` — then ``config.toml``'s
-    ``[live] adapter`` (see :func:`src.config.live_adapter`). An unknown winner
-    is a config error (``ValueError``), never a silent fallback to the default:
-    a typo'd adapter must not trade on the wrong side. An explicit ``null`` for
-    ``adapter``/``broker`` is a bad VALUE, not an unset key, and raises too.
+    ``cfg.adapter`` is already resolved from the strategy JSON file + config.toml
+    default by ``load_live_config``. This function just applies the CLI override
+    and validates. An explicit ``--adapter None`` is a bad value, not an unset
+    flag, and raises.
     """
-    winner: object = cli_flag
-    if winner is None:
-        # ``_first_named`` returns ``_ABSENT`` when NO key is present and the
-        # key's own value (possibly ``None``) when one is.
-        winner = _first_named(raw, params, ("adapter", "broker"))
-        if winner is _ABSENT:
-            return cast("AdapterName", live_adapter())
-        if winner is None:
+    if cli_flag is not None:
+        if cli_flag not in _ADAPTER_NAMES:
             raise ValueError(
-                f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got None "
-                "(an explicit null is a bad value, not an unset key)"
+                f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got {cli_flag!r}"
             )
-    if winner not in _ADAPTER_NAMES:
-        raise ValueError(
-            f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got {winner!r}"
-        )
-    return cast("AdapterName", winner)
+        return cast("AdapterName", cli_flag)
+    return cfg.adapter
 
 
 def resolve_adapter(
@@ -169,25 +150,6 @@ def resolve_adapter(
     return build_ibkr_adapter(
         cfg, scope, ledger, client, dry_run, log, allow_oth=allow_oth
     )
-
-
-def _first_named(
-    raw: Mapping[str, object],
-    params: Mapping[str, object],
-    keys: tuple[str, ...],
-) -> object:
-    """The first value for the first of *keys* present, top-level before params.
-
-    Key order is the precedence (``adapter`` before the back-compat ``broker``);
-    within a key, the flat/top-level position wins over ``strategy_params``.
-    Returns :data:`_ABSENT` when no key is present anywhere — distinct from a key
-    present with a ``None`` value, which is a bad value the caller must reject.
-    """
-    for key in keys:
-        for source in (raw, params):
-            if key in source:
-                return source[key]
-    return _ABSENT
 
 
 __all__ = ["LiveAdapter", "resolve_adapter", "resolve_adapter_name"]

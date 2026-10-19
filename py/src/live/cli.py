@@ -260,7 +260,7 @@ def _config_report(
     """
     cfg = load_live_config(config_path)
     raw = _read_json(config_path)
-    resolved = resolve_adapter_name(adapter, raw, cfg.strategy_params)
+    resolved = resolve_adapter_name(adapter, cfg)
     store = read_store(
         ledger, _config_scope(cfg, resolved), initial_capital=cfg.initial_capital
     )
@@ -445,7 +445,7 @@ def _open_watch_session(
     raw = _read_json(config_path)
     # The scope-selecting adapter is resolved ONCE, as the one-shot path does, so
     # the watch agrees with ``live run --adapter`` and with the one-shot ``pf``.
-    resolved = resolve_adapter_name(adapter, raw, cfg.strategy_params)
+    resolved = resolve_adapter_name(adapter, cfg)
     # The READ broker follows ``_pf_broker``'s rule: the flag, else a config's
     # EXPLICITLY named broker, else no broker (store-only). A config that never
     # named one must not open an ibkr session just because the default is ibkr.

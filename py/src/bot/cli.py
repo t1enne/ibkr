@@ -26,7 +26,7 @@ from src.live.lease import CycleInProgressError
 from src.live.ledger import LedgerReadError
 from src.live.pipeline import PortfolioFetchError
 from src.live.freshness import StaleDataError
-from src.live.run_once import _read_json, load_live_config, run_once
+from src.live.run_once import load_live_config, run_once
 from src.live.scope import (
     AdapterName,
     ScopeParts,
@@ -310,9 +310,8 @@ def load_scope(
     Returns ``(cfg, scope, resolved_adapter)``; the child receives the resolved
     adapter so parent and child mint the identical scope.
     """
-    raw = _read_json(config_path)
     cfg = load_live_config(config_path)
-    resolved = resolve_adapter_name(adapter_flag, raw, cfg.strategy_params)
+    resolved = resolve_adapter_name(adapter_flag, cfg)
     scope = scope_of(ScopeParts(resolved, config_name_of(cfg), config_scope_hash(cfg)))
     return cfg, scope, resolved
 
