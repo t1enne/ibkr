@@ -12,9 +12,9 @@ here persists a level, stamps a column or keeps an intent row.
   of the same pair, anchored on the lot's OWN open/fill time (never the decision
   bar, never the clock).
 - :func:`resting_legs` — OUR resting protective legs on a conid, ANY count
-  (0..n), ours-by-prefix + conid + ``Submitted`` + known kind, all agreeing on
-  the wire side. A lone ``sl`` is protection, so a strategy arming only a stop
-  is never read as naked (item 4).
+  (0..n), ours-by-prefix + conid + a resting status (:func:`is_resting_status`)
+  + known kind, all agreeing on the wire side. A lone ``sl`` is protection, so a
+  strategy arming only a stop is never read as naked (item 4).
 - :func:`resting_bracket` — the PAIR view of the same rule; ``None`` when either
   leg is missing or foreign. Only for flows that genuinely need a full pair.
 - :func:`unprotected_targets` — the pure per-cycle backstop (spec §4.2): every
@@ -53,8 +53,26 @@ TakeKind = "take_profit"
 LevelKind = Literal["stop", "take_profit"]
 _LEVEL_KINDS: frozenset[str] = frozenset({StopKind, TakeKind})
 
-#: The wire's "resting" status (spec §0) — the ONLY proof a level rests.
-_RESTING = "SUBMITTED"
+#: The wire statuses that count as a level RESTING (spec §0).
+#:
+#: ``Submitted`` is the qualified state. ``PreSubmitted`` is the state IBKR parks
+#: an order in while the market is closed or the order awaits exchange
+#: qualification — a real, live, working GTC bracket placed out of hours reads
+#: this way, so treating it as non-resting reported a protected lot as NAKED and
+#: made the cycle market-close the lot it had just bracketed. Genuinely broken
+#: states (``Inactive``, ``Cancelled``, ``Rejected``, ``PendingSubmit``) stay
+#: non-resting, so fail-closed is preserved.
+_RESTING: frozenset[str] = frozenset({"SUBMITTED", "PRESUBMITTED"})
+
+
+def is_resting_status(status: str) -> bool:
+    """Whether a wire order status proves the level is resting.
+
+    The ONE resting rule, shared by the pure backstop (:func:`resting_legs`) and
+    the IBKR edge's post-submit re-read, so the two readers cannot disagree
+    about what "resting" means. Case/whitespace tolerant because the wire is.
+    """
+    return status.strip().upper() in _RESTING
 
 
 def _finite_positive(level: float | None) -> bool:
@@ -252,7 +270,7 @@ def resting_legs(
     """OUR resting protective legs on *conid* — any count, side-consistent.
 
     Ours means the ref carries our ``scope_tag`` prefix and the row is on
-    ``conid``. RESTING means the wire status reads ``Submitted`` (spec §0) — an
+    ``conid``. RESTING means the wire status is in :data:`_RESTING` — an
     ``Inactive``/``Pending Submit`` leg from a failed confirm is NOT protection,
     and a row whose kind is unreadable off ``orderType`` is not a leg at all.
 
@@ -266,7 +284,7 @@ def resting_legs(
         for o in working
         if _is_ours(o.order_ref, scope_tag)
         and o.conid == conid
-        and o.status.strip().upper() == _RESTING
+        and is_resting_status(o.status)
         and kind_of(o) in _LEVEL_KINDS
     ]
     if not ours:
@@ -507,6 +525,7 @@ __all__ = [
     "ProtectionTarget",
     "bracket_children",
     "child_ref",
+    "is_resting_status",
     "kind_of",
     "level_bracket_intents",
     "protective_ref",

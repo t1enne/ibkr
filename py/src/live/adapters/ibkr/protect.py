@@ -43,6 +43,7 @@ from src.live.protect import (
     ProtectionTarget,
     bracket_children,
     child_ref,
+    is_resting_status,
     kind_of,
     resting_legs,
     unprotected_results,
@@ -57,12 +58,10 @@ from src.live.types import FeedError, OrderIntent, feed_error
 _PAIR_MAX_REPLIES = 5
 
 #: How many post-confirm re-reads prove a pair rests before we call it
-#: UNPROTECTED. A just-submitted pair occasionally takes a beat to flip
-#: ``Submitted`` on the working read.
+#: UNPROTECTED. A just-submitted pair occasionally takes a beat to flip onto
+#: the working read. The resting RULE itself lives in ``src.live.protect``
+#: (``is_resting_status``) so this edge and the pure backstop cannot drift.
 _BRACKET_VERIFY_RETRIES = 3
-
-#: The wire's "resting" status (spec §0) — the ONLY proof a level rests.
-_SUBMITTED = "SUBMITTED"
 
 
 @dataclass(frozen=True)
@@ -419,11 +418,11 @@ class BracketProtectionMixin(_BracketHost):
     async def _re_read_resting(
         self, symbol: str, conid: int, refs: tuple[str, ...]
     ) -> tuple[WorkingOrder, ...] | None:
-        """Re-read the working orders until BOTH refs read ``Submitted``.
+        """Re-read the working orders until BOTH refs read as resting.
 
         Bounded retry (``_BRACKET_VERIFY_RETRIES``) with the broker's poll
         interval; ``None`` on exhaustion — the caller reports ``UNPROTECTED``.
-        A row whose status is not ``Submitted`` never counts (a failed-confirm
+        A row whose status is not resting never counts (a failed-confirm
         ``Inactive`` row is not protection, spec §0).
         """
         for _ in range(_BRACKET_VERIFY_RETRIES):
@@ -432,9 +431,7 @@ class BracketProtectionMixin(_BracketHost):
                 return None
             rows = tuple(index.value.values())
             ours = [
-                o
-                for o in rows
-                if o.order_ref in refs and o.status.strip().upper() == _SUBMITTED
+                o for o in rows if o.order_ref in refs and is_resting_status(o.status)
             ]
             if len(ours) == len(refs):
                 # One leg or many: return exactly the matched legs, never index
@@ -442,7 +439,7 @@ class BracketProtectionMixin(_BracketHost):
                 return tuple(ours)
             await self._sleep(self._poll_interval_s)
         self._log(
-            f"protect {symbol}: pair not re-read as Submitted after "
+            f"protect {symbol}: pair not re-read as resting after "
             f"{_BRACKET_VERIFY_RETRIES} reads"
         )
         return None
