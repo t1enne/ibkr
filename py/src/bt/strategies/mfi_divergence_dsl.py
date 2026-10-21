@@ -433,13 +433,13 @@ def _enter(
         equity, ctx.state.portfolio.positions, p.max_gross_exposure, p.risk_pct
     ):
         return
-    stop = p.entry_stop_atr * atr / close
+    stop_dist = p.entry_stop_atr * atr
     if side == "long":
         ctx.long(
             sym,
             size=p.risk_pct,
             size_mode="equity",
-            sl=stop,
+            sl=close - stop_dist,
             reason=(
                 f"[mfi_div] long {sym}: bullish MFI divergence {close:.2f} "
                 f"(gap={p.div_min_gap:.1f})"
@@ -450,7 +450,7 @@ def _enter(
             sym,
             size=p.risk_pct,
             size_mode="equity",
-            sl=stop,
+            sl=close + stop_dist,
             reason=(
                 f"[mfi_div] short {sym}: bearish MFI divergence {close:.2f} "
                 f"(gap={p.div_min_gap:.1f})"

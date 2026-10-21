@@ -127,8 +127,10 @@ STRATEGY_TYPE = "my_strategy"
 def on_candle(ctx):
     fast = ctx.ta.ema("AAPL", 9)
     slow = ctx.ta.ema("AAPL", 21)
+    px = ctx.price("AAPL")
     if ctx.cross_over(fast, slow):
-        ctx.long("AAPL", size=0.1, sl=0.04, tp=0.08, reason="ema cross up")
+        # sl/tp are ABSOLUTE prices (same convention as ctx.set_stops)
+        ctx.long("AAPL", size=0.1, sl=px * 0.96, tp=px * 1.08, reason="ema cross up")
     elif ctx.cross_under(fast, slow):
         ctx.close("AAPL", reason="ema cross down")
 ```
@@ -141,7 +143,13 @@ Surface (all cursor-safe, no future bars):
   (`view[-2]` = one bar ago); never out of range — the view is cursor-truncated, so it
   structurally cannot leak a future bar.
 - `ctx.long / ctx.short(sym, size=, sl=, tp=, size_mode="capital"|"equity")` — open a fresh lot,
-  `size` = 0..1 fraction of the capital base. `sl`/`tp` are fractional percentages (0.04 = 4%).
+  `size` = 0..1 fraction of the capital base. `sl`/`tp` are **ABSOLUTE PRICES**, same convention
+  as `ctx.set_stops` — a strategy holding a fractional distance (`p.entry_stop_atr * atr / px`)
+  converts it itself (`px * (1 - pct)` long, `px * (1 + pct)` short; helper: `sl_tp_from_pct`).
+  The level is fixed at signal time, so it reflects the signal bar's price, not the fill's.
+  `None` (default) leaves that leg unarmed.
+- `ctx.set_stops(sym, sl=, tp=)` — re-arm SL/TP for every open lot, ratchet-only (never widens);
+  absolute prices, `None` leaves a leg unchanged. Takes effect from the NEXT bar.
 - `ctx.close(sym)` — close all lots; `ctx.partial_close(sym, qty, lot=, tag=)` — shed a fraction of one.
 - `ctx.ohlcv(sym)`, `ctx.price(sym)`, `ctx.position(sym)`, `ctx.quantity(sym)`, `ctx.avg_entry(sym)`.
 - `ctx.cross_over / cross_under`, `ctx.change`, `ctx.barssince`, `ctx.nz` (Pine built-ins).

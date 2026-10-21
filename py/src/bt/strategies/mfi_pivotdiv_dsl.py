@@ -307,12 +307,24 @@ def _enter(
         p.risk_pct,
     ):
         return
-    stop = p.entry_stop_atr * atr / close
+    stop_dist = p.entry_stop_atr * atr
     reason = (
         f"[pivotdiv] {side} {sym}: MFI swing div at {pivot_price:.2f} "
         f"(mfi {pivot_osc:.1f}); enter {close:.2f}"
     )
     if side == "long":
-        ctx.long(sym, size=p.risk_pct, size_mode="equity", sl=stop, reason=reason)
+        ctx.long(
+            sym,
+            size=p.risk_pct,
+            size_mode="equity",
+            sl=close - stop_dist,
+            reason=reason,
+        )
     else:
-        ctx.short(sym, size=p.risk_pct, size_mode="equity", sl=stop, reason=reason)
+        ctx.short(
+            sym,
+            size=p.risk_pct,
+            size_mode="equity",
+            sl=close + stop_dist,
+            reason=reason,
+        )

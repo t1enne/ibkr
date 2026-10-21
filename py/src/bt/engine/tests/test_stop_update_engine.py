@@ -39,19 +39,19 @@ class _FixtureMod:
 def _arm_only_once(ctx: StrategyContext) -> None:
     """Enter long once, then arm ONE absolute stop on the very next bar.
 
-    ``sl=0.05`` on the entry is the dsl convention (fraction of the entry
-    price at SIGNAL time): the entry signal is generated on bar1 at close 100
-    and carries an absolute 95.0 stop, but fills at bar2's open (111). The
-    arming bar computes an absolute 105.0 level off its own close; the bar
-    AFTER that must be the one that stops the position, even though the arming
-    bar's own low (96) traded below the NEW level (105) but above the OLD one
-    (95) — the level must not be live on the bar that computed it.
+    ``sl`` on the entry is an ABSOLUTE price (the ``ctx.long``/``set_stops``
+    convention): the entry signal is generated on bar1 at close 100 and
+    carries the 95.0 level, but fills at bar2's open (111). The arming bar
+    computes an absolute 105.0 level off its own close; the bar AFTER that
+    must be the one that stops the position, even though the arming bar's own
+    low (96) traded below the NEW level (105) but above the OLD one (95) — the
+    level must not be live on the bar that computed it.
     """
     if ctx.phase == "warmup":
         return
     sym = ctx.candle.symbol
     if ctx.quantity(sym) == 0:
-        ctx.long(sym, size=0.9, sl=0.05, reason="entry")
+        ctx.long(sym, size=0.9, sl=ctx.price(sym) * 0.95, reason="entry")
         return
     if ctx.shared.get("armed"):
         return

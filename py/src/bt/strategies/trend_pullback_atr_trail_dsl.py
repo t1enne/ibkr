@@ -192,10 +192,16 @@ def on_candle(ctx: StrategyContext):
         )
         size = qty * price / ctx.state.portfolio.initial_capital
 
+        # ``stop_loss``/``take_profit`` are fractional pcts; ``ctx.long``
+        # takes ABSOLUTE levels. <=0 disables that leg (None).
+        sl = price * (1 - ctx.params.stop_loss) if ctx.params.stop_loss > 0 else None
+        tp = (
+            price * (1 + ctx.params.take_profit) if ctx.params.take_profit > 0 else None
+        )
         ctx.long(
             sym,
             size=size,
-            sl=ctx.params.stop_loss,
-            tp=ctx.params.take_profit,
+            sl=sl,
+            tp=tp,
             reason="[trail] 50wSMA up + ATR oversold",
         )

@@ -190,12 +190,12 @@ def _vol_dry(o, p: Params, n: int) -> bool:
 def _enter(ctx: StrategyContext, p: Params, sym: str, close: float, atr: float) -> None:
     if not (atr > 0 and close > 0 and ctx.state.portfolio.cash > 0):
         return
-    stop = p.entry_stop_atr * atr / close
+    stop_dist = p.entry_stop_atr * atr
     ctx.long(
         sym,
         size=p.risk_pct,
         size_mode="equity",
-        sl=stop,
+        sl=close - stop_dist,
         reason=(
             f"[pullback] long {sym}: fresh marginal low {close:.2f} "
             f"on dried vol in uptrend (ROC>={p.sym_roc_min:.2f})"

@@ -384,8 +384,8 @@ def _open_position(
         ctx.long(
             sym,
             size=size,
-            sl=sl_pct,
-            tp=open_tp_pct,
+            sl=sl_abs,
+            tp=entry_ref * (1 + open_tp_pct) if open_tp_pct is not None else None,
             reason="[bias5-displace] LONG",
             tag="b5l",
         )
@@ -394,8 +394,8 @@ def _open_position(
         ctx.short(
             sym,
             size=size,
-            sl=sl_pct,
-            tp=open_tp_pct,
+            sl=sl_abs,
+            tp=entry_ref * (1 - open_tp_pct) if open_tp_pct is not None else None,
             reason="[bias5-displace] SHORT",
             tag="b5s",
         )

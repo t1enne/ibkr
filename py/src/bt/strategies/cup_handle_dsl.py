@@ -22,11 +22,10 @@ Sizing / SL-TP semantics (DSL convention):
   (``qty = base*size/price``, capped by cash and per-symbol allocation). The
   strategy still bounds its stop distance to the risk budget via
   ``cap_stop_dist`` against the equity-scaled notional.
-* ``ctx.long(sl=, tp=)`` interprets its args as *fractional percentages* of
-  entry converted via ``sl_tp_from_pct`` (absolute = entry*(1±pct)), NOT as
-  absolute prices. The original computes absolute ``stop_loss``/``target``
-  levels, so those are converted back to fractions before emission:
-  ``sl_pct = stop_dist / entry`` and ``tp_pct = (target - entry) / entry``.
+* ``ctx.long(sl=, tp=)`` takes ABSOLUTE PRICES (same convention as
+  ``ctx.set_stops``). The original computes absolute ``stop_loss``/``target``
+  levels, so those are passed straight through:
+  ``sl = entry - stop_dist`` and ``tp = target`` (``None`` when unarmed).
 """
 
 from __future__ import annotations
@@ -631,9 +630,11 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
     if not trending and params.trend_tp_mult > 0 and handle.cup_depth > 0:
         target = entry_price + params.trend_tp_mult * handle.cup_depth
 
-    # Convert absolute SL/TP levels back to fractional pct for ctx.long.
-    sl_pct = stop_dist / entry_price if stop_dist > 0 else 0.0
-    tp_pct = (target - entry_price) / entry_price if target > 0 else 0.0
+    # ``ctx.long`` takes ABSOLUTE SL/TP levels: the stop is the primitive
+    # absolute level ``entry_price - stop_dist``; the optional trend TP is
+    # ``target`` itself (None when disabled).
+    sl_abs = entry_price - stop_dist if stop_dist > 0 else None
+    tp_abs = target if target > 0 else None
 
     ctx.shared["handle_lows"][sym] = handle.low
     ctx.shared["cooldowns"][sym] = params.cooldown_bars
@@ -642,8 +643,8 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
     # ``max_symbol_allocation`` in the strategy config.
     ctx.long(
         sym,
-        sl=sl_pct,
-        tp=tp_pct,
+        sl=sl_abs,
+        tp=tp_abs,
         reason=(
             f"breakout above {handle.breakout_level:.2f} "
             f"(depth={handle.cup_depth:.2f} · {result.reason})"

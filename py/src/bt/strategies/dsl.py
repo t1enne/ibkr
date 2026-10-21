@@ -26,8 +26,9 @@ Shape::
     def on_candle(ctx: StrategyContext):
         fast = ctx.ta.ema("AAPL", 9)
         slow = ctx.ta.ema("AAPL", 21)
+        px = ctx.price("AAPL")
         if ctx.cross_over(fast, slow):
-            ctx.long("AAPL", size=0.1, sl=0.04, tp=0.08)
+            ctx.long("AAPL", size=0.1, sl=px * 0.96, tp=px * 1.08)
         elif ctx.cross_under(fast, slow):
             ctx.close("AAPL")
 
@@ -47,7 +48,6 @@ from src.bt.state import ActionType, TradeSignal, BacktestState, Candle, Positio
 from src.bt.strategies.fundamentals_context import Fundamentals
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.ta_context import OhlcvView, TaContext
-from src.bt.strategies.utils import sl_tp_from_pct
 
 if TYPE_CHECKING:
     pass
@@ -415,7 +415,13 @@ class StrategyContext:
         live book at emit time. When ``size`` is omitted the engine's shared
         sizing layer sizes the position (signal emitted with ``qty=0``),
         regardless of ``size_mode``.
-        ``sl``/``tp`` are fractional percentages converted to absolute levels.
+        ``sl``/``tp`` are ABSOLUTE PRICES (same convention as
+        :meth:`set_stops`), not fractions of the entry. A strategy holding a
+        fractional stop distance converts it itself
+        (``px * (1 - pct)`` long, ``px * (1 + pct)`` short); ``None``
+        (the default) leaves that leg unarmed. The level is fixed at SIGNAL
+        time — the fill can land at a later open, so a level derived from
+        ``ctx.price(sym)`` is a convention, not a guarantee.
         ``tag`` is an optional strategy-facing lot label (Pine entry-name
         analogue, e.g. ``"spy-r1"``) stored on the :class:`Position` so
         ``partial_close(..., tag=...)`` is readable lot targeting instead of
@@ -446,8 +452,10 @@ class StrategyContext:
         keeps capital utilization high — the share count is recomputed from the
         live book at emit time. When ``size`` is omitted the engine's shared
         sizing layer sizes the position (signal emitted with ``qty=0``),
-        regardless of ``size_mode``. ``sl``/``tp`` are fractional percentages
-        converted to absolute levels.
+        regardless of ``size_mode``. ``sl``/``tp`` are ABSOLUTE PRICES (same
+        convention as :meth:`set_stops`) — the short leg's ``sl`` is ABOVE the
+        entry and ``tp`` BELOW it; a strategy holding fractional distances
+        converts them itself.
         ``tag`` is an optional strategy-facing lot label (Pine entry-name
         analogue) stored on the :class:`Position` for readable ``partial_close``
         lot targeting.
@@ -508,8 +516,9 @@ class StrategyContext:
         Emits one ``stop_update`` ``TradeSignal`` per open lot, each targeting
         its own ``position_id``; the portfolio layer ratchets the levels
         (tighten-only, never widen). ``sl``/``tp`` here are ABSOLUTE PRICES —
-        unlike ``ctx.long(sl=)``, whose ``sl`` is a fraction of the entry price.
-        ``None`` for a leg leaves it unchanged. A no-op when ``sym`` is flat.
+        the same convention as ``ctx.long(sl=, tp=)``. For a short, ``sl`` is
+        above and ``tp`` below the entry. ``None`` for a leg leaves it
+        unchanged. A no-op when ``sym`` is flat.
 
         Timing: the level takes effect from the NEXT bar. The engine drains the
         update out of the fill path and applies it AFTER the current bar's own
@@ -553,10 +562,10 @@ class StrategyContext:
     ) -> None:
         self._assert_tradable(action, sym)
         price = self.price(sym)
-        is_long = action == ActionType.long
-        sl_price, tp_price = sl_tp_from_pct(
-            price, sl or 0.0, tp or 0.0, is_long=is_long
-        )
+        # ``sl``/``tp`` are ABSOLUTE PRICES, passed through verbatim: the
+        # portfolio layer reads ``signal.stop_loss``/``take_profit`` directly
+        # (see ``pure.py``), exactly as it does for ``set_stops``. A strategy
+        # holding a fractional distance converts it before emitting.
         # Explicit ``size`` -> 0..1 fraction of a capital base -> absolute share
         # count. ``size_mode`` picks the base: ``"capital"`` = initial capital
         # (legacy fixed-dollar behavior); ``"equity"`` = live MTM equity, so a
@@ -577,8 +586,8 @@ class StrategyContext:
                 price=price,
                 qty=qty,
                 reason=reason,
-                stop_loss=sl_price,
-                take_profit=tp_price,
+                stop_loss=sl,
+                take_profit=tp,
                 tag=tag,
             )
         )

@@ -235,7 +235,7 @@ def _enter_short(
         sym,
         size=p.risk_pct,
         size_mode="equity",
-        sl=stop_dist / close,
+        sl=close + stop_dist,
         reason=(
             f"[mfi_exh] short {sym}: marginal HH {close:.2f} on dried vol "
             f"with MFI rollover (gap={p.mfi_gap:.1f})"

@@ -631,15 +631,15 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     )
 
     put(best=px)
-    # Arming the initial stop in the SAME call via ``sl`` keeps the dsl
-    # convention (fraction of the entry price, not absolute): ``stop_price`` is
-    # the sizing stop distance, so the level lands at entry − vwatr_mult*ATR.
+    # Arming the initial stop in the SAME call via ``sl`` (ABSOLUTE PRICE):
+    # ``stop_price`` is the DISTANCE at entry − vwatr_mult*ATR, so subtract it
+    # from the signal-time price instead of passing it as a fraction.
     ctx.long(
         sym,
         size=size,
         size_mode="equity",
         reason=reason,
-        sl=stop_price / px,
+        sl=px - stop_price,
     )
 
 

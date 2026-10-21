@@ -108,10 +108,14 @@ def _deploy_equal_weight(
         except Exception:
             continue
         if px > 0:
+            # ``stop_loss_pct`` is a fractional distance; convert to the
+            # ABSOLUTE level ``ctx.long(sl=)`` takes. 0.0 leaves the leg
+            # unarmed.
+            sl = px * (1 - params.stop_loss_pct) if params.stop_loss_pct > 0 else None
             ctx.long(
                 sym,
                 size=per_eq,
-                sl=params.stop_loss_pct,
+                sl=sl,
                 reason=f"[rvwf] long {sym} (equal weight)",
                 size_mode="equity",
             )

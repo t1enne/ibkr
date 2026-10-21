@@ -208,6 +208,6 @@ def _enter_short(
         sym,
         size=p.risk_pct,
         size_mode="equity",
-        sl=stop_dist / close,
+        sl=close + stop_dist,
         reason=reason,
     )
