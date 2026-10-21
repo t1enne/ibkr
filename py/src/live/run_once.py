@@ -23,13 +23,13 @@ from src.bt.cmds._shared import _json_default
 from src.bt.state import PortfolioState
 from src.bt.table import Col, Table, render as render_table
 from src.bt.types import StrategyConfig
-from src.config import live_adapter
 from src.data.ibkr.client import IbkrClient
 from src.data.ibkr.gateway import IbkrGateway
-from src.live.adapter import LiveAdapter, resolve_adapter_name, resolve_adapter
+from src.live.adapter import LiveAdapter, resolve_adapter
 from src.live.divergence import Divergence
 from src.live.console import console_log
 from src.live.ledger import SqliteLedger, config_hash
+from src.live.options import LiveOptions
 from src.live.pipeline import run_cycle
 from src.live.pure import OrderResult
 from src.live.report import CycleReport, unsafe_outcomes
@@ -61,25 +61,25 @@ _stderr_log = console_log
 def run_once(
     config_path: str,
     *,
-    dry_run: bool = False,
-    max_age_days: int,
-    fmt: str = "text",
-    adapter: str | None = None,
+    options: LiveOptions,
     allow_unsafe: bool = False,
-    allow_oth: bool = False,
 ) -> int:
     """Run ONE live cycle for *config_path*; return its machine exit code.
 
     ``0`` for a clean cycle, ``_UNSAFE_EXIT_CODE`` for a cycle that may hold
     something the operator cannot see. Transient failures propagate as the typed
     exceptions ``live_run`` translates — the caller retries (bot §5) or fails a
-    cron line. ``allow_unsafe`` forces ``0`` for an unsafe cycle.
-    ``allow_oth`` when true, the broker may auto-confirm orders placed outside
-    trading hours. Default (false) rejects them.
+    cron line. ``allow_unsafe`` forces ``0`` for an unsafe cycle; it is the ONE
+    knob that is flag-only and never a ``[live]`` setting.
+
+    *options* is the ALREADY MERGED option set
+    (:func:`src.live.options.merge_live_options`) — this function never re-reads
+    a flag or ``config.toml``, so precedence is stated in exactly one place.
     """
-    cfg = load_live_config(config_path)
+    cfg = load_strat_config(config_path)
     raw = _read_json(config_path)
-    resolved = resolve_adapter_name(adapter, cfg)
+    resolved = options.adapter
+    dry_run = options.dry_run
     # Audit key vs ownership key (plan §1.4): the config hash identifies the
     # revision that wrote the scope; the scope keys the book, the cOID prefix and
     # the lease. The scope is minted ONCE here from the ORIGINAL raw config, never
@@ -91,7 +91,7 @@ def run_once(
     if not dry_run:  # a dry run writes nothing (not even the strategy row)
         ledger.ensure_strategy(strategy_id, scope, strategy.name, cfg.initial_capital)
     backend, gateway = _build_backend(
-        cfg, resolved, scope, ledger, dry_run, allow_oth=allow_oth
+        cfg, resolved, scope, ledger, dry_run, allow_oth=options.allow_oth
     )
     # Plan §7.3: label which source produced this run's costs. A resolved IBKR run
     # books the broker's exact per-execution commission but still SIZES on the sim
@@ -104,12 +104,12 @@ def run_once(
         strategy=strategy,
         strategy_id=strategy_id,
         scope=scope,
-        max_age_days=max_age_days,
+        max_age_days=options.max_age,
         dry_run=dry_run,
         gateway=gateway,
         cost=cost,
     )
-    click.echo(render_report(report, fmt, scope))
+    click.echo(render_report(report, options.format, scope))
     _log_info(f"cycle exit {_exit_code(report, allow_unsafe)}")
     return _exit_code(report, allow_unsafe)
 
@@ -235,28 +235,6 @@ async def _run_cycle(
             await gateway.aclose()
 
 
-def resolve_broker(
-    raw: Mapping[str, object], params: Mapping[str, object]
-) -> tuple[str, bool]:
-    """The ONE read of the config's ``broker`` key: ``(name, was_named_explicitly)``.
-
-    Precedence: flat/top-level, then ``strategy_params``, then ``config.toml``'s
-    ``[live] adapter``. The explicit-named flag comes from the same scan, so it
-    can never contradict the resolved name. ``live run`` does NOT consult this
-    for adapter SELECTION (its ``--adapter`` always carries a value); it is the
-    config description used by ``live pf`` and the sim broker.
-    """
-    for source in (raw, params):
-        if "broker" in source:
-            value = source["broker"]
-            if value not in _ADAPTERS:
-                raise ValueError(
-                    f"broker must be one of {sorted(_ADAPTERS)}, got {value!r}"
-                )
-            return cast("str", value), True
-    return live_adapter(), False
-
-
 def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
     """Dump a strategy-only projection of *strategy* into *tmp*; return its path.
 
@@ -270,7 +248,30 @@ def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
     return str(path)
 
 
-def load_live_config(path: str) -> LiveConfig:
+def resolve_broker(
+    raw: Mapping[str, object], params: Mapping[str, object]
+) -> tuple[str, bool]:
+    """The ONE read of a config's ``broker`` key: ``(name, was_named_explicitly)``.
+
+    Precedence: flat/top-level, then ``strategy_params``. The explicit-named flag
+    comes from the same scan, so it cannot contradict the resolved name. This
+    NEVER decides adapter selection for ``live run`` (that is
+    :func:`src.live.options.merge_live_options`); it is the config description
+    ``live pf`` uses to decide whether to read a broker at all, so an unnamed
+    config reads store-only rather than defaulting to ibkr.
+    """
+    for source in (raw, params):
+        if "broker" in source:
+            value = source["broker"]
+            if value not in _ADAPTERS:
+                raise ValueError(
+                    f"broker must be one of {sorted(_ADAPTERS)}, got {value!r}"
+                )
+            return cast("str", value), True
+    return "", False
+
+
+def load_strat_config(path: str) -> LiveConfig:
     """Parse + validate the live JSON -> ``LiveConfig`` (strategy + sizing).
 
     Strategy fields go through ``StrategyConfig``; the live-only sizing keys are
@@ -282,7 +283,6 @@ def load_live_config(path: str) -> LiveConfig:
     strategy = _strategy_config(path, raw)
     params = strategy.strategy_params
     size_mode, size, alloc = _sizing(raw, params)
-    raw_broker, _ = resolve_broker(raw, params)
     commission = _float_or((raw, params), "commission", strategy.commission)
     spread_bps = _float_or((raw, params), "spread_bps", strategy.spread_bps)
     slippage_bps = _float_or((raw, params), "slippage_bps", strategy.slippage_bps)
@@ -309,8 +309,6 @@ def load_live_config(path: str) -> LiveConfig:
         size_mode=size_mode,
         size=size,
         max_symbol_allocation=alloc,
-        adapter=cast("AdapterName", live_adapter()),
-        broker=cast("Literal['sim', 'ibkr']", raw_broker),
         config_name=strategy.name,
     )
 
@@ -608,8 +606,8 @@ def _float_or_none(
 
 
 __all__ = [
-    "load_live_config",
-    "render_report",
+    "load_strat_config",
     "resolve_broker",
+    "render_report",
     "run_once",
 ]

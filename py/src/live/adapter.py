@@ -25,7 +25,7 @@ Two honest qualifications, both load-bearing:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol, cast, get_args
+from typing import Protocol
 
 from src.bt.state import PortfolioState
 from src.data.ibkr.client import IbkrClient
@@ -36,10 +36,6 @@ from src.live.ledger import SqliteLedger
 from src.live.result import Result
 from src.live.scope import AdapterName
 from src.live.types import FeedError, LiveConfig, OrderIntent, PortfolioSnapshot
-
-#: Every adapter name a scope may name — DERIVED from the ONE typing definition
-#: (``src.live.scope.AdapterName``), never a second literal list that can drift.
-_ADAPTER_NAMES: tuple[str, ...] = get_args(AdapterName)
 
 
 class LiveAdapter(Protocol):
@@ -106,26 +102,6 @@ class LiveAdapter(Protocol):
     async def close(self) -> Result[None, FeedError]: ...
 
 
-def resolve_adapter_name(
-    cli_flag: str | None,
-    cfg: LiveConfig,
-) -> AdapterName:
-    """Which adapter this run uses: CLI ``--adapter`` or ``cfg.adapter``.
-
-    ``cfg.adapter`` is already resolved from the strategy JSON file + config.toml
-    default by ``load_live_config``. This function just applies the CLI override
-    and validates. An explicit ``--adapter None`` is a bad value, not an unset
-    flag, and raises.
-    """
-    if cli_flag is not None:
-        if cli_flag not in _ADAPTER_NAMES:
-            raise ValueError(
-                f"adapter must be one of {sorted(_ADAPTER_NAMES)}, got {cli_flag!r}"
-            )
-        return cast("AdapterName", cli_flag)
-    return cfg.adapter
-
-
 def resolve_adapter(
     cfg: LiveConfig,
     adapter_name: AdapterName,
@@ -152,4 +128,4 @@ def resolve_adapter(
     )
 
 
-__all__ = ["LiveAdapter", "resolve_adapter", "resolve_adapter_name"]
+__all__ = ["LiveAdapter", "resolve_adapter"]

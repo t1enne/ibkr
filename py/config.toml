@@ -1,11 +1,30 @@
 # Operator settings — non-secret defaults a CLI cannot guess.
 # Secrets stay in `.env` (IBKR_USERNAME / IBKR_PASSWORD).
 # `IBKR_CONFIG_PATH` points elsewhere (tests do).
+#
+# Every key is OPTIONAL — omit for the code default. Precedence is one level:
+# CLI flag > the key here > code default. A value outside a key's vocabulary
+# (a misspelled adapter or format) RAISES rather than falling back, so a typo
+# can never silently trade the wrong side or emit a format nothing can parse.
 
 [live]
-# The adapter a live run/`live pf` uses when neither `--adapter` nor the
-# strategy config names one. One of "ibkr" | "sim".
+# The adapter a live cycle trades through. One of "ibkr" | "sim". Default: ibkr.
 adapter = "ibkr"
+# Allow BUY/SELL MKT orders outside regular trading hours
+allow_oth = true
+# Staleness gate
+max_age = 5
+# Reconcile and report without placing anything. Default: false.
+# Safe direction only: this can make a run LESS dangerous, never more.
+# dry_run = false
+
+# Report format: "text" | "json". Default: text.
+# format = "text"
+
+# NOT available here, by design: `--allow-unsafe`. It forces exit 0 on a cycle
+# the operator cannot fully see, and it is the one signal a scheduler alerts on.
+# Setting it in a file would make that silence deployment-wide. Keep it a
+# per-invocation flag; never put it in a scheduled run.
 
 [bot]
 # Defaults for `ibkr bot start` flags. Every key is optional — omit for code
@@ -14,7 +33,8 @@ adapter = "ibkr"
 # Cadence in seconds. When unset: one bar of the config's `bars[0]`.
 # interval = 3600
 
-# Staleness gate in days. When unset: 2x cadence, clamped >= 1.
+# Staleness gate in days for a resident BOT. When unset: 2x cadence, clamped >= 1.
+# This feeds `bot start`/`bot _run` only; `live run` reads `[live] max_age`.
 # max_age = 2
 
 # Transient cycles to retry before exiting.

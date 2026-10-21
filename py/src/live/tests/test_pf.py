@@ -17,7 +17,7 @@ import pytest
 
 from src.data.db import get_connection
 from src.exec.refs import scope_tag
-from src.live.cli import _config_report, load_live_config
+from src.live.cli import _config_report, load_strat_config
 from src.live.ledger import ExecutionRecord, SqliteLedger
 from src.live.pf import (
     BrokerLot,
@@ -304,7 +304,7 @@ def test_an_ibkr_scope_never_reports_a_cash_divergence() -> None:
 def _cfg(tmp_path: Path, **live_keys: object) -> LiveConfig:
     target = tmp_path / "cfg.json"
     target.write_text(json.dumps({**BASE_CONFIG, **live_keys}))
-    return load_live_config(str(target))
+    return load_strat_config(str(target))
 
 
 def test_pf_adapter_flag_selects_the_scope(

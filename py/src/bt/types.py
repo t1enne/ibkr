@@ -90,24 +90,12 @@ class StrategyConfig:
     commission_per_share: float | None = None
     commission_min: float = 0.0
     commission_max_pct: float | None = None
-    # Which broker the strategy trades through: ``"sim"`` (the candle
-    # ``SimExchange`` backtest adapter) or ``"ibkr"`` (the live edge). Default
-    # preserves every existing JSON's behaviour. An unrecognised value fails
-    # loudly at construction rather than silently falling back to the sim.
-    # NOTE: the live CLI (``ibkr live run``) resolves its adapter from the
-    # config's ``broker`` key through ``resolve_broker`` (phase 2); it reads the
-    # key once, not this field.
-    broker: BrokerName = "sim"
     #: Stable strategy identity that survives a config edit (plan rev 4.1 §4):
     #: the per-scope book key AND the cOID prefix a strategy uses to recognise
     #: its own fills on a shared account. Defaults to ``name`` when unset.
     scope: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.broker not in ("sim", "ibkr"):
-            raise ValueError(
-                f"Unknown broker {self.broker!r}; expected one of ['ibkr', 'sim']"
-            )
         if not self.scope:
             self.scope = self.name
 

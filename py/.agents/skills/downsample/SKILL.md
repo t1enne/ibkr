@@ -94,32 +94,40 @@ not understood the parent yet — stop and read the module, do not proceed.
 This is the normal, expected port. Not a fallback.
 
 - `bars`: `["1h", "1d"]` — `1h` is the base fill grid, `1d` is the signal feed.
-- `strategy_type`: a NEW sibling module (e.g. `vwatr_div_htf_dsl` porting
-  `vwatr_div_dsl`). Copy the original and change only WHERE each read is taken.
+- `strategy_type`: **the SAME module as the daily original.** Resolve the signal
+  interval from the run, never from a second file:
+  `_state_interval(ctx) -> None if ctx.interval == "1d" else "1d"`. `None`
+  means the base feed IS the signal feed (daily venue); `"1d"` means an
+  intraday base that only times the fill. Reference:
+  `src/bt/strategies/vwatr_div_dsl.py`, which serves BOTH venues.
 - `strategy_params`: **the original daily values, unchanged.** Params keep their
   daily-bar units; no `×7`.
 - `warmup`: daily-bar warm-up large enough for the slowest `1d` indicator plus
   one completion-lag bucket.
 
-In the new module, every signal/state read goes to `1d`:
+In the module, every signal/state read goes through that resolver:
 
 ```python
-_STATE_INTERVAL = "1d"          # one constant, one spelling
-close = ctx.ohlcv(sym, _STATE_INTERVAL).close
-vwatr = ctx.ta.vwatr(sym, params.vwatr_period, interval=_STATE_INTERVAL)
+si = _state_interval(ctx)        # None (base feed) or "1d"
+close = ctx.ohlcv(sym, si).close
+vwatr = ctx.ta.vwatr(sym, params.vwatr_period, interval=si)
 ```
 
 The base (1h) bar is used for exactly one thing: **selecting the fill**. A daily
 rule that goes true is emitted once, and fills at the next base bar's open.
 
-### Why this path needs a new module (and the approval it carries)
+A second module is a fork of the rule set and will drift from it — do not write
+one. The parity check is two `bt run`s on the same code: one `["1d"]`, one
+`["1h","1d"]`.
 
-Writing a sibling module edits strategy CODE, and AGENTS.md hard rule 1 +
-SKILL.md's trade-by-trade review gate mean the port is **reviewed trade by
-trade before it is trusted**. That review is the point — the HTF port is not
-"config-only", so it cannot be waved through. Frame it as the expected path and
-get the review; do not treat the extra work as a reason to fall back to a
-bar-count-scaled `["1h"]`-only config.
+### Why the venue switch carries the approval
+
+Re-pointing a strategy at `["1h","1d"]` changes the fills it takes, and AGENTS.md
+hard rule 1 + SKILL.md's trade-by-trade review gate mean the result is
+**reviewed trade by trade before it is trusted**. An intraday run is not
+"config-only" in effect, so it cannot be waved through. Frame it as the expected
+path and get the review; do not treat the extra work as a reason to fall back to
+a bar-count-scaled `["1h"]`-only config.
 
 ### When bar-count scaling is even legitimate
 
@@ -152,9 +160,11 @@ evidence for the rule.)
 
 ### The corrected design
 
-Reference: `src/bt/strategies/vwatr_div_htf_dsl.py`.
+Reference: `src/bt/strategies/vwatr_div_dsl.py` (both venues, one module).
 
-- **`_new_daily_bucket(holder, sym, n_daily)`** — the gate. Compares the call's
+- **`_new_daily_bucket(ctx, holder, sym, n_daily)`** — the gate. Returns True
+  unconditionally on the daily venue (`_state_interval(ctx) is None`), else
+  compares the call's
   own `len(ctx.ta.<ind>(sym, interval="1d"))` against the last base bar's. True
   only on the first base bar of a newly-completed daily bucket. Because the
   engine fires `on_candle` on base bars and never on `1d` candles, the visible

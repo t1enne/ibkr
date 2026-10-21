@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import zlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, cast, get_args
+from typing import Literal, cast, get_args
 
 import pandas as pd
 
@@ -29,14 +29,7 @@ __all__ = [
     "synthetic_conid",
 ]
 from src.bt.state.factories import build_commission_model, create_execution_params
-from src.config import live_adapter
 from src.exec.types import OrderSide, OrderType
-
-if TYPE_CHECKING:
-    # Type-only: ``scope`` imports ``LiveConfig`` from here, so a runtime import
-    # would be a cycle. ``AdapterName`` is the ONE definition of the adapter
-    # vocabulary (never redefined in this module).
-    from src.live.scope import AdapterName
 
 #: Actions the screen can emit that require a live decision. ``flat`` is never
 #: produced: absence of a signal is HOLD downstream.
@@ -425,15 +418,6 @@ class LiveConfig:
     size_mode: Literal["equity", "cash", "fixed"] = "equity"
     size: float = 0.0
     max_symbol_allocation: float = 1.0
-    # The resolved backend this config trades through (plan §2.2). The CLI
-    # overrides it with ``--adapter`` when that flag is passed explicitly; absent
-    # a flag this is what ``resolve_adapter_name`` resolves, falling back to the
-    # back-compat ``broker`` key below, then ``config.toml``'s ``[live] adapter``.
-    adapter: AdapterName = cast("AdapterName", live_adapter())
-    # Which broker this config TRADES through, kept as the back-compat source for
-    # adapter resolution (``resolve_broker``) and as a description of the config.
-    # A run's actual backend is ``adapter`` — this no longer selects it.
-    broker: Literal["sim", "ibkr"] = cast("Literal['sim', 'ibkr']", live_adapter())
     #: The config's ``name`` — the ``<config_name>`` scope segment.
     config_name: str = ""
 

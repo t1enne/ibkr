@@ -12,13 +12,12 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TextIO, cast, get_args
+from typing import TextIO
 
 import click
 import pandas as pd
 
-from src.config import read_bot_config, live_adapter
-from src.live.adapter import resolve_adapter_name
+from src.config import read_live_config
 from src.shared.style import COLOR, PLAIN, Styler
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.gateway import IbkrGateway
@@ -26,6 +25,12 @@ from src.live.pipeline import PortfolioFetchError
 from src.live.freshness import StaleDataError
 from src.live.lease import CycleInProgressError
 from src.live.ledger import LedgerReadError, SqliteLedger
+from src.live.options import (
+    LiveOptions,
+    adapter_names,
+    format_names,
+    merge_live_options,
+)
 from src.live.adapters.sim.store import SimBookStore, resolve_sim_book_path
 from src.live.pf import (
     BrokerSide,
@@ -50,17 +55,19 @@ from src.live.scope import (
 # and their tests, rather than a second copy that would drift.
 from src.live.run_once import (
     _read_json,
-    load_live_config,
+    load_strat_config,
     resolve_broker,
     run_once,
 )
 from src.live.types import FeedError, LiveConfig
 
-#: Adapters ``--adapter`` accepts. Phase 2 ships ``ibkr`` read-only.
-_ADAPTERS = get_args(AdapterName)
-#: The same vocabulary, DERIVED from its ONE definition (``scope.AdapterName``):
-#: a second literal list would let a name be accepted by one layer and rejected
-#: by another.
+#: Adapters ``--adapter`` accepts, DERIVED from the ONE typing definition
+#: (``scope.AdapterName``): a second literal list would let a name be accepted by
+#: one layer and rejected by another.
+_ADAPTERS = adapter_names()
+
+#: Report formats ``--format`` accepts, derived the same way.
+_FORMATS = format_names()
 
 #: A sleep seam so a watch loop's cadence is injectable in tests (never slept
 #: through the wall clock). ``time.sleep`` is the production default.
@@ -82,23 +89,33 @@ def live_group() -> None:
 
 @click.command("run")
 @click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
-@click.option("--dry-run", is_flag=True, help="Reconcile + report; place nothing.")
+@click.option(
+    "--dry-run",
+    "dry_run",
+    flag_value=True,
+    default=None,
+    help="Reconcile + report; place nothing. Unset: `[live] dry_run`, then false.",
+)
 @click.option(
     "--max-age",
     "-a",
     type=int,
     default=None,
-    help="Staleness gate in days. Default: ``[bot] max_age`` in config.toml, then 5.",
+    help="Staleness gate in days. Unset: `[live] max_age`, then 5.",
 )
 @click.option(
-    "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
+    "--format",
+    "-F",
+    "fmt",
+    type=click.Choice(_FORMATS),
+    default=None,
+    help="Report format. Unset: `[live] format`, then `text`.",
 )
 @click.option(
     "--adapter",
     type=click.Choice(_ADAPTERS),
     default=None,
-    help="Broker adapter to run through. Unset, the config decides (its `adapter` "
-    "key, then the back-compat `broker` key), defaulting to `ibkr`.",
+    help="Broker adapter to run through. Unset: `[live] adapter`, then `ibkr`.",
 )
 @click.option(
     "--allow-unsafe",
@@ -107,38 +124,49 @@ def live_group() -> None:
         "Exit 0 even when the cycle is unsafe (placement/resync error, a book "
         "divergence, or an unresolved/wedged/timed-out order). For callers that "
         "consume the report themselves; the default exits non-zero so cron can "
-        "see it."
+        "see it. DELIBERATELY flag-only: it is never a `[live]` setting."
     ),
 )
 @click.option(
     "--allow-oth",
-    is_flag=True,
+    "allow_oth",
+    flag_value=True,
+    default=None,
     help=(
         "Allow placing BUY/SELL MKT orders outside NYSE trading hours "
-        "(Mon-Fri 9:30-16:00 ET). Default: refuse and warn."
+        "(Mon-Fri 9:30-16:00 ET). Unset: `[live] allow_oth`, then refuse and warn."
     ),
 )
 def live_run(
     config_path: str,
-    dry_run: bool,
+    dry_run: bool | None,
     max_age: int | None,
-    fmt: str,
+    fmt: str | None,
     adapter: str | None,
     allow_unsafe: bool,
-    allow_oth: bool,
+    allow_oth: bool | None,
 ) -> None:
-    """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing."""
-    bot_cfg = read_bot_config()
-    resolved_max_age = max_age if max_age is not None else bot_cfg.max_age
+    """Run ONE live cycle (cron-friendly). --dry-run reconciles without placing.
+
+    Every knob except ``--allow-unsafe`` may also come from ``config.toml``'s
+    ``[live]`` table; a flag always wins over the file.
+    """
     try:
+        # The merge is INSIDE the guard: a typo in ``[live] adapter`` is a config
+        # error and must map to exit 1, not a traceback on a cron line.
+        options = merge_live_options(
+            adapter,
+            allow_oth,
+            read_live_config(),
+            LiveOptions(),
+            max_age=max_age,
+            dry_run=dry_run,
+            fmt=fmt,
+        )
         code = run_once(
             config_path,
-            dry_run=dry_run,
-            max_age_days=resolved_max_age if resolved_max_age is not None else 5,
-            fmt=fmt,
-            adapter=adapter,
+            options=options,
             allow_unsafe=allow_unsafe,
-            allow_oth=allow_oth,
         )
     except (
         ValueError,
@@ -165,14 +193,20 @@ live_group.add_command(live_run)
     type=click.Path(exists=True, dir_okay=False),
 )
 @click.option(
-    "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
+    "--format",
+    "-F",
+    "fmt",
+    type=click.Choice(_FORMATS),
+    default=None,
+    help="Report format. Unset: `[live] format`, then `text`.",
 )
 @click.option(
     "--adapter",
     type=click.Choice(_ADAPTERS),
     default=None,
     help="Broker to read; a filter over which broker side is included. "
-    "Absent = store-only (no broker read).",
+    "Absent = store-only (no broker read) — `[live] adapter` does NOT apply here, "
+    "because a report must not open a broker the operator did not ask for.",
 )
 @click.option(
     "--watch",
@@ -186,7 +220,7 @@ live_group.add_command(live_run)
 )
 def live_pf(
     config_path: str | None,
-    fmt: str,
+    fmt: str | None,
     adapter: str | None,
     watch_seconds: float | None,
 ) -> None:
@@ -218,6 +252,20 @@ def live_pf(
     creation). The exit code is 0 (report printed), 1 (a config/gateway/read
     failure) or 2 (usage) — there is no unsafe path here.
     """
+
+    # ``pf`` reads, it never trades: ONLY the report format is resolved from
+    # ``[live]``. ``--adapter`` stays a pure filter (absent = store-only), so it
+    # is NOT defaulted from ``[live] adapter`` — a report must never open a broker
+    # the operator did not ask for. The merge sits inside the guard so a ``[live]``
+    # typo is exit 1, not a traceback.
+    try:
+        merged = merge_live_options(
+            None, None, read_live_config(), LiveOptions(), fmt=fmt
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    fmt = merged.format
+
     if watch_seconds is not None and fmt == "json":
         raise click.ClickException("--watch cannot be combined with --format json")
     ledger = SqliteLedger()
@@ -258,9 +306,11 @@ def _config_report(
     the same adapter: ``pf --adapter sim`` after ``run --adapter sim`` reads the
     sim scope, not the config's default.
     """
-    cfg = load_live_config(config_path)
+    cfg = load_strat_config(config_path)
     raw = _read_json(config_path)
-    resolved = resolve_adapter_name(adapter, cfg)
+    resolved = merge_live_options(
+        adapter, None, read_live_config(), LiveOptions()
+    ).adapter
     store = read_store(
         ledger, _config_scope(cfg, resolved), initial_capital=cfg.initial_capital
     )
@@ -278,9 +328,8 @@ def _config_scope(cfg: LiveConfig, resolved_adapter: AdapterName) -> str:
     """The scope a config addresses: ``<adapter>_<config_name>_<config_hash>``.
 
     The SAME mint ``live run`` uses, so ``pf``/``status`` read the scope a cycle
-    writes. *resolved_adapter* is the caller's :func:`resolve_adapter_name`
-    result, so the CLI ``--adapter`` flag selects the scope exactly as it does a
-    run.
+    writes. *resolved_adapter* is the caller's merge result, so the CLI
+    ``--adapter`` flag selects the scope exactly as it does a run.
     """
     return scope_of(
         ScopeParts(resolved_adapter, config_name_of(cfg), config_scope_hash(cfg))
@@ -303,9 +352,6 @@ def _pf_broker(
     gateway.
     """
     resolved = adapter
-    if resolved is None and raw is not None and cfg is not None:
-        name, named = resolve_broker(raw, cfg.strategy_params)
-        resolved = name if named else None
     if resolved is None:
         return None
     if resolved == "sim":
@@ -427,39 +473,42 @@ def _open_watch_session(
     store-only or ``sim`` read needs no session at all (the store is re-read per
     tick). No lease is taken and no DDL runs: the frame calls the same read
     helpers the one-shot path uses.
+
+    *adapter* is the raw ``--adapter`` flag; the resolved name below is the one
+    the scope and the broker read both use, minted by the same merge ``live run``
+    applies.
     """
+    resolved = merge_live_options(adapter, None, read_live_config(), LiveOptions())
     if config_path is None:
-        if adapter == "ibkr":
+        if resolved.adapter == "ibkr":
             return _ibkr_watch_session(
                 ledger,
                 ledger.scopes_of_store,
                 0.0,
             )
         return _WatchSession(
-            _store_frame(
-                ledger, None, adapter, cast("AdapterName", live_adapter()), style
-            ),
+            _store_frame(ledger, None, resolved.adapter, resolved.adapter, style),
             _noop,
         )
-    cfg = load_live_config(config_path)
+    cfg = load_strat_config(config_path)
     raw = _read_json(config_path)
     # The scope-selecting adapter is resolved ONCE, as the one-shot path does, so
     # the watch agrees with ``live run --adapter`` and with the one-shot ``pf``.
-    resolved = resolve_adapter_name(adapter, cfg)
+    resolved_adapter = resolved.adapter
     # The READ broker follows ``_pf_broker``'s rule: the flag, else a config's
     # EXPLICITLY named broker, else no broker (store-only). A config that never
     # named one must not open an ibkr session just because the default is ibkr.
     read_as = adapter
     if read_as is None:
-        # ``resolve_broker`` reads the ``broker`` key and reports whether it was
-        # named explicitly; ``ibkr`` is a fallback, not a selection.
         named, was_named = resolve_broker(raw, cfg.strategy_params)
         read_as = named if was_named else None
     if read_as != "ibkr":
-        return _WatchSession(_store_frame(ledger, cfg, read_as, resolved, style), _noop)
+        return _WatchSession(
+            _store_frame(ledger, cfg, read_as, resolved_adapter, style), _noop
+        )
     return _ibkr_watch_session(
         ledger,
-        lambda: (_config_scope(cfg, resolved),),
+        lambda: (_config_scope(cfg, resolved_adapter),),
         cfg.initial_capital,
         style,
     )

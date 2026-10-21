@@ -375,7 +375,7 @@ def test_stop_cli_writes_flag_while_the_lock_is_held(
     monkeypatch.setattr("src.db.path.LIVE_DB_PATH", tmp_path / "live.db")
     monkeypatch.setenv("IBKR_BOT_RUNTIME_DIR", str(tmp_path / "runtime"))
     config = write_config(tmp_path / "cfg.json")
-    scope = load_scope(config, None)[1]
+    scope = load_scope(config)[1]
 
     registry = BotRegistry(tmp_path / "live.db", tmp_path / "runtime")
     registry.write_pid_record(

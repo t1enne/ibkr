@@ -32,7 +32,6 @@ from src.bot.registry import BotRegistry
 from src.db.path import resolve_live_db_path
 from src.bot.spawn import (
     READY_TIMEOUT_S,
-    adapter_flag_of,
     ready_fd_of,
     run_config_of,
     wait_ready,
@@ -82,7 +81,7 @@ class FakeChildSpawner:
             if self.registry is not None
             else BotRegistry(resolve_live_db_path())
         )
-        _, scope, _ = load_scope(cfg, adapter_flag_of(argv))
+        _, scope = load_scope(cfg)
         fd = registry.acquire_lifetime(scope)
         self.held_fds.append(fd)
         registry.write_pid_record(
@@ -136,7 +135,7 @@ class SelectiveClaimSpawner:
         self.calls += 1
         cfg = run_config_of(argv)
         assert cfg is not None
-        _, scope, _ = load_scope(cfg, adapter_flag_of(argv))
+        _, scope = load_scope(cfg)
         if scope in self.failed_scopes:
             return os.getpid()  # die before claiming: never touch the pipe
         fd = self.registry.acquire_lifetime(scope)
@@ -198,7 +197,7 @@ def test_concurrent_double_start_spawns_once(tmp_path: Path) -> None:
 
     registry = BotRegistry(db, runtime)
     spawner = FakeChildSpawner(registry)
-    _, scope, _ = load_scope(config, None)
+    _, scope = load_scope(config)
 
     barrier = threading.Barrier(2)
     outcomes: list[StartOutcome] = []
@@ -259,7 +258,7 @@ def test_start_failed_claim_exits_nonzero_and_bounded(
     monkeypatch.setattr("src.db.path.LIVE_DB_PATH", tmp_path / "live.db")
     monkeypatch.setenv("IBKR_BOT_RUNTIME_DIR", str(tmp_path / "runtime"))
     config = write_config(tmp_path / "cfg.json")
-    scope = load_scope(config, None)[1]
+    scope = load_scope(config)[1]
 
     spawner = NoReadySpawner()
     monkeypatch.setattr("src.bot.cli._build_spawner", lambda: spawner)
@@ -286,8 +285,8 @@ def test_start_isolation_bad_sibling_spares_good_bot(
     monkeypatch.setenv("IBKR_BOT_RUNTIME_DIR", str(tmp_path / "runtime"))
     good_cfg = write_config(tmp_path / "good.json", name="bot_good")
     bad_cfg = write_config(tmp_path / "bad.json", name="bot_bad")
-    good_scope = load_scope(good_cfg, None)[1]
-    bad_scope = load_scope(bad_cfg, None)[1]
+    good_scope = load_scope(good_cfg)[1]
+    bad_scope = load_scope(bad_cfg)[1]
     assert good_scope != bad_scope
 
     registry = BotRegistry(resolve_live_db_path())
@@ -319,7 +318,7 @@ def test_double_start_loser_is_ok_false(tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
     spawner = BlockingChildSpawner(registry, entered, release)
-    _, scope, _ = load_scope(config, None)
+    _, scope = load_scope(config)
 
     outcomes: list[StartOutcome] = []
     errors: list[BaseException] = []
@@ -395,7 +394,7 @@ def test_released_lock_reads_exited_and_stale(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     registry = BotRegistry(db, runtime)
     config = write_config(tmp_path / "cfg.json")
-    _, scope, _ = load_scope(config, None)
+    _, scope = load_scope(config)
 
     # clean stop: child sees the stop flag, stamps exit 0, releases the lock
     pid, read_fd = _spawn_lock_holding_child(registry, scope, config)

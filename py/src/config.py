@@ -30,30 +30,6 @@ _ROOT = Path(__file__).resolve().parents[1]
 #: The operator settings file (read at import, like the sqlite paths).
 CONFIG_PATH = Path(os.environ.get(_CONFIG_PATH_ENV) or _ROOT / "config.toml")
 
-#: Adapters a live run may name. The runtime vocabulary LITERAL cannot be
-#: imported here — this module is a leaf (imports nothing from ``src.*``, by
-#: design) — so it is duplicated ONCE and pinned by a test against the ONE
-#: typing definition, ``src.live.scope.AdapterName``.
-_ADAPTERS = ("ibkr", "sim")
-
-#: Used when the file, the table or the key is absent — the file is an override
-#: surface, not a requirement.
-DEFAULT_LIVE_ADAPTER = "ibkr"
-
-
-def live_adapter() -> str:
-    """``[live] adapter`` from ``config.toml``, else :data:`DEFAULT_LIVE_ADAPTER`.
-
-    A missing file or table is the default, never an error. A value outside the
-    adapter vocabulary raises: a typo must not silently trade the wrong side.
-    """
-    value = _table("live").get("adapter", DEFAULT_LIVE_ADAPTER)
-    if value not in _ADAPTERS:
-        raise ValueError(
-            f"live.adapter must be one of {sorted(_ADAPTERS)}, got {value!r}"
-        )
-    return _cast("str", value)
-
 
 def _table(name: str) -> Mapping[str, object]:
     """The ``[name]`` table of :data:`CONFIG_PATH`, or ``{}`` when absent."""
@@ -109,4 +85,66 @@ def read_bot_config() -> BotConfig:
         max_age=max_age,
         retries=retries,
         no_sync=no_sync,
+    )
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    """``[live]`` section values, all optional. ``None`` = absent from file.
+
+    Entrypoint code merges this with CLI flags + code defaults
+    (:func:`src.live.options.merge_live_options`). The adapter VALUE is not
+    validated here — this module is a leaf with no access to the adapter
+    vocabulary, and a wrong name must be refused by the layer that knows it.
+
+    ``allow_unsafe`` is deliberately ABSENT: it disables the exit code a
+    scheduler alerts on, so it stays a per-invocation flag and never a
+    deployment-wide default (see §Live trading).
+    """
+
+    adapter: str | None = None
+    allow_oth: bool | None = None
+    #: Staleness gate in days. ``[live]`` owns this, not ``[bot]``: a one-shot
+    #: cron cycle and a resident bot age differently.
+    max_age: int | None = None
+    #: Reconcile + report, place nothing. Safe direction only, so a file may set
+    #: it; a flag still wins either way.
+    dry_run: bool | None = None
+    #: ``text`` | ``json`` report format.
+    format: str | None = None
+
+
+def read_live_config() -> LiveConfig:
+    """Parse the ``[live]`` TOML table into a :class:`LiveConfig`.
+
+    Missing file, missing table, and missing keys all produce the default
+    (``None``-filled) config — the file is an override surface, not a
+    requirement. A bad TYPE raises eagerly; whether a string names a real
+    adapter (or a real format) is the merge layer's call, because this module
+    is a leaf that cannot see either vocabulary.
+    """
+    raw = _table("live")
+    adapter: object | None = raw.get("adapter")
+    allow_oth: object | None = raw.get("allow_oth")
+    max_age: object | None = raw.get("max_age")
+    dry_run: object | None = raw.get("dry_run")
+    fmt: object | None = raw.get("format")
+
+    if adapter is not None and not isinstance(adapter, str):
+        raise ValueError(f"live.adapter must be a string, got {adapter!r}")
+    if allow_oth is not None and not isinstance(allow_oth, bool):
+        raise ValueError(f"live.allow_oth must be true/false, got {allow_oth!r}")
+    if max_age is not None and (not isinstance(max_age, int) or max_age <= 0):
+        raise ValueError(f"live.max_age must be a positive integer, got {max_age!r}")
+    if dry_run is not None and not isinstance(dry_run, bool):
+        raise ValueError(f"live.dry_run must be true/false, got {dry_run!r}")
+    if fmt is not None and not isinstance(fmt, str):
+        raise ValueError(f"live.format must be a string, got {fmt!r}")
+
+    return LiveConfig(
+        adapter=adapter,
+        allow_oth=allow_oth,
+        max_age=max_age,
+        dry_run=dry_run,
+        format=fmt,
     )

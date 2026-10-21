@@ -26,7 +26,7 @@ from src.live.pure import OrderResult
 from src.live.cli import (
     _config_scope,
     live_group,
-    load_live_config,
+    load_strat_config,
 )
 from src.live.divergence import Divergence
 from src.live.report import CycleReport
@@ -148,6 +148,26 @@ def test_live_run_missing_file_exits_two(tmp_path: Path) -> None:
     """A nonexistent CONFIG_PATH is a usage error (click exits 2)."""
     out = CliRunner().invoke(live_group, ["run", str(tmp_path / "nope.json")])
     assert out.exit_code == 2
+
+
+def test_live_run_bad_configured_adapter_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``[live]`` adapter typo exits 1 with a message, never a traceback.
+
+    The type IS a correct string, so only the merge can refuse it — and it must
+    refuse through the CLI's config-error path so a cron line sees exit 1.
+    """
+    settings = tmp_path / "config.toml"
+    settings.write_text('[live]\nadapter = "smi"\n')
+    # ``CONFIG_PATH`` is resolved at import, so patching the attribute is the only
+    # way to point one test at its own file.
+    monkeypatch.setattr("src.config.CONFIG_PATH", settings)
+    config = tmp_path / "strategy.json"
+    config.write_text(json.dumps(BASE_CONFIG))
+    out = CliRunner().invoke(live_group, ["run", str(config), "--dry-run"])
+    assert out.exit_code == 1, out.output
+    assert "adapter must be one of" in out.output
 
 
 def test_clean_cycle_exits_zero(
@@ -470,7 +490,7 @@ def test_dry_run_leaves_every_row_count_unchanged(
     assert _row_counts(db) == before
     assert not (
         db.parent
-        / f"{db.name}.{scope_tag(_config_scope(load_live_config(path), 'sim'))}.cycle.lock"
+        / f"{db.name}.{scope_tag(_config_scope(load_strat_config(path), 'sim'))}.cycle.lock"
     ).exists()
 
 
@@ -575,3 +595,65 @@ def test_a_divergence_makes_the_cycle_unsafe() -> None:
     # — see ``test_allow_unsafe_names_a_divergence_in_the_suppression_note``. The
     # JSON report's key shape is rendering, not behaviour: not pinned here.
     assert _divergent_report().is_unsafe()
+
+
+def _invoke_with_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: str,
+    *extra: str,
+) -> tuple[CliResult, dict[str, object]]:
+    """Run one cycle with a ``[live]`` table, capturing what the cycle received."""
+    seen: dict[str, object] = {}
+
+    class FakeLedger:
+        def ensure_strategy(self, *a: object, **k: object) -> None:
+            seen["ensured"] = True
+
+    async def fake_cycle(*a: object, **kwargs: object) -> CycleReport:
+        seen.update(kwargs)
+        return _report()
+
+    config = tmp_path / "config.toml"
+    config.write_text(settings)
+    monkeypatch.setattr("src.config.CONFIG_PATH", config)
+    monkeypatch.setattr("src.live.run_once.SqliteLedger", lambda *a, **k: FakeLedger())
+    monkeypatch.setattr("src.live.run_once.run_cycle", fake_cycle)
+    path = write_config(tmp_path)
+    return CliRunner().invoke(live_group, ["run", path, *extra]), seen
+
+
+def test_live_dry_run_comes_from_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``[live] dry_run = true`` promotes an ordinary run to a dry run.
+
+    Pinned because the failure mode is the dangerous direction: the cycle would
+    PLACE. A dry run must also write no strategy row.
+    """
+    out, seen = _invoke_with_settings(tmp_path, monkeypatch, "[live]\ndry_run = true\n")
+    assert out.exit_code == 0, out.output
+    assert seen["dry_run"] is True
+    assert "ensured" not in seen
+
+
+def test_live_max_age_comes_from_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``[live] max_age`` sets the staleness gate (``[bot] max_age`` does not)."""
+    out, seen = _invoke_with_settings(
+        tmp_path, monkeypatch, "[live]\nmax_age = 3\n[bot]\nmax_age = 40\n"
+    )
+    assert out.exit_code == 0, out.output
+    assert seen["max_age_days"] == 3
+
+
+def test_live_format_comes_from_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``[live] format = "json"`` emits the machine document."""
+    out, _ = _invoke_with_settings(tmp_path, monkeypatch, '[live]\nformat = "json"\n')
+    assert out.exit_code == 0, out.output
+    # The report is followed by the run's log line, so parse the document only.
+    document = out.output[: out.output.index("\n}") + 2]
+    assert json.loads(document)["scope"]

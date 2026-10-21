@@ -13,22 +13,20 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import get_args
 
 import click
 
-from src.config import BotConfig, read_bot_config
+from src.config import BotConfig, read_bot_config, read_live_config
 from src.db.path import resolve_live_db_path
-from src.live.adapter import resolve_adapter_name
 from src.live.lease import CycleInProgressError
 from src.live.ledger import LedgerReadError
+from src.live.options import LiveOptions, adapter_names, merge_live_options
 from src.live.pipeline import PortfolioFetchError
 from src.live.freshness import StaleDataError
-from src.live.run_once import load_live_config, run_once
+from src.live.run_once import load_strat_config, run_once
 from src.live.scope import (
-    AdapterName,
     ScopeParts,
     config_hash as config_scope_hash,
     config_name_of,
@@ -49,7 +47,7 @@ from src.bot.stop import STOP_WAIT_S, StopOutcome, stop_one
 from src.bot.types import BotLiveness, BotRecord, BotSpawner
 
 #: The adapters ``--adapter`` accepts, derived from the ONE typing literal.
-_ADAPTERS = get_args(AdapterName)
+_ADAPTERS = adapter_names()
 
 
 @dataclass(frozen=True)
@@ -88,7 +86,8 @@ def bot_group() -> None:
     "--adapter",
     type=click.Choice(_ADAPTERS),
     default=None,
-    help="Broker adapter to run through. Default: the config chooses (live run precedence).",
+    help="Broker adapter to run through. Default: `[live] adapter` in config.toml, "
+    "then `ibkr`.",
 )
 @click.option(
     "--interval",
@@ -130,13 +129,21 @@ def bot_start(
     """
     cfg = read_bot_config()
     options = _merge_bot_options(interval, max_age, no_sync, retries, cfg, BotOptions())
+    try:
+        # The merge is INSIDE the guard: a ``[live]`` typo is a config error and
+        # must map to exit 1, not a traceback.
+        live_options = merge_live_options(
+            adapter, None, read_live_config(), LiveOptions()
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     registry = _build_registry()
     spawner = _build_spawner()
     outcomes: list[StartOutcome] = []
     for config in configs:
         try:
             outcomes.append(
-                start_one(registry, spawner, config, adapter, dry_run, options)
+                start_one(registry, spawner, config, live_options, dry_run, options)
             )
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -212,7 +219,7 @@ def _stop_scopes(
     scopes: list[str] = []
     for config in configs:
         try:
-            scopes.append(load_scope(config, None)[1])
+            scopes.append(load_scope(config)[1])
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
     return scopes
@@ -256,7 +263,8 @@ def bot_run_child(
     the parent never reports a bot live before it genuinely is. What follows is
     the resident loop (§5).
     """
-    cfg, scope, _ = load_scope(config_path, adapter)
+    live_options = merge_live_options(adapter, None, read_live_config(), LiveOptions())
+    cfg, scope = load_scope(config_path, live_options)
     registry = _build_registry()
     options = _merge_bot_options(
         interval, max_age, no_sync, retries, read_bot_config(), BotOptions()
@@ -268,7 +276,7 @@ def bot_run_child(
             scope=scope,
             registry=registry,
             options=options,
-            run_cycle=_run_cycle_fn(adapter),
+            run_cycle=_run_cycle_fn(live_options),
             on_ready=lambda: _signal(ready_fd, b"1"),
         )
     except BotAlreadyRunningError as exc:
@@ -278,16 +286,24 @@ def bot_run_child(
         raise click.exceptions.Exit(code)
 
 
-def _run_cycle_fn(adapter: str | None) -> RunCycleFn:
+def _run_cycle_fn(live_options: LiveOptions) -> RunCycleFn:
     """The production cycle seam: one live cycle through ``run_once``.
 
     ``run_once`` takes its OWN lease, so the bot takes none and the two can
-    never nest a lock. Its unsafe code (3) is returned as-is.
+    never nest a lock. Its unsafe code (3) is returned as-is. The adapter is
+    already resolved, so every tick of this bot trades the same backend.
+
+    The loop's CADENCE-derived *max_age_days* replaces the option's, because a
+    resident bot ages against its own bar interval — that is a per-tick fact no
+    ``[live]`` file setting can know. Every other knob rides through untouched.
     """
 
     def run(config_path: str, max_age_days: int) -> int:
         try:
-            return run_once(config_path, max_age_days=max_age_days, adapter=adapter)
+            return run_once(
+                config_path,
+                options=replace(live_options, max_age=max_age_days),
+            )
         except (
             ValueError,
             StaleDataError,
@@ -302,25 +318,33 @@ def _run_cycle_fn(adapter: str | None) -> RunCycleFn:
 
 
 def load_scope(
-    config_path: str, adapter_flag: str | None = None
-) -> tuple[LiveConfig, str, str]:
-    """Load+validate the config, resolve the adapter (``live run`` precedence),
-    and derive the scope key — the ONE identity this bot owns.
+    config_path: str, live_options: LiveOptions | None = None
+) -> tuple[LiveConfig, str]:
+    """Load+validate the config and derive the scope key — the bot's identity.
 
-    Returns ``(cfg, scope, resolved_adapter)``; the child receives the resolved
-    adapter so parent and child mint the identical scope.
+    *live_options* is the ALREADY MERGED adapter choice (the same
+    :func:`merge_live_options` ``live run`` uses), so parent and child mint the
+    identical scope from one resolution rather than each re-deriving it. Absent,
+    the ``[live]`` table decides on its own — what ``bot stop`` needs, since it
+    mints no scope but must address the one a start already minted.
     """
-    cfg = load_live_config(config_path)
-    resolved = resolve_adapter_name(adapter_flag, cfg)
-    scope = scope_of(ScopeParts(resolved, config_name_of(cfg), config_scope_hash(cfg)))
-    return cfg, scope, resolved
+    adapter = (
+        live_options
+        if live_options is not None
+        else merge_live_options(None, None, read_live_config(), LiveOptions())
+    )
+    cfg = load_strat_config(config_path)
+    scope = scope_of(
+        ScopeParts(adapter.adapter, config_name_of(cfg), config_scope_hash(cfg))
+    )
+    return cfg, scope
 
 
 def start_one(
     registry: BotLiveness,
     spawner: BotSpawner,
     config_path: str,
-    adapter_flag: str | None,
+    live_options: LiveOptions | None,
     dry_run: bool,
     options: BotOptions | None = None,
 ) -> StartOutcome:
@@ -329,10 +353,16 @@ def start_one(
     Dry runs probe without side effects and never spawn. A live scope is
     reported, never respawned; the probe is repeated INSIDE the spawning claim,
     which is what serializes concurrent starts. ``live`` is reported only after
-    the child's ready byte.
+    the child's ready byte. ``None`` for *live_options* resolves the ``[live]``
+    table, exactly as ``load_scope`` does.
     """
+    resolved = (
+        live_options
+        if live_options is not None
+        else merge_live_options(None, None, read_live_config(), LiveOptions())
+    )
     opts = options if options is not None else BotOptions()
-    _, scope, adapter = load_scope(config_path, adapter_flag)
+    _, scope = load_scope(config_path, resolved)
     if dry_run:
         current = registry.probe(scope)
         if current is not None and current.state == "live":
@@ -354,7 +384,7 @@ def start_one(
                         child_argv(
                             config_path,
                             ready_fd=write_fd,
-                            adapter=adapter,
+                            adapter=resolved.adapter,
                             interval=opts.interval,
                             max_age=opts.max_age,
                             no_sync=opts.no_sync,

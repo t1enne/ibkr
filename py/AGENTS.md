@@ -266,7 +266,7 @@ uv run ibkr live abandon --scope <scope> --symbol AAPL --action long --yes
   `live`. A cycle only uses the gateway client to read/place — it never probes
   readiness, resolves the account or mentions a session mode.
 - **Adapter resolution:** CLI `--adapter` (unset by default) > config `adapter` >
-  legacy config `broker` > `[live] adapter` in `py/config.toml` (read by
+  `[live] adapter` in `py/config.toml` (read by
   `src/config.py`, overridable with `IBKR_CONFIG_PATH`; a typo raises, never a
   silent fallback). That file is the ONE place a default adapter literal lives.
   Both adapters (`ibkr`, `sim`) are STATELESS —
