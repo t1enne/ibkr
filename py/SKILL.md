@@ -665,6 +665,14 @@ throughput knob, not a correctness one):
   sweep stays sequential). It is heavier than split (grid × folds), so it
   pays off at lower fold counts.
 
+- **Memory scales with `--workers`** — each pooled worker holds its own copy
+  of the loaded feed (pickled once per worker), so peak RSS rises roughly with
+  worker count on top of the parent. No fixed per-worker number exists: measure
+  actual RSS before raising `--workers` on a large universe, and size from a
+  **fresh measurement** — available RAM varies widely between runs on the same
+  machine, so a remembered figure is not a budget.
+
 Effective workers are capped at the unit count, so `--workers` much larger
-than the number of combos/folds wastes nothing. Rule of thumb: raise `--workers`
-only once a single run would take more than a few seconds.
+than the number of combos/folds wastes nothing (it only costs spawn time).
+Rule of thumb: raise `--workers` only once a single run would take more than a
+few seconds.

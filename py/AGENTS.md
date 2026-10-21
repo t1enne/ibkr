@@ -85,8 +85,12 @@ uv run ibkr bt optimize strats/trend.json '{...grid...}' --folds 4 --workers 4
 # feed) — the spawn overhead then exceeds the savings. Prefer --workers when a
 # run would take more than a few seconds: many combos (sweep benefits most;
 # a ~200-combo sweep measured ~3x faster at --workers 8), many folds (split /
-# optimize, esp. --folds 10+), or heavy intraday feeds. Effective workers are
-# capped at the unit count, so oversized --workers is harmless.
+# optimize, esp. --folds 10+), or heavy intraday feeds. Memory scales with
+# worker count (each pooled worker holds its own copy of the loaded feed), so
+# measure actual per-run RSS before raising --workers on a large universe and
+# size from a fresh measurement -- available RAM varies widely between runs.
+# Effective workers are capped at the unit count, so oversized --workers is
+# harmless (it only costs spawn time).
 ```
 
 ### Fills: rejected or scaled = results not solid

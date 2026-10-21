@@ -377,10 +377,20 @@ many-fold splits over heavy feeds.
   A single optimize is heavier than a split (grid × folds), so it benefits at
   lower fold counts than split.
 
+**Memory scales with `--workers`.** Each pooled worker holds its own copy of the
+loaded feed (the feed is pickled once per worker), so peak RSS grows roughly
+with worker count on top of the parent. There is no fixed number to quote —
+measure your actual per-run RSS (`/usr/bin/time -v`, or `ps` on a running
+worker) before raising `--workers` on a large universe, and size it from a
+**fresh measurement**: available RAM on a given machine varies widely between
+runs, so a remembered number is not a budget.
+
 **Rule of thumb:** default `--workers 1`; raise it when a single unrunnable run
 would take more than a few seconds (many combos, many folds, or heavy
 per-candle data). When in doubt, time `--workers 1` first — if it is already
-fast (<~2s), more workers will only add overhead.
+fast (<~2s), more workers will only add overhead. Effective workers are capped
+at the unit count, so an oversized `--workers` is harmless — it just costs
+spawn time.
 
 All commands usable via `make run <subcommand> <args>`.
 

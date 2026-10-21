@@ -27,6 +27,28 @@ a deterministic order even though work completes out of order. ``workers <= 1``
 falls back to a plain sequential loop — preserving all existing behaviour and
 programmatic/tests paths that never pass ``workers``.
 
+Cost model — throughput, not correctness
+----------------------------------------
+Every count is identical across worker counts: the engine is a pure function of
+its inputs, so pooling changes only wall-clock time. Two costs bound the useful
+worker count:
+
+* **Fixed spawn cost (~2s per pooled run)** — a ``forkserver`` plus workers has
+to start before any task runs, so a pool only pays when the units it
+parallelizes are expensive by comparison. A few combos/folds on a small feed
+are slower pooled than sequential; reach for ``workers > 1`` once a single run
+would take more than a few seconds (many combos, many folds, heavy intraday
+feeds).
+* **Memory scales with worker count** — ``pool_init`` gives each worker its own
+copy of the shared read-only inputs (notably the candle feed), so peak RSS
+rises roughly with ``workers`` on top of the parent process. There is no fixed
+per-worker figure: measure actual RSS before raising ``workers`` on a large
+universe, and note that available RAM on a given host varies between runs, so
+size from a fresh measurement rather than a remembered number.
+
+``effective_workers`` is capped at the task count, so an oversized ``workers``
+never spawns idle processes — it only wastes spawn time.
+
 Worker functions must be *module-level* (picklable by qualified name) and read
 shared inputs from ``WORKER_STATE``.
 """
