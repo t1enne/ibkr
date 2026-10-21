@@ -39,6 +39,36 @@ def _get_returns(equity_curve: pd.Series) -> pd.Series:
     return returns
 
 
+def _daily_returns(equity_curve: pd.Series) -> pd.Series:
+    """Per-session returns: one return per calendar date, in order.
+
+    The engine samples the equity curve once per BASE bar, so an intraday-base
+    run oversamples the same equity path relative to a daily-base run: a day's
+    move is spread across its intraday bars, separated by exact-zero returns
+    while the book is flat. Moments computed from those per-bar returns are a
+    function of the base interval, not of risk.
+
+    Collapsing to one value per calendar date (the day's last mark) first makes
+    the returns cadence-invariant: the same dated equity path reports the same
+    tail statistics whether it was sampled once a session or many times within
+    it. When the curve is already one point per date -- a daily-base run -- the
+    collapse is the identity, so those numbers are unchanged.
+
+    Non-datetime indices (e.g. a synthetic positional curve) are returned as
+    per-step returns unchanged; there is no calendar to collapse on.
+    """
+    if len(equity_curve) < 2:
+        return equity_curve.diff().dropna()
+    if not isinstance(equity_curve.index, pd.DatetimeIndex):
+        return _get_returns(equity_curve)
+    # ``Grouper(freq="D")`` reindexes onto every calendar day, so empty
+    # (non-session) days appear as NaN groups -- drop them, keeping only dates
+    # the curve actually sampled.
+    last_per_date = equity_curve.groupby(pd.Grouper(freq="D")).last().dropna()
+    returns = last_per_date.pct_change().dropna()
+    return returns
+
+
 def _equity_curve_time_info(equity_curve: pd.Series) -> tuple[float, float]:
     if len(equity_curve) < 2:
         return 0.0, 0.0
@@ -207,14 +237,26 @@ def omega_ratio(equity_curve: pd.Series, risk_free_rate: float = 0.0) -> float:
 
 
 def skewness(equity_curve: pd.Series) -> float:
-    returns = _get_returns(equity_curve)
+    """Per-session return skewness (see :func:`_daily_returns`).
+
+    Cadence-invariant: sampling the same dated equity path once a session or
+    many times within it yields the same value, so runs at different base
+    intervals are comparable. Zero for fewer than three session returns.
+    """
+    returns = _daily_returns(equity_curve)
     if len(returns) < 3:
         return 0.0
     return float(returns.skew())
 
 
 def kurtosis(equity_curve: pd.Series) -> float:
-    returns = _get_returns(equity_curve)
+    """Per-session excess return kurtosis (see :func:`_daily_returns`).
+
+    Cadence-invariant: sampling the same dated equity path once a session or
+    many times within it yields the same value, so a base-interval change does
+    not move the tail statistic. Zero for fewer than four session returns.
+    """
+    returns = _daily_returns(equity_curve)
     if len(returns) < 4:
         return 0.0
     return float(returns.kurt())

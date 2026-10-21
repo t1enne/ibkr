@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -9,6 +10,8 @@ from src.bt.metrics import (
     capital_utilization,
     drawdown_periods,
     get_backtest_results_analysis,
+    kurtosis,
+    skewness,
     trade_count,
     win_rate,
 )
@@ -196,3 +199,130 @@ def test_drawdown_periods_filters_below_threshold() -> None:
     shallow = drawdown_periods(_curve([100.0, 97.0, 100.0]), min_drawdown=0.01)
     assert len(shallow) == 1
     assert shallow[0].net_drawdown_pct == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
+# skewness / kurtosis — cadence invariance
+# ---------------------------------------------------------------------------
+
+
+def _daily_equity_path(n_days: int = 150) -> pd.Series:
+    """A deterministic dated equity path, one point per business day."""
+    rng = np.random.default_rng(1234)
+    rets = rng.normal(0.0004, 0.02, n_days)
+    equity = 100_000.0 * np.cumprod(1.0 + rets)
+    idx = pd.date_range("2023-01-02", periods=n_days, freq="B")
+    return pd.Series(equity, index=idx, dtype=float)
+
+
+def _intraday_sample(daily: pd.Series, bars_per_day: int = 7) -> pd.Series:
+    """The same dated path sampled ``bars_per_day`` times a session.
+
+    Within a session the mark walks from the prior session's close to this
+    session's close, so the session's last intraday point equals the daily
+    path's value for that date. Bars are stamped at session times, not
+    midnight, so an intraday point shares its date with its daily point.
+    """
+    dates = pd.DatetimeIndex(daily.index)
+    stamps = pd.DatetimeIndex(
+        [
+            date + pd.Timedelta(hours=13 + k)
+            for date in dates
+            for k in range(bars_per_day)
+        ]
+    )
+    values: list[float] = []
+    prev = float(daily.iloc[0])
+    for close in daily.values:
+        walk = np.linspace(prev, float(close), bars_per_day)
+        values.extend(float(v) for v in walk)
+        prev = float(close)
+    return pd.Series(values, index=stamps, dtype=float)
+
+
+def test_kurtosis_is_cadence_invariant() -> None:
+    """Regression: the same dated equity path sampled intraday vs daily.
+
+    Pre-fix, ``kurtosis`` took per-bar returns, so the intraday sample spread
+    each session's move across its intraday bars with exact-zero returns
+    between them and reported a mechanically inflated excess kurtosis. After
+    the fix both cadences collapse to one return per session and agree.
+
+    Verified to FAIL against the pre-fix implementation: the intraday sample
+    reported a different (inflated) kurtosis than the daily sample.
+    """
+    daily = _daily_equity_path()
+    intraday = _intraday_sample(daily)
+    assert len(intraday) == len(daily) * 7
+    assert kurtosis(intraday) == pytest.approx(kurtosis(daily), rel=1e-9)
+
+
+def test_skewness_is_cadence_invariant() -> None:
+    """Regression: skewness, same two-cadence construction as kurtosis.
+
+    Verified to FAIL against the pre-fix implementation.
+    """
+    daily = _daily_equity_path()
+    intraday = _intraday_sample(daily)
+    assert skewness(intraday) == pytest.approx(skewness(daily), rel=1e-9)
+
+
+def test_daily_base_curve_numbers_unchanged() -> None:
+    """Characterisation: a one-point-per-date curve is untouched by the fix.
+
+    The collapsed session returns of a daily curve are its own per-step
+    returns, so a daily-base run's reported numbers cannot move.
+    """
+    daily = _daily_equity_path()
+    per_step = daily.pct_change().dropna()
+    assert len(per_step) == len(daily) - 1
+    assert kurtosis(daily) == pytest.approx(float(per_step.kurt()))
+    assert skewness(daily) == pytest.approx(float(per_step.skew()))
+
+
+def test_moments_are_deterministic() -> None:
+    """Characterisation: repeated calls on the same curve are identical."""
+    intraday = _intraday_sample(_daily_equity_path())
+    assert kurtosis(intraday) == kurtosis(intraday)
+    assert skewness(intraday) == skewness(intraday)
+
+
+def test_moments_edge_cases() -> None:
+    """Characterisation: empty / tiny / flat / NaN curves stay well-defined."""
+    empty = pd.Series([], dtype=float)
+    assert kurtosis(empty) == 0.0
+    assert skewness(empty) == 0.0
+
+    single = pd.Series([100.0], index=pd.date_range("2024-01-01", periods=1))
+    assert kurtosis(single) == 0.0
+    assert skewness(single) == 0.0
+
+    # all-flat: zero variance, one session per date
+    flat = pd.Series(
+        [100.0] * 10, index=pd.date_range("2024-01-01", periods=10, freq="B")
+    )
+    assert kurtosis(flat) == pytest.approx(0.0) or np.isnan(kurtosis(flat))
+    assert np.isfinite(skewness(flat))
+
+    # fewer than 4 session returns -> kurtosis undefined, returns 0.0
+    three = pd.Series(
+        [100.0, 101.0, 102.0], index=pd.date_range("2024-01-01", periods=3, freq="B")
+    )
+    assert kurtosis(three) == 0.0
+    assert skewness(three) == 0.0
+
+    # NaN in the curve: dropna in pct_change keeps the defined stretch
+    nan_curve = pd.Series(
+        [100.0, np.nan, 102.0, 101.0, 103.0, 105.0, 104.0],
+        index=pd.date_range("2024-01-01", periods=7, freq="B"),
+    )
+    assert np.isfinite(kurtosis(nan_curve))
+    assert np.isfinite(skewness(nan_curve))
+
+
+def test_positional_index_uses_per_step_returns() -> None:
+    """Characterisation: a non-datetime index has no calendar to collapse on."""
+    curve = pd.Series([100.0, 101.0, 99.0, 102.0, 103.0, 98.0])
+    per_step = curve.pct_change().dropna()
+    assert kurtosis(curve) == pytest.approx(float(per_step.kurt()))
+    assert skewness(curve) == pytest.approx(float(per_step.skew()))
