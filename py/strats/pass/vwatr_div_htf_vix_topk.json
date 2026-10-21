@@ -5,10 +5,11 @@
   "trading_end": "2026-09-01",
   "commission": 0.05,
   "initial_capital": 50000,
-  "strategy_type": "vwatr_div_htf_dsl",
+  "strategy_type": "vwatr_div_dsl",
   "bars": ["1h", "1d"],
   "strategy_params": {
-    "risk_pct": 0.005, "risk_topk": 2,
+    "risk_pct": 0.005,
+    "risk_topk": 2,
     "risk_amp": 2.5
   },
   "symbols": [

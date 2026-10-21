@@ -1,58 +1,50 @@
 """VWATR divergence strategy -- long only, one unconditional breakout entry.
 
-Entry: rising VWATR expansion on a breakout above the recent high, taken only
-while the tradable universe is in a breadth leg up (``_trend_cross_section``).
-Within that gate the trigger is unconditional by design -- entry-side features
-carry no measurable edge on this population, so name selection lives in sizing
-instead. The gate cuts the 2022-style drawdown depth and lifts Sharpe/Ann
-out of sample (mean OOS 1.37 -> 1.46, min -1.11 -> -0.91); it does not shorten
-recovery time -- a 575d underwater span is the bear's, not the rule's.
+ONE module, ONE parameter grammar, TWO execution venues. Every signal, state and
+sizing read is a DAILY read (``_state_interval``); the base bar
+(``config.bars[0]``) only decides WHEN a signal fills. The config's ``bars`` is
+the ONLY switch:
+
+=============  ===================  ====================================
+``bars``       signal read          what the run is
+=============  ===================  ====================================
+``["1d"]``     base feed (``None``) daily: reads and fills are both daily
+``["1h","1d"]`` ``"1d"``             intraday: daily rules, base-bar fill
+=============  ===================  ====================================
+
+Entry: rising VWATR expansion on a breakout above the prior ``breakout_look``
+highs, taken only while the universe is in a breadth leg up. Within that gate
+the trigger is unconditional by design -- entry-side features carry no
+measurable edge here, so name selection lives in sizing instead.
 
 Exit, in order:
 
-1. VWATR slope divergence while price is at a new high. This is the primary
-   exit and it is load-bearing: turning it off lowers return AND worsens
-   drawdown and tail risk -- it is not a free early out. It is a STATE rule
-   (expansion decelerating), not a price level, so it stays a next-open
-   ``ctx.close``.
-2. ``vwatr_mult`` chandelier trail off the running best close, armed each bar
-   as an ABSOLUTE stop level via ``ctx.set_stops`` (ratcheted, never widened):
-   it fires INTRABAR on the next bar's low at the level (gap-adjusted), instead
-   of the old next-open close. Width is load-bearing too -- widening it loses
-   Sharpe monotonically. ``tp`` is unused on this strategy.
+1. VWATR slope divergence at a new high -- the primary exit, and load-bearing
+   (turning it off lowers return AND worsens drawdown and tails). A STATE rule,
+   so it stays a next-open ``ctx.close``.
+2. ``vwatr_mult`` chandelier trail off the running best close, armed via
+   ``ctx.set_stops`` as an ABSOLUTE level (ratchet-only): fires intrabar on the
+   next bar's low, gap-adjusted. Width is load-bearing. ``tp`` unused.
 
-Sizing: flat ``risk_pct`` of LIVE equity times the amplifiers, so the risk
-budget re-levers as the book compounds. Sizing off a frozen capital base
-instead cuts cash-exhaustion fill scaling but caps compounding, and therefore
-caps return. A structural book-slot cap (``_BOOK_SLOTS``) throttles per-name
-size once open names plus the bar's cohort exceed 10, so a dense trend tape
-self-scales instead of leaving it to the engine's silent cohort scale.
+Intraday, the once-per-daily-bucket guard: a daily rule holds for the rest of
+its session, so ``_new_daily_bucket`` gates the ENTRY and the ``decel`` EXIT to
+the first base bar of a COMPLETED daily bucket. The trail is the one exception,
+and only in its FIRING: its LEVEL is recomputed from the daily read but
+re-armed every base bar (``set_stops`` is tighten-only, so the arm is
+idempotent and gating it would only leave the level stale for a session).
 
-Amplifier, one knob, neutral by default (``_amp_score``): ``risk_amp`` is a
-non-conserved cross-sectional trend re-lever (only a slow SMA slope pays;
-short slopes and EMA variants screen at ~zero rank IC) gated to the leg-up,
-and ``risk_topk`` is a conserved concentration onto the most-liquid names by
-trailing dollar volume (the OOS-stable predictor of which names carry the
-realized PnL; per-trade RETURN is unpredictable at ~0 IC). They multiply:
-the re-lever lifts return, the concentration re-deploys the same budget onto
-the payers without extra cash-exhaustion scaling. Portfolio vol-regime factor
-(``_fred_band_score``) is structural, no param: shrink the low-vol bucket
-only; rising vol is not the risk on this population.
+Lookahead-free on both venues: HTF reads expose COMPLETED daily buckets only,
+and the VIX read resolves the greatest grid date at or before the cursor.
 
-The binding constraint is cash-exhaustion fill scaling (see AGENTS.md § Fills),
-not Sharpe: every extra unit of return at fixed per-name risk is bought with
-silently scaled opens, so the honest point is the highest-return node whose
-Scaled count is still zero.
+Sizing: ``risk_pct`` of LIVE equity times ``_amp_score`` and the structural
+``_fred_band_score``. The ``_BOOK_SLOTS`` cap throttles per-name size before the
+engine's silent cash-exhaustion cohort scale, the binding constraint (AGENTS.md
+§ Fills).
 
-Data contract: ``ctx.ta.vwatr`` / ``ctx.ta.vwatr_baseline`` are shared TA using
-a PLAIN rolling-mean ATR (not Wilder) -- swapping in ``ctx.ta.atr`` silently
-changes every stop distance.
-
-Cut for evidence; do not re-add without a sweep: ``risk_symvol_amp`` (negative
-rank IC), the FRED + earnings + clamp sizing layer (inert once the cap
-collapses), ``norm_mode``, ``baseline_gate``, ``risk_trend_kind``. The exit path
-and risk/amp surface are plateaus, not spikes -- re-sweep before changing a
-default, and A/B any re-add rather than trusting prose.
+Data contract: ``ctx.ta.vwatr`` / ``vwatr_baseline`` use a PLAIN rolling-mean
+ATR, not Wilder -- ``ctx.ta.atr`` would silently change every stop distance. A
+``1d`` read needs ``vwatr_period + vwatr_base_win`` completed buckets, so
+``warmup`` must cover that many TRADING days.
 
 Single kill switch: ``decel_ratio=0`` turns the divergence exit OFF.
 """
@@ -82,27 +74,37 @@ from src.bt.strategies.types import (
 STRATEGY_TYPE = "vwatr_div_dsl"
 _STATE_KEY = "vwatr_div_state"
 
+#: Signal read interval. ``_state_interval`` returns ``None`` (the base feed)
+#: when ``bars[0]`` is itself daily, else this completed-bucket feed.
+_SIGNAL_INTERVAL = "1d"
+_BASE_INTERVAL_1D = "1d"
+
 
 @dataclass(frozen=True)
 class _State:
+    """Per-symbol cross-call state (``ctx.shared``, per run)."""
+
     best: float | None = None
+    #: Visible daily-bucket count at the last base bar -- the once-per-bucket
+    #: guard's baseline. Only consulted when the read is an HTF feed.
+    daily_count: int | None = None
 
 
 @dataclass(frozen=True)
 class Params(StrategyParams):
-    # -- VWATR --
-    vwatr_period: int = 14
-    vwatr_base_win: int = 60
+    # -- VWATR: the signal, the stop and their units --
+    vwatr_period: int = 14  # DAILY bars
+    vwatr_base_win: int = 60  # DAILY bars
     vwatr_mult: float = 3.0  # chandelier trail width AND the sizing stop
-    slope_bars: int = 2
-    breakout_look: int = 20
+    slope_bars: int = 2  # DAILY bars: the expansion gate and the exit slope
+    breakout_look: int = 20  # DAILY bars: close > the prior 20 daily highs
     # -- sizing: flat risk budget times ONE trend amplifier --
     risk_pct: float = 0.004
     risk_amp: float = 0.0  # 0 = flat; see _amp_score (non-conserved re-lever)
     risk_topk: int = 0  # >0 = also concentrate onto the top-K by dollar vol
     # -- rolling universe selection (0 = OFF: trade every configured symbol) --
     select_top_n: int = 0  # >0 -> trade only the rolling top-N survivors
-    select_bars: int = 126  # re-selection period in bars (~6 months)
+    select_bars: int = 126  # re-selection period in DAILY bars (~6 months)
     # -- exit --
     decel_ratio: float = 0.1  # VWATR slope-divergence exit; 0 turns it OFF
 
@@ -116,6 +118,21 @@ def on_candle(ctx: StrategyContext) -> None:
         if sym.startswith("GATE_"):
             continue  # synthetic macro series: fed for the gate, never traded
         _process_symbol(ctx, p, sym)
+
+
+def _state_interval(ctx: StrategyContext) -> str | None:
+    """Signal read interval for this run; ``None`` means the base feed.
+
+    ``None`` is the daily venue (every bar is its own bucket, so the guard is
+    moot); anything else is an intraday base where the signal is the completed
+    ``1d`` bucket and the base bar only times the fill.
+    """
+    return None if ctx.interval == _BASE_INTERVAL_1D else _SIGNAL_INTERVAL
+
+
+def _is_htf(ctx: StrategyContext) -> bool:
+    """True when the SIGNAL reads a higher-timeframe feed (base bar = fill only)."""
+    return _state_interval(ctx) is not None
 
 
 def _slope_decelerating(
@@ -138,16 +155,19 @@ def _slope_decelerating(
     return slope_now < decel_ratio * slope_prev
 
 
-#: FRED (VIX) derisking -- STRUCTURAL, no params. Percentile of the latest VIX
-#: print against its prior window; shrink the low-vol bucket only. Rising vol is
-#: NOT the risk on this population, and narrowing to the low band measured
-#: better OOS than the older mid-band shrink.
+#: FRED (VIX) derisking -- STRUCTURAL, no params. Shrinks the low-vol bucket
+#: only: rising vol is not the risk on this population.
+#:
+#: This is the ONE read taken at the BASE-bar cursor rather than on a completed
+#: daily bucket. ``load_daily`` forward-fills VIX onto a nightly grid, so the
+#: print resolved at the cursor is at most the previous session's close -- the
+#: value a daily-bar run reads for that session -- and it steps at the first
+#: base bar of each day, the same bucket the entry is evaluated on.
 _FRED_ASSET: str = "vix"
 _FRED_WIN: int = 250
 _RS_BAND_LO: float = 0.45
-#: Low-vol size factor. Lower is the Sharpe end of the frontier, higher the
-#: Ann end; the shipped value takes the Ann, since Ann is the binding
-#: constraint at the chosen risk/amp.
+#: Low-vol size factor (structural). Lower is the Sharpe end of the frontier,
+#: higher the Ann end.
 _RS_BAND_FACTOR: float = 0.80
 _FRED_CACHE_KEY = "vwatr_div_fred_series"
 
@@ -155,9 +175,8 @@ _FRED_CACHE_KEY = "vwatr_div_fred_series"
 def _fred_series(ctx: StrategyContext) -> tuple[np.ndarray, np.ndarray] | None:
     """VIX prints as ``(dates, values)``, cached in ``ctx.shared`` per run.
 
-    ``load_daily`` forward-fills blanks on a daily grid, so the array is dense
-    and a cursor lookup is one searchsorted -- no per-bar disk read, and no way
-    to see a print dated after the cursor.
+    Dense nightly grid, so a cursor lookup is one searchsorted: no per-bar disk
+    read, and no way to see a print dated after the cursor.
     """
     cache: dict[str, tuple[np.ndarray, np.ndarray] | None] = ctx.shared.setdefault(
         _FRED_CACHE_KEY, {}
@@ -188,9 +207,10 @@ def _percentile_rank(series: np.ndarray, i: int, window: int) -> float:
 
 
 def _fred_band_score(ctx: StrategyContext) -> float:
-    """Portfolio-level VIX factor: ``_RS_BAND_FACTOR`` in the low-vol bucket,
-    neutral otherwise. Neutral too when the series is missing or the cursor
-    precedes it -- a missing print is not a vol signal.
+    """``_RS_BAND_FACTOR`` in the low-vol bucket, neutral otherwise.
+
+    Neutral too when the series is missing or the cursor precedes it -- a
+    missing print is not a vol signal. Lookahead-free at any cursor resolution.
     """
     series = _fred_series(ctx)
     if series is None:
@@ -203,42 +223,71 @@ def _fred_band_score(ctx: StrategyContext) -> float:
     return _RS_BAND_FACTOR if pct < _RS_BAND_LO else 1.0
 
 
-#: Trend amplifier constants. The horizon is a slow SMA slope because short
-#: horizons carry no measurable rank IC against realized trades while the long
-#: slope repeats its sign out of sample. The gate is a "leg up": breadth, i.e.
-#: enough of the tradable universe above its own SMA.
+#: Trend amplifier constants. Slow SMA slope (short horizons carry no rank IC)
+#: and a breadth "leg up" gate: enough of the universe above its own SMA. Both
+#: DAILY bars -- a 50-bar window on an intraday base would read a 1-week signal.
 _TREND_LOOK: int = 50
 _TREND_GATE_LO: float = 0.5
 _TREND_CACHE_KEY = "vwatr_div_trend"
 _COHORT_CACHE_KEY = "vwatr_div_cohort"
-#: Book-slot cap: per-name risk is scaled by ``_BOOK_SLOTS / book`` once the book
-#: (open names + this bar's cohort) exceeds it, so a dense trend tape throttles
-#: size BEFORE the engine silently cohort-scales. Lets risk_pct/amp rise without
-#: cash-exhaustion scaling. Plateau over 8-12 slots; 10 is the flat middle.
+#: Book-slot cap: per-name risk scales by ``_BOOK_SLOTS / book`` once the book
+#: (open names + this bar's cohort) exceeds it, so a dense tape throttles size
+#: BEFORE the engine silently cohort-scales.
 _BOOK_SLOTS: int = 10
 
 
-def _breakout_count(ctx: StrategyContext, p: Params) -> int:
-    """Number of flat symbols that fire an entry on THIS bar (cohort size).
+def _new_daily_bucket(
+    ctx: StrategyContext, holder: dict[str, _State], sym: str, n_daily: int
+) -> bool:
+    """True when ``sym`` has one MORE visible daily bucket than the last base
+    bar -- i.e. this base bar is the bucket's first.
 
-    Cached per timestamp; bounded. Approximates the cohort the engine will
-    execute in one bar cycle, so size can be damped before the engine silently
-    scales it. With rolling selection ON, the cohort counts ONLY the selected
-    names -- the engine sees nothing else open, and counting the whole universe
-    overstates the cohort ~4x and pins the book-slot throttle permanently on.
+    The intraday once-per-bucket guard. Always True on the daily venue, where
+    every bar is its own bucket.
+    """
+    if not _is_htf(ctx):
+        return True
+    state = holder.get(sym) or _State()
+    last = state.daily_count
+    if last is None:  # first base bar this run processed for ``sym``
+        holder[sym] = dataclasses.replace(state, daily_count=n_daily)
+        return False
+    holder[sym] = dataclasses.replace(state, daily_count=max(last, n_daily))
+    return n_daily > last
+
+
+def _daily_reads(
+    ctx: StrategyContext, p: Params, sym: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """``(close, vwatr, baseline)`` on the signal feed, or None.
+
+    Cursor-truncated. Every signal, stop and sizing number comes from these
+    arrays, so they share one interval.
+    """
+    o = ctx.ohlcv(sym, _state_interval(ctx))
+    if o is None or len(o.close) == 0:
+        return None
+    close = o.close.to_array()
+    vwatr = ctx.ta.vwatr(sym, p.vwatr_period, interval=_state_interval(ctx)).to_array()
+    base = ctx.ta.vwatr_baseline(
+        sym, p.vwatr_period, p.vwatr_base_win, interval=_state_interval(ctx)
+    ).to_array()
+    if close.size == 0 or vwatr.size < close.size or base.size < close.size:
+        return None
+    return close, vwatr, base
+
+
+def _breakout_count(ctx: StrategyContext, p: Params) -> int:
+    """Number of flat symbols whose entry rule is true on this bar.
+
+    Cached per timestamp; bounded; read-only. Approximates the cohort the engine
+    will execute in one bar cycle so size can be damped first. With selection
+    ON it counts only the selected names the engine can actually open.
     """
     cache: dict[object, int] = ctx.shared.setdefault(_COHORT_CACHE_KEY, {})
     ts = ctx.candle.timestamp
     if ts in cache:
         return cache[ts]
-    need = max(p.breakout_look + 1, 2 * p.slope_bars + 1)
-    # The engine only executes signals for symbols that clear the rolling
-    # universe selection, so the cohort the book-slot cap must absorb is the
-    # breakout count WITHIN that selected set -- not the whole configured
-    # universe. Counting all 147 names overstates the cohort ~4x and keeps the
-    # throttle (<_BOOK_SLOTS) permanently engaged, halving deployment on the
-    # broad-universe configs. Missing names are deselected, so they open nothing
-    # and must not inflate the damp.
     tradable = _selection(ctx, p) if p.select_top_n > 0 else None
     count = 0
     for sym in ctx.symbols:
@@ -246,23 +295,23 @@ def _breakout_count(ctx: StrategyContext, p: Params) -> int:
             continue
         if tradable is not None and sym not in tradable:
             continue
-        o = ctx.ohlcv(sym)
+        o = ctx.ohlcv(sym, _state_interval(ctx))
         if o is None:
             continue
         close = o.close.to_array()
-        m = len(close)
-        if m < need:
+        n = close.size
+        if n < p.breakout_look + 1:
             continue
         px = float(close[-1])
-        v = ctx.ta.vwatr(sym, p.vwatr_period).to_array()
-        if m == 0 or not np.isfinite(px) or px <= 0:
+        v = ctx.ta.vwatr(sym, p.vwatr_period, interval=_state_interval(ctx)).to_array()
+        if not np.isfinite(px) or px <= 0 or v.size < n:
             continue
-        v_now = float(v[-1])
-        v_prev = float(v[m - 1 - p.slope_bars])
+        v_now = float(v[n - 1])
+        v_prev = float(v[n - 1 - p.slope_bars])
         if not (np.isfinite(v_now) and np.isfinite(v_prev)) or not (v_now > v_prev):
             continue
-        prior = close[m - 1 - p.breakout_look : m - 1]
-        if len(prior) < p.breakout_look or not np.all(np.isfinite(prior)):
+        prior = close[n - 1 - p.breakout_look : n - 1]
+        if prior.size < p.breakout_look or not np.all(np.isfinite(prior)):
             continue
         if px > float(np.max(prior)):
             count += 1
@@ -275,13 +324,11 @@ def _breakout_count(ctx: StrategyContext, p: Params) -> int:
 def _trend_cross_section(
     ctx: StrategyContext, p: Params
 ) -> tuple[dict[str, float], bool]:
-    """Per-bar map of slope percentile + the leg-up gate, computed ONCE.
+    """Per-bar map of daily slope percentile + the leg-up gate, computed once.
 
-    Slope = 50d SMA vs the 50d SMA one horizon earlier, as a fraction of price.
-    ``pct`` is the symbol's rank among the tradable universe at this bar (0..1),
-    i.e. the cross-sectional selection score. ``leg_up`` is the breadth gate.
-    Results are cached under the current timestamp in ``ctx.shared`` because
-    ``on_candle`` invokes one symbol per call.
+    Slope is the ``_TREND_LOOK``-session SMA vs the SMA one horizon earlier, as
+    a fraction of price; ``pct`` is its cross-sectional rank (0..1). Cached per
+    timestamp in ``ctx.shared`` because ``on_candle`` visits one symbol a call.
     """
     cache: dict[object, tuple[dict[str, float], bool]] = ctx.shared.setdefault(
         _TREND_CACHE_KEY, {}
@@ -294,7 +341,7 @@ def _trend_cross_section(
     for sym in ctx.symbols:
         if sym.startswith("GATE_"):
             continue
-        o = ctx.ohlcv(sym)
+        o = ctx.ohlcv(sym, _state_interval(ctx))
         if o is None or len(o.close) < 2 * _TREND_LOOK:
             continue
         close = o.close.to_array()
@@ -311,6 +358,9 @@ def _trend_cross_section(
         pcts[sym] = (
             (below + 0.5 * ties) / max(1, len(slopes) - 1) if len(slopes) > 1 else 0.5
         )
+    # Breadth is the share of the readable universe above its own SMA. No
+    # minimum-size guard -- at one symbol the ratio is 0 or 1 over a denominator
+    # of one, which is the rule, not a degenerate case to correct.
     leg_up = (
         (sum(1 for v in above.values() if v) / len(above)) >= _TREND_GATE_LO
         if above
@@ -324,22 +374,14 @@ def _trend_cross_section(
 
 
 def _amp_score(p: Params, ctx: StrategyContext, sym: str) -> float:
-    """One amplifier knob: non-conserved trend re-lever inside a leg up, plus
-    an optional conserved dollar-volume top-K concentration.
+    """Size multiplier: trend re-lever inside a leg up, times optional
+    dollar-volume top-K concentration.
 
-    The two effects multiply and each is load-bearing:
-
-    1. Re-lever (``risk_amp``): ``1 + amp*(2*trend_pct - 1)`` inside a leg-up
-       breadth gate. Boosting ALL names in a strong tape by their trend rank is
-       what lifts return (the top names also carry the PnL); gating it to the
-       leg-up is what keeps it from blowing up in a bear. ``amp=0`` or gate
-       shut -> 1.0 (flat).
-    2. Concentration (``risk_topk > 0``, ``_DV_CONC`` strength): the top-K
-       names by trailing-60d dollar volume get ``x(1+conc)`` and the rest a
-       compensating cut so the cohort budget is unchanged. Dollar volume is the
-       OOS-stable predictor of which names carry the realized PnL (per-trade
-       RETURN is unpredictable at ~0 IC); this re-deploys the same budget onto
-       them. ``risk_topk=0`` -> no concentration.
+    1. ``risk_amp``: ``1 + amp*(2*trend_pct - 1)``, gated to the leg-up. ``0``
+       or gate shut -> flat.
+    2. ``risk_topk > 0``: top-K names by trailing dollar volume draw
+       ``x(1+_DV_CONC)``, the rest take a compensating cut, so the cohort's
+       total budget is unchanged.
 
     Both neutral when off. A missing trend read is not a weak trend.
     """
@@ -355,25 +397,20 @@ def _amp_score(p: Params, ctx: StrategyContext, sym: str) -> float:
     return score
 
 
-#: Dollar-volume concentration. Cross-sectional percentile of trailing 60d
-#: dollar volume. Unlike trend slope it is a SIZE/participation signal: names
-#: with heavy recent dollar flow are the ones that carry the realized PnL in
-#: this long-only breakout book (per-trade-PnL rank IC ~ +0.09 is the single
-#: most OOS-stable predictor measured; per-trade RETURN is unpredictable at
-#: ~0 IC across every trailing stat). Sized onto live equity, a high-dv name
-#: is where a breakout is actually being paid for -- that's the size target.
-#: top-K names draw more, the rest a compensating cut, so total deployment
-#: (and so cash-exhaustion scaling) is unchanged. Consumed by _dv_topk_score.
+#: Dollar-volume concentration: cross-sectional percentile of trailing 60d
+#: dollar volume. A SIZE/participation signal -- heavy dollar flow is where a
+#: breakout is actually being paid for -- and conserved by ``_dv_topk_score``,
+#: so total deployment (and cash-exhaustion scaling) is unchanged.
 _DV_LOOK: int = 60
 _DV_CACHE_KEY = "vwatr_div_dv"
 #: Conserved top-K concentration strength (structural). Boosting more leaks
-#: cash-exhaustion scaling; the shipped value was A/B'd on the broad book.
+#: cash-exhaustion scaling.
 _DV_CONC: float = 1.0
 
 
 def _dv_cross_section(ctx: StrategyContext) -> dict[str, float]:
-    """Per-symbol trailing-60d dollar-volume percentile within the universe,
-    computed ONCE per timestamp and cached in ``ctx.shared`` (bounded)."""
+    """Trailing-60d dollar-volume percentile within the universe, computed once
+    per timestamp and cached in ``ctx.shared`` (bounded)."""
     cache: dict[object, dict[str, float]] = ctx.shared.setdefault(_DV_CACHE_KEY, {})
     ts = ctx.candle.timestamp
     if ts in cache:
@@ -382,12 +419,12 @@ def _dv_cross_section(ctx: StrategyContext) -> dict[str, float]:
     for sym in ctx.symbols:
         if sym.startswith("GATE_"):
             continue
-        o = ctx.ohlcv(sym)
+        o = ctx.ohlcv(sym, _state_interval(ctx))
         if o is None:
             continue
         close = o.close.to_array()
         volume = o.volume.to_array()
-        if len(close) < _DV_LOOK or len(volume) < _DV_LOOK:
+        if close.size < _DV_LOOK or volume.size < _DV_LOOK:
             continue
         d = float(np.mean(close[-_DV_LOOK:] * volume[-_DV_LOOK:]))
         if np.isfinite(d) and d > 0:
@@ -404,14 +441,11 @@ def _dv_cross_section(ctx: StrategyContext) -> dict[str, float]:
 
 
 def _dv_topk_score(ctx: StrategyContext, p: Params, sym: str) -> float:
-    """Conserved top-K concentration on trailing-60d dollar volume.
+    """Conserved top-K concentration on trailing dollar volume.
 
-    The top-``risk_topk`` most-liquid names of the cohort get ``x(1+conc)``
-    and the rest a compensating cut ``x(1 - conc*k/rest)`` so the cohort's
-    total risk budget sums to ~n (same deployment, no added cash-exhaustion
-    scaling). Dollar volume is the OOS-stable predictor of which names carry
-    the realized PnL, so the budget is re-deployed onto them. Neutral (1.0)
-    when the symbol has no dv read or the cohort is empty.
+    Top ``risk_topk`` names get ``x(1+conc)``, the rest a compensating cut, so
+    the cohort budget still sums to ~n. Neutral (1.0) when the symbol has no dv
+    read or the cohort is empty.
     """
     picks = _selection(ctx, p) if p.select_top_n > 0 else None
     pcts = _dv_cross_section(ctx)
@@ -420,7 +454,7 @@ def _dv_topk_score(ctx: StrategyContext, p: Params, sym: str) -> float:
     else:
         cohort = sorted((s for s, v in pcts.items() if v > 0), key=lambda s: pcts[s])
     n = len(cohort)
-    if not cohort or n == 0:
+    if not cohort:
         return 1.0
     pos = cohort.index(sym) if sym in cohort else -1
     if pos < 0:
@@ -435,12 +469,11 @@ def _dv_topk_score(ctx: StrategyContext, p: Params, sym: str) -> float:
     return 1.0 - _DV_CONC * (k / rest)
 
 
-#: Rolling selection: the top-``select_top_n`` names by the combined rank of
-#: trailing dollar volume and realized vol -- the two features that separate a
-#: live, actively traded high-vol book from the rest of a research universe.
-#: Selection is recomputed every ``select_bars`` bars and held in ``ctx.shared``
-#: (per-run by construction). Deselected names are NOT force-closed: the trail
-#: and the divergence exit still own every open position.
+#: Rolling selection: top-``select_top_n`` names by combined rank of trailing
+#: dollar volume and realized vol. DAILY reads -- the feature describes a name
+#: over months, so the selected set matches on either venue. Recomputed every
+#: ``select_bars`` bars, held in ``ctx.shared``. Deselected names are NOT
+#: force-closed: the trail and the divergence exit still own open positions.
 _SELECT_CACHE_KEY = "vwatr_div_selection"
 _SELECT_LOOK: int = 60
 
@@ -456,17 +489,20 @@ def _pct_rank(vals: dict[str, float], sym: str) -> float:
 def _selection(ctx: StrategyContext, p: Params) -> frozenset[str]:
     """Tradable set for the current bar: the last rebalance's picks.
 
-    Re-selects when ``select_bars`` base bars have elapsed (tracked by the
-    reference symbol's bar count, so the period is exact in bars, not wall
-    days). Names without ``_SELECT_LOOK`` bars of history are never picked --
-    a fresh listing is not a liquidity signal.
+    Re-selects after ``select_bars`` signal-feed bars (counted off the reference
+    symbol, so exact in that interval's bars, not wall days). Names without
+    ``_SELECT_LOOK`` bars of history are never picked.
     """
     holder: dict[str, object] = ctx.shared.setdefault(_SELECT_CACHE_KEY, {})
     ref = next((s for s in ctx.symbols if not s.startswith("GATE_")), None)
-    frame = ctx.ohlcv(ref) if ref is not None else None
+    frame = ctx.ohlcv(ref, _state_interval(ctx)) if ref is not None else None
     bars = 0 if frame is None else len(frame.close)
     last_bars = holder.get("bars")
-    if isinstance(last_bars, int) and bars - last_bars < p.select_bars:
+    if (
+        isinstance(last_bars, int)
+        and bars - last_bars < p.select_bars
+        and "picks" in holder
+    ):
         return cast("frozenset[str]", holder["picks"])
 
     dv: dict[str, float] = {}
@@ -474,12 +510,12 @@ def _selection(ctx: StrategyContext, p: Params) -> frozenset[str]:
     for sym in ctx.symbols:
         if sym.startswith("GATE_"):
             continue
-        o = ctx.ohlcv(sym)
+        o = ctx.ohlcv(sym, _state_interval(ctx))
         if o is None:
             continue
         close = o.close.to_array()
         volume = o.volume.to_array()
-        if len(close) < _SELECT_LOOK + 1 or len(volume) < _SELECT_LOOK:
+        if close.size < _SELECT_LOOK + 1 or volume.size < _SELECT_LOOK:
             continue
         logret = np.diff(np.log(close[-(_SELECT_LOOK + 1) :]))
         rvol = float(np.std(logret, ddof=1))
@@ -500,96 +536,148 @@ def _selection(ctx: StrategyContext, p: Params) -> frozenset[str]:
     return picks
 
 
-def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
-    holder: dict[str, _State] = ctx.shared.setdefault(_STATE_KEY, {})
-    state = holder.get(sym) or _State()
-    holder[sym] = state
+def _exit_inputs(
+    ctx: StrategyContext, p: Params, sym: str, state: _State
+) -> tuple[np.ndarray, int, float | None, bool]:
+    """Signal-feed VWATR array, its length, the running high-water mark, and
+    whether the latest signal close set a new high.
 
-    def put(**kw: object) -> None:
-        nonlocal state
-        state = dataclasses.replace(state, **kw)
-        holder[sym] = state
+    The mark is the last SIGNAL close, never the base-bar price: on an intraday
+    base ratcheting off an hourly close runs it ahead of the daily mark the
+    trail and the divergence test are written against.
+    """
+    reads = _daily_reads(ctx, p, sym)
+    if reads is None:
+        return np.empty(0), 0, None, False
+    close_d, v_d, _ = reads
+    nd = v_d.size
+    if close_d.size == 0:
+        return v_d, nd, None, False
+    close_now = float(close_d[-1])
+    if not np.isfinite(close_now) or close_now <= 0:
+        return v_d, nd, None, False
+    best = state.best
+    if best is None or not np.isfinite(best):
+        return v_d, nd, close_now, True
+    at_new_high = close_now >= best
+    return v_d, nd, max(best, close_now), at_new_high
 
-    o = ctx.ohlcv(sym)
-    if o is None or len(o.close) == 0:
-        return
 
-    close = o.close.to_array()
-    n = len(close)
+def _arm_trail(
+    ctx: StrategyContext, p: Params, sym: str, state: _State, best: float, px: float
+) -> _State:
+    """Arm the signal-derived chandelier level for the NEXT bar.
 
-    px = float(close[-1])
-    if not np.isfinite(px) or px <= 0:
-        return
+    ``best`` and the VWATR distance are both daily quantities, so the level is
+    the source's. ``set_stops`` is tighten-only, so re-arming an unchanged level
+    is idempotent -- free on every base bar, keeps a live stop between reads.
+    """
+    reads = _daily_reads(ctx, p, sym)
+    if reads is None:
+        return dataclasses.replace(state, best=best)
+    _, v_d, _ = reads
+    nd = v_d.size
+    if nd == 0:
+        return dataclasses.replace(state, best=best)
+    vwatr_now = float(v_d[nd - 1])
+    if not np.isfinite(vwatr_now) or vwatr_now <= 0:
+        return dataclasses.replace(state, best=best)
+    stop_distance = p.vwatr_mult * vwatr_now
+    ctx.set_stops(
+        sym,
+        sl=best - stop_distance,
+        reason=(
+            f"trail {sym}: arm {best - stop_distance:.2f} "
+            f"−{stop_distance:.2f} ({stop_distance / px:.2%}) "
+            f"off best {best:.2f}"
+        ),
+    )
+    return dataclasses.replace(state, best=best)
 
-    vwatr_arr = ctx.ta.vwatr(sym, p.vwatr_period).to_array()
-    vwatr = float(vwatr_arr[-1]) if n else float("nan")
-    if not np.isfinite(vwatr) or vwatr <= 0:
-        return
 
-    base_now = float(ctx.ta.vwatr_baseline(sym, p.vwatr_period, p.vwatr_base_win)[-1])
+def _exit_daily(
+    ctx: StrategyContext, p: Params, sym: str, state: _State, px: float
+) -> _State:
+    """Exit path on the signal read: divergence close, else the trail.
 
-    # ---- exit while long ----
-    if ctx.quantity(sym) != 0:
-        best = state.best
-        if best is None or not np.isfinite(best):
-            put(best=px)
-            return
-        if px > best:
-            put(best=px)
-            best = px
+    Called only on bucket bars (every bar on the daily venue), so the rule is
+    read where a daily-bar run would read it. ``decel`` is a STATE rule gated on
+    a new high -> next-open close. The trail is a PRICE level, re-armed here
+    and by ``_rearm_trail`` between reads so it still fires intrabar.
+    """
+    v_d, nd, best, at_new_high = _exit_inputs(ctx, p, sym, state)
+    if best is None:
+        return state
 
-        reason: str | None = None
-
-        # 1) slope divergence under a new high — a STATE rule (VWATR expansion
-        # decelerating against the prior window), not a price level: it remains
-        # a next-open close, and it clears the running best.
-        if (
-            p.decel_ratio > 0
-            and px >= best
-            and _slope_decelerating(vwatr_arr, n, p.slope_bars, p.decel_ratio)
-        ):
-            reason = (
-                f"decel {sym}: {px:.2f} at best, slope < {p.decel_ratio:.2f}× prior"
-            )
-        if reason is not None:
-            put(best=None)
-            ctx.close(sym, reason=reason)
-            return
-
-        # 2) chandelier trail: ARM the level (ratchet-only) for the NEXT bar
-        # instead of closing at the next open. A ``set_stops`` does NOT clear
-        # ``best`` — the trail lives with the position; the armed level fires
-        # intrabar on the next bar's low, gap-adjusted. ``tp`` intentionally
-        # unused: no take-profit on this strategy.
-        stop_distance = p.vwatr_mult * vwatr
-        ctx.set_stops(
+    # 1) slope divergence at a new high — a STATE rule, so a next-open close.
+    # ``at_new_high`` is the signal-feed analogue of ``px >= best``; testing the
+    # base close instead fires into a partly-formed bucket.
+    if (
+        p.decel_ratio > 0
+        and at_new_high
+        and _slope_decelerating(v_d, nd, p.slope_bars, p.decel_ratio)
+    ):
+        ctx.close(
             sym,
-            sl=best - stop_distance,
             reason=(
-                f"trail {sym}: arm {best - stop_distance:.2f} "
-                f"−{stop_distance:.2f} ({stop_distance / px:.2%}) "
-                f"off best {best:.2f}"
+                f"decel {sym}: {best:.2f} at best, slope < {p.decel_ratio:.2f}× prior"
             ),
         )
-        return
+        return dataclasses.replace(state, best=None)
 
-    # ---- entry: rising expansion + structural breakout ----
+    # 2) chandelier trail: ARM the level for the NEXT bar rather than closing at
+    # the next open. ``set_stops`` does NOT clear ``best`` — the trail lives with
+    # the position. ``tp`` intentionally unused: no take-profit.
+    return _arm_trail(ctx, p, sym, state, best, px)
+
+
+def _rearm_trail(
+    ctx: StrategyContext, p: Params, sym: str, state: _State, px: float
+) -> _State:
+    """Refresh the high-water mark + trail arm on a NON-bucket base bar.
+
+    The divergence exit is deliberately absent -- it is a state rule and only
+    ``_exit_daily`` (bucket bars) may fire it.
+    """
+    _, nd, best, _ = _exit_inputs(ctx, p, sym, state)
+    if best is None or nd == 0:
+        return state
+    return _arm_trail(ctx, p, sym, state, best, px)
+
+
+def _entry(
+    ctx: StrategyContext, p: Params, sym: str, px: float, holder: dict[str, _State]
+) -> None:
+    """Evaluate and emit the entry on a bucket bar (no-op when it doesn't fire).
+
+    ``px`` is the base-bar price: the fill is timed on it, the break condition
+    itself is the signal feed's last close.
+    """
+    reads = _daily_reads(ctx, p, sym)
+    if reads is None:
+        return
+    close_d, v_d, base_d = reads
+    nd = close_d.size
+    if nd <= 2 * p.slope_bars:
+        return
+    base_now = float(base_d[nd - 1])
     if not np.isfinite(base_now) or base_now <= 0:
         return
 
-    if n <= p.slope_bars:
+    vwatr_d = float(v_d[nd - 1])
+    vwatr_d_prev = float(v_d[nd - 1 - p.slope_bars])
+    if not (np.isfinite(vwatr_d) and np.isfinite(vwatr_d_prev)):
         return
-    vwatr_prev = float(vwatr_arr[n - 1 - p.slope_bars])
-    if not np.isfinite(vwatr_prev):
-        return
-    if not (vwatr > vwatr_prev):
+    if not (vwatr_d > vwatr_d_prev):
         return
 
-    prior = close[n - 1 - p.breakout_look : n - 1]
-    if len(prior) < p.breakout_look or not np.all(np.isfinite(prior)):
+    # Breakout: the last close above the max of the prior ``breakout_look``
+    # closes -- one rule, same bar count, whatever the fill venue.
+    prior = close_d[nd - 1 - p.breakout_look : nd - 1]
+    if prior.size < p.breakout_look or not np.all(np.isfinite(prior)):
         return
     prior_high = float(np.max(prior))
-    if not (px > prior_high):
+    if not (float(close_d[nd - 1]) > prior_high):
         return
 
     # Breadth gate: only take breakouts while the universe is in a leg up
@@ -604,7 +692,9 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
     if p.select_top_n > 0 and sym not in _selection(ctx, p):
         return
 
-    stop_price = p.vwatr_mult * vwatr
+    # The stop distance is the signal VWATR: the same risk unit the source
+    # sizes against, so ``risk_pct`` keeps its meaning whatever the fill venue.
+    stop_price = p.vwatr_mult * vwatr_d
     # Size off LIVE EQUITY: the risk budget re-levers with the book, which is
     # what keeps deployment (and therefore Ann) up as equity compounds.
     equity = ctx.current_equity()
@@ -624,16 +714,22 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         return
 
     reason = (
-        f"{sym}: {px:.2f} > {prior_high:.2f}, "
-        f"vwatr {vwatr:.3f} {vwatr / base_now:.2f}× base {base_now:.3f}, "
-        f"↑ {vwatr_prev:.3f}/{p.slope_bars}b, "
-        f"risk {risk_eff:.1%} ×{score:.2f}, stop {stop_price:.2f}"
+        f"{sym}: close {float(close_d[nd - 1]):.2f} > {prior_high:.2f} "
+        f"({p.breakout_look}b), "
+        f"vwatr {vwatr_d:.3f} {vwatr_d / base_now:.2f}× base {base_now:.3f}, "
+        f"↑ {vwatr_d_prev:.3f}/{p.slope_bars}b, "
+        f"risk {risk_eff:.1%} ×{score:.2f}, stop {stop_price:.2f}, "
+        f"fill @ {px:.2f}"
     )
 
-    put(best=px)
+    # Seed the high-water mark from the signal close that triggered the entry,
+    # not the fill price: ``best`` is a signal-feed quantity everywhere else on
+    # this strategy (see ``_exit_inputs``).
+    state = holder.get(sym) or _State()
+    holder[sym] = dataclasses.replace(state, best=float(close_d[nd - 1]))
     # Arming the initial stop in the SAME call via ``sl`` (ABSOLUTE PRICE):
-    # ``stop_price`` is the DISTANCE at entry − vwatr_mult*ATR, so subtract it
-    # from the signal-time price instead of passing it as a fraction.
+    # ``stop_price`` is the DISTANCE at entry − vwatr_mult*VWATR, so subtract it
+    # from the price the fill is timed off instead of passing it as a fraction.
     ctx.long(
         sym,
         size=size,
@@ -641,6 +737,49 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         reason=reason,
         sl=px - stop_price,
     )
+
+
+def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
+    holder: dict[str, _State] = ctx.shared.setdefault(_STATE_KEY, {})
+    state = holder.get(sym) or _State()
+    holder[sym] = state
+
+    reads = _daily_reads(ctx, p, sym)
+    if reads is None:
+        return
+    nd = reads[0].size
+
+    # The once-per-bucket guard (see the module docstring). Consumes the signal
+    # read length unconditionally, so the baseline is adopted on the first bar
+    # even while flat and never re-baselines later. Always True on the daily
+    # venue, where the read IS the base feed.
+    new_bucket = _new_daily_bucket(ctx, holder, sym, nd)
+    state = holder[sym]
+
+    base = ctx.ohlcv(sym)
+    if base is None or len(base.close) == 0:
+        return
+    px = float(base.close[-1])
+    if not np.isfinite(px) or px <= 0:
+        return
+
+    # ---- exit while long ----
+    if ctx.quantity(sym) != 0:
+        if not new_bucket:
+            # Between daily reads the base bar owns one action only: keep the
+            # daily-derived trail level armed. It is a PRICE stop, not a state
+            # rule, so re-arming it at base cadence is idempotent
+            # (``set_stops`` ratchets tighten-only) and keeps the position
+            # covered until the next bucket closes.
+            holder[sym] = _rearm_trail(ctx, p, sym, state, px)
+            return
+        holder[sym] = _exit_daily(ctx, p, sym, state, px)
+        return
+
+    if not new_bucket:
+        return  # entry is a DAILY decision: once per completed bucket
+
+    _entry(ctx, p, sym, px, holder)
 
 
 def _shift(values: np.ndarray, bars: int) -> np.ndarray:
@@ -658,26 +797,43 @@ def _as_series(index, values: np.ndarray):
 
 def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
     """Post-run chart spec (cursor at terminal bar; ctx.ta series are the
-    full visible history)."""
+    full visible history).
+
+    The price pane is the BASE (execution) feed — that is where the fill lands.
+    The signal series is reindexed onto the base index with a forward fill; on
+    an intraday base with completed daily buckets that means a daily value only
+    paints from the bar AFTER its session closed.
+    """
     sym = ctx.candle.symbol
     df = ctx.state.candles.get((sym, ctx.interval))
     if df is None or len(df) < params.vwatr_period + params.vwatr_base_win:
         return PlotSpec()
 
     close = ctx.ta.close(sym).to_array()
-    vwatr_arr = ctx.ta.vwatr(sym, params.vwatr_period).to_array()
-    slope = vwatr_arr - _shift(vwatr_arr, params.slope_bars)
+    sig = ctx.ohlcv(sym, _state_interval(ctx))
+    sig_close = np.full(close.shape, np.nan, dtype=np.float64)
+    sig_slope = np.full(close.shape, np.nan, dtype=np.float64)
+    if sig is not None and len(sig.close) > 2 * params.slope_bars:
+        sc = sig.close.to_array()
+        v_s = ctx.ta.vwatr(
+            sym, params.vwatr_period, interval=_state_interval(ctx)
+        ).to_array()
+        s_slope = v_s - _shift(v_s, params.slope_bars)
+        # Each signal bucket paints from the next base bar onwards (its session
+        # has closed by then), so offset the mapped values by one base bar.
+        sig_close[1 : 1 + sc.size] = sc[: len(sig_close) - 1]
+        sig_slope[1 : 1 + s_slope.size] = s_slope[: len(sig_slope) - 1]
 
-    stop_band = params.vwatr_mult * vwatr_arr
-    upper = close + stop_band
-    lower = close - stop_band
+    stop_band = params.vwatr_mult * sig_close
+    upper = sig_close + stop_band
+    lower = sig_close - stop_band
 
     look = params.breakout_look
     channel = np.full(close.shape, np.nan, dtype=np.float64)
-    if len(close) > look:
+    if len(sig_close) > look:
         from numpy.lib.stride_tricks import sliding_window_view
 
-        channel[look:] = sliding_window_view(close, look).max(axis=1)[:-1]
+        channel[look:] = sliding_window_view(sig_close, look).max(axis=1)[:-1]
 
     markers: list[Marker] = []
     for trade in ctx.state.portfolio.trades:
@@ -693,17 +849,22 @@ def plot(ctx: StrategyContext, params: Params) -> PlotSpec:
 
     return PlotSpec(
         overlays=(
+            Overlay(sparse(_as_series(df.index, sig_close)), "close", "line", "price"),
             Overlay(
-                sparse(_as_series(df.index, channel)), "breakout_high", "line", "price"
+                sparse(_as_series(df.index, channel)),
+                f"breakout_high ({look})",
+                "line",
+                "price",
             ),
             Overlay(sparse(_as_series(df.index, upper)), "trail_hi", "line", "price"),
             Overlay(sparse(_as_series(df.index, lower)), "trail_lo", "line", "price"),
         ),
-        # slope pair only: vwatr/close = noise; baseline div failed.
+        # slope pair only: vwatr/close = noise; baseline div failed. The source
+        # interval is the rule's; the base bar only times the fill.
         panels=(
             Panel(
-                sparse(_as_series(df.index, slope)),
-                f"vwatr slope ({params.slope_bars}b)",
+                sparse(_as_series(df.index, sig_slope)),
+                f"vwatr slope ({params.slope_bars}b, entry + exit state)",
                 (0.0,),
             ),
         ),
