@@ -1,5 +1,5 @@
 from src.bt.state import Candle, BacktestState
-from typing import Generator, cast
+from typing import Generator, Mapping, Sequence, cast
 from src.data.resample import resample_multiindex
 import pandas as pd
 import numpy as np
@@ -32,9 +32,45 @@ def _df_to_multiindex(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_htf_feeds(
+    df: pd.DataFrame,
+    htf_intervals: Sequence[str],
+) -> dict[str, pd.DataFrame]:
+    """Resample the base feed to every higher timeframe exactly once.
+
+    Pure function. The returned mapping is handed to BOTH ``candle_generator``
+    (which yields HTF candles) and ``TaContext.from_data`` (which prefetches
+    HTF indicator arrays), so both consumers derive from one resample and can
+    never diverge. Keys are the frequency strings (e.g. ``"4h"``); values are
+    ``(symbol, timestamp)``-MultiIndex OHLCV frames from
+    :func:`resample_multiindex` (session-anchored for intraday hour buckets,
+    calendar-aligned otherwise).
+
+    ``dropna()`` is applied uniformly so the session-anchored and calendar
+    paths agree on which buckets are dropped; without it a NaN-close bucket
+    would survive one path and not the other, desynchronising the store's HTF
+    rows from the feed's HTF rows.
+
+    Args:
+        df: Base MultiIndex-column OHLCV DataFrame (as consumed by the engine).
+        htf_intervals: Higher-timeframe frequencies; empty yields an empty dict.
+
+    Returns:
+        ``{freq: resampled_frame}`` — one entry per requested interval.
+    """
+    if df.empty or not htf_intervals:
+        return {}
+    df_mi = _df_to_multiindex(df)
+    return {
+        freq: resample_multiindex(df_mi, freq, completed_only=False).dropna()
+        for freq in htf_intervals
+    }
+
+
 def candle_generator(
     df: pd.DataFrame,
     config,
+    htf_feeds: Mapping[str, pd.DataFrame] | None = None,
 ) -> Generator[Candle, None, None]:
     """Create a generator that yields Candles (OHLCV bars) from a DataFrame.
 
@@ -47,6 +83,10 @@ def candle_generator(
     Args:
         df: DataFrame with MultiIndex (symbol, timestamp) containing OHLCV
         config: StrategyConfig with symbols, bar, and htf settings, or list of symbols (legacy)
+        htf_feeds: Pre-resampled HTF frames from :func:`build_htf_feeds`. When
+            ``None`` the feeds are built here from ``config.bars[1:]``
+            (back-compat for direct callers/tests); production passes the same
+            mapping instance also handed to ``TaContext.from_data``.
 
     Yields:
         Candle objects for each symbol at each timestamp
@@ -66,9 +106,6 @@ def candle_generator(
     if df.empty or len(df.index) == 0:
         return
 
-    # Convert to MultiIndex format for resampling
-    df_mi = _df_to_multiindex(df)
-
     # Pre-extract base OHLCV into numpy arrays for fast iteration.
     # df has MultiIndex columns: (symbol, field). Extract each (sym, field)
     # into a plain numpy array indexed by row position.
@@ -82,10 +119,11 @@ def candle_generator(
 
     timestamps = df.index
 
-    # Pre-compute HTF DataFrames
-    htf_dfs: dict[str, pd.DataFrame] = {}
-    for freq in htf_intervals:
-        htf_dfs[freq] = resample_multiindex(df_mi, freq, completed_only=False)
+    # HTF frames: the caller's shared mapping when supplied, else resample once
+    # here (back-compat). Never both — one resample per HTF interval per run.
+    htf_dfs: Mapping[str, pd.DataFrame] = (
+        htf_feeds if htf_feeds is not None else build_htf_feeds(df, htf_intervals)
+    )
 
     # Get all unique timestamps across base and HTF
     all_timestamps: set = set()

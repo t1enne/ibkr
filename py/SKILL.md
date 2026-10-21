@@ -123,7 +123,7 @@ from src.bt.strategies.dsl import strategy
 
 STRATEGY_TYPE = "my_strategy"
 
-@strategy(bars="1d")
+@strategy()
 def on_candle(ctx):
     fast = ctx.ta.ema("AAPL", 9)
     slow = ctx.ta.ema("AAPL", 21)
@@ -159,7 +159,11 @@ Surface (all cursor-safe, no future bars):
   just bypassed — prefer the shortcut methods).
 
 Cross-timeframe reads (base bar vs HTF) go through `ctx.ta.<indicator>(sym, interval=...)`
-or `state.candles.get((sym, interval))` — both cursor-truncated.
+or `state.candles.get((sym, interval))` — both cursor-truncated and **HTF-safe**.
+An HTF read exposes **completed buckets only** (Pine `lookahead=false`): a
+higher-timeframe bar becomes visible only once its bucket has closed, so the
+forming bucket's future-inclusive OHLC never leaks. `interval=None` (default)
+aliases to the base interval.
 
 Register a strategy by dropping the file in `src/bt/strategies/` — the import
 path is `src.bt.strategies.<module_name>`. Optional typed `Params` dataclass
@@ -194,9 +198,12 @@ classification bucket they earn — see `strats/README.md`):
 
 - `training_start`/`training_end` — warmup window (data loaded for indicator/model warmup before trading)
 - `trading_start`/`trading_end` — actual backtest window
-- `bars` — list of bar sizes; `bars[0]` is the base signal interval, additional
-  entries (e.g. `["1h", "4h"]`) are higher-timeframe bars injected alongside
-  (lookahead-safe). There is no separate `htf` field.
+- `bars` — list of bar sizes; `bars[0]` is the base signal interval and the
+  single source of truth for it (the `@strategy` decorator takes no interval
+  argument). Additional entries (e.g. `["1h", "4h"]`) add higher-timeframe
+  feeds, readable via `ctx.ta.<ind>(sym, interval="4h")` or
+  `state.candles.get((sym, "4h"))`; both expose completed buckets only. There
+  is no separate `htf` field.
 - `commission` — fixed commission per trade
 - `strategy_params` — arbitrary dict forwarded verbatim to `on_candle(state, candle, params)`;
   position sizing, stop-loss/take-profit, and any model hyper-params live here
@@ -300,10 +307,13 @@ else:
 
 ### Multi-timeframe reads
 
-Prefer `state.candles.get((sym, freq))` (or DSL `ctx.ta` with an explicit
-`interval=`) for HTF bars — both are cursor-truncated and lookahead-safe.
-There is no `state.model_state` channel; cross-candle model state is owned by
-the strategy (`ctx.shared`).
+Prefer DSL `ctx.ta.<ind>(sym, interval=freq)` for HTF indicators — it computes
+once over the full series and does O(1) cursor-truncated reads, and it is the
+same door as the base interval. `state.candles.get((sym, freq))` also works and
+is now HTF-safe (completed buckets only), but it rebuilds a DataFrame per call
+(O(N²) if used per candle). Both expose **completed buckets only**
+(Pine `lookahead=false`). There is no `state.model_state` channel; cross-candle
+model state is owned by the strategy (`ctx.shared`).
 
 ## Testing
 
@@ -327,7 +337,8 @@ uv run pytest src/bt/risk/tests/ -v
 - **Two sources, one command.** `data dl` fetches candles via the IBKR Gateway **and** company fundamentals from SEC EDGAR (no Gateway, disk-cached) — one symbol list, both passes, always. US macro = `scripts/fetch_macro_fred.py` (`FRED_API_KEY` is configured, writes `assets/*.csv`) is separate and not fixed by `data dl`.
 - **Bar size**: strategies expect the bar size in config to match available data. Most data is `1h`.
 - **HTF lookahead**: `state.candles.get((sym, freq))` and the DSL `ctx.ta`
-  `interval=` reads are both safe (cursor-truncated).
+  `interval=` reads are both safe — each exposes COMPLETED HTF buckets only
+  (Pine `lookahead=false`), never the forming bucket's future-inclusive OHLC.
 - **Multiple symbols**: the engine iterates all symbols per timestamp. `on_candle` fires only on the last symbol per timestamp (so `state.candles` has all symbols' data). Signals for any symbol are valid — engine routes fills by `signal.symbol`. Pending signals for non-current symbols fill when that symbol's own `_execute_pending` stage runs (same bar cycle, later in the timestamp iteration).
 - **Model-backed strategies** (e.g. a Kalman pairs filter): the model is
   strategy-owned — an `OnlinePairs`-style filter object lives in `ctx.shared`
@@ -445,7 +456,7 @@ and index with `searchsorted` — the pattern behind `vwatr_div_dsl.py`
 ```python
 from src.indicators.macro._shared import load_daily
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx):
     cache = ctx.shared.setdefault("macros", {})
     if "vix" not in cache:

@@ -138,16 +138,17 @@ iteration) truncates rows beyond the cursor. Fast-path methods (`latest`,
 `ctx.candle.interval` is `"1h"` for base bars, `"4h"` for HTF bars, etc. The
 engine fires the strategy only on base-interval candles, so `ctx.candle.interval`
 is the signal interval at every call. Multi-interval strategies that also read
-HTF structure reach the accumulated store via `ctx.state.candles` (cursor-
-truncated):
+HTF structure use `ctx.ta` with an explicit `interval=`, or read the accumulated
+store via `ctx.state.candles` (both cursor-truncated; both expose **completed
+HTF buckets only** — Pine `lookahead=false`):
 
 ```python
-@strategy(bars="1h")
+@strategy()
 def on_candle(ctx):
-    # HTF trend read straight from the store (ctx.ta serves only the base interval)
-    htf_df = ctx.state.candles.get((ctx.candle.symbol, "4h"))
-    if htf_df is not None and len(htf_df) > 0:
-        htf_close = htf_df["close"].iloc[-1]
+    # HTF trend read through ctx.ta: one compute, O(1) cursor-truncated reads.
+    htf_close = ctx.ta.close(ctx.candle.symbol, interval="4h")
+    if len(htf_close) > 0:
+        trend_up = htf_close[-1] > htf_close[-2]
     ...
 ```
 
@@ -174,7 +175,7 @@ class Params(StrategyParams):
     top_n: int = 1
     size: float = 0.05
 
-@strategy(bars="1h")
+@strategy()
 def on_candle(ctx):
     params: Params = ctx.params
     closes = {}

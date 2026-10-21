@@ -86,7 +86,7 @@ def _feed(symbols: list[str], n: int = 30) -> pd.DataFrame:
     return df
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _burst(ctx: StrategyContext):
     """Enter the WHOLE book on two separate bars, then exit everything.
 

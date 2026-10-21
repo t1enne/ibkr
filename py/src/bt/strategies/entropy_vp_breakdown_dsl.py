@@ -473,7 +473,7 @@ def _size(ctx: StrategyContext, params: Params, price: float, atr_val: float) ->
 # ---------------------------------------------------------------------------
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
     params: Params = ctx.params
     shared = ctx.shared

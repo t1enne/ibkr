@@ -184,7 +184,7 @@ def _pair_legs(params: Params) -> list[tuple[str, str]]:
     return legs
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext) -> None:
     """Re-rank every pair on a fixed cadence; hold the resulting long/short book.
 

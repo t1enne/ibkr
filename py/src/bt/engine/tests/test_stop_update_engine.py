@@ -35,7 +35,7 @@ class _FixtureMod:
     on_candle: object
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _arm_only_once(ctx: StrategyContext) -> None:
     """Enter long once, then arm ONE absolute stop on the very next bar.
 

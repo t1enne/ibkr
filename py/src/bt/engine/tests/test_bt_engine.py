@@ -45,7 +45,7 @@ def _make_multi_idx_df(symbols: list[str], n: int = 5) -> pd.DataFrame:
     return df
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _fixture_dsl_on_candle(ctx: StrategyContext):
     """Real ``@strategy`` fixture — DSL replacement for the removed plain
     ``_stub_strategy``. Fires one long on the 3rd on_candle dispatch using a
@@ -129,7 +129,7 @@ def test_run_backtest_rejects_plain_strategy_mod():
 # --- initial_state seeding -------------------------------------------------
 
 
-@strategy(bars="1d")
+@strategy()
 def _exit_when_holding(ctx: StrategyContext):
     """A held-lot exit: ``ctx.close`` is a NO-OP on a flat book, so this emits
     only while a lot is open — the rule a screen's short window cannot reach
@@ -260,3 +260,78 @@ def test_candle_generator_4h_emits_two_per_full_day():
     candles = list(candle_generator(df, bt.config))
     htf = [c for c in candles if c.interval == "4h"]
     assert len(htf) == n_days * 2
+
+
+def test_htf_offgrid_bucket_label_does_not_crash_run():
+    """REGRESSION: a session-anchored HTF bucket label off the base bar grid runs.
+
+    A 1h session starting at 14:30 gives 4h bucket labels at 14:30 and 18:30;
+    18:30 is not a base bar, so the candle stream carries HTF-only timestamps.
+    Pre-fix the bar flush indexed an empty buffer and raised ``IndexError``.
+    This drives the full ``run`` path with a base+HTF config to prove it.
+    """
+    # Session anchored at 14:30, hourly base bars, 4h HTF => 18:30 HTF-only ts.
+    stamps = []
+    for day in range(1, 6):
+        stamps += [f"2025-01-{day:02d} 14:30", f"2025-01-{day:02d} 15:00"]
+        stamps += [f"2025-01-{day:02d} {h:02d}:00" for h in range(16, 21)]
+    idx = pd.to_datetime(stamps)
+    n = len(idx)
+    data = {
+        ("SPY", "open"): [100.0] * n,
+        ("SPY", "high"): [105.0] * n,
+        ("SPY", "low"): [95.0] * n,
+        ("SPY", "close"): [102.0] * n,
+        ("SPY", "volume"): [1000.0] * n,
+    }
+    df = pd.DataFrame(data, index=idx)
+    df.columns = pd.MultiIndex.from_tuples(df.columns)
+    cfg = _cfg_1h_4h(["SPY"])
+    cfg = replace(cfg, trading_start="2025-01-01", trading_end="2025-01-31")
+    bt = Backtest(cfg)
+
+    @strategy()
+    def _noop(ctx: StrategyContext):
+        if ctx.phase == "warmup":
+            return
+        # Read the HTF door so the off-grid label path is exercised end-to-end.
+        _ = ctx.ta.close(ctx.candle.symbol, interval="4h")
+
+    results = run(
+        bt,
+        df,
+        strat_mod=type("M", (), {"on_candle": _noop}),
+        evaluation_clock_check=False,
+    )
+    assert results is not None
+
+
+def test_candle_generator_prebuilt_feeds_equals_internal():
+    """CHARACTERISATION: prebuilt HTF feeds yield the identical candle stream.
+
+    ``run`` builds the HTF feeds once and hands the same mapping to the generator
+    and the TaContext; the generator's internal fallback (``htf_feeds=None``)
+    must produce the same candles. Holds before and after the change — it guards
+    the single-resample contract.
+    """
+    from src.bt.engine.utils import build_htf_feeds
+
+    df = _hourly_df(["SPY"], days=3)
+    bt = Backtest(_cfg_1h_4h(["SPY"]))
+    feeds = build_htf_feeds(df, bt.config.bars[1:])
+    prebuilt = list(candle_generator(df, bt.config, htf_feeds=feeds))
+    internal = list(candle_generator(df, bt.config))
+    assert len(prebuilt) == len(internal)
+    for a, b in zip(prebuilt, internal):
+        assert (a.timestamp, a.symbol, a.interval) == (
+            b.timestamp,
+            b.symbol,
+            b.interval,
+        )
+        assert (a.open, a.high, a.low, a.close, a.volume) == (
+            b.open,
+            b.high,
+            b.low,
+            b.close,
+            b.volume,
+        )

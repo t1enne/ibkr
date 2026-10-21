@@ -22,7 +22,7 @@ Shape::
 
     STRATEGY_TYPE = "ema_cross"
 
-    @strategy(bars="1d")
+    @strategy()
     def on_candle(ctx: StrategyContext):
         fast = ctx.ta.ema("AAPL", 9)
         slow = ctx.ta.ema("AAPL", 21)
@@ -655,7 +655,6 @@ class _StrategyAdapter:
     __slots__ = (
         "ctx_fn",
         "params_cls",
-        "interval",
         "stateful",
         "__name__",
     )
@@ -663,12 +662,10 @@ class _StrategyAdapter:
     def __init__(
         self,
         fn: FunctionType,
-        bars: str,
         stateful: bool,
     ) -> None:
         self.ctx_fn = fn
         self.params_cls = None
-        self.interval = bars
         self.stateful = stateful
         self.__name__ = "on_candle"
 
@@ -721,18 +718,22 @@ class _StrategyAdapter:
                 )
         # The engine only fires on_candle on base-interval candles (HTF-only
         # candles skip signal generation), so ``candle.interval`` is the true
-        # signal interval at every call -- i.e. ``config.bars[0]`` regardless of
-        # the (per-strategy) decorator ``bars``. Derive the context interval from
-        # the candle so a config using a non-``bars`` base bar (e.g. "1h") stays
-        # consistent with the TaContext base interval. ``self.interval`` is kept
-        # for introspection/back-compat only.
+        # signal interval at every call -- i.e. ``config.bars[0]``. Derive the
+        # context interval from the candle so it always matches the TaContext
+        # base interval; the config's ``bars[0]`` is the single source of truth.
+        # The engine fires only on base-interval candles, which always carry
+        # their interval; a missing one would silently mis-key ``ctx.interval``
+        # against the TaContext base, so fail loud instead.
+        assert candle.interval is not None, (
+            "on_candle fired on a candle with no interval"
+        )
         ctx = StrategyContext(
             state=state,
             candle=candle,
             params=params,
             ta=ta,
             symbols=symbols_from(state),
-            interval=candle.interval or self.interval,
+            interval=candle.interval,
             fundamentals=fundamentals,
         )
         if holder is not None:
@@ -744,7 +745,7 @@ class _StrategyAdapter:
         return ctx._signals
 
 
-def strategy(bars: str = "1d", stateful: bool = False):
+def strategy(stateful: bool = False):
     """Decorate ``def on_candle(ctx: StrategyContext)`` into an engine hook.
 
     Returns an adapter (callable ``on_candle(state, candle, params) ->
@@ -759,9 +760,9 @@ def strategy(bars: str = "1d", stateful: bool = False):
     kept as a no-op shim for split/sweep back-compat.
 
     Args:
-        bars: signal interval served by ``ctx`` (matches the config base bar).
         stateful: when True, persist cross-call state in ``ctx.shared`` (a
-            per-run dict, fresh for every run window).
+            per-run dict, fresh for every run window). The signal interval is
+            the config's ``bars[0]`` — there is no decorator interval argument.
 
     Invariant: a module-level ``plot`` (if present) is NOT part of the engine
     contract. It is never called from ``on_candle`` and is never invoked by the
@@ -769,7 +770,7 @@ def strategy(bars: str = "1d", stateful: bool = False):
     """
 
     def decorate(fn: FunctionType):
-        adapter = _StrategyAdapter(fn, bars, stateful)
+        adapter = _StrategyAdapter(fn, stateful)
         module = sys.modules.get(fn.__module__)
         if module is not None:
             adapter.params_cls = getattr(module, "Params", None)

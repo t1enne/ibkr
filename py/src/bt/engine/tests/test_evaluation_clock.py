@@ -28,7 +28,7 @@ class _FixtureMod:
     on_candle: object
 
 
-@strategy(bars="1d")
+@strategy()
 def _noop_on_candle(ctx: StrategyContext):
     """Runs to completion without emitting — the guard, not the strategy, is
     under test."""

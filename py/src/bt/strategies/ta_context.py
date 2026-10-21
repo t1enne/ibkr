@@ -2,9 +2,11 @@
 
 Built once at engine start from the complete OHLCV feed, then handed to a
 decorated strategy. Every indicator is computed **once** over the full series
-(memoised per ``(symbol, indicator, period, *args)``), cached as a numpy array,
-and exposed as a cursor-truncated :class:`~src.bt.strategies.series.SeriesView`
-bounded by the engine's ``CandleStore`` cursor.
+(memoised per ``(indicator, symbol, interval, *args)``), cached as a numpy
+array, and exposed as a cursor-truncated
+:class:`~src.bt.strategies.series.SeriesView` bounded by the engine's
+``CandleStore`` cursor. Passing ``interval="4h"`` reads a higher-timeframe
+feed; HTF reads expose **completed buckets only** (Pine ``lookahead=false``).
 
 This structurally fixes the hot path in the old ``on_candle`` style, where
 ``ta.ema(closes, period).iloc[-1]`` recomputed the whole EMA *per symbol per
@@ -22,7 +24,7 @@ Example from a DSL strategy::
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, TYPE_CHECKING
+from typing import Callable, Iterable, Mapping, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -34,9 +36,14 @@ if TYPE_CHECKING:
 
 _FIELDS = ("open", "high", "low", "close", "volume")
 
-# A single indicator + its args identifies a cache entry. Hashable because all
-# members are ints/strings.
-CacheKey = tuple[str, str, tuple]
+# A single indicator + its args on a specific (symbol, interval) identifies a
+# cache entry. Hashable because all members are ints/strings. The interval is a
+# distinct field (not folded into args) so a 4h EMA of period 9 can never
+# collide with a 1h EMA of period 9.
+CacheKey = tuple[str, str, str, tuple]
+
+# Internal registry key: one feed per (symbol, interval).
+FeedKey = tuple[str, str]
 
 # Guard for the volume-weighted denominator: a window whose volume sums to
 # (near) zero has no meaningful VWATR and must yield NaN, not inf.
@@ -79,7 +86,7 @@ class TaContext:
 
     def __init__(
         self,
-        complete: dict[str, dict[str, np.ndarray]],
+        complete: dict[FeedKey, dict[str, np.ndarray]],
         symbols: tuple[str, ...],
         base_interval: str,
     ) -> None:
@@ -98,38 +105,31 @@ class TaContext:
         data: pd.DataFrame,
         symbols: Iterable[str],
         base_interval: str,
+        htf_feeds: Mapping[str, pd.DataFrame] | None = None,
     ) -> "TaContext":
         """Build a TaContext from a MultiIndex-column OHLCV DataFrame.
 
         Extracts per-symbol numpy arrays once (a cheap copy of the base arrays,
-        shared by every indicator via cached compute).
+        shared by every indicator via cached compute). ``htf_feeds`` (from
+        :func:`src.bt.engine.utils.build_htf_feeds`) adds one feed per
+        ``(symbol, freq)``, keyed by ``freq``; it must be the SAME mapping
+        instance handed to ``candle_generator`` so HTF feed rows equal the HTF
+        rows the engine accumulates.
         """
-        if hasattr(data.columns, "levels") and isinstance(data.columns, pd.MultiIndex):
-            cols = data.columns
-        else:
-            cols = None
+        cols = data.columns if isinstance(data.columns, pd.MultiIndex) else None
+        syms = tuple(symbols)
 
-        complete: dict[str, dict[str, np.ndarray]] = {}
-        for sym in symbols:
-            arrays: dict[str, np.ndarray] = {}
-            if cols is not None and (sym, "close") in cols:
-                # Align the TaContext feed with the engine's CandleStore 1:1.
-                # ``candle_generator`` skips a symbol's candle whenever its close
-                # is non-finite (data gap / closed market), so the store only ever
-                # accumulates rows with a finite close. We must drop the same rows
-                # here, otherwise ``cursor_count`` (store-based) and ``values[idx]``
-                # (this feed) point at different timestamps -> silent misalignment.
-                mask = np.isfinite(data[(sym, "close")].to_numpy(dtype=np.float64))
-                for f in _FIELDS:
-                    if (sym, f) in cols:
-                        arrays[f] = data[(sym, f)].to_numpy(dtype=np.float64)[mask]
-                    else:
-                        arrays[f] = np.array([], dtype=np.float64)
-            else:
-                for f in _FIELDS:
-                    arrays[f] = np.array([], dtype=np.float64)
-            complete[sym] = arrays
-        return cls(complete, tuple(symbols), base_interval)
+        complete: dict[FeedKey, dict[str, np.ndarray]] = {}
+        for sym in syms:
+            complete[(sym, base_interval)] = _extract_symbol_arrays(data, cols, sym)
+        for freq, feed in (htf_feeds or {}).items():
+            if freq == base_interval:
+                raise ValueError(
+                    f"HTF feed interval {freq!r} collides with the base interval"
+                )
+            for sym in syms:
+                complete[(sym, freq)] = _extract_htf_arrays(feed, sym)
+        return cls(complete, syms, base_interval)
 
     def bind(self, store: "CandleStore") -> None:
         """Bind the engine's CandleStore to share its cursor."""
@@ -146,30 +146,49 @@ class TaContext:
 
     # -- internal helpers -----------------------------------------------------
 
+    def _ck(self, kind: str, sym: str, interval: str | None, *args: object) -> CacheKey:
+        """Cache key for one indicator on one ``(symbol, interval)``.
+
+        ``interval=None`` aliases to the base interval, so every existing call
+        site is unchanged. The interval is part of the key so the same indicator
+        + period on two intervals caches separately.
+        """
+        return (kind, sym, interval or self._base_interval, args)
+
     def _series(self, sym: str, interval: str | None) -> dict[str, np.ndarray]:
-        """Per-symbol field arrays; ``interval`` must match the signal bar."""
+        """Per-``(symbol, interval)`` field arrays.
+
+        ``interval=None`` aliases to the base interval (every existing call site
+        is byte-identical). An unknown ``(symbol, interval)`` raises ``KeyError``
+        listing the available intervals.
+        """
         iv = interval or self._base_interval
-        if iv != self._base_interval:
-            raise ValueError(
-                f"TaContext only serves the signal interval '{self._base_interval}' "
-                f"(got '{iv}'). Indicators over higher timeframes are a follow-up."
-            )
         try:
-            return self._complete[sym]
+            return self._complete[(sym, iv)]
         except KeyError:
-            raise KeyError(f"symbol {sym!r} not in TaContext feed") from None
+            if not any(s == sym for (s, _) in self._complete):
+                raise KeyError(f"symbol {sym!r} not in TaContext feed") from None
+            available = sorted({i for (s, i) in self._complete if s == sym})
+            raise KeyError(
+                f"interval {iv!r} not in TaContext feed for {sym!r}; "
+                f"available intervals: {available}"
+            ) from None
 
     def _lengther(self, sym: str, interval: str | None) -> Callable[[], int]:
         """Return a lengther reading the cursor-truncated count from the store."""
         iv = interval or self._base_interval
         store = self._store
+        feed = self._complete[(sym, iv)]
 
         def _len() -> int:
             if store is None:
-                arr = self._complete[sym].get("close")
+                arr = feed.get("close")
                 return len(arr) if arr is not None else 0
+            # ``cursor_count`` already applies the HTF completion lag (the store
+            # is constructed with the HTF interval set), so we must NOT subtract
+            # another bucket here — that would double-apply the lag.
             n = store.cursor_count(sym, iv)
-            close_arr = self._complete[sym].get("close")
+            close_arr = feed.get("close")
             feed_n = len(close_arr) if close_arr is not None else 0
             if n > feed_n:
                 # The store accumulated more bars than this symbol's aligned feed
@@ -206,7 +225,10 @@ class TaContext:
     # -- raw OHLCV ---------------------------------------------------------------
 
     def ohlcv(self, sym: str, interval: str | None = None) -> OhlcvView:
-        """Cursor-truncated OHLCV for ``sym`` (fields as SeriesViews)."""
+        """Cursor-truncated OHLCV for ``sym`` (fields as SeriesViews).
+
+        An HTF ``interval`` exposes COMPLETED buckets only.
+        """
         arrays = self._series(sym, interval)
         iv = interval or self._base_interval
         return OhlcvView(
@@ -229,7 +251,7 @@ class TaContext:
         """Pine ``ema`` — exponential moving average over ``period`` bars."""
         from src.indicators.ta import ema as _ema
 
-        key: CacheKey = ("ema", sym, (period,))
+        key = self._ck("ema", sym, interval, period)
         arr = self._compute(
             key, lambda: _pnl(self._series(sym, interval)["close"], period, _ema)
         )
@@ -239,7 +261,7 @@ class TaContext:
         """Pine ``sma`` — simple moving average over ``period`` bars."""
         from src.indicators.ta import sma as _sma
 
-        key: CacheKey = ("sma", sym, (period,))
+        key = self._ck("sma", sym, interval, period)
         arr = self._compute(
             key, lambda: _pnl(self._series(sym, interval)["close"], period, _sma)
         )
@@ -251,7 +273,7 @@ class TaContext:
         """Pine ``atr`` — Wilder average true range over ``period`` bars."""
         from src.indicators.ta import atr as _atr
 
-        key: CacheKey = ("atr", sym, (period,))
+        key = self._ck("atr", sym, interval, period)
         a = self._series(sym, interval)
 
         def _calc() -> np.ndarray:
@@ -267,7 +289,7 @@ class TaContext:
         """Pine ``adx`` — average directional index over ``period`` bars."""
         from src.indicators.ta import adx as _adx
 
-        key: CacheKey = ("adx", sym, (period,))
+        key = self._ck("adx", sym, interval, period)
         a = self._series(sym, interval)
 
         def _calc() -> np.ndarray:
@@ -283,7 +305,7 @@ class TaContext:
         """Pine ``rsi`` — relative strength index over ``period`` bars."""
         from src.indicators.ta import rsi as _rsi
 
-        key: CacheKey = ("rsi", sym, (period,))
+        key = self._ck("rsi", sym, interval, period)
         arr = self._compute(
             key, lambda: _pnl(self._series(sym, interval)["close"], period, _rsi)
         )
@@ -295,7 +317,7 @@ class TaContext:
         """Pine ``mfi`` — money flow index over ``period`` bars (0..100)."""
         from src.indicators.ta import mfi as _mfi
 
-        key: CacheKey = ("mfi", sym, (period,))
+        key = self._ck("mfi", sym, interval, period)
         a = self._series(sym, interval)
 
         def _calc() -> np.ndarray:
@@ -318,7 +340,7 @@ class TaContext:
         """
         from src.indicators.ta import obv_z as _obv_z
 
-        key: CacheKey = ("obv_z", sym, (window,))
+        key = self._ck("obv_z", sym, interval, window)
         a = self._series(sym, interval)
 
         def _calc() -> np.ndarray:
@@ -335,7 +357,7 @@ class TaContext:
         Wilder-smoothed like :meth:`atr`) and ``TR`` is the standard true range.
         Same units as price, so a stop distance in VWATR is a dollar distance.
         """
-        key: CacheKey = ("vwatr", sym, (period,))
+        key = self._ck("vwatr", sym, interval, period)
         a = self._series(sym, interval)
 
         def _calc() -> np.ndarray:
@@ -350,7 +372,7 @@ class TaContext:
         :meth:`atr`; this accessor exposes the raw bar ranges so a caller can
         smooth them its own way.
         """
-        key: CacheKey = ("true_range", sym, ())
+        key = self._ck("true_range", sym, interval)
         a = self._series(sym, interval)
         arr = self._compute(
             key, lambda: _true_range_np(a["high"], a["low"], a["close"])
@@ -366,7 +388,7 @@ class TaContext:
         Same units and same true range, different smoothing — the divergence
         exits that normalize by range want this one.
         """
-        key: CacheKey = ("plain_atr", sym, (period,))
+        key = self._ck("plain_atr", sym, interval, period)
         a = self._series(sym, interval)
         arr = self._compute(
             key,
@@ -386,7 +408,7 @@ class TaContext:
         until both the VWATR warm-up (``period`` bars) and the baseline window
         are satisfied (``period + window - 1`` bars).
         """
-        key: CacheKey = ("vwatr_baseline", sym, (period, window))
+        key = self._ck("vwatr_baseline", sym, interval, period, window)
         a = self._series(sym, interval)
 
         def _calc() -> np.ndarray:
@@ -407,7 +429,7 @@ class TaContext:
 
     def sum(self, sym: str, period: int, interval: str | None = None) -> SeriesView:
         """Pine ``sum`` — rolling sum (e.g. volume) over ``period`` bars."""
-        key: CacheKey = ("sum", sym, (period,))
+        key = self._ck("sum", sym, interval, period)
         values = self._series(sym, interval)["close"]
         arr = self._compute(key, lambda: _rolling_sum_np(values, period))
         return self._view(sym, arr, interval)
@@ -419,7 +441,7 @@ class TaContext:
         period: int,
         interval: str | None,
     ) -> SeriesView:
-        key: CacheKey = (kind, sym, (period,))
+        key = self._ck(kind, sym, interval, period)
         arr = self._compute(
             key,
             lambda: _rolling_extreme_np(
@@ -437,6 +459,54 @@ class TaContext:
 # small pandas/numpy helpers (indicator compute is once-per-series, so pandas
 # overhead here is amortised across every per-candle read)
 # ---------------------------------------------------------------------------
+
+
+def _extract_symbol_arrays(
+    data: pd.DataFrame,
+    cols: pd.Index | None,
+    sym: str,
+) -> dict[str, np.ndarray]:
+    """Per-field numpy arrays for one symbol of the base feed.
+
+    Aligns the TaContext feed with the engine's CandleStore 1:1: the generator
+    skips a symbol's candle whenever its close is non-finite (data gap / closed
+    market), so the store only accumulates finite-close rows. Dropping the same
+    rows here keeps ``cursor_count`` (store) and ``values[idx]`` (this feed) on
+    the same timestamps.
+    """
+    arrays: dict[str, np.ndarray] = {}
+    if cols is not None and (sym, "close") in cols:
+        mask = np.isfinite(data[(sym, "close")].to_numpy(dtype=np.float64))
+        for f in _FIELDS:
+            if (sym, f) in cols:
+                arrays[f] = data[(sym, f)].to_numpy(dtype=np.float64)[mask]
+            else:
+                arrays[f] = np.array([], dtype=np.float64)
+    else:
+        for f in _FIELDS:
+            arrays[f] = np.array([], dtype=np.float64)
+    return arrays
+
+
+def _extract_htf_arrays(feed: pd.DataFrame, sym: str) -> dict[str, np.ndarray]:
+    """Per-field numpy arrays for one symbol of a resampled HTF frame.
+
+    The HTF frame is ``(symbol, timestamp)``-MultiIndex; row order matches the
+    order ``candle_generator`` yields those candles, so the feed and the store
+    share one index space. ``dropna`` was applied by ``build_htf_feeds``, so no
+    further filtering happens here.
+    """
+    arrays: dict[str, np.ndarray] = {}
+    try:
+        sym_df = feed.xs(sym, level="symbol")
+    except KeyError:
+        sym_df = None
+    for f in _FIELDS:
+        if sym_df is not None and f in sym_df.columns:
+            arrays[f] = sym_df[f].to_numpy(dtype=np.float64)
+        else:
+            arrays[f] = np.array([], dtype=np.float64)
+    return arrays
 
 
 def _ser(arr: np.ndarray) -> pd.Series:
@@ -534,10 +604,13 @@ def init_ta(
     data: pd.DataFrame,
     symbols: Iterable[str],
     base_interval: str,
+    htf_feeds: Mapping[str, pd.DataFrame] | None = None,
 ) -> TaContext:
     """Convenience factory: build a TaContext from the base OHLCV feed.
 
     ``data`` must be the same MultiIndex-column DataFrame underlying the candle
     generator so indicator arrays line up 1:1 with the engine's cursor.
+    ``htf_feeds`` (from ``build_htf_feeds``) must be the SAME mapping instance
+    handed to ``candle_generator``, so HTF feed rows equal the accumulated rows.
     """
-    return TaContext.from_data(data, symbols, base_interval)
+    return TaContext.from_data(data, symbols, base_interval, htf_feeds)

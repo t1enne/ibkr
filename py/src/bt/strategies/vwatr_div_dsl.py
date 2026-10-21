@@ -107,7 +107,7 @@ class Params(StrategyParams):
     decel_ratio: float = 0.1  # VWATR slope-divergence exit; 0 turns it OFF
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext) -> None:
     if ctx.phase == "warmup":
         return

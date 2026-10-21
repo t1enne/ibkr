@@ -704,7 +704,7 @@ def _manage_position(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) 
 # ---------------------------------------------------------------------------
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
     # Warmup bars fill strategy state only — no fill can happen there, so the
     # DSL raises on any entry emitted during them. Accumulators above/below

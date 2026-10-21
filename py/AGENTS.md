@@ -552,7 +552,7 @@ engine mints a **fresh `ctx.shared` dict per run/window**, so cross-window
 bleed is impossible by construction:
 
 ```python
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
     cooldowns = ctx.shared.setdefault("cooldowns", {})
     trails = ctx.shared.setdefault("trails", {})
@@ -723,14 +723,17 @@ in DSL as `ctx.state.candles`). The candle generator interleaves HTF candles
 (e.g. `"4h"`) at boundaries after all base candles for that timestamp, and the
 engine fires the strategy only on base-interval candles — HTF-only candles are
 merely accumulated and never trigger signal generation. A strategy reads HTF
-structure from the store (`ctx.ta` serves only the base/signal interval):
+structure through `ctx.ta` with an explicit `interval=` (preferred: one compute,
+O(1) reads) or from the store. Both are cursor-truncated and expose **completed
+HTF buckets only** (Pine `lookahead=false`) — the forming bucket's
+future-inclusive OHLC is never visible:
 
 ```python
-@strategy(bars="1h")
+@strategy()
 def on_candle(ctx):
-    htf_df = ctx.state.candles.get((ctx.candle.symbol, "4h"))
-    if htf_df is not None and len(htf_df) >= 2:
-        htf_trend = htf_df["close"].iloc[-1] > htf_df["close"].iloc[-2]
+    htf = ctx.ta.close(ctx.candle.symbol, interval="4h")
+    if len(htf) >= 2:
+        htf_trend = htf[-1] > htf[-2]
     ...
 ```
 

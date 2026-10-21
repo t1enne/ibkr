@@ -43,7 +43,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from src.bt.engine.candle_store import CandleStore, CandleRows
-from src.bt.engine.utils import candle_generator, merge_bt_state
+from src.bt.engine.utils import build_htf_feeds, candle_generator, merge_bt_state
 
 from dataclasses import dataclass, field, replace
 from typing import Generator, Tuple, Optional, Any, Callable, Mapping
@@ -140,6 +140,7 @@ def run_backtest(
     strategy_state: Optional[dict] = None,
     fundamentals: Any = None,
     signal_observer: Optional[Callable] = None,
+    htf_intervals: Optional[frozenset[str]] = None,
 ) -> Tuple[BacktestResults, BacktestState]:
     """Run backtest with the given candle generator and handlers.
 
@@ -170,6 +171,10 @@ def run_backtest(
             fiscal series loaded once from the local DB). Typed ``Any`` like
             ``ta`` — the engine layer stays decoupled from the strategy layer and
             the DSL narrows it via isinstance.
+        htf_intervals: Higher-timeframe intervals (``config.bars[1:]``). The
+            CandleStore hides each one's forming bucket from every read so the
+            raw ``state.candles`` HTF path cannot leak the future. ``None``
+            (direct callers) means no HTF keys.
 
     Returns:
         Tuple of (BacktestResults, final BacktestState)
@@ -212,7 +217,7 @@ def run_backtest(
 
     # Create CandleStore once — wraps rows by reference, mutates in-place.
     # Strategies access it as state.candles (Mapping interface) + .latest()/.count().
-    store = CandleStore(rows)
+    store = CandleStore(rows, htf_intervals=htf_intervals or frozenset())
     # Bind the prefetched TaContext (DSL) to share the store's cursor. Reading
     # ``store.ta`` from a decorated strategy is always lookahead-safe because
     # the TaContext slices against this same cursor.
@@ -238,7 +243,13 @@ def run_backtest(
     bar: list[Candle] = []
     bar_ts: Optional[pd.Timestamp] = None
     for candle in candle_gen:
-        if bar_ts is not None and candle.timestamp != bar_ts:
+        is_base = not candle.interval or candle.interval == config.bars[0]
+        # Flush only on a NEW BASE bar. An HTF-only timestamp (a session-anchored
+        # bucket label can fall off the base bar grid) must not flush the pending
+        # base bar early — that would run its stages 4-8 against the HTF tick's
+        # cursor and shift fill timing. The base bar waits for its own next base
+        # bar.
+        if is_base and bar_ts is not None and candle.timestamp != bar_ts:
             state = _flush_bar(
                 bar,
                 state,
@@ -256,7 +267,8 @@ def run_backtest(
                 signal_observer,
             )
             bar = []
-        bar_ts = candle.timestamp
+        if is_base:
+            bar_ts = candle.timestamp
         # Phase for this bar: bars strictly before ``test_start`` are warmup —
         # the strategy IS invoked (accumulators/indicators fill, cursor
         # advances) but trading is suppressed and emitting a signal is a hard
@@ -268,7 +280,7 @@ def run_backtest(
         )
         # Stage 1: stash EVERY candle (base + HTF) into the same accumulator
         rows, state = _append_candle(rows, state, candle, config.bars[0])
-        if not candle.interval or candle.interval == config.bars[0]:
+        if is_base:
             bar.append(candle)
 
     if bar:
@@ -1054,7 +1066,14 @@ def run(
     if evaluation_clock_check:
         _assert_evaluation_clock_covers_window(data, bt.config)
 
-    gen = candle_generator(data, bt.config)
+    # Resample every HTF once and share the SAME mapping with both consumers:
+    # the candle generator (yields HTF candles) and the TaContext (prefetches
+    # HTF indicator arrays). One resample per HTF interval, and store rows and
+    # feed rows derive from one source, so they cannot diverge.
+    htf_intervals = tuple(bt.config.bars[1:])
+    htf_feeds = build_htf_feeds(data, htf_intervals)
+
+    gen = candle_generator(data, bt.config, htf_feeds=htf_feeds)
     exchange = default_exchange()
     risk_handler = default_risk_handler()
 
@@ -1068,7 +1087,7 @@ def run(
     on_candle = strat_mod.on_candle
     from src.bt.strategies.ta_context import init_ta
 
-    ta = init_ta(data, bt.config.symbols, bt.config.bars[0])
+    ta = init_ta(data, bt.config.symbols, bt.config.bars[0], htf_feeds=htf_feeds)
     strategy_state = {} if getattr(on_candle, "stateful", False) else None
     if fundamentals is None:
         # Load the symbol set's as-first-stated fiscal series once per run. A
@@ -1090,5 +1109,6 @@ def run(
         fundamentals=fundamentals,
         signal_observer=signal_observer,
         initial_state=initial_state,
+        htf_intervals=frozenset(htf_intervals),
     )
     return results

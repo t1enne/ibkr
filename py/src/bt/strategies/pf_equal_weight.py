@@ -44,7 +44,7 @@ class Params(StrategyParams):
     rebalance_days: int = 0
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
     """Open equal-weight longs on the first bar; optional periodic rebalance.
 

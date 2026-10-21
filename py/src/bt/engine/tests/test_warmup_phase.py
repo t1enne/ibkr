@@ -74,7 +74,7 @@ def _cfg(
 # --- fixtures -------------------------------------------------------------
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _count_phases(ctx: StrategyContext):
     """Record every dispatch's phase and close, then always try to go long."""
     seen = ctx.shared.setdefault("seen", [])
@@ -83,7 +83,7 @@ def _count_phases(ctx: StrategyContext):
     ctx.long(ctx.candle.symbol, size=0.05, reason="always")
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _warm_then_trade(ctx: StrategyContext):
     """Accumulate during warmup (no emission), enter ONCE when trading starts.
 
@@ -183,7 +183,7 @@ def test_wide_warmup_report_records_every_phase() -> None:
     data = _daily_df(["AAPL"], 20)
     phases: list[tuple[str, pd.Timestamp]] = []
 
-    @strategy(bars="1d", stateful=True)
+    @strategy(stateful=True)
     def _record(ctx: StrategyContext):
         phases.append((ctx.phase, ctx.candle.timestamp))
 
@@ -261,7 +261,7 @@ def test_each_fold_window_gets_its_own_warmup() -> None:
 
     warmups: dict[pd.Timestamp, int] = {}
 
-    @strategy(bars="1d", stateful=True)
+    @strategy(stateful=True)
     def _count_warmup(ctx: StrategyContext):
         warmups[ctx.candle.timestamp] = 0 if ctx.phase != "warmup" else 1
 

@@ -100,7 +100,7 @@ def _cfg(symbols: list[str], capital: float = 10_000.0) -> StrategyConfig:
     )
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _all_in_on_first_bar(ctx: StrategyContext):
     """Emit one explicit-qty long for EVERY symbol on the first dispatch.
 
@@ -160,7 +160,7 @@ def test_same_timestamp_batch_allocates_equally_and_all_fill():
     assert sum(notionals) <= 10_000.0 + 1e-6
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _close_one_open_rest(ctx: StrategyContext):
     """Bar 0: open every symbol. Bar 2: close AAA and open DDD in ONE bar.
 
@@ -194,7 +194,7 @@ def test_close_in_same_cohort_is_not_scaled_and_frees_cash():
     assert result.final_state.portfolio.cash >= 0
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _oversize_entry(ctx: StrategyContext):
     """Request far more than the book can fund, on the first bar."""
     n = ctx.shared.setdefault("_n", 0)
@@ -220,7 +220,7 @@ def test_no_rejection_when_everything_fits(capsys):
     assert capsys.readouterr().err == ""
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _rotating_cohort(ctx: StrategyContext):
     """Adversarial multi-symbol churn: staggered entries AND exits.
 
@@ -292,7 +292,7 @@ def test_rotating_cohort_is_order_invariant_under_tight_cash():
 _HELD = frozenset({"AAA", "BBB", "CCC"})
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def _cohort_over_held_book(ctx: StrategyContext):
     """Re-open a cohort while the OTHER half of the book is still HELD.
 

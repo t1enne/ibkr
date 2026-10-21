@@ -44,9 +44,15 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
     *Cursor* — a timestamp ceiling set via ``.advance(ts)`` by the engine
     before each strategy invocation.  DataFrames built via the Mapping
     interface are truncated to the cursor, so a strategy never sees data
-    from future timestamps.  ``.latest()`` and ``.count()`` are not
-    cursor-truncated (they return the absolute latest value known to the
-    accumulator).
+    from future timestamps.
+
+    *HTF completion lag* — intervals passed via ``htf_intervals`` are aggregates
+    of the base bar whose rows are labelled by bucket START but carry the whole
+    bucket. Every truncating read (``cursor_count``, ``_build_df``/
+    ``__getitem__``/``get``/``items``/``values``, ``latest``, ``count``,
+    ``prior_ohlcv``) hides the forming bucket by requiring the bucket's END to
+    have passed the cursor (``max(0, raw - 1)``). The base interval is
+    unchanged. A symbol gapped at the cursor may lag one extra bucket — safe.
 
     ``Mapping`` interface: ``__getitem__``, ``get``, ``__contains__``,
     ``__len__``, ``__iter__``, ``keys``, ``items``, ``values``.
@@ -59,18 +65,27 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         "_strategy_state",
         "_fundamentals",
         "_phase",
+        "_htf_intervals",
     )
 
     def __init__(
         self,
         rows: CandleRows,
         cursor: Timestamp | None = None,
+        htf_intervals: frozenset[str] = frozenset(),
     ) -> None:
         self._rows: CandleRows = rows
         self._cursor: Timestamp | None = cursor
         self._ta: Any = None  # optional prefetched TaContext (DSL)
         self._strategy_state: dict | None = None  # optional per-run DSL holder
         self._fundamentals: Any = None  # optional Fundamentals store (DSL)
+        # Intervals whose rows aggregate the base bar. A row for one of these is
+        # labelled by its bucket START but carries the WHOLE bucket (see
+        # ``resample_ohlcv``), so it must stay hidden until its bucket has
+        # CLOSED — exposing it at its label leaks up to ``width - 1`` base bars
+        # of future. Every truncating read applies one bucket of lag for these;
+        # the base interval is untouched.
+        self._htf_intervals: frozenset[str] = htf_intervals
         # Engine-owned phase flag: "warmup" while the engine walks bars before
         # ``test_start``, otherwise "trade". The DSL mirrors it onto
         # ``ctx.phase`` and uses it to make signal emission during warmup a
@@ -167,17 +182,42 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         """
         if self._cursor is None or not self._rows:
             return False
+        cursor_ns = np.datetime64(self._cursor.to_datetime64())
         return all(
-            self.cursor_count(sym, iv) == int(cols["_len"][0])
-            for (sym, iv), cols in self._rows.items()
+            int(
+                np.searchsorted(
+                    cols["timestamp"][: int(cols["_len"][0])], cursor_ns, side="right"
+                )
+            )
+            == int(cols["_len"][0])
+            for cols in self._rows.values()
         )
 
+    def _visible(self, sym: str, interval: str, n: int) -> int:
+        """Rows of *sym*/*interval* whose data is knowable at the cursor.
+
+        Raw ``searchsorted`` count, then the HTF completion lag: a higher-
+        timeframe bucket is only visible once its END has passed the cursor,
+        which (buckets tile contiguously per session) means
+        ``max(0, raw_count - 1)``. A symbol gapped at the cursor may then lag
+        one extra bucket — the safe direction, never a leak.
+        """
+        if self._cursor is None:
+            return n
+        cols = self._rows[(sym, interval)]
+        cursor_ns = np.datetime64(self._cursor.to_datetime64())
+        raw = int(np.searchsorted(cols["timestamp"][:n], cursor_ns, side="right"))
+        if interval in self._htf_intervals:
+            return raw - 1 if raw > 0 else 0
+        return raw
+
     def cursor_count(self, sym: str, interval: str) -> int:
-        """Number of accumulated bars for *sym*/*interval* up to the cursor.
+        """Number of COMPLETED bars for *sym*/*interval* up to the cursor.
 
         Like ``_build_df`` truncation, but O(log n) numpy ``searchsorted`` and
         zero DataFrame allocation. Falls back to the absolute count when no
-        cursor is set.
+        cursor is set. HTF intervals apply one bucket of completion lag (see
+        ``_visible``).
         """
         cols = self._rows.get((sym, interval))
         if cols is None:
@@ -185,11 +225,7 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         n = int(cols["_len"][0])
         if n == 0:
             return 0
-        if self._cursor is None:
-            return n
-        cursor_ns = np.datetime64(self._cursor.to_datetime64())
-        ts_arr = cols["timestamp"][:n]
-        return int(np.searchsorted(ts_arr, cursor_ns, side="right"))
+        return self._visible(sym, interval, n)
 
     # -- mutation (called by engine, not strategies) --------------------
 
@@ -199,21 +235,44 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
     # -- fast path: O(1) from numpy, no DataFrame build -----------------
 
     def latest(self, sym: str, interval: str) -> float | None:
-        """Return the most recent close for *sym* at *interval*, or None."""
+        """Most recent close for *sym*/*interval*, or None.
+
+        Base interval: the absolute latest accumulated close (unchanged — a base
+        row is a complete bar, so there is no forming bucket to hide). HTF
+        interval: the last COMPLETED bucket, so the forming bucket's
+        future-inclusive close is never returned. O(1).
+        """
         cols = self._rows.get((sym, interval))
         if cols is None:
             return None
         n = int(cols["_len"][0])
         if n == 0:
             return None
-        return float(cols["close"][n - 1])
+        visible = (
+            n
+            if interval not in self._htf_intervals
+            else self._visible(sym, interval, n)
+        )
+        if visible == 0:
+            return None
+        return float(cols["close"][visible - 1])
 
     def count(self, sym: str, interval: str) -> int:
-        """Return the number of accumulated bars for *sym* at *interval*."""
+        """Accumulated bars for *sym*/*interval*.
+
+        Base interval: the absolute count (unchanged). HTF interval: the number
+        of COMPLETED buckets (one bucket of lag), so a forming bucket is never
+        counted.
+        """
         cols = self._rows.get((sym, interval))
         if cols is None:
             return 0
-        return int(cols["_len"][0])
+        n = int(cols["_len"][0])
+        return (
+            n
+            if interval not in self._htf_intervals
+            else self._visible(sym, interval, n)
+        )
 
     def prior_ohlcv(self, sym: str, interval: str) -> dict[str, float] | None:
         """OHLCV of the bar immediately *before* the cursor — O(1), no allocation.
@@ -244,25 +303,22 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
     def _build_df(self, key: tuple[str, str]) -> DataFrame:
         cols = self._rows[key]
         n = int(cols["_len"][0])
-        ts_arr = cols["timestamp"][:n]
 
-        # Truncate to cursor
+        # Truncate to cursor (with the HTF completion lag for HTF intervals)
         if self._cursor is not None:
-            cursor_ns = np.datetime64(self._cursor.to_datetime64())
-            idx = np.searchsorted(ts_arr, cursor_ns, side="right")
-            n = int(idx)
-            ts_arr = ts_arr[:n]
-            if n == 0:
-                return pd.DataFrame(
-                    {
-                        "open": [],
-                        "high": [],
-                        "low": [],
-                        "close": [],
-                        "volume": [],
-                    },
-                    index=pd.DatetimeIndex([]),
-                )
+            n = self._visible(key[0], key[1], n)
+        ts_arr = cols["timestamp"][:n]
+        if n == 0:
+            return pd.DataFrame(
+                {
+                    "open": [],
+                    "high": [],
+                    "low": [],
+                    "close": [],
+                    "volume": [],
+                },
+                index=pd.DatetimeIndex([]),
+            )
 
         return pd.DataFrame(
             {

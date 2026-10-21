@@ -78,7 +78,7 @@ def _filter(ctx: StrategyContext, params: Params) -> OnlinePairs:
     return kf
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
     pair = _pair(ctx, ctx.params)
     if pair is None:

@@ -306,7 +306,7 @@ def _atr_stop_hit(
     return float(o.high[-1]) >= pos.entry_price + stop_dist
 
 
-@strategy(bars="1d", stateful=True)
+@strategy(stateful=True)
 def on_candle(ctx: StrategyContext):
     params: Params = ctx.params
     shared = ctx.shared
