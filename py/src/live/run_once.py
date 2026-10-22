@@ -15,7 +15,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, fields, replace
 from pathlib import Path
-from typing import Any, Literal, cast, get_args
+from typing import Any, Literal, cast
 
 import click
 from src.bt import load_strategy
@@ -48,10 +48,6 @@ SizeMode = Literal["equity", "cash", "fixed"]
 _SIZE_MODES = frozenset({"equity", "cash", "fixed"})
 #: The keys ``StrategyConfig`` itself defines — everything else is a live-only key.
 _STRATEGY_FIELDS = frozenset(f.name for f in fields(StrategyConfig))
-#: The adapters a ``broker`` key may name, derived from the ONE typing literal.
-_ADAPTERS = get_args(AdapterName)
-
-
 _UNSAFE_EXIT_CODE = 3
 
 
@@ -246,29 +242,6 @@ def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
     path = Path(tmp) / "strategy.json"
     path.write_text(json.dumps(asdict(strategy), default=_json_default))
     return str(path)
-
-
-def resolve_broker(
-    raw: Mapping[str, object], params: Mapping[str, object]
-) -> tuple[str, bool]:
-    """The ONE read of a config's ``broker`` key: ``(name, was_named_explicitly)``.
-
-    Precedence: flat/top-level, then ``strategy_params``. The explicit-named flag
-    comes from the same scan, so it cannot contradict the resolved name. This
-    NEVER decides adapter selection for ``live run`` (that is
-    :func:`src.live.options.merge_live_options`); it is the config description
-    ``live pf`` uses to decide whether to read a broker at all, so an unnamed
-    config reads store-only rather than defaulting to ibkr.
-    """
-    for source in (raw, params):
-        if "broker" in source:
-            value = source["broker"]
-            if value not in _ADAPTERS:
-                raise ValueError(
-                    f"broker must be one of {sorted(_ADAPTERS)}, got {value!r}"
-                )
-            return cast("str", value), True
-    return "", False
 
 
 def load_strat_config(path: str) -> LiveConfig:
@@ -607,7 +580,6 @@ def _float_or_none(
 
 __all__ = [
     "load_strat_config",
-    "resolve_broker",
     "render_report",
     "run_once",
 ]

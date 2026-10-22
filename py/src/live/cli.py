@@ -56,7 +56,6 @@ from src.live.scope import (
 from src.live.run_once import (
     _read_json,
     load_strat_config,
-    resolve_broker,
     run_once,
 )
 from src.live.types import FeedError, LiveConfig
@@ -204,9 +203,8 @@ live_group.add_command(live_run)
     "--adapter",
     type=click.Choice(_ADAPTERS),
     default=None,
-    help="Broker to read; a filter over which broker side is included. "
-    "Absent = store-only (no broker read) — `[live] adapter` does NOT apply here, "
-    "because a report must not open a broker the operator did not ask for.",
+    help="Broker to read. Unset: `[live] adapter`. The read REUSES the running "
+    "gateway session (`ibkr gw` owns login) — it never starts one.",
 )
 @click.option(
     "--watch",
@@ -233,38 +231,36 @@ def live_pf(
     ref no longer appears in three tables; a ``stats`` table carries the
     headline P&L (realized / unrealized / total, cost basis, win-loss tally).
 
-    ``--adapter`` is a FILTER, not a requirement: given, it selects the broker
-    to read (``ibkr`` account-wide, or the ``sim`` book straight from the store)
-    and the report includes the broker block + divergence; absent, the report is
-    store-only and no broker is touched.
+    ``--adapter`` and ``--format`` follow the SAME precedence ``live run`` uses:
+    flag, then ``config.toml [live]``, then the code default. A broker read is
+    not required for that: ``pf`` only ever READS an existing gateway session
+    (``ibkr gw`` owns login and keepalive), so resolving ``ibkr`` here can never
+    start one — it fails cleanly if no session is live.
 
     ``--watch SECONDS`` turns the one-shot report into a polling view: the store
     and broker are re-read and re-rendered every SECONDS until Ctrl-C (exit 0).
-    The gateway is authenticated and the ledger constructed ONCE for the whole
-    session, so no tick runs DDL, takes a lease or re-gates. On a TTY the screen
-    is a flicker-free alternate screen, restored on exit; off a TTY (a pipe or a
-    cron log) each frame is appended after a separator, so ``>> log`` stays
-    readable and NOT ONE escape byte is written. ``--watch`` with ``--format
-    json`` is refused: a machine format has no use for an endless refresh.
+    The ledger is constructed ONCE for the whole session, so no tick runs DDL,
+    takes a lease or re-gates. On a TTY the screen is a flicker-free alternate
+    screen, restored on exit; off a TTY (a pipe or a cron log) each frame is
+    appended after a separator, so ``>> log`` stays readable and NOT ONE escape
+    byte is written. ``--watch`` with ``--format json`` is refused: a machine
+    format has no use for an endless refresh.
 
     Nothing is placed and nothing is written: no lease is taken, no strategy row
     is ensured and no DDL runs (a read of an unwritten db is an empty store, not a
     creation). The exit code is 0 (report printed), 1 (a config/gateway/read
     failure) or 2 (usage) — there is no unsafe path here.
     """
-
-    # ``pf`` reads, it never trades: ONLY the report format is resolved from
-    # ``[live]``. ``--adapter`` stays a pure filter (absent = store-only), so it
-    # is NOT defaulted from ``[live] adapter`` — a report must never open a broker
-    # the operator did not ask for. The merge sits inside the guard so a ``[live]``
-    # typo is exit 1, not a traceback.
+    # Resolved BEFORE the ledger so a ``[live]`` typo is exit 1, not a traceback:
+    # one merge feeds the report format AND the adapter the broker read uses.
     try:
-        merged = merge_live_options(
-            None, None, read_live_config(), LiveOptions(), fmt=fmt
+        options = merge_live_options(
+            adapter, None, read_live_config(), LiveOptions(), fmt=fmt
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-    fmt = merged.format
+    fmt = options.format
+    adapter = options.adapter
 
     if watch_seconds is not None and fmt == "json":
         raise click.ClickException("--watch cannot be combined with --format json")
@@ -285,9 +281,9 @@ def live_pf(
 
 def _all_scopes_report(
     ledger: SqliteLedger,
-    adapter: str | None,
+    adapter: AdapterName | None,
 ) -> PfReport:
-    """Every scope in the store, plus a broker read when ``--adapter`` names one."""
+    """Every scope in the store, plus a broker read when an adapter is resolved."""
     scopes = ledger.scopes_of_store()
     stores = tuple(read_store(ledger, scope) for scope in scopes)
     broker = _pf_broker(ledger, adapter, None, None, stores)
@@ -301,10 +297,10 @@ def _config_report(
 ) -> PfReport:
     """The config's scope, plus a broker read when one is resolved.
 
-    The adapter is resolved ONCE here (``--adapter``, then the config's own key),
-    exactly as ``live run`` does, so BOTH the scope and the broker read address
-    the same adapter: ``pf --adapter sim`` after ``run --adapter sim`` reads the
-    sim scope, not the config's default.
+    ONE resolution feeds both halves: the scope minted from ``[live] adapter``
+    and the broker actually read, so a report can never show a different backend
+    than the one it addresses (``pf`` after ``run --adapter sim`` reads the sim
+    scope AND the sim book).
     """
     cfg = load_strat_config(config_path)
     raw = _read_json(config_path)
@@ -316,7 +312,7 @@ def _config_report(
     )
     broker = _pf_broker(
         ledger,
-        adapter,
+        resolved,
         raw,
         cfg,
         (store,),
@@ -338,18 +334,20 @@ def _config_scope(cfg: LiveConfig, resolved_adapter: AdapterName) -> str:
 
 def _pf_broker(
     ledger: SqliteLedger,
-    adapter: str | None,
+    adapter: AdapterName | None,
     raw: Mapping[str, object] | None,
     cfg: LiveConfig | None,
     stores: tuple[StoreSide, ...],
 ) -> BrokerSide | None:
-    """Resolve the broker to read (if any) and read it.
+    """Read the broker *adapter* names, or nothing when there is none.
 
-    ``--adapter`` wins; otherwise a config's EXPLICITLY-named ``broker`` key; a
-    config that never named one reads NO broker (store-only), so ``live pf
-    <strategy.json>`` works with no configuration beyond the strategy. A ``sim``
-    read is the store's own account book (``read_sim_broker``) — no fixture, no
-    gateway.
+    *adapter* is ALREADY resolved by the caller (flag > ``[live] adapter`` >
+    default); this function never re-reads a flag or the file. ``None`` means
+    store-only, which the watch path still uses for a config that names no
+    broker. A ``sim`` read is the store's own account book
+    (``read_sim_broker``) — no fixture, no gateway. An ``ibkr`` read REUSES the
+    session ``ibkr gw`` owns: it resolves the account and reads the book, and
+    never logs in.
     """
     resolved = adapter
     if resolved is None:
@@ -371,16 +369,19 @@ def _pf_broker(
 
 
 async def _open_ibkr_session() -> tuple[IbkrGateway, str]:
-    """Open ONE authenticated session and resolve its account.
+    """Attach to the session ``ibkr gw`` owns and resolve its account.
 
-    Returns the OPEN gateway and the resolved account; the caller owns
-    ``aclose``. A failure is a typed ``SessionNotReady`` (exit 1), never a
-    traceback.
+    Returns the OPEN gateway handle and the resolved account; the caller owns
+    ``aclose``. This NEVER logs in and never starts a gateway: a down or logged-out
+    session is a typed ``SessionNotReady`` (exit 1), never a traceback.
     """
     gateway = IbkrGateway(IbkrClient())
     try:
         account = await gateway.client.resolve_account()
         return gateway, account
+    except IbkrError as exc:
+        await gateway.aclose()
+        raise SessionNotReady(FeedError(kind=exc.kind, message=str(exc))) from exc
     except BaseException:
         await gateway.aclose()
         raise
@@ -390,10 +391,11 @@ async def _read_ibkr_pf(
     scopes: tuple[str, ...],
     owned: frozenset[str],
 ) -> BrokerSide:
-    """Open a session, resolve the account, then read the IBKR book once.
+    """Resolve the account on the EXISTING session, then read the IBKR book once.
 
     The client is ALWAYS closed in the ``finally``; nothing is placed and no lease
-    is taken.
+    is taken. A gateway that is down or logged out surfaces as ``SessionNotReady``
+    (exit 1), never a traceback — ``pf`` reports, it does not start a session.
     """
     gateway, account = await _open_ibkr_session()
     try:
@@ -427,15 +429,16 @@ def _styler(fmt: str, tty: bool) -> Styler:
 def _watch_pf(
     ledger: SqliteLedger,
     config_path: str | None,
-    adapter: str | None,
+    adapter: AdapterName,
     interval: float,
 ) -> None:
     """Re-read the store + broker and re-render every *interval* until Ctrl-C.
 
     The one-shot plumbing runs ONCE — the ledger is reused (so no tick can DDL),
-    and an ``ibkr`` session is authenticated before the loop and only its book is
-    re-read per tick. A per-tick read failure is rendered as a typed error line
-    and the loop keeps going. Teardown restores the screen on every exit path.
+    and an ``ibkr`` gateway handle is taken before the loop and only its book is
+    re-read per tick. That handle REUSES the session ``ibkr gw`` already owns; it
+    never logs in. A per-tick read failure is rendered as a typed error line and
+    the loop keeps going. Teardown restores the screen on every exit path.
     """
     tty = sys.stdout.isatty()
     session = _open_watch_session(ledger, config_path, adapter, _styler("text", tty))
@@ -462,53 +465,39 @@ class _WatchSession:
 def _open_watch_session(
     ledger: SqliteLedger,
     config_path: str | None,
-    adapter: str | None,
+    adapter: AdapterName,
     style: Styler = PLAIN,
 ) -> _WatchSession:
     """Resolve the watch's frame + teardown ONCE, before the loop starts.
 
-    An ``ibkr`` read (with or without a config) opens ONE gateway on ONE
-    persistent event loop — the client is authenticated here and only its book is
-    re-read per tick, so the connection pool is never rebound to a fresh loop. A
-    store-only or ``sim`` read needs no session at all (the store is re-read per
-    tick). No lease is taken and no DDL runs: the frame calls the same read
-    helpers the one-shot path uses.
+    An ``ibkr`` read (with or without a config) holds ONE gateway on ONE
+    persistent event loop — only its book is re-read per tick, so the connection
+    pool is never rebound to a fresh loop. That gateway is a REUSED session
+    (``ibkr gw`` owns login), never one this process starts. A ``sim`` read
+    needs no session at all (the store is re-read per tick). No lease is taken
+    and no DDL runs: the frame calls the same read helpers the one-shot path
+    uses.
 
-    *adapter* is the raw ``--adapter`` flag; the resolved name below is the one
-    the scope and the broker read both use, minted by the same merge ``live run``
-    applies.
+    *adapter* is ALREADY resolved by the caller, so the watch and the one-shot
+    report always address the same backend and mint the same scope.
     """
-    resolved = merge_live_options(adapter, None, read_live_config(), LiveOptions())
     if config_path is None:
-        if resolved.adapter == "ibkr":
+        if adapter == "ibkr":
             return _ibkr_watch_session(
                 ledger,
                 ledger.scopes_of_store,
                 0.0,
             )
         return _WatchSession(
-            _store_frame(ledger, None, resolved.adapter, resolved.adapter, style),
+            _store_frame(ledger, None, adapter, adapter, style),
             _noop,
         )
     cfg = load_strat_config(config_path)
-    raw = _read_json(config_path)
-    # The scope-selecting adapter is resolved ONCE, as the one-shot path does, so
-    # the watch agrees with ``live run --adapter`` and with the one-shot ``pf``.
-    resolved_adapter = resolved.adapter
-    # The READ broker follows ``_pf_broker``'s rule: the flag, else a config's
-    # EXPLICITLY named broker, else no broker (store-only). A config that never
-    # named one must not open an ibkr session just because the default is ibkr.
-    read_as = adapter
-    if read_as is None:
-        named, was_named = resolve_broker(raw, cfg.strategy_params)
-        read_as = named if was_named else None
-    if read_as != "ibkr":
-        return _WatchSession(
-            _store_frame(ledger, cfg, read_as, resolved_adapter, style), _noop
-        )
+    if adapter != "ibkr":
+        return _WatchSession(_store_frame(ledger, cfg, adapter, adapter, style), _noop)
     return _ibkr_watch_session(
         ledger,
-        lambda: (_config_scope(cfg, resolved_adapter),),
+        lambda: (_config_scope(cfg, adapter),),
         cfg.initial_capital,
         style,
     )
