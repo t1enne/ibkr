@@ -1,56 +1,19 @@
 """Adaptive-entropy-gated VP breakdown — dynamic ATR trail (DSL).
 
-SHORT-only order-flow breakdown, built on the Volume Profile
-(``vp_breakout_dsl``'s short leg) and gated everywhere by the
-**adaptive-entropy regime gate**.
+SHORT-only order-flow breakdown: a close below the rolling Value Area Low on
+expanding volume, held near the bar low and not in an uptrend. Regime gates
+keep the book from fading a rising tape — adaptive entropy per symbol, a VIX
+level read against its multi-year baseline, and an optional SPY trend switch.
+Exit on a revert into the value area or the chandelier ATR trail.
 
-Two layers of AE gating keep the book from bleeding when the regime changes:
+The VIX gate reads the ABSOLUTE level relative to its own baseline, not a
+percentile rank: rank normalises away the crash-regime level it must refuse.
+Findings: in a wide window the edge is thin and sample-sparse, and returns do
+not concentrate in bear years — a crash recovery is a losing venue.
 
-  * **Per-symbol entry gate** — a short is entered only when the symbol's
-    quantised ``trend`` is at or above ``min_trend`` (``-1`` = bear-only,
-    ``0`` = flat/bear).
-  * **Market regime filter** (``market_filter``) — a dedicated feed-only AE
-    tracker on ``market_symbol`` (the broad market) acts as a macro risk
-    switch, and every market-regime call is **double-confirmed** by two
-    independent layers: (1) the market AE ``trend`` (
-    ``+1`` bullish), and (2) the market close vs its slow
-    ``market_confirm_window`` SMA. The AE layer catches short-term momentum;
-    the SMA layer is a slow, non-flipping trend filter, so a single noisy AE
-    bar can't mislabel the regime. When both layers agree the market is a
-    **confirmed bull**, the strategy BLOCKS new shorts AND FORCE-CLOSES open
-    shorts. Optionally (``require_market_bear``) new shorts are additionally
-    gated on both layers agreeing the market is a **confirmed bear** (AE
-    ``-1`` and close below SMA), so the short edge is only harvested in a
-    robust down regime.
-
-Entry signal — a **VP breakdown** (mirrors ``vp_breakout_dsl._enter``'s short
-leg, reused here for the same order-flow thesis but gated by entropy instead of
-the Kaufman efficiency ratio):
-
-  * ``close < VAL`` — the bar closes below the rolling Value Area Low (close,
-    not a wick; ``strength`` near the bar's low),
-  * **expanding volume** — the bar's volume ``>= vol_expand_mult *`` the prior
-    ``vol_period`` average (order-flow confirmation out of the fair-value
-    range),
-  * **not in an uptrend** — price on the wrong side of its own rolling mean
-    (concurrency filter).
-
-The Value Area comes from an :class:`src.indicators.volume_profile.strategy.
-OnlineVP` per symbol in ``ctx.shared``, fed once per candle on the *prior* bars
-(no same-bar lookahead — ``OnlineVP.observe`` excludes the current bar).
-
-Exits use a **dynamic ATR stop**: a chandelier-style trailing stop re-anchored
-every bar on ``highest(high, trail_lookback) - trail_atr_mult * ATR`` and only
-ever moved in our favour (down for a short); it widens with volatility and
-tightens against price as the trade works. A revert back **into the value area**
-(close > VAL) fires an immediate exit regardless (the institutional tag stop).
-
-All cross-candle state (per-symbol ``OnlineAdaptiveEntropy`` + ``OnlineVP``
-instances, cooldowns, per-bar snapshots, dynamic-trail bookkeeping) lives in
-``ctx.shared`` via ``@strategy(stateful=True)`` — a fresh holder per run/window,
-so there is no cross-window bleed and the strategy is safe across concurrent
-split/sweep/optimize workers. Pure helpers take cursor-truncated arrays /
-SeriesViews so there is no lookahead.
+Lookahead-free: VP, entropy and VIX reads all resolve at or before the cursor.
+State lives in ``ctx.shared`` via ``@strategy(stateful=True)``, minted per
+run/window, so there is no cross-window bleed and sweeps are worker-safe.
 """
 
 from __future__ import annotations
@@ -61,6 +24,7 @@ from typing import cast
 import numpy as np
 
 from src.bt.state.types import Position
+from src.indicators.macro._shared import load_daily
 from src.indicators.volume_profile.strategy import OnlineVP
 from src.indicators.adaptive_entropy import AdaptiveEntropyConfig, OnlineAdaptiveEntropy
 from src.bt.size.pure import risk_sized_qty
@@ -82,6 +46,7 @@ _MARKET_KEY = "market_trend"  # int: market AE quantised trend (-1/0/1), or None
 _MARKET_TRACKER_KEY = "market_tracker"  # OnlineAdaptiveEntropy on the market symbol
 _MARKET_BULL_RUN_KEY = "market_bull_run"  # int: consecutive market-bull bars
 _MARKET_SMA_KEY = "market_above_sma"  # bool: market close > slow SMA (layer-2 confirm)
+_VIX_CACHE_KEY = "entropy_vix_series"  # tuple[dates, values] for the VIX grid
 
 
 @dataclass(frozen=True)
@@ -103,14 +68,6 @@ class Params(StrategyParams):
     # when ``max_stretch_atr <= 0``.
     max_stretch_atr: float = 0.0
     stretch_ema_period: int = 20
-    # -- oscillator timing gate (independent; default off) --
-    # Require the entry bar's oscillator to have *rolled over* from an extreme
-    # rather than confirming at the low: enter only when the oscillator sits at
-    # or below ``osc_ceiling`` (i.e. no longer overbought). ``osc_kind`` selects
-    # ``"rsi"`` or ``"mfi"``. Disabled when ``osc_ceiling <= 0``.
-    osc_kind: str = "rsi"
-    osc_period: int = 14
-    osc_ceiling: float = 0.0
     # -- SPY trend gate (independent; default off) --
     # Block NEW shorts unless the broad market is in a down/flat regime. Two
     # independent reads, either of which must confirm a *non-bull* tape:
@@ -156,6 +113,21 @@ class Params(StrategyParams):
     # book carry shorts while the broad market is robustly bearish, so the short
     # edge is harvested where it exists instead of fired into a rising tape.
     require_market_bear: bool = False
+    # -- VIX vol-regime gate (FRED series, structural read) --
+    # The short edge is a breakdown *out of a quiet range*; in a crash-driven
+    # high-vol tape breakdowns are exhausted, not fresh. The gate reads the VIX
+    # level RELATIVE TO ITS OWN LONG-RUN BASELINE (a multi-year mean), not a
+    # percentile rank of recent prints: a rank normalises away the absolute
+    # level, so the post-crash tape (elevated, recovering) reads as "middle of
+    # the pack" and stays open — the one regime the edge must refuse.
+    #   * ``vix_max_ratio > 0`` — require ``ratio <= vix_max_ratio`` (skip panic),
+    #   * ``vix_min_ratio > 0`` — require ``ratio >= vix_min_ratio`` (skip dead tape).
+    # ``ratio = vix / baseline``. Both 0 disables the gate. Lookahead-free: the
+    # grid is forward-filled nightly, so the print resolved at the cursor is at
+    # most the previous session's close.
+    vix_baseline_years: float = 5.0
+    vix_max_ratio: float = 0.0
+    vix_min_ratio: float = 0.0
     # -- dynamic ATR trailing stop --
     atr_period: int = 14
     stop_atr_mult: float = 2.0
@@ -397,25 +369,6 @@ def _stretch_ok(
     return stretch <= params.max_stretch_atr
 
 
-def _osc_ok(ctx: StrategyContext, sym: str, params: Params) -> bool:
-    """Oscillator timing gate: short only once the oscillator is not overbought.
-
-    Reads ``rsi`` or ``mfi`` (per ``osc_kind``) at the entry bar and requires it
-    at or below ``osc_ceiling`` — i.e. the oscillator has rolled over from its
-    extreme rather than confirming at the low. Returns ``True`` (allow) when the
-    filter is disabled or the read is unavailable.
-    """
-    if params.osc_ceiling <= 0:
-        return True
-    if params.osc_kind == "mfi":
-        val = _last(ctx.ta.mfi(sym, params.osc_period))
-    else:
-        val = _last(ctx.ta.rsi(sym, params.osc_period))
-    if np.isnan(val):
-        return True
-    return val <= params.osc_ceiling
-
-
 def _spy_trend_ok(ctx: StrategyContext, params: Params) -> bool:
     """SPY trend gate: allow a NEW short only when the market is not bullish.
 
@@ -446,6 +399,81 @@ def _spy_trend_ok(ctx: StrategyContext, params: Params) -> bool:
                 roc = close / ref - 1.0
                 if roc > params.spy_roc_max:
                     return False  # SPY rising -> bull tape, no shorts
+    return True
+
+
+def _vix_series(ctx: StrategyContext) -> tuple[np.ndarray, np.ndarray] | None:
+    """VIX prints as ``(dates, values)`` on a dense nightly grid, cached per run.
+
+    Forward-filled on load, so the print resolved at a cursor is at most the
+    previous session's close — lookahead-free at any base interval.
+    """
+    cached = ctx.shared.get(_VIX_CACHE_KEY)
+    if cached is False:
+        return None  # sentinel: asset absent, never reload
+    if cached is not None:
+        return cast(tuple[np.ndarray, np.ndarray], cached)
+    s = load_daily("vix")
+    if s.empty:
+        ctx.shared[_VIX_CACHE_KEY] = False  # sentinel: absent, don't reload
+        return None
+    pair = (
+        np.asarray(s.index.values, dtype="datetime64[ns]"),
+        s.to_numpy(dtype=float),
+    )
+    ctx.shared[_VIX_CACHE_KEY] = pair
+    return pair
+
+
+def _vix_ratio(ctx: StrategyContext, params: Params) -> float | None:
+    """Latest VIX divided by its own trailing multi-year baseline.
+
+    The baseline is the mean of every print in the ``vix_baseline_years`` span
+    ending at the cursor, so ``ratio`` is an ABSOLUTE vol read that is still
+    comparable across decades: 1.0 is a normal tape, 1.5 an elevated one, 0.7 a
+    dead one. That is what a percentile rank cannot express — after a crash the
+    trailing window is mostly elevated prints, so the rank drops back to ~0.5
+    while the level is still 1.5x normal.
+
+    ``None`` when the gate is disabled, the series is absent, the cursor
+    precedes coverage, or the baseline window is too thin — a missing read is
+    not a vol signal and must not block a trade.
+    """
+    if params.vix_max_ratio <= 0 and params.vix_min_ratio <= 0:
+        return None
+    pair = _vix_series(ctx)
+    if pair is None:
+        return None
+    dates, values = pair
+    j = int(np.searchsorted(dates, np.datetime64(ctx.candle.timestamp))) - 1
+    if j < 0 or j >= values.size or not np.isfinite(values[j]):
+        return None
+    span = int(params.vix_baseline_years * 252)
+    if span <= 0:
+        return None
+    hist = values[max(0, j - span) : j]
+    hist = hist[np.isfinite(hist)]
+    if hist.size < 2:
+        return None
+    baseline = float(np.mean(hist))
+    if baseline <= 0:
+        return None
+    return float(values[j]) / baseline
+
+
+def _vix_ok(ctx: StrategyContext, params: Params) -> bool:
+    """VIX vol-regime gate: allow a NEW short only inside the configured band.
+
+    Returns ``True`` (allow) whenever the gate is disabled or the read is
+    unavailable — the gate narrows an existing edge, it never creates one.
+    """
+    ratio = _vix_ratio(ctx, params)
+    if ratio is None:
+        return True
+    if params.vix_max_ratio > 0 and ratio > params.vix_max_ratio:
+        return False
+    if params.vix_min_ratio > 0 and ratio < params.vix_min_ratio:
+        return False
     return True
 
 
@@ -489,7 +517,10 @@ def on_candle(ctx: StrategyContext):
     if ctx.phase == "warmup":
         return
     risk_off = not market_risk_on(shared, params)
-    spy_ok = _spy_trend_ok(ctx, params)  # SPY not-bull check, once per bar
+    # Per-bar gate reads shared by the entry path and the exit-on-flip path.
+    spy_ok = _spy_trend_ok(ctx, params)
+    vix_ok = _vix_ok(ctx, params)
+    gates = (risk_off, spy_ok, vix_ok)
 
     # ---- Advances / exits first --------------------------------------------
     for sym in ctx.symbols:
@@ -525,13 +556,27 @@ def on_candle(ctx: StrategyContext):
             continue
         if risk_off:
             continue  # no new shorts while the market is confirmed-bull
-        _enter(ctx, sym, params)
+        _enter(ctx, sym, params, gates)
 
 
 # ── entry (VP breakdown gated by bear regime) ────────────────────────────────
 
 
-def _enter(ctx: StrategyContext, sym: str, params: Params) -> None:
+def _enter(
+    ctx: StrategyContext,
+    sym: str,
+    params: Params,
+    gates: tuple[bool, bool, bool],
+) -> None:
+    """Open a short when the VP breakdown and every regime gate agree.
+
+    ``gates`` carries the bar's market-level reads (``risk_off``, SPY non-bull,
+    VIX in band) computed once in ``on_candle``; the per-symbol gates are
+    evaluated here.
+    """
+    risk_off, spy_ok, vix_ok = gates
+    if risk_off:
+        return
     snap = _snap(ctx, sym)
     if snap is None or not getattr(snap, "ready", False):
         return
@@ -559,20 +604,20 @@ def _enter(ctx: StrategyContext, sym: str, params: Params) -> None:
     # Market-level confirmed-bear gate: when enabled, shorts require BOTH AE
     # (market trend == -1) and slow-SMA (close below SMA) to agree the broad
     # market is bearish — only harvest the short edge in a real down regime.
+    # A read, not a mutate: the market tracker was already fed this bar.
     if not market_bear_ok(ctx.shared, params):
         return
 
     # SPY trend gate: never short into a rising broad market.
-    if not _spy_trend_ok(ctx, params):
+    if not spy_ok:
+        return
+
+    # VIX vol-regime gate: only harvest breakdowns inside the configured band.
+    if not vix_ok:
         return
 
     # Stretch filter: reject entries already too far below their own short EMA.
     if not _stretch_ok(ctx, sym, params, close, atr_val):
-        return
-
-    # Oscillator timing gate: only short once the oscillator has rolled off an
-    # extreme (not while price is still confirming at the lows).
-    if not _osc_ok(ctx, sym, params):
         return
 
     avg_vol = _avg_volume(ctx, sym, params)
@@ -614,6 +659,7 @@ def _enter(ctx: StrategyContext, sym: str, params: Params) -> None:
         size=size,
         reason=f"[breakdown] short close {close:.2f} < VAL {val:.2f} in bear regime",
     )
+    # The dynamic trail takes over from here and only ratchets lower.
     ctx.shared[_POS_KEY][sym] = {"entry": close, "trail": stop_price, "pid": ""}
 
 
