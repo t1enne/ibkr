@@ -5,29 +5,76 @@ Imports the actual fetching primitives from the ibkr layer, symbol resolution
 from `symbols` and the SEC ingest from `fundamentals.dl` — it never imports
 from `sync`.
 
-The two sources are one operator action but independent transports: candles
-come from the IBKR Gateway, fundamentals from SEC EDGAR (cached on disk). A
-symbol list is resolved once and feeds both passes.
+Two independent phases, each owning its own progress bar and its own summary:
+:func:`run_fundamentals` (SEC EDGAR) then :func:`run_candles` (IBKR Gateway).
+The command is just those two calls in order, so neither phase knows about the
+other and either can be run alone. Inside a phase the per-chunk INFO stream is
+muted (:func:`set_verbose`) because a bar and timestamped progress lines cannot
+share one terminal; warn/error/retry stay loud, and the phase's report table
+carries the outcome — failures and remaining gaps alike.
 """
 
 from __future__ import annotations
 
 import asyncio
+import sys
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, TextIO
 
 import click
 
+from src.bt.table import Col, Table, render as render_table
 from src.data._shared import resolve_symbol_list
 from src.data.fundamentals.dl import download as download_fundamentals
-from src.data.ibkr.candles import candles_batch
+from src.data.ibkr.candles import candles_batch, gap_range
 from src.data.symbols import resolve_symbols
-from src.data.types import ISymbol, ProgressFn, SyncResult
+from src.data.types import CandleDict, ISymbol, ProgressFn, SymbolOutcome, SyncResult
 from src.shared.runtime_log import info as _log_info
-from src.shared.runtime_log import step as _log_step
+from src.shared.runtime_log import set_verbose as _set_verbose
+from src.shared.style import Styler
+
+#: Sink for a fetched chunk of candles (I/O boundary — default writes to the DB).
+type ChunkSink = Callable[[list[CandleDict]], None]
+#: Called once per conid with its gaps still missing, or ``None`` on failure.
+type ItemFn = Callable[[int, Optional[list[tuple[datetime, datetime]]]], None]
+#: Runs one phase under a progress bar; returns the lines it wants printed.
+type PhaseFn[T] = Callable[[ProgressFn], Awaitable[T]]
 
 
-# ── Download orchestration ─────────────────────────────────────
+# ── Phase runner ───────────────────────────────────────────────
+
+
+async def run_phase[T](
+    label: str,
+    total: int,
+    body: PhaseFn[T],
+) -> T:
+    """Run *body* under one progress bar labelled *label*.
+
+    The phase reports progress through the ``ProgressFn`` it is handed; the bar
+    only ever moves forward, so a phase that re-reports an earlier count cannot
+    rewind it. INFO is muted for the duration (see the module docstring) and
+    restored afterwards, even on failure.
+    """
+    with click.progressbar(
+        length=max(1, total), label=label, width=40, file=sys.stderr
+    ) as bar:
+
+        def _progress(status: str, current: int, total: int) -> None:
+            del status  # the bar reports counts; its label is fixed
+            bar.length = max(1, total)
+            if current > bar.pos:
+                bar.update(current - bar.pos)
+
+        _set_verbose(False)
+        try:
+            return await body(_progress)
+        finally:
+            _set_verbose(True)
+
+
+# ── Candle phase ───────────────────────────────────────────────
 
 
 async def _get_candles(
@@ -35,11 +82,13 @@ async def _get_candles(
     from_date: date,
     to_date: Optional[date] = None,
     bar: str = "1h",
-) -> list[int]:
+    on_chunk: Optional[ChunkSink] = None,
+    on_item: Optional[ItemFn] = None,
+) -> dict[int, list[tuple[datetime, datetime]] | None]:
     """Fetch missing candle data for resolved symbols.
 
-    Returns list of conids that were successfully fetched.
-    Errors propagate — no silent swallowing.
+    Returns ``{conid: gaps still missing or None if the fetch raised}`` — the
+    gaps ``candles()`` already computed, so no caller re-scans the DB.
     """
     from_dt = datetime.combine(from_date, datetime.min.time())
     to_dt = datetime.combine(to_date, datetime.max.time()) if to_date else None
@@ -49,23 +98,54 @@ async def _get_candles(
         from_datetime=from_dt,
         to_datetime=to_dt,
         bar=bar,
+        on_chunk=on_chunk,
+        on_item=on_item,
     )
 
 
-def _report(
-    updated: list[str],
-    failed: list[str],
-    not_found: list[str],
-) -> None:
-    """Print final summary line."""
-    parts = []
-    if updated:
-        parts.append(f"updated: {len(updated)}")
-    if failed:
-        parts.append(f"failed: {len(failed)} ({', '.join(failed)})")
-    if not_found:
-        parts.append(f"not found: {len(not_found)} ({', '.join(not_found)})")
-    _log_info(", ".join(parts))
+def _report(result: SyncResult, *, file: TextIO | None = None) -> None:
+    """Render the run's final table: totals, then one row per symbol.
+
+    A symbol is a problem only when it failed or still has gaps; clean symbols
+    collapse into the header count so a 300-symbol universe stays readable.
+    """
+    out = file or sys.stderr
+    styler = Styler(enabled=out.isatty())
+    broken = [s for s in result.symbols if not (s.ok and not s.gaps)]
+
+    complete = sum(1 for s in result.symbols if s.ok and not s.gaps)
+    heading = (
+        f"resolved {result.resolved}  "
+        f"complete {complete}  "
+        f"failed {sum(1 for s in result.symbols if not s.ok)}  "
+        f"gaps {result.gaps_found}  "
+        f"unresolved {len(result.unresolved)}"
+    )
+    click.echo(heading, err=out is sys.stderr, file=out)
+
+    if not broken:
+        click.echo("  no failures, no remaining gaps", err=out is sys.stderr, file=out)
+        return
+
+    rows = tuple(
+        (
+            s.ticker,
+            "failed" if not s.ok else ("gaps" if s.gaps else "ok"),
+            str(len(s.gaps)) if s.gaps else "-",
+            gap_range(s.gaps),
+            (s.error or "")[:80],
+        )
+        for s in broken
+    )
+    cols = (
+        Col("symbol", role="strong"),
+        Col("state"),
+        Col("gaps", ">"),
+        Col("range"),
+        Col("detail"),
+    )
+    lines = render_table(Table(columns=cols, rows=rows), sep="  ", styler=styler)
+    click.echo("\n".join(lines), err=out is sys.stderr, file=out)
 
 
 async def download(
@@ -74,11 +154,9 @@ async def download(
     to_date: Optional[date] = None,
     bar: str = "1h",
     on_progress: Optional[ProgressFn] = None,
+    on_chunk: Optional[ChunkSink] = None,
 ) -> SyncResult:
     """Sync historical candle data for the given tickers.
-
-    Shows a progress bar per-symbol on stderr, then prints a final
-    Updated: N, Failed: M, Not found: K summary.
 
     Args:
         tickers: List of ticker symbols to sync
@@ -86,21 +164,23 @@ async def download(
         to_date: End date for historical data (defaults to now)
         bar: Bar size (e.g. "1h", "1d")
         on_progress: Optional progress callback (I/O boundary)
+        on_chunk: Optional sink for fetched candles (default: write to the DB)
 
     Returns:
-        SyncResult with resolved count, fetched conids, and gap count.
+        SyncResult with per-symbol outcomes — failures, remaining gaps and
+        unresolved tickers all land here rather than in the log stream.
 
     Raises:
         ValueError: If no symbols could be resolved
     """
-    updated: list[str] = []
-    failed: list[str] = []
-    not_found: list[str] = []
-
     if on_progress:
         on_progress("Resolving symbols...", 0, len(tickers))
 
     symbols = await resolve_symbols(tickers)
+    resolved_tickers = {s.ticker for s in symbols}
+    unresolved = tuple(
+        t for t in (x.upper() for x in tickers) if t not in resolved_tickers
+    )
 
     if on_progress:
         on_progress(
@@ -112,28 +192,81 @@ async def download(
     if not symbols:
         raise ValueError(f"No symbols resolved for tickers: {tickers}")
 
-    _log_info(f"resolved {len(symbols)}/{len(tickers)} symbols")
+    # One completed symbol is one unit of the bar: ``on_item`` fires per symbol
+    # (success or failure), so the bar advances exactly ``len(symbols)`` times.
+    done = 0
 
-    for i, sym in enumerate(symbols, 1):
-        _log_step(i, len(symbols), sym.ticker)
-        fetched = await _get_candles([sym], from_date, to_date, bar=bar)
-        if sym.conid in fetched:
-            updated.append(sym.ticker)
-        else:
-            failed.append(sym.ticker)
+    def _item(_conid: int, _gaps: list[tuple[datetime, datetime]] | None) -> None:
+        nonlocal done
+        done += 1
+        if on_progress:
+            on_progress("Candles", done, len(symbols))
 
-    _report(updated, failed, not_found)
+    fetched = await _get_candles(
+        symbols, from_date, to_date, bar=bar, on_chunk=on_chunk, on_item=_item
+    )
 
-    fetched_conids = [s.conid for s in symbols if s.ticker in updated]
+    outcomes = tuple(
+        SymbolOutcome(sym.ticker, sym.conid, error="fetch failed")
+        if fetched.get(sym.conid) is None
+        else SymbolOutcome(sym.ticker, sym.conid, gaps=tuple(fetched[sym.conid] or ()))
+        for sym in symbols
+    )
+
+    result = SyncResult(
+        resolved=len(symbols),
+        fetched=[c for c, gaps in fetched.items() if gaps is not None],
+        gaps_found=sum(len(o.gaps) for o in outcomes),
+        symbols=outcomes,
+        unresolved=unresolved,
+    )
 
     if on_progress:
-        on_progress("Sync complete", len(fetched_conids), len(symbols))
+        on_progress("Sync complete", len(result.fetched), len(symbols))
 
-    return SyncResult(
-        resolved=len(symbols),
-        fetched=fetched_conids,
-        gaps_found=len(fetched_conids),
+    return result
+
+
+async def run_candles(
+    tickers: list[str],
+    from_date: date,
+    to_date: Optional[date] = None,
+    bar: str = "1h",
+) -> SyncResult:
+    """Candle phase: one ``candles`` bar, then the outcome table.
+
+    Owns everything the merged command needs, so the command itself stays a
+    call list: bar, quiet INFO, report. Returns the :class:`SyncResult` for a
+    caller that wants the numbers (a test, a later phase).
+    """
+
+    async def _body(progress: ProgressFn) -> SyncResult:
+        result = await download(
+            tickers, from_date=from_date, to_date=to_date, bar=bar, on_progress=progress
+        )
+        _report(result)
+        return result
+
+    return await run_phase("candles", len(tickers), _body)
+
+
+async def run_fundamentals(
+    tickers: list[str],
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    refresh: bool = False,
+    cache: Optional[str] = None,
+) -> int:
+    """Fundamentals phase: one ``fundamentals`` bar, then the written-row count.
+
+    Reads as the candle phase's twin, but the bar is SEC's own — its download
+    already reports progress per symbol, so this adds no second one. Returns the
+    total rows written so a caller need not parse the printed summary.
+    """
+    recaps = await download_fundamentals(
+        tickers, from_date=from_date, to_date=to_date, refresh=refresh, cache=cache
     )
+    return sum(r.rows for r in recaps)
 
 
 # ── Command ────────────────────────────────────────────────────
@@ -193,23 +326,30 @@ def dl_cmd(
     never silently imposed on it).
     """
     symbols_list = resolve_symbol_list(symbols, universe)
-    f_date = date.fromisoformat(from_date)
-    t_date = date.fromisoformat(to_date) if to_date else None
 
-    async def _run():
-        await download_fundamentals(
+    async def _run() -> None:
+        await run_fundamentals(
             symbols_list,
-            from_date=(
-                date.fromisoformat(fundamentals_from) if fundamentals_from else None
-            ),
-            to_date=(date.fromisoformat(fundamentals_to) if fundamentals_to else None),
+            from_date=_opt_date(fundamentals_from),
+            to_date=_opt_date(fundamentals_to),
             refresh=refresh_fundamentals,
             cache=fundamentals_cache,
         )
-        click.echo("", err=True)
-        await download(symbols_list, from_date=f_date, to_date=t_date, bar=bar)
+        result = await run_candles(
+            symbols_list,
+            from_date=date.fromisoformat(from_date),
+            to_date=_opt_date(to_date),
+            bar=bar,
+        )
+        if result.unresolved:
+            _log_info(f"unresolved: {', '.join(result.unresolved)}")
 
     asyncio.run(_run())
+
+
+def _opt_date(value: Optional[str]) -> Optional[date]:
+    """Parse an optional ``YYYY-MM-DD`` flag value."""
+    return date.fromisoformat(value) if value else None
 
 
 def register(group: click.Group) -> None:

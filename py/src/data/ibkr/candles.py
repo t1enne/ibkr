@@ -15,7 +15,6 @@ from src.data.types import CandleDict
 from src.data.xcal import is_non_trading_day
 from src.shared.runtime_log import (
     error as _log_error,
-    gap_table as _log_gap_table,
     info as _log_info,
     warn as _log_warn,
 )
@@ -59,36 +58,57 @@ def timestamp_to_datetime(ts: int) -> datetime:
 
 
 def _is_all_non_trading(gap_start: datetime, gap_end: datetime) -> bool:
-    """Check if every date in [gap_start, gap_end) is a non-trading day.
+    """Check if every date in [gap_start, gap_end] is a non-trading day.
 
-    For partial days at the boundaries:
-    - Start day: ignored if gap starts after 18:00 (market already closed)
-    - End day: ignored if gap ends before 16:00 (market hasn't closed —
-      incomplete trading day at the forward edge, e.g. last close → now)
+    The boundaries are partial by construction, so neither end is judged as a
+    whole day:
 
-    Examples:
-      Fri 19:00 → Sun 10:23:  Sat+Sun are non-trading → True
-      Fri 10:00 → Sun 10:23:  Fri is a trading day, gap starts during market → False
-      Fri 19:00 → Mon 10:23:  Mon is a trading day → False (Mon still in session)
-      Fri 19:00 → Mon 16:30:  Mon closed → False (Mon is a trading day)
-      Fri 19:00 → Mon 15:00:  Mon hasn't closed → Mon skipped → True
+    - **Start day** is skipped always. A gap begins at the last stored bar —
+      mid-session — so the remainder of that day was never expected to exist.
+      Deliberately date-based: the universe spans markets with different session
+      hours, so no single close time would be right.
+    - **Any day from today onward** is skipped. Such a day may still be trading,
+      or may have closed hours ago without the vendor settling it — neither is
+      missing history.
+
+    Examples (today = Mon, last bar Fri 15:30, gap runs to Tue):
+      → Sun 10:23:  Sat+Sun are non-trading, nothing else in range → True
+      → Mon 23:59:  Mon is today, unsettled → True
+      → Tue 09:00:  Tue is not today, unsettled → True
+      → Thu 09:00:  Wed is past and a trading day → False
     """
+    # A day is owed bars only once it is safely behind us. Any day from today
+    # onward may still be trading or may have closed hours ago without the
+    # vendor settling it, so the whole unsettled tail owes nothing.
+    settled_before = _today_utc()
+
     d = gap_start.date()
     end = gap_end.date()
     while d <= end:
         dt = datetime.combine(d, datetime.min.time())
-        # Skip start day if gap begins after market close
-        if d == gap_start.date() and gap_start.hour >= 18:
+        # The gap starts mid-session at the last stored bar, so the rest of
+        # that day is not owed.
+        if d == gap_start.date():
             d += timedelta(days=1)
             continue
-        # Skip end day if gap ends before market close — incomplete day, no data to fetch
-        if d == gap_end.date() and gap_end.hour < 16:
+        # Skip any day that has not settled yet.
+        if d >= settled_before:
             d += timedelta(days=1)
             continue
         if not is_non_trading_day(dt):
             return False
         d += timedelta(days=1)
     return True
+
+
+def _today_utc() -> date:
+    """UTC today — the clock domain of every stored timestamp.
+
+    ``timestamp_to_datetime`` yields naive UTC, so the forward edge must be
+    judged in UTC too; a local date runs a day ahead east of Greenwich. A seam,
+    so a test can pin the forward-edge clock.
+    """
+    return datetime.now(timezone.utc).date()
 
 
 def calculate_gaps(
@@ -424,7 +444,8 @@ async def candles(
     bar: str = "1h",
     force_fetch: bool = False,
     ticker: Optional[str] = None,
-):
+    on_chunk: Optional[Callable[[list[CandleDict]], None]] = None,
+) -> list[tuple[datetime, datetime]]:
     """Fetch candles from IBKR API with rate limiting and retry support.
 
     Args:
@@ -434,6 +455,14 @@ async def candles(
         bar: Bar size (e.g., "1h", "1d")
         force_fetch: If True, ignore existing data and fetch all (default: False)
         ticker: Optional ticker symbol. If not provided, will fetch from API.
+        on_chunk: Called with each fetched chunk as it arrives, so a caller can
+            write candles without buffering a multi-year backfill. ``None``
+            writes each chunk to the DB (the default, standalone behaviour).
+
+    Returns:
+        The merged gap ranges still missing AFTER the fetch — empty means the
+        symbol holds the full requested window. One slice is the contract the
+        operator report and a bot's health both read.
     """
     if to_datetime is None:
         to_datetime = datetime.now()
@@ -461,7 +490,7 @@ async def candles(
         gaps = _merge_and_sort_gaps(gaps)
 
     if not gaps:
-        return
+        return []
 
     _log_info(f"{ticker} {len(gaps)} gap(s) {gaps[0][0]}→{gaps[-1][1]}")
 
@@ -474,24 +503,36 @@ async def candles(
             _log_error(f"bulk insert failed for {ticker}")
             raise
 
+    sink = on_chunk if on_chunk is not None else _write_chunk
     for gap_start, gap_end in gaps:
         await _fetch_candles_iterative(
-            conid, ticker, bar, gap_start, gap_end, on_chunk=_write_chunk
+            conid, ticker, bar, gap_start, gap_end, on_chunk=sink
         )
 
-    # Verify: re-check gaps after insert and warn if any remain
-    verify_oldest, verify_newest = await get_existing_range(ticker)
-    remaining = calculate_gaps(from_datetime, to_datetime, verify_oldest, verify_newest)
-    internal_remaining = await asyncio.to_thread(
+    return await remaining_gaps(ticker, from_datetime, to_datetime)
+
+
+async def remaining_gaps(
+    ticker: str,
+    from_datetime: datetime,
+    to_datetime: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """Gaps still missing for *ticker* over the window, after a fetch.
+
+    Re-reads the stored edges and re-scans internals, so it reports what a
+    later reader would actually find rather than what a fetch claimed to write.
+    """
+    oldest, newest = await get_existing_range(ticker)
+    edge = calculate_gaps(from_datetime, to_datetime, oldest, newest)
+    internal = await asyncio.to_thread(
         find_internal_gaps, ticker, from_datetime, to_datetime
     )
-    remaining = _merge_and_sort_gaps(remaining + internal_remaining)
-
-    if remaining:
-        _gap_rows.append((ticker, str(len(remaining)), _gap_range(remaining)))
+    return _merge_and_sort_gaps(edge + internal)
 
 
-def _gap_range(gaps: list[tuple[datetime, datetime]]) -> str:
+def gap_range(
+    gaps: tuple[tuple[datetime, datetime], ...] | list[tuple[datetime, datetime]],
+) -> str:
     """Short range string for a gap list, e.g. "2026-10-13→2026-10-15"."""
     if not gaps:
         return "-"
@@ -500,18 +541,17 @@ def _gap_range(gaps: list[tuple[datetime, datetime]]) -> str:
     return f"{start}→{end}"
 
 
-# Module-level accumulator: ``candles()`` appends post-fetch gaps here;
-# ``candles_batch()`` emits ONE gap summary table and clears it.
-_gap_rows: list[tuple[str, str, str]] = []
-
-
 async def candles_batch(
     conids: list[int],
     from_datetime: datetime,
     to_datetime: Optional[datetime] = None,
     max_concurrent: int = 1,
     bar: str = "1h",
-) -> list[int]:
+    on_chunk: Optional[Callable[[list[CandleDict]], None]] = None,
+    on_item: Optional[
+        Callable[[int, Optional[list[tuple[datetime, datetime]]]], None]
+    ] = None,
+) -> dict[int, list[tuple[datetime, datetime]] | None]:
     """Fetch candles for multiple conids with rate limiting and batching.
 
     Args:
@@ -520,30 +560,34 @@ async def candles_batch(
         to_datetime: End datetime for fetching (defaults to now)
         max_concurrent: Maximum concurrent requests
         bar: Bar size (e.g., "1h", "1d")
+        on_chunk: Sink for fetched chunks (default: write straight to the DB)
+        on_item: Called once per conid with its gaps still missing, or ``None``
+            when the fetch raised — the only per-symbol signal a progress bar
+            and a report need.
 
     Returns:
-        List of conids that were successfully fetched
+        ``{conid: gaps still missing}`` for every conid; a ``None`` value means
+        that symbol's fetch raised. ``candles()`` already computed those gaps, so
+        they are passed through rather than re-scanned here.
     """
-
-    global _gap_rows
-    _gap_rows = []
-
     semaphore = asyncio.Semaphore(max_concurrent)
 
-    async def fetch_with_limit(c: int) -> int | None:
+    async def fetch_with_limit(
+        c: int,
+    ) -> tuple[int, list[tuple[datetime, datetime]] | None]:
+        gaps: list[tuple[datetime, datetime]] | None = None
         try:
             async with semaphore:
-                await candles(c, from_datetime, to_datetime, bar)
-                return c
+                gaps = await candles(
+                    c, from_datetime, to_datetime, bar, on_chunk=on_chunk
+                )
         except Exception as e:
             _log_error(f"failed to fetch conid {c}: {e}")
-            return None
+            gaps = None
+        if on_item is not None:
+            on_item(c, gaps)
+        return c, gaps
 
     results = await asyncio.gather(*[fetch_with_limit(c) for c in conids])
 
-    # ONE gap summary table instead of 200 individual lines
-    if _gap_rows:
-        _log_gap_table("remaining gaps", _gap_rows)
-        _gap_rows = []
-
-    return [r for r in results if r is not None]
+    return dict(results)

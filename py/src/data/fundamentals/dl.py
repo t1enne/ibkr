@@ -73,8 +73,9 @@ async def download(
 ) -> tuple[DownloadRecap, ...]:
     """Fetch and persist fundamentals for ``symbols``; returns per-symbol recap.
 
-    Shows a progress bar on stderr then prints a final
-    Updated: N, Failed: M, Not found: K summary.
+    Shows its own ``fundamentals`` progress bar on stderr. The merged ``data dl``
+    command runs ``dl.run_fundamentals`` instead, which owns a bar for the whole
+    run — this entry point is the standalone form and keeps its own.
 
     A symbol SEC has no CIK for (ETF, non-US registrant) or whose payload errors
     is reported with ``rows=0`` rather than aborting the batch — a mixed
@@ -82,35 +83,41 @@ async def download(
 
     Only the rows actually written are reported, and symbols that produced no new
     rows are skipped at the DB, so the recap matches what a read would find.
+
+    No history is re-downloaded: ``companyfacts`` is cached per symbol on disk,
+    so a warm run makes no HTTP call at all and an unchanged payload writes
+    nothing (``Unchanged``). ``--refresh`` is the only way to bypass the cache.
     """
     bootstrap()
 
     updated: list[str] = []
     failed: list[str] = []
     not_found: list[str] = []
+    unchanged: list[str] = []
 
     payloads = await download_fundamentals(symbols, cache=cache, refresh=refresh)
 
-    with click.progressbar(
-        symbols,
-        label="fundamentals",
-        item_show_func=lambda s: s.upper() if s else "",
-        width=40,
-        file=sys.stderr,
-    ) as pb:
+    total = len(symbols)
+
+    def _rows(advance: Callable[[int, str], None]) -> list[DownloadRecap]:
+        """Persist every payload, calling ``advance(i, ticker)`` per symbol."""
         recaps: list[DownloadRecap] = []
-        for symbol in pb:
+        for i, symbol in enumerate(symbols, 1):
             ticker = symbol.upper()
             payload = payloads.get(ticker)
             if payload is None:
                 not_found.append(ticker)
                 recaps.append(DownloadRecap(ticker, 0, 0, None, None))
+                advance(i, ticker)
                 continue
             try:
                 rows = _window(sec_payload_to_rows(ticker, payload), from_date, to_date)
                 written = insert_fundamentals(rows)
                 if written:
                     updated.append(ticker)
+                elif rows:
+                    # Facts already stored — a no-op re-run, not a miss.
+                    unchanged.append(ticker)
                 else:
                     not_found.append(ticker)
                 recaps.append(
@@ -125,8 +132,18 @@ async def download(
             except Exception:
                 failed.append(ticker)
                 recaps.append(DownloadRecap(ticker, 0, 0, None, None))
+            advance(i, ticker)
+        return recaps
 
-    _report(updated, failed, not_found)
+    with click.progressbar(
+        length=total,
+        label="fundamentals",
+        width=40,
+        file=sys.stderr,
+    ) as pb:
+        recaps = _rows(lambda _done, _ticker: pb.update(1))
+
+    _report(updated, failed, not_found, unchanged)
     return tuple(recaps)
 
 
@@ -134,11 +151,19 @@ def _report(
     updated: list[str],
     failed: list[str],
     not_found: list[str],
+    unchanged: list[str],
 ) -> None:
-    """Print final summary line to stderr."""
+    """Print final summary line to stderr.
+
+    ``Unchanged`` and ``Not found`` are different answers: the first holds
+    symbols whose facts are already stored (a re-run wrote nothing because
+    nothing was new), the second holds symbols SEC has no data for at all.
+    """
     parts = []
     if updated:
         parts.append(f"Updated: {len(updated)}")
+    if unchanged:
+        parts.append(f"Unchanged: {len(unchanged)}")
     if failed:
         parts.append(f"Failed: {len(failed)} ({', '.join(failed)})")
     if not_found:

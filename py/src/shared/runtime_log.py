@@ -18,7 +18,6 @@ from typing import IO
 
 import click
 
-from src.bt.table import Col, Table, render as render_table
 from src.shared.style import Styler
 
 
@@ -32,8 +31,26 @@ def _styler(file: IO[str] | None = None) -> Styler:
     return Styler(enabled=f.isatty())
 
 
+#: Gates :func:`info` only. ``warn``/``error``/``retry``/``success`` always speak:
+#: a quiet run must still surface what went wrong, and only the per-chunk
+#: chatter is what a progress bar cannot share a terminal with.
+_VERBOSE: bool = True
+
+
+def set_verbose(enabled: bool) -> None:
+    """Suppress (or restore) the ordinary ``info`` stream for this process.
+
+    Set by a command that owns the terminal with a progress bar; the caller
+    must restore it, so a later command in the same process still logs.
+    """
+    global _VERBOSE  # noqa: PLW0603
+    _VERBOSE = enabled
+
+
 def info(msg: str, *, file: IO[str] | None = None) -> None:
-    """Timestamped info line — ordinary progress."""
+    """Timestamped info line — ordinary progress. Silent when not verbose."""
+    if not _VERBOSE:
+        return
     click.echo(_ts() + " " + msg, err=file is None, nl=True, file=file)
 
 
@@ -80,33 +97,6 @@ def success(name: str, detail: str = "", *, file: IO[str] | None = None) -> None
         err=file is None,
         file=file,
     )
-
-
-def gap_table(
-    heading: str,
-    rows: list[tuple[str, str, str]],
-    *,
-    file: IO[str] | None = None,
-) -> None:
-    """A compact table of gaps — one row per symbol, 3 cols.
-
-    ``rows`` is ``(symbol, gap_count, gap_range_or_reason)``. Renders as a
-    titled table so 200 lines become ~10.
-    """
-    s = _styler(file)
-    cols = (
-        Col("symbol", role="strong"),
-        Col("gaps", ">"),
-        Col("range"),
-    )
-    table_lines = render_table(
-        Table(columns=cols, rows=tuple(rows)),
-        sep="  ",
-        styler=s,
-    )
-    out = [_ts() + " " + s.role(heading + ":", "title")]
-    out.extend(table_lines)
-    click.echo("\n".join(out), err=file is None, file=file)
 
 
 def step(

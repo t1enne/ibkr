@@ -34,6 +34,7 @@ __all__ = [
     "ISymbol",
     "PreviewResult",
     "ProgressFn",
+    "SymbolOutcome",
     "SymbolSchema",
     "SyncResult",
     "UniverseConf",
@@ -116,13 +117,35 @@ class SyncResult:
     """
 
     resolved: int  # How many tickers resolved successfully
-    fetched: list[int]  # Conids that had new data fetched
-    gaps_found: int  # Total gap segments filled
+    fetched: list[int]  # Conids whose fetch ran without raising
+    gaps_found: int  # Gaps still missing across every symbol after the run
+    symbols: tuple[SymbolOutcome, ...] = ()  # Per-symbol outcomes, input order
+    unresolved: tuple[str, ...] = ()  # Tickers that never resolved to a conid
 
     @property
     def total_fetched(self) -> int:
-        """Number of symbols that received new data."""
+        """Symbols whose fetch ran to completion (not ones that got new rows)."""
         return len(self.fetched)
+
+
+@dataclass(frozen=True)
+class SymbolOutcome:
+    """Per-symbol result of a candle download.
+
+    ``gaps`` is the count of merged ranges still missing AFTER the fetch (empty
+    means the symbol is complete over the requested window); ``error`` is the
+    failure reason, and is ``None`` for a symbol that never failed.
+    """
+
+    ticker: str
+    conid: int
+    gaps: tuple[tuple[datetime, datetime], ...] = ()
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the fetch did not raise."""
+        return self.error is None
 
 
 @dataclass(frozen=True)
