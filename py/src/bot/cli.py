@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import click
+import pandas as pd
 
 from src.config import BotConfig, read_bot_config, read_live_config
 from src.db.path import resolve_live_db_path
@@ -35,6 +36,13 @@ from src.live.scope import (
 from src.live.types import LiveConfig
 
 from src.bot.liveness import BotAlreadyRunningError, BotStartInProgressError
+from src.bot.logs import (
+    DEFAULT_TAIL,
+    LogTail,
+    follow,
+    read_tail,
+    sleep_tick,
+)
 from src.bot.loop import EXIT_TRANSIENT, BotOptions, RunCycleFn, run_loop
 from src.bot.registry import BotRegistry
 from src.bot.spawn import (
@@ -62,6 +70,22 @@ class StartOutcome:
     scope: str
     ok: bool
     spawned: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class RestartOutcome:
+    """One target's restart result (``bot restart``).
+
+    ``ok`` means a bot is live for that scope afterwards; ``restarted`` says
+    THIS invocation stopped a live bot and spawned its replacement (False when
+    the target was already dead and merely started).
+    """
+
+    config_path: str
+    scope: str
+    ok: bool
+    restarted: bool
     message: str
 
 
@@ -127,16 +151,8 @@ def bot_start(
 
     Idempotent: a scope that is already live is reported, never respawned.
     """
-    cfg = read_bot_config()
-    options = _merge_bot_options(interval, max_age, no_sync, retries, cfg, BotOptions())
-    try:
-        # The merge is INSIDE the guard: a ``[live]`` typo is a config error and
-        # must map to exit 1, not a traceback.
-        live_options = merge_live_options(
-            adapter, None, read_live_config(), LiveOptions()
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    options = _bot_options_of(interval, max_age, no_sync, retries)
+    live_options = _resolve_live_options(adapter)
     registry = _build_registry()
     spawner = _build_spawner()
     outcomes: list[StartOutcome] = []
@@ -150,6 +166,23 @@ def bot_start(
     _render_start(outcomes, fmt)
     if not dry_run and not all(outcome.ok for outcome in outcomes):
         raise click.exceptions.Exit(1)
+
+
+def _resolve_live_options(adapter: str | None) -> LiveOptions:
+    """The merged ``[live]`` options — a config typo is exit 1, not a traceback."""
+    try:
+        return merge_live_options(adapter, None, read_live_config(), LiveOptions())
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _bot_options_of(
+    interval: int | None, max_age: int | None, no_sync: bool, retries: int | None
+) -> BotOptions:
+    """The CLI flags merged over ``config.toml [bot]`` and code defaults."""
+    return _merge_bot_options(
+        interval, max_age, no_sync, retries, read_bot_config(), BotOptions()
+    )
 
 
 @bot_group.command("status")
@@ -232,6 +265,367 @@ def _render_stop(outcomes: Sequence[StopOutcome]) -> None:
         return
     for outcome in outcomes:
         click.echo(f"{outcome.scope}: {outcome.message}")
+
+
+@bot_group.command("restart")
+@click.argument(
+    "configs",
+    nargs=-1,
+    required=False,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--all",
+    "all_scopes",
+    is_flag=True,
+    help="Restart every bot the registry knows, not just the named configs.",
+)
+@click.option(
+    "--wait",
+    "wait_s",
+    type=float,
+    default=STOP_WAIT_S,
+    help="Seconds to await a bot's exit before refusing to replace it.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the plan; spawn nothing, write nothing.",
+)
+@click.option(
+    "--adapter",
+    type=click.Choice(_ADAPTERS),
+    default=None,
+    help="Broker adapter to run through. Default: `[live] adapter` in config.toml, "
+    "then `ibkr`.",
+)
+@click.option(
+    "--interval",
+    "-i",
+    type=int,
+    default=None,
+    help="Cadence in seconds. Default: one bar of the config's `bars[0]`.",
+)
+@click.option(
+    "--max-age",
+    "-a",
+    type=int,
+    default=None,
+    help="Staleness gate in days. Default: twice the cadence, clamped to >= 1.",
+)
+@click.option("--no-sync", is_flag=True, help="Skip the pre-cycle candle sync.")
+@click.option(
+    "--retries",
+    type=int,
+    default=None,
+    help="Transient (exit 1) cycles to retry before exiting. Default: 1.",
+)
+@click.option(
+    "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
+)
+def bot_restart(
+    configs: tuple[str, ...],
+    all_scopes: bool,
+    wait_s: float,
+    dry_run: bool,
+    adapter: str | None,
+    interval: int | None,
+    max_age: int | None,
+    no_sync: bool,
+    retries: int | None,
+    fmt: str,
+) -> None:
+    """Stop then start each target; exit 0 when every target is live.
+
+    A bot still live when the wait runs out is reported, never replaced: the
+    stop is a request, so a restart never signals and never escalates. A target
+    already dead is just started.
+    """
+    if not all_scopes and not configs:
+        raise click.UsageError("give one or more config paths, or --all")
+    live_options = _resolve_live_options(adapter)
+    options = _bot_options_of(interval, max_age, no_sync, retries)
+    registry = _build_registry()
+    spawner = _build_spawner()
+    targets = _all_targets(registry) if all_scopes else _config_targets(configs)
+    outcomes = [
+        restart_one(registry, spawner, target, live_options, dry_run, wait_s, options)
+        for target in targets
+    ]
+    _render_restart(outcomes, fmt)
+    if not dry_run and not all(outcome.ok for outcome in outcomes):
+        raise click.exceptions.Exit(1)
+
+
+def _config_targets(configs: tuple[str, ...]) -> list[tuple[str, str]]:
+    """``(config_path, scope)`` per named config; an unknown config is exit 1."""
+    targets: list[tuple[str, str]] = []
+    for config in configs:
+        try:
+            targets.append((config, load_scope(config)[1]))
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    return targets
+
+
+def _all_targets(registry: BotRegistry) -> list[tuple[str, str]]:
+    """``(recorded config_path, scope)`` per registry row — the bot's identity."""
+    return [(record.config_path, record.scope) for record in registry.list_bots()]
+
+
+def restart_one(
+    registry: BotLiveness,
+    spawner: BotSpawner,
+    target: tuple[str, str],
+    live_options: LiveOptions | None,
+    dry_run: bool,
+    wait_s: float = STOP_WAIT_S,
+    options: BotOptions | None = None,
+) -> RestartOutcome:
+    """Stop (only when live) then start one bot — the unit of ``bot restart``.
+
+    The stop is ``stop_one``'s request plus a bounded await, never a signal. A
+    scope still locked at the deadline is left ALONE and reported: replacing it
+    would mean two writers on a live book. A dead target goes straight to
+    :func:`start_one`, whose claim and ready byte make the start idempotent.
+    """
+    config_path, scope = target
+    if dry_run:
+        return RestartOutcome(config_path, scope, True, False, "would restart")
+    if not Path(config_path).is_file():
+        return RestartOutcome(config_path, scope, False, False, "config path missing")
+    current = registry.probe(scope)
+    was_live = current is not None and current.state == "live"
+    if was_live:
+        stop = stop_one(registry, scope, wait=True, timeout_s=wait_s)
+        if stop.still_live:
+            return RestartOutcome(config_path, scope, False, False, stop.message)
+    start = start_one(registry, spawner, config_path, live_options, dry_run, options)
+    message = (
+        f"stopped, then {start.message}" if was_live else f"not live; {start.message}"
+    )
+    return RestartOutcome(config_path, scope, start.ok, start.spawned, message)
+
+
+def _render_restart(outcomes: Sequence[RestartOutcome], fmt: str) -> None:
+    """One terse line per target, or the JSON list of the same.
+
+    A still-live target says so by its stop message (``still live``); nothing
+    else in the line implies a replacement happened.
+    """
+    if fmt == "json":
+        click.echo(json.dumps([_restart_dict(o) for o in outcomes], indent=2))
+        return
+    if not outcomes:
+        click.echo("no bots to restart")
+        return
+    for outcome in outcomes:
+        click.echo(f"{outcome.scope}: {outcome.message}")
+
+
+def _restart_dict(outcome: RestartOutcome) -> dict[str, object]:
+    """The machine-parseable shape of one restart result."""
+    return {
+        "config_path": outcome.config_path,
+        "scope": outcome.scope,
+        "ok": outcome.ok,
+        "restarted": outcome.restarted,
+        "message": outcome.message,
+    }
+
+
+@bot_group.command("logs")
+@click.argument(
+    "configs",
+    nargs=-1,
+    required=False,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option(
+    "--all",
+    "all_scopes",
+    is_flag=True,
+    help="Every bot the registry knows, not just the named configs.",
+)
+@click.option(
+    "--follow",
+    "-f",
+    "follow_logs",
+    is_flag=True,
+    help="Stream appended lines until Ctrl-C (a bounded poll: no busy spin). "
+    "A truncated or rotated log is re-read from its start.",
+)
+@click.option(
+    "--tail",
+    "-n",
+    "tail",
+    default=str(DEFAULT_TAIL),
+    show_default=True,
+    metavar="N|all",
+    help="Print only the last N lines; `all` prints the whole file.",
+)
+@click.option(
+    "--timestamps",
+    "-t",
+    is_flag=True,
+    help="Prefix each target's lines with the log file's last-modified time. "
+    "The log records no per-line time, so this is per-file, not per-line.",
+)
+@click.option(
+    "--format", "-F", "fmt", type=click.Choice(["text", "json"]), default="text"
+)
+def bot_logs(
+    configs: tuple[str, ...],
+    all_scopes: bool,
+    follow_logs: bool,
+    tail: str,
+    timestamps: bool,
+    fmt: str,
+) -> None:
+    """Print each target's bot log; -f keeps streaming it.
+
+    Reading only: nothing is created, locked or spawned. Several targets each
+    get a header (==> scope <==) before their lines; one target prints bare
+    lines so pipes stay clean. Under --follow the targets are read interleaved,
+    and a log that shrinks or vanishes is reopened from its start, so a
+    truncation or a logrotate swap is survivable. A target with no log yet is
+    reported in its place; the command fails only when EVERY target is
+    missing, so one young bot never hides a real log.
+    """
+    if not all_scopes and not configs:
+        raise click.UsageError("give one or more config paths, or --all")
+    limit = _tail_limit(tail)
+    registry = _build_registry()
+    targets = [
+        _target_of(registry, target)
+        for target in _log_targets(registry, configs, all_scopes)
+    ]
+    tails = [read_tail(config, scope, path, limit) for config, scope, path in targets]
+    try:
+        _emit_logs(tails, follow_logs, timestamps, fmt)
+    except KeyboardInterrupt:
+        return
+    if tails and all(tail.missing for tail in tails):
+        raise click.exceptions.Exit(1)
+
+
+def _log_targets(
+    registry: BotRegistry, configs: tuple[str, ...], all_scopes: bool
+) -> list[tuple[str, str]]:
+    """The same ``(config_path, scope)`` rule ``stop``/``restart`` use."""
+    return _all_targets(registry) if all_scopes else _config_targets(configs)
+
+
+def _target_of(registry: BotRegistry, target: tuple[str, str]) -> tuple[str, str, Path]:
+    """``(config_path, scope, log_path)`` — the registry owns where the log is."""
+    config_path, scope = target
+    return config_path, scope, registry.log_path(scope)
+
+
+def _tail_limit(tail: str) -> int | None:
+    """``--tail`` as a line count, or ``None`` for the literal ``all``."""
+    if tail.strip().lower() == "all":
+        return None
+    try:
+        count = int(tail)
+    except ValueError as exc:
+        raise click.UsageError(
+            f"--tail takes a line count or `all`, not {tail!r}"
+        ) from exc
+    if count < 0:
+        raise click.UsageError("--tail takes a count >= 0")
+    return count
+
+
+def _emit_logs(
+    tails: Sequence[LogTail], follow_logs: bool, timestamps: bool, fmt: str
+) -> None:
+    """Text lines (optionally streamed) or one JSON object per target.
+
+    Under ``--follow`` the targets are polled in one tight round so their lines
+    interleave; the shared tick means one Ctrl-C ends the whole command. JSON
+    is one object per target — already parseable, so ``--follow`` stays text.
+    """
+    if fmt == "json":
+        for tail in tails:
+            click.echo(json.dumps(_log_dict(tail), indent=2))
+        return
+    if not tails:
+        click.echo("no bots to log", err=True)
+        return
+    header = len(tails) > 1
+    present: list[LogTail] = []
+    for tail in tails:
+        if tail.missing:
+            click.echo(f"no log for {tail.scope} ({tail.path})", err=True)
+            continue
+        present.append(tail)
+        _print_lines(tail, tail.lines, header, timestamps)
+    if follow_logs:
+        _interleave(present, header, timestamps)
+
+
+def _interleave(tails: Sequence[LogTail], header: bool, timestamps: bool) -> None:
+    """Poll every followed log once per round so their lines interleave.
+
+    One generator per target, each ended by the SAME ``sleep_tick`` returning
+    ``None``; ending them together is what makes one Ctrl-C (or, in a test, one
+    stop signal) release every stream instead of stranding a sibling.
+    """
+    stop: list[bool] = []
+
+    def tick() -> str | None:
+        if stop:
+            return None
+        return sleep_tick()
+
+    live = [(tail, follow(tail.path, tail.offset, tick)) for tail in tails]
+    while live:
+        still: list[tuple[LogTail, Iterator[str]]] = []
+        for tail, stream in live:
+            line = next(stream, None)
+            if line is not None:
+                _print_lines(tail, (line,), header, timestamps)
+                still.append((tail, stream))
+        live = still
+
+
+def _print_lines(
+    tail: LogTail, lines: Sequence[str], header: bool, timestamps: bool
+) -> None:
+    """One target's lines, with the compose-style header and mtime prefix."""
+    if not lines:
+        return
+    if header:
+        click.echo(f"==> {tail.scope} <==")
+    prefix = _stamp(tail.path) if timestamps else ""
+    for line in lines:
+        click.echo(f"{prefix}{line}")
+
+
+def _stamp(path: Path) -> str:
+    """The log file's last write as an ISO time, or nothing when unknowable.
+
+    Per LINE time is not recoverable: ``loop._log`` writes a bare
+    ``cycle exit N``. The file's own mtime is the most this reader can honestly
+    say, and it is exactly what ``--timestamps``' help promises.
+    """
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        return ""
+    return f"[{pd.Timestamp.fromtimestamp(mtime, tz='UTC').isoformat()}] "
+
+
+def _log_dict(tail: LogTail) -> dict[str, object]:
+    """The machine-parseable shape of one target's log."""
+    return {
+        "config_path": tail.config_path,
+        "scope": tail.scope,
+        "path": str(tail.path),
+        "lines": list(tail.lines),
+        "missing": tail.missing,
+    }
 
 
 @bot_group.command("_run", hidden=True)
@@ -533,8 +927,10 @@ def _live_severity(records: Sequence[BotRecord]) -> int:
 
 
 __all__ = [
+    "RestartOutcome",
     "StartOutcome",
     "bot_group",
     "load_scope",
+    "restart_one",
     "start_one",
 ]

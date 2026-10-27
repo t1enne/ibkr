@@ -25,6 +25,24 @@ states the behaviour that does not drift.
   returns; `--wait SECONDS` bounds the await — a bot still live at the bound is
   reported as such, not killed (escalate out of band). `stop` is not a flatten:
   the book stays open by design (D12/D13 stand).
+- `ibkr bot restart <config.json ...> [--all] [--dry-run]` — stop then start
+  each target. The stop is the same **request** as `bot stop` (`--wait SECONDS`
+  bounds it); a bot still live at the bound is **not** force-killed and never
+  replaced — that target reports `still live` and the command exits non-zero.
+  A target that is already dead is simply started. `--all` restarts every bot
+  the registry knows, by the config path recorded at spawn; a recorded path
+  gone from disk fails that row only. Start options are `start`'s: `--adapter`,
+  `-i/--interval`, `-a/--max-age`, `--no-sync`, `--retries`, `--format`.
+  `--dry-run` prints the plan and writes nothing — no spawn, no stop flag.
+- `ibkr bot logs <config.json ...> [--all]` — print each target's log,
+  `docker logs` style. `-n/--tail N|all` (default: the last few hundred lines;
+  `all` prints the file), `-f/--follow` streams appended lines until Ctrl-C,
+  `-t/--timestamps` prefixes the file's last-write time, `-F text|json` gives
+  raw lines or one object per target. **Read-only**: it writes nothing, takes
+  no lock, spawns nothing. Several targets each get a `==> <scope> <==`
+  header (a single target prints bare lines) and are read interleaved under
+  `--follow`. A target with no log yet reports `no log for <scope> (<path>)`;
+  the command fails only when every target is missing.
 - `ibkr bot status [--format text|json]` — one row per bot: scope, state
   (`live` / `exited` / `stale`), pid, started time, config path, last exit code.
   Exits non-zero when a still-live bot last reported a transient failure.
@@ -98,6 +116,17 @@ One log per bot: `<runtime>/<scope_tag>.log` (`IBKR_BOT_RUNTIME_DIR` overrides;
 `runtime/` is gitignored). A cycle's exit code lands there every cycle. Logs
 grow unbounded — rotation is out of band and required for a long-running
 deployment.
+
+`ibkr bot logs` is the reader; nothing else writes there. Lines are bare
+(`cycle exit N`): the file carries **no per-line timestamp**, so
+`--timestamps` prefixes the log file's own last-write time — the most that is
+actually knowable — and every line of one read shares that prefix. It is a
+per-file stamp, not a per-line one; do not read it as when a cycle ran. Only
+the pid row's `started_at` and exit code date anything finer.
+
+`--follow` polls on a short bounded sleep (no busy spin, Ctrl-C exits 0). A
+log that shrinks or disappears — truncation, or a rotation that swapped the
+file — is reopened from its start, so a follow survives `logrotate`.
 
 ## systemd — `scripts/ibkr-bot@.service`
 
