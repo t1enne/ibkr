@@ -190,6 +190,51 @@ class MetadataStore(_SqliteOps):
         )
         return tuple(_audit_of(row) for row in rows)
 
+    def executions_count_of(self, scope: str) -> int:
+        """How many fills the scope's book holds (the delete guard's read).
+
+        A missing table reads as ``0``, like every other never-written read.
+        """
+        rows = _read(
+            self._database,
+            lambda: (
+                LiveExecution.select(
+                    fn.COUNT(LiveExecution.execution_id).alias("count")
+                )
+                .where(LiveExecution.scope == scope)
+                .execute()
+            ),
+            (),
+        )
+        row = next(iter(rows), None)
+        return int(getattr(row, "count", 0) or 0)
+
+    def delete_scope(self, scope: str) -> tuple[int, int]:
+        """Delete OUR durable record for *scope*: audit rows and fill fold.
+
+        Returns ``(strategy_rows, execution_rows)`` deleted. ONE transaction, so
+        a scope never half-exists.
+
+        This is the destructive verb behind ``ibkr live rm`` and it touches the
+        LOCAL book only. It places nothing, cancels nothing and never edits the
+        account book: deleting a scope while the account still holds its lots
+        makes the next cycle read a held position as FLAT and re-enter it, which
+        is double exposure. Callers gate on flat + no live bot; this method
+        cannot see either, so it must not be reached without them.
+
+        The fill fold is the ONLY position record, so deleting it does NOT
+        flatten a position — it forgets one. Migrations rename-never-drop;
+        this is a scope-scoped row delete, not a schema drop.
+        """
+        with self._write():
+            strategies = (
+                LiveStrategy.delete().where(LiveStrategy.scope == scope).execute()
+            )
+            executions = (
+                LiveExecution.delete().where(LiveExecution.scope == scope).execute()
+            )
+        return int(strategies), int(executions)
+
 
 class BookStore(_SqliteOps):
     """Ledger mixin: our fill-derived book, its executions and its cash seed.

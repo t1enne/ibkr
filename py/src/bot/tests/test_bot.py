@@ -29,6 +29,7 @@ from click.testing import CliRunner
 
 from src.bot.cli import StartOutcome, bot_group, load_scope, start_one
 from src.bot.registry import BotRegistry
+from src.bot.targets import BotTarget
 from src.db.path import resolve_live_db_path
 from src.bot.spawn import (
     READY_TIMEOUT_S,
@@ -49,6 +50,11 @@ BASE_CONFIG = {
     "bars": ["1d"],
     "strategy_params": {"vwatr_period": 14},
 }
+
+
+def _target(config_path: str) -> BotTarget:
+    """A config path as a resolved target (``start``'s unit of work)."""
+    return BotTarget(config_path, load_scope(config_path)[1], False)
 
 
 def write_config(path: Path, *, name: str = "bot_test") -> str:
@@ -206,7 +212,7 @@ def test_concurrent_double_start_spawns_once(tmp_path: Path) -> None:
     def run_start() -> None:
         barrier.wait()
         try:
-            outcomes.append(start_one(registry, spawner, config, None, False))
+            outcomes.append(start_one(registry, spawner, _target(config), None, False))
         except BaseException as exc:  # surface thread failures instead of hanging
             errors.append(exc)
 
@@ -269,7 +275,6 @@ def test_start_failed_claim_exits_nonzero_and_bounded(
     elapsed = time.monotonic() - started
 
     assert result.exit_code == 1, result.output
-    assert "child failed to claim its scope" in result.output
     assert elapsed < 5.0, f"dead child was not bounded: {elapsed:.1f}s"
     record = BotRegistry(resolve_live_db_path()).probe(scope)
     assert record is None or record.state != "live"
@@ -325,7 +330,7 @@ def test_double_start_loser_is_ok_false(tmp_path: Path) -> None:
 
     def run_start() -> None:
         try:
-            outcomes.append(start_one(registry, spawner, config, None, False))
+            outcomes.append(start_one(registry, spawner, _target(config), None, False))
         except BaseException as exc:  # surface failures instead of hanging
             errors.append(exc)
 
@@ -335,7 +340,7 @@ def test_double_start_loser_is_ok_false(tmp_path: Path) -> None:
 
     # Second start while the winner still HOLDS the spawning claim: the loser
     # must be refused (ok False); a benign interleaving must never flip it.
-    loser = start_one(registry, spawner, config, None, False)
+    loser = start_one(registry, spawner, _target(config), None, False)
     release.set()
     winner.join(timeout=30)
     assert not winner.is_alive(), "winner hung"

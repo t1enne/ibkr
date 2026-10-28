@@ -194,6 +194,20 @@ def write_exit_code(
     return True
 
 
+def forget_pid_row(db: str | Path, scope: str) -> bool:
+    """Remove the scope's pid row; ``True`` when a row was actually deleted.
+
+    The registry forgets a bot; it never kills one. Callers must prove the bot
+    is not live first — deleting a live bot's row orphans its lock file and
+    leaves a running process nothing can stop by name.
+    """
+    try:
+        Path(bot_pid_path(db, scope)).unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 class BotRegistry:
     """Registry surface: probe/list/claim for the supervisor, record helpers
     for the child. One instance = one db + one runtime dir; the flock seam is
@@ -272,6 +286,15 @@ class BotRegistry:
     ) -> bool:
         """Stamp this life's exit code; a no-op when the row is a newer life's."""
         return write_exit_code(self._db, scope, code, pid=pid, started_at=started_at)
+
+    def forget(self, scope: str) -> bool:
+        """Drop the scope's registry row and stop flag (never touches a live bot).
+
+        Log files are left alone: they are the only forensic record of what the
+        bot did, and an operator can delete one deliberately.
+        """
+        self.stop_flag_path(scope).unlink(missing_ok=True)
+        return forget_pid_row(self._db, scope)
 
     def log_path(self, scope: str) -> Path:
         """The bot's log: ``<runtime>/<scope_tag>.log``."""

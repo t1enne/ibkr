@@ -58,6 +58,14 @@ class BotLiveness(Protocol):
         """
         ...
 
+    def list_bots(self) -> list[BotRecord]:
+        """Every row the registry holds, in the registry's own order.
+
+        ``--all`` and a bare ``ls`` need the whole registry, not one scope; a
+        fake that omits this is a type error here rather than a runtime one.
+        """
+        ...
+
     def log_path(self, scope: str) -> Path:
         """Where the bot's output is appended: ``<runtime>/<scope_tag>.log``."""
         ...

@@ -328,6 +328,34 @@ only by our own already-confirmed reducing fills (a same-cycle flip) — do not
 widen that; stop-loss/take-profit and LMT are **refused**, never silently sent
 naked and never implied in the report; a partially filled entry is not topped up.
 
+### Bot logs (`src/bot`)
+
+`ibkr bot` writes its own log files; `src/live` never does. One file per scope,
+`<runtime>/<scope_tag>.log`, one line per fact:
+`<ts> <LEVEL> <event> k=v…` with a UTC ISO-8601 second-precision `Z` timestamp.
+`scope` and `pid` are on every line the bot writes. The bot rotates the file
+itself (`IBKR_BOT_LOG_MAX_BYTES`/`IBKR_BOT_LOG_KEEP`), and
+`IBKR_BOT_LOG_LEVEL` sets the minimum level — all three are read by the bot
+process at startup.
+
+- **The journal is not on the trade path.** It reports a cycle's code; it never
+  sits between a read and a place, and no fail-closed branch depends on it.
+- **A log write failure never changes an exit code.** The pid row is the
+  authority; the failure goes to stderr.
+- `cycle.exit`'s `code=` and the pid row's `exit_code` are written from the same
+  value, so `bot logs` and `bot ls` cannot disagree.
+- `--dry-run` spawns no child, so no journal exists and no file is created.
+- A config that no longer mints its registry row's scope is **refused** by
+  `start`/`restart` (exit 1) rather than spawned under either identity: the
+  claim would cover the old scope while the child trades the new one, which is
+  the double-exposure hazard §Live trading names.
+- A legacy bare `cycle exit N` line is passed through verbatim by the reader;
+  do not "upgrade" historic logs in place.
+- A scope is **never re-minted when a registry row exists** — TARGET resolution
+  (`resolve_targets`) is registry-row-first, so `logs`/`inspect`/`stop` still
+  address a running bot whose config was edited or deleted. This is invariant
+  §5 applied to the supervisor.
+
 ### Gateway contract
 
 `/iserver/account/orders` echoes our client order id as **`order_ref`** (not

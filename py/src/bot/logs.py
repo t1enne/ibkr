@@ -10,6 +10,7 @@ here invents one.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -42,7 +43,6 @@ class LogTail:
     nothing is fabricated.
     """
 
-    config_path: str
     scope: str
     path: Path
     lines: tuple[str, ...]
@@ -74,12 +74,12 @@ def tail_lines(path: Path, limit: int | None) -> tuple[list[str], int]:
     return (whole if limit is None else list(held)), offset
 
 
-def read_tail(config_path: str, scope: str, path: Path, limit: int | None) -> LogTail:
+def read_tail(scope: str, path: Path, limit: int | None) -> LogTail:
     """One target's tail; a missing log is reported, never invented."""
     if not path.is_file():
-        return LogTail(config_path, scope, path, (), 0, True)
+        return LogTail(scope, path, (), 0, True)
     lines, offset = tail_lines(path, limit)
-    return LogTail(config_path, scope, path, tuple(lines), offset, False)
+    return LogTail(scope, path, tuple(lines), offset, False)
 
 
 def follow(path: Path, offset: int, tick: TickFn, first: str = "") -> Iterator[str]:
@@ -92,7 +92,9 @@ def follow(path: Path, offset: int, tick: TickFn, first: str = "") -> Iterator[s
 
     Rotation and truncation look alike — the file is shorter than our position,
     or gone — and both reopen from zero, which is where a rotated file's
-    replacement (or a truncated one) starts.
+    replacement (or a truncated one) starts. A rotation that keeps the file
+    LONGER than our position is caught by the inode check in :func:`_reopen`,
+    so our own rename-based rotation cannot leave a follower on the old file.
     """
     assert offset >= 0, "an offset is a byte count"
     handle = path.open("rb") if path.is_file() else None
@@ -126,18 +128,43 @@ def _read_chunk(handle: BufferedReader, pending: str) -> tuple[str, str]:
 def _reopen(
     handle: BufferedReader | None, path: Path, pending: str
 ) -> tuple[BufferedReader | None, str]:
-    """Re-point at the file, from zero when it shrank or went away."""
+    """Re-point at the file, from zero when it was rotated or truncated.
+
+    A rotation RENAMES the live file away, so a held handle keeps reading the
+    rotated generation and would replay or fragment its bytes. The inode check
+    is what distinguishes that from an ordinary append: same inode means the
+    position is still ours, a different (or missing) inode means the file we
+    were reading is no longer the live log, so we start over at its beginning.
+    """
     if not path.is_file():
         if handle is not None:
             handle.close()
         return None, ""
     position = handle.tell() if handle is not None else 0
+    rotated = handle is not None and _inode(handle) != _inode_of(path)
     was_shrunk = position > _size(path)
     if handle is not None:
         handle.close()
     fresh = path.open("rb")
-    fresh.seek(0 if was_shrunk else position)
-    return fresh, "" if was_shrunk else pending
+    restart = rotated or was_shrunk
+    fresh.seek(0 if restart else position)
+    return fresh, "" if restart else pending
+
+
+def _inode(handle: BufferedReader) -> int:
+    """The open handle's file identity (``0`` when the OS will not say)."""
+    try:
+        return os.fstat(handle.fileno()).st_ino
+    except OSError:
+        return 0
+
+
+def _inode_of(path: Path) -> int:
+    """*path*'s current file identity (``-1`` when it is gone)."""
+    try:
+        return path.stat().st_ino
+    except OSError:
+        return -1
 
 
 def _size(path: Path) -> int:

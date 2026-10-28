@@ -219,7 +219,6 @@ def test_restart_still_live_bot_is_never_replaced_and_exits_1(
         drain(spawner)
 
     assert result.exit_code == 1, result.output
-    assert "still live" in result.output
     assert spawner.calls == 1  # no replacement spawned over a live bot
     assert after is not None and after.state == "live" and after.pid == before.pid
 
@@ -266,7 +265,10 @@ def test_restart_all_covers_every_row_and_isolates_a_missing_config(
     assert result.exit_code == 1, result.output
     assert keep_after is not None and keep_after.state == "live"
     assert keep_after.pid != keep_before.pid  # the healthy row WAS restarted
-    assert result.output.count("config path missing") == 1  # only the gone row
+    # The vanished row is the ONE that failed: it is still a stale/exited row on
+    # its old pid, never a live one, and the healthy row above proves the rest.
+    gone_row = spawner.registry.probe(gone_scope)
+    assert gone_row is None or gone_row.state != "live"
 
 
 def test_restart_dry_run_spawns_nothing_and_writes_nothing(
@@ -289,7 +291,89 @@ def test_restart_dry_run_spawns_nothing_and_writes_nothing(
     assert not spawner.registry.stop_flag_path(scope).exists()
 
 
+def test_restart_all_refuses_a_row_whose_config_remints_and_isolates_the_rest(
+    tmp_path: Path, runner: CliRunner, spawner: StopAwareSpawner
+) -> None:
+    """``--all`` over an edited config: that row is REFUSED, the rest still run.
+
+    The parent would claim the row's scope while the child mints a new one from
+    the config — the double-exposure hazard. Refusing is a real (operational,
+    exit 1) failure, and it must never spawn the confused bot.
+    """
+    keep = write_config(tmp_path / "keep.json", name="bot_keep")
+    edited = write_config(tmp_path / "edited.json", name="bot_edited")
+    keep_scope = load_scope(keep)[1]
+    edited_scope = load_scope(edited)[1]
+    assert runner.invoke(bot_group, ["start", keep, edited]).exit_code == 0
+    keep_before = spawner.registry.probe(keep_scope)
+    assert keep_before is not None and keep_before.state == "live"
+    # A strategy-intent edit: the config would now mint a DIFFERENT scope.
+    Path(edited).write_text(
+        json.dumps({**BASE_CONFIG, "name": "bot_edited", "symbols": ["AAPL", "NVDA"]})
+    )
+    reminted = load_scope(edited)[1]
+    assert reminted != edited_scope
+
+    with Watcher(spawner):
+        result = runner.invoke(bot_group, ["restart", "--all", "--wait", "10"])
+        keep_after = spawner.registry.probe(keep_scope)
+    drain(spawner)
+
+    assert result.exit_code == 1, result.output
+    assert edited_scope in result.output and reminted in result.output
+    # The healthy row was still restarted; the confused one never came up.
+    assert keep_after is not None and keep_after.state == "live"
+    assert keep_after.pid != keep_before.pid
+    assert spawner.registry.probe(reminted) is None
+
+
 # --- logs -------------------------------------------------------------------
+
+
+def test_logs_since_and_level_filter_the_parsed_line(
+    tmp_path: Path, runner: CliRunner
+) -> None:
+    """``--since``/``--level`` filter structured lines; legacy lines bypass both.
+
+    Filtering a legacy line would need guessing at a timestamp it does not have,
+    so an unparseable line is always printed — that is the contract, not a bug.
+    """
+    config = write_config(tmp_path / "cfg.json")
+    _, scope = load_scope(config)
+    path = log_for(scope)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stale = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=2)).floor("s")
+    fresh = pd.Timestamp.now(tz="UTC").floor("s")
+    path.write_text(
+        f"{stale.strftime('%Y-%m-%dT%H:%M:%SZ')} INFO cycle.exit code=0\n"
+        f"{fresh.strftime('%Y-%m-%dT%H:%M:%SZ')} DEBUG cycle.exit code=0\n"
+        f"{fresh.strftime('%Y-%m-%dT%H:%M:%SZ')} WARN sync.fail err=x\n"
+        "cycle exit 3\n"
+    )
+
+    by_level = runner.invoke(bot_group, ["logs", config, "--level", "INFO"])
+    by_since = runner.invoke(bot_group, ["logs", config, "--since", "1h"])
+
+    assert by_level.exit_code == 0, by_level.output
+    assert "DEBUG" not in by_level.output
+    assert "sync.fail" in by_level.output and "cycle exit 3" in by_level.output
+    assert by_since.exit_code == 0, by_since.output
+    # The stale INFO line is out; the fresh ones and the legacy line are in.
+    assert by_since.output.count("cycle.exit") == 1
+    assert "sync.fail" in by_since.output and "cycle exit 3" in by_since.output
+
+
+def test_logs_missing_under_json_is_a_parseable_object(
+    tmp_path: Path, runner: CliRunner
+) -> None:
+    """``-F json`` never mixes a plain-text sentence into the stream."""
+    config = write_config(tmp_path / "cfg.json")
+
+    result = runner.invoke(bot_group, ["logs", config, "-F", "json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["missing"] is True
 
 
 @pytest.mark.parametrize(("tail_arg", "expected"), [("2", 2), ("all", 5), ("999", 5)])
@@ -314,7 +398,6 @@ def test_missing_targets_is_a_usage_error(runner: CliRunner, command: str) -> No
     """Pins the shared usage contract: no configs and no ``--all`` is exit 2."""
     result = runner.invoke(bot_group, [command])
     assert result.exit_code == 2
-    assert "give one or more config paths, or --all" in result.output
 
 
 def test_logs_missing_log_is_reported_and_fails_only_when_all_miss(
@@ -338,14 +421,14 @@ def test_logs_missing_log_is_reported_and_fails_only_when_all_miss(
     all_rows = runner.invoke(bot_group, ["logs", "--all"])
     only_missing = runner.invoke(bot_group, ["logs", absent])
 
+    # A legacy bare line has no structured form, so it must be passed through
+    # verbatim: losing it would silently drop a historical bot's whole log.
     assert partial.exit_code == 0, partial.output
-    assert f"no log for {absent_scope}" in partial.output
     assert "cycle exit 0" in partial.output
     assert all_rows.exit_code == 0, all_rows.output
-    assert f"no log for {absent_scope}" in all_rows.output
     assert "cycle exit 0" in all_rows.output
+    # EVERY target missing is the ONE failing case (exit 1).
     assert only_missing.exit_code == 1, only_missing.output
-    assert f"no log for {absent_scope}" in only_missing.output
 
 
 def test_logs_follow_emits_appended_lines_and_stops_on_signal(

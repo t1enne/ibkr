@@ -11,6 +11,10 @@ never mid-cycle), ``SyncFn`` (the candle refresh) and ``RunCycleFn`` (one live
 cycle, returning its exit code). Retry policy: ``0`` continues, ``1`` is
 retried up to a bounded count, ``2``/``3`` stop the bot immediately (``3`` needs
 an operator). One bot's exit never aborts its siblings.
+
+``Journal`` is the bot's own log seam (plan §3): every lifecycle fact is one
+structured line, and the cycle's exit code is journaled BEFORE the pid row takes
+the same value, so ``ls`` and ``logs`` can never disagree about it.
 """
 
 from __future__ import annotations
@@ -21,12 +25,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
-from typing import Protocol
+from typing import Literal, Protocol
 
 import pandas as pd
-from click import echo
 
 from src.live.types import LiveConfig
+from src.bot.journal import Journal, build_journal
 from src.bot.registry import BotRegistry
 from src.bot.sync import SyncFn, sync_cfg
 
@@ -98,6 +102,7 @@ class _Life:
     sync: SyncFn
     sleep: SleepFn
     today: Callable[[], date]
+    journal: Journal
 
 
 def bar_seconds(bar: str) -> int:
@@ -153,40 +158,55 @@ def run_loop(
     sleep: SleepFn = _default_sleep,
     today: Callable[[], date] = date.today,
     on_ready: Callable[[], None] | None = None,
+    journal: Journal | None = None,
 ) -> int:
     """The resident loop for one bot; returns the process exit code (§5).
 
     Derive the cadence, claim the scope lock for life, then loop
     ``sync -> cycle -> record -> sleep``. *on_ready* fires once the lock and pid
-    row exist — the spawn handshake's ready signal (§4.1).
+    row exist — the spawn handshake's ready signal (§4.1). *journal* is the
+    bot's own log, built for the scope's file when absent.
     """
     cadence = derive_cadence(
         cfg.bars[0], interval=options.interval, max_age=options.max_age
     )
     with registry.hold_lifetime(scope):
-        pid = os.getpid()
-        started_at = pd.Timestamp.now()
+        pid, started_at = os.getpid(), pd.Timestamp.now()
+        log = journal if journal is not None else _journal_for(scope, pid, registry)
         registry.write_pid_record(
             scope, pid=pid, started_at=started_at, config_path=config_path
         )
         if on_ready is not None:
             on_ready()
         life = _Life(
-            config_path=config_path,
-            scope=scope,
-            pid=pid,
-            started_at=started_at,
-            cfg=cfg,
-            options=options,
-            cadence=cadence,
-            run_cycle=run_cycle,
-            sync=sync,
-            sleep=sleep,
-            today=today,
+            config_path,
+            scope,
+            pid,
+            started_at,
+            cfg,
+            options,
+            cadence,
+            run_cycle,
+            sync,
+            sleep,
+            today,
+            log,
         )
+        log.emit("INFO", "start.ready", {"config": config_path})
         code = _loop_body(registry, life)
+        log.emit("INFO", "bot.exit", {"code": str(code)})
         registry.record_exit_code(scope, code, pid=pid, started_at=started_at)
         return code
+
+
+def _journal_for(scope: str, pid: int, registry: BotRegistry) -> Journal:
+    """The scope's file journal, with the environment's bounds and level.
+
+    Delegates to ``build_journal`` rather than constructing a ``FileJournal``:
+    the dataclass defaults are NOT the operator's settings, and building it
+    directly silently ignored ``IBKR_BOT_LOG_MAX_BYTES``/``_KEEP``/``_LEVEL``.
+    """
+    return build_journal(scope, pid, registry)
 
 
 def _loop_body(registry: BotRegistry, life: _Life) -> int:
@@ -197,21 +217,27 @@ def _loop_body(registry: BotRegistry, life: _Life) -> int:
     bound; ``2``/``3`` are terminal.
     """
     failures = 0
+    cycle = 0
     while True:
+        cycle += 1
+        started = time.monotonic()
         code = _tick(life)
-        _log(registry, life.scope, code)
+        failure_of = _outcome_of(code, failures, life.options.retries)
+        life.journal.emit("INFO", "cycle.exit", _cycle_fields(cycle, code, started))
+        if failure_of == "exhausted":
+            life.journal.emit(
+                "WARN", "retries.exhausted", {"failures": str(failures + 1)}
+            )
+        # Journal FIRST, pid row second: both carry the same code, so ``ls``
+        # (the row) and ``logs`` (the line) cannot report different outcomes.
         registry.record_exit_code(
             life.scope, code, pid=life.pid, started_at=life.started_at
         )
-        if code == 0:
-            failures = 0
-        elif code == EXIT_TRANSIENT:
-            failures += 1
-            if failures > life.options.retries:
-                return code
-        else:
+        if failure_of in {"exhausted", "terminal"}:
             return code
+        failures = failures + 1 if code == EXIT_TRANSIENT else 0
         if _sleep_until_stop(registry, life):
+            life.journal.emit("INFO", "stop.observed", {})
             return 0
 
 
@@ -221,7 +247,7 @@ def _tick(life: _Life) -> int:
         try:
             life.sync(life.cfg, today=life.today())
         except Exception as exc:  # sync raise/timeout => exit 1, never a cycle
-            echo(f"sync failed: {exc}", err=True)
+            life.journal.emit("WARN", "sync.fail", {"err": str(exc)})
             return EXIT_TRANSIENT
     return life.run_cycle(life.config_path, life.cadence.max_age_days)
 
@@ -242,21 +268,38 @@ def _sleep_until_stop(registry: BotRegistry, life: _Life) -> bool:
     return False
 
 
-def _log(registry: BotRegistry, scope: str, code: int) -> None:
-    """Append one cycle's exit code to the bot's log (registry owns the path)."""
-    try:
-        with registry.log_path(scope).open("a") as handle:
-            handle.write(f"cycle exit {code}\n")
-    except OSError:
-        # A log we cannot write must not stop the bot: the pid row records the
-        # same code and liveness is the lock, not the log.
-        echo(f"bot {scope}: cycle exit {code}", err=True)
+type _Transition = Literal["continue", "exhausted", "terminal"]
+
+
+def _outcome_of(code: int, failures: int, retries: int) -> _Transition:
+    """What one cycle's code means for the loop: carry on, retry, or exit.
+
+    ``0`` continues, ``1`` is retried until the bound is spent (the code after
+    this failing cycle's increment), and anything else is terminal — ``2``/``3``
+    must exit immediately, and an unknown code fails CLOSED rather than looping
+    on it forever.
+    """
+    if code == 0:
+        return "continue"
+    if code != EXIT_TRANSIENT:
+        return "terminal"
+    return "exhausted" if failures + 1 > retries else "continue"
+
+
+def _cycle_fields(cycle: int, code: int, started: float) -> dict[str, str]:
+    """The ``cycle.exit`` field set: the counter, the code and the duration."""
+    return {
+        "n": str(cycle),
+        "code": str(code),
+        "dur": f"{time.monotonic() - started:.1f}s",
+    }
 
 
 __all__ = [
     "EXIT_TRANSIENT",
     "BotOptions",
     "Cadence",
+    "Journal",
     "RunCycleFn",
     "SleepFn",
     "bar_seconds",

@@ -25,6 +25,8 @@ from src.live.pipeline import PortfolioFetchError
 from src.live.freshness import StaleDataError
 from src.live.lease import CycleInProgressError
 from src.live.ledger import LedgerReadError, SqliteLedger
+from src.db.path import resolve_live_db_path
+from src.bot.registry import BotRegistry
 from src.live.options import (
     LiveOptions,
     adapter_names,
@@ -40,6 +42,7 @@ from src.live.pf import (
     read_sim_broker,
     read_store,
     render_pf,
+    scope_holds_positions,
 )
 from src.live.scope import (
     AdapterName,
@@ -207,6 +210,20 @@ live_group.add_command(live_run)
     "gateway session (`ibkr gw` owns login) — it never starts one.",
 )
 @click.option(
+    "--all",
+    "all_scopes",
+    is_flag=True,
+    help="Include scopes that hold no open lot (no config given). "
+    "Retired config revisions pile up here; `ibkr live rm` retires one.",
+)
+@click.option(
+    "--closed",
+    "show_closed",
+    is_flag=True,
+    help="Also show symbols whose fills already round-tripped (qty 0). "
+    "Off by default: they are history, not exposure.",
+)
+@click.option(
     "--watch",
     "watch_seconds",
     type=click.FloatRange(min=0, min_open=True),
@@ -220,12 +237,15 @@ def live_pf(
     config_path: str | None,
     fmt: str | None,
     adapter: str | None,
+    all_scopes: bool,
+    show_closed: bool,
     watch_seconds: float | None,
 ) -> None:
     """Show scopes, their P&L and one merged positions table, plus the broker.
 
-    With CONFIG_PATH the report covers that config's scope. WITHOUT it, EVERY
-    scope the store knows about. Either way each scope renders its own lots,
+    With CONFIG_PATH the report covers that config's scope. WITHOUT it, every
+    scope that still holds an OPEN lot (``--all`` widens that to every scope the
+    store knows, including the retired config revisions that hold nothing). Either way each scope renders its own lots,
     order intents and stored fills — MERGED into one ``positions`` row per
     symbol (lot, newest order and the P&L its fills imply), so the same order
     ref no longer appears in three tables; a ``stats`` table carries the
@@ -264,15 +284,17 @@ def live_pf(
 
     if watch_seconds is not None and fmt == "json":
         raise click.ClickException("--watch cannot be combined with --format json")
+    if all_scopes and config_path is not None:
+        raise click.ClickException("--all applies to the no-config report only")
     ledger = SqliteLedger()
     if watch_seconds is not None:
-        _watch_pf(ledger, config_path, adapter, watch_seconds)
+        _watch_pf(ledger, config_path, adapter, watch_seconds, all_scopes, show_closed)
         return
     try:
         report = (
-            _all_scopes_report(ledger, adapter)
+            _all_scopes_report(ledger, adapter, all_scopes, show_closed)
             if config_path is None
-            else _config_report(ledger, config_path, adapter)
+            else _config_report(ledger, config_path, adapter, show_closed)
         )
     except (SessionNotReady, ValueError, LedgerReadError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -282,18 +304,34 @@ def live_pf(
 def _all_scopes_report(
     ledger: SqliteLedger,
     adapter: AdapterName | None,
+    all_scopes: bool = False,
+    show_closed: bool = False,
 ) -> PfReport:
-    """Every scope in the store, plus a broker read when an adapter is resolved."""
+    """Every scope that holds exposure (or every scope, with *all_scopes*).
+
+    The default drops scopes whose fill fold holds no open lot: a retired config
+    revision leaves a scope behind that nothing will ever reconcile again, and
+    listing it beside a live book buries the rows that matter. With no scope
+    left there is no broker read either — there is nothing to reconcile.
+    """
     scopes = ledger.scopes_of_store()
     stores = tuple(read_store(ledger, scope) for scope in scopes)
-    broker = _pf_broker(ledger, adapter, None, None, stores)
-    return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker)
+    if not all_scopes:
+        stores = tuple(store for store in stores if scope_holds_positions(store))
+    broker = _pf_broker(ledger, adapter, None, None, stores) if stores else None
+    return PfReport(
+        as_of=pd.Timestamp.now(tz="UTC"),
+        stores=stores,
+        broker=broker,
+        show_closed=show_closed,
+    )
 
 
 def _config_report(
     ledger: SqliteLedger,
     config_path: str,
     adapter: str | None,
+    show_closed: bool = False,
 ) -> PfReport:
     """The config's scope, plus a broker read when one is resolved.
 
@@ -317,7 +355,12 @@ def _config_report(
         cfg,
         (store,),
     )
-    return PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=(store,), broker=broker)
+    return PfReport(
+        as_of=pd.Timestamp.now(tz="UTC"),
+        stores=(store,),
+        broker=broker,
+        show_closed=show_closed,
+    )
 
 
 def _config_scope(cfg: LiveConfig, resolved_adapter: AdapterName) -> str:
@@ -431,6 +474,8 @@ def _watch_pf(
     config_path: str | None,
     adapter: AdapterName,
     interval: float,
+    all_scopes: bool = False,
+    show_closed: bool = False,
 ) -> None:
     """Re-read the store + broker and re-render every *interval* until Ctrl-C.
 
@@ -441,7 +486,9 @@ def _watch_pf(
     the loop keeps going. Teardown restores the screen on every exit path.
     """
     tty = sys.stdout.isatty()
-    session = _open_watch_session(ledger, config_path, adapter, _styler("text", tty))
+    session = _open_watch_session(
+        ledger, config_path, adapter, _styler("text", tty), all_scopes, show_closed
+    )
     try:
         watch_pf_loop(
             session.frame,
@@ -467,6 +514,8 @@ def _open_watch_session(
     config_path: str | None,
     adapter: AdapterName,
     style: Styler = PLAIN,
+    all_scopes: bool = False,
+    show_closed: bool = False,
 ) -> _WatchSession:
     """Resolve the watch's frame + teardown ONCE, before the loop starts.
 
@@ -485,22 +534,48 @@ def _open_watch_session(
         if adapter == "ibkr":
             return _ibkr_watch_session(
                 ledger,
-                ledger.scopes_of_store,
+                _scopes_fn(ledger, all_scopes),
                 0.0,
+                style,
+                show_closed=show_closed,
             )
         return _WatchSession(
-            _store_frame(ledger, None, adapter, adapter, style),
+            _store_frame(
+                ledger, None, adapter, adapter, style, all_scopes, show_closed
+            ),
             _noop,
         )
     cfg = load_strat_config(config_path)
     if adapter != "ibkr":
-        return _WatchSession(_store_frame(ledger, cfg, adapter, adapter, style), _noop)
+        return _WatchSession(
+            _store_frame(ledger, cfg, adapter, adapter, style, all_scopes, show_closed),
+            _noop,
+        )
     return _ibkr_watch_session(
         ledger,
         lambda: (_config_scope(cfg, adapter),),
         cfg.initial_capital,
         style,
+        show_closed=show_closed,
     )
+
+
+def _scopes_fn(ledger: SqliteLedger, all_scopes: bool) -> Callable[[], tuple[str, ...]]:
+    """Per-tick scope list for the no-config watch: exposure only by default.
+
+    Re-evaluated every tick, so a scope that opens or retires mid-watch joins or
+    leaves the report without restarting it.
+    """
+
+    def scopes() -> tuple[str, ...]:
+        every = ledger.scopes_of_store()
+        if all_scopes:
+            return every
+        return tuple(
+            scope for scope in every if scope_holds_positions(read_store(ledger, scope))
+        )
+
+    return scopes
 
 
 def _ibkr_watch_session(
@@ -508,6 +583,7 @@ def _ibkr_watch_session(
     scopes_fn: Callable[[], tuple[str, ...]],
     initial_capital: float,
     style: Styler = PLAIN,
+    show_closed: bool = False,
 ) -> _WatchSession:
     """Hold ONE ibkr session open on a persistent loop, then read only the book.
 
@@ -535,7 +611,12 @@ def _ibkr_watch_session(
             read_ibkr_broker(gateway.client, account, scopes, owned)
         )
         return render_pf(
-            PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
+            PfReport(
+                as_of=pd.Timestamp.now(tz="UTC"),
+                stores=stores,
+                broker=broker,
+                show_closed=show_closed,
+            ),
             "text",
             style,
         )
@@ -553,6 +634,8 @@ def _store_frame(
     adapter: str | None,
     resolved_adapter: AdapterName,
     style: Styler = PLAIN,
+    all_scopes: bool = False,
+    show_closed: bool = False,
 ) -> Callable[[], str]:
     """A store (+ sim broker) frame builder for the scopes a watch covers.
 
@@ -562,9 +645,16 @@ def _store_frame(
     """
 
     def frame() -> str:
-        stores, broker = _store_and_broker(ledger, cfg, adapter, resolved_adapter)
+        stores, broker = _store_and_broker(
+            ledger, cfg, adapter, resolved_adapter, all_scopes
+        )
         return render_pf(
-            PfReport(as_of=pd.Timestamp.now(tz="UTC"), stores=stores, broker=broker),
+            PfReport(
+                as_of=pd.Timestamp.now(tz="UTC"),
+                stores=stores,
+                broker=broker,
+                show_closed=show_closed,
+            ),
             "text",
             style,
         )
@@ -577,6 +667,7 @@ def _store_and_broker(
     cfg: LiveConfig | None,
     adapter: str | None,
     resolved_adapter: AdapterName,
+    all_scopes: bool = False,
 ) -> tuple[tuple[StoreSide, ...], BrokerSide | None]:
     """Re-read the store side and (for ``sim``) the store's account book, per tick.
 
@@ -587,6 +678,8 @@ def _store_and_broker(
     """
     if cfg is None:
         stores = tuple(read_store(ledger, scope) for scope in ledger.scopes_of_store())
+        if not all_scopes:
+            stores = tuple(store for store in stores if scope_holds_positions(store))
     else:
         scope = _config_scope(cfg, resolved_adapter)
         stores = (read_store(ledger, scope, initial_capital=cfg.initial_capital),)
@@ -656,3 +749,91 @@ def _noop() -> None:
 
 
 live_group.add_command(live_pf)
+
+
+@click.command("rm")
+@click.argument("scopes", nargs=-1, required=True)
+@click.option(
+    "--yes",
+    "confirmed",
+    is_flag=True,
+    help="Actually delete. Without it this only reports what WOULD go.",
+)
+@click.option(
+    "--force-flat",
+    is_flag=True,
+    help="Delete a scope whose book still holds an OPEN lot. Read the warning "
+    "before using it: this FORGETS a live position, it does not close one.",
+)
+def live_rm(scopes: tuple[str, ...], confirmed: bool, force_flat: bool) -> None:
+    """Delete the durable book (and bot registry row) for each SCOPE.
+
+    Retiring a config revision leaves its scope behind forever: the fills keep
+    piling up in ``live pf`` and the scope is never reconciled again. This is
+    the ``docker rm`` for that — it removes OUR record only.
+
+    THREE guards, all failing closed. A scope is refused when (1) the bot
+    registry says it is LIVE, or (2) it is not provably FLAT (its own fill fold
+    still holds an open lot), unless ``--force-flat``. Guard 2 is the dangerous
+    one: deleting the fill fold does not close the position at the broker, it
+    FORGETS it, and the next cycle reads a held lot as flat and re-enters it.
+    Verify broker-side before passing ``--force-flat``.
+
+    Nothing is placed, cancelled or amended at the broker — run a cycle with
+    ``ibkr live run`` to flatten first. The account book (the shared IBKR
+    account, or the sim JSON) is never touched.
+
+    Without ``--yes`` this is a dry run: it prints what would go and exits 0.
+    """
+    ledger = SqliteLedger()
+    registry = BotRegistry(resolve_live_db_path())
+    known = set(ledger.scopes_of_store())
+    failures = 0
+    for scope in scopes:
+        if scope not in known:
+            # Not an error worth aborting the rest: a typo'd scope deleting
+            # nothing is exactly what the operator wanted.
+            click.echo(
+                click.style(f"{scope}: unknown scope, nothing to delete", fg="yellow")
+            )
+            continue
+        refused = _rm_refusal(ledger, registry, scope, force_flat)
+        if refused is not None:
+            click.echo(click.style(f"{scope}: REFUSED {refused}", fg="red"), err=True)
+            failures += 1
+            continue
+        fills = ledger.executions_count_of(scope)
+        if not confirmed:
+            click.echo(f"{scope}: would delete (dry run) {fills} fills + bot row")
+            continue
+        strategies, executions = ledger.delete_scope(scope)
+        registry.forget(scope)
+        click.echo(f"{scope}: deleted {executions} fills, {strategies} audit rows")
+    if failures:
+        raise click.exceptions.Exit(1)
+
+
+def _rm_refusal(
+    ledger: SqliteLedger,
+    registry: BotRegistry,
+    scope: str,
+    force_flat: bool,
+) -> str | None:
+    """Why *scope* must not be deleted, or ``None`` when it is safe.
+
+    Two independent guards, both reporting the reason so the operator can act on
+    it: stop the bot, or flatten the book. Order matters only for the message —
+    a live bot is reported before the flat check, since it is the fixable one.
+    """
+    record = registry.probe(scope)
+    if record is not None and record.state == "live":
+        return f"(bot is LIVE, pid {record.pid}) — `ibkr bot stop` it first"
+    if not force_flat and scope_holds_positions(read_store(ledger, scope)):
+        return (
+            "(book holds OPEN lots) — flatten it with a cycle first, or pass "
+            "--force-flat to forget the position (the broker lot stays)"
+        )
+    return None
+
+
+live_group.add_command(live_rm)

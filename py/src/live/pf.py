@@ -143,6 +143,10 @@ class PfReport:
     as_of: pd.Timestamp
     stores: tuple[StoreSide, ...]
     broker: BrokerSide | None = None
+    #: Render rows the fills already round-tripped (``qty == 0``). Off by
+    #: default: a closed symbol is history, not exposure, and on a book with
+    #: many round-trips it drowns the handful of rows that are still open.
+    show_closed: bool = False
 
 
 def read_store(
@@ -470,6 +474,27 @@ def scope_stats(store: StoreSide, broker: BrokerSide | None = None) -> ScopeStat
     )
 
 
+def scope_holds_positions(store: StoreSide) -> bool:
+    """True when the scope's own fill fold still holds an OPEN lot.
+
+    The ``live pf`` default is to show only scopes that hold exposure: a scope
+    whose fills all net to zero has nothing to reconcile against the broker, and
+    a book with a long history accumulates one such scope per retired config
+    revision. This is a read of our own fold — never the broker's book.
+    """
+    return bool(store.lots)
+
+
+def _visible_rows(
+    store: StoreSide, broker: BrokerSide | None, show_closed: bool
+) -> tuple[PositionRow, ...]:
+    """The store's merged rows, with the round-tripped ones dropped by default."""
+    rows = position_rows(store, broker)
+    if show_closed:
+        return rows
+    return tuple(row for row in rows if row.qty != 0.0)
+
+
 def _open_views(
     store: StoreSide, broker: BrokerSide | None
 ) -> tuple[dict[str, _LotView], list[str]]:
@@ -741,7 +766,7 @@ def _render_json(report: PfReport) -> str:
         "positions": [
             asdict(row)
             for store in report.stores
-            for row in position_rows(store, report.broker)
+            for row in _visible_rows(store, report.broker, report.show_closed)
         ],
         "divergence": list(_divergence(report)),
     }
@@ -790,7 +815,7 @@ def _render_text(report: PfReport, style: Styler = PLAIN) -> str:
         _table(
             "positions",
             _POSITION_COLS,
-            _position_text_rows(report.stores, report.broker),
+            _position_text_rows(report.stores, report.broker, report.show_closed),
             style,
         )
     )
@@ -910,7 +935,9 @@ def _stats_row(stats: ScopeStats) -> tuple[str, ...]:
 
 
 def _position_text_rows(
-    stores: tuple[StoreSide, ...], broker: BrokerSide | None
+    stores: tuple[StoreSide, ...],
+    broker: BrokerSide | None,
+    show_closed: bool = False,
 ) -> tuple[tuple[str, ...], ...]:
     """Every scope's merged position rows, each with its matching account cells.
 
@@ -927,7 +954,7 @@ def _position_text_rows(
     rows: list[tuple[str, ...]] = []
     matched: set[str] = set()
     for store in stores:
-        for row in position_rows(store, broker):
+        for row in _visible_rows(store, broker, show_closed):
             lots = tuple(
                 lot for lot in account.get(row.symbol, ()) if lot.id in owned_ids
             )
