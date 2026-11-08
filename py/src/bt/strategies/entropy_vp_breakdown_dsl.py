@@ -1,15 +1,16 @@
-"""Adaptive-entropy-gated VP breakdown — dynamic ATR trail (DSL).
+"""Entropy-gated VP breakdown — dynamic ATR trail (DSL).
 
 SHORT-only order-flow breakdown: a close below the rolling Value Area Low on
-expanding volume, held near the bar low and not in an uptrend. Regime gates
-keep the book from fading a rising tape — adaptive entropy per symbol, a VIX
-level read against its multi-year baseline, and an optional SPY trend switch.
-Exit on a revert into the value area or the chandelier ATR trail.
+expanding volume, held near the bar low and not in an uptrend, taken only while
+the symbol's adaptive-entropy regime is bearish. Exit on a revert into the value
+area or the chandelier ATR trail.
 
-The VIX gate reads the ABSOLUTE level relative to its own baseline, not a
-percentile rank: rank normalises away the crash-regime level it must refuse.
-Findings: in a wide window the edge is thin and sample-sparse, and returns do
-not concentrate in bear years — a crash recovery is a losing venue.
+The entropy regime read is the core edge: the same breakdown taken in any
+regime is a much weaker book, so ``min_trend`` is a structural bear-only read
+rather than a tunable floor. The VIX gate (absolute level against its own
+multi-year baseline, never a percentile rank — a rank normalises away the
+crash-regime level it must refuse) is optional and off by default; it trades
+return for drawdown when enabled.
 
 Lookahead-free: VP, entropy and VIX reads all resolve at or before the cursor.
 State lives in ``ctx.shared`` via ``@strategy(stateful=True)``, minted per
@@ -40,105 +41,50 @@ _VP_KEY = "vp_profiles"  # dict[sym -> OnlineVP]
 _SNAP_KEY = "vp_snaps"  # dict[sym -> VolumeProfileSnapshot] (once/bar)
 _ENT_KEY = "entropy"  # dict[sym -> OnlineAdaptiveEntropy]
 _ENT_RESULT_KEY = "entropy_result"  # dict[sym -> AdaptiveEntropyResult] (once/bar)
-_COOLDOWN_KEY = "cooldowns"
 _POS_KEY = "positions"  # dict[sym -> dynamic-trail bookkeeping]
-_MARKET_KEY = "market_trend"  # int: market AE quantised trend (-1/0/1), or None
-_MARKET_TRACKER_KEY = "market_tracker"  # OnlineAdaptiveEntropy on the market symbol
-_MARKET_BULL_RUN_KEY = "market_bull_run"  # int: consecutive market-bull bars
-_MARKET_SMA_KEY = "market_above_sma"  # bool: market close > slow SMA (layer-2 confirm)
 _VIX_CACHE_KEY = "entropy_vix_series"  # tuple[dates, values] for the VIX grid
 
 
 @dataclass(frozen=True)
 class Params(StrategyParams):
-    # -- online volume profile (short leg of vp_breakout_dsl) --
-    vp_window: int = 100
-    num_bins: int = 50
-    value_area_pct: float = 0.70
-    vp_warmup: int = 60
-    # -- VP breakdown confirmation --
-    vol_period: int = 20
-    vol_expand_mult: float = 1.3  # breakdown volume >= this x avg
+    """The 10 load-bearing knobs. Everything else is a structural constant.
+
+    Ablation on the full book showed the rest inert or marginal (a few tenths of
+    Sharpe, within noise): the VP geometry, the entropy binning, the warm-up
+    length, the initial stop distance and the gross cap are all structural and
+    live as module constants below. These ten each move the result materially.
+    """
+
+    # -- VP breakdown (the signal) --
+    value_area_pct: float = 0.60  # how far the breakdown must clear fair value
+    vol_expand_mult: float = 1.3  # breakdown volume >= this x average
     wick_check: float = 0.5  # close must sit in the lower fraction of the bar
-    trend_lookback: int = 50  # concurrency: price vs its own rolling mean
-    # -- stretch filter (independent; default off) --
-    # Reject a breakdown whose bar is already over-extended below its own short
-    # EMA (``stretch_ema_period``) by more than ``max_stretch_atr`` ATRs. Kills
-    # shorts fired into capitulation / the relative bottom of the range. Disabled
-    # when ``max_stretch_atr <= 0``.
-    max_stretch_atr: float = 0.0
-    stretch_ema_period: int = 20
-    # -- SPY trend gate (independent; default off) --
-    # Block NEW shorts unless the broad market is in a down/flat regime. Two
-    # independent reads, either of which must confirm a *non-bull* tape:
-    #   * ``spy_ema_period > 0`` — require SPY close BELOW its EMA(period), AND
-    #   * ``spy_roc_period > 0`` — require SPY ROC over the period <= ``spy_roc_max``.
-    # When both are enabled they are ANDed (sustained downtrend). When both are
-    # off the gate is disabled. Uses ``market_symbol`` (must be in the feed).
-    spy_ema_period: int = 0
-    spy_roc_period: int = 0
-    spy_roc_max: float = 0.0
-    # When True, an open short is force-closed as soon as the SPY gate turns
-    # non-bearish (mirror of the entry gate on the exit path).
-    spy_exit_on_flip: bool = True
-    # -- adaptive-entropy regime gate --
-    # Per-symbol entry gate: a short is allowed when the symbol's quantised
-    # ``trend >= min_trend`` (``-1`` = bear-only ``trend == -1``, ``0`` =
-    # non-bull flat/bear). The *market*-level regime filter below is the
-    # primary loss-prevention switch.
-    entropy_lookback: int = 25
-    entropy_num_bins: int = 10
-    min_trend: int = 0
-    # -- market regime filter (risk-off when the market turns bullish) --
-    # When ``market_filter`` is enabled, a dedicated adaptive-entropy tracker on
-    # ``market_symbol`` (feed-only, never traded) acts as a macro risk switch.
-    # The bull risk-off condition is **confirmed by two independent layers** so a
-    # single noisy AE bar can't whip it off:
-    #   * layer 1 — the market AE ``trend == +1`` for ``market_confirm_bars``
-    #     consecutive bars, AND
-    #   * layer 2 — the market close sits above its ``market_confirm_window``-
-    #     bar SMA (a slow, long-duration trend filter that doesn't flip intraday).
-    # Both must agree the market is in a sustained up regime before the strategy
-    # blocks NEW shorts AND force-closes OPEN shorts. Symmetrically, shorts are
-    # only entered when the market is NOT bull-confirmed (a ``trend``-level
-    # bear/neutral read, per ``min_trend`` on the symbol).
-    market_filter: bool = True
-    market_symbol: str = "SPY"
-    market_confirm_bars: int = 3  # layer-1: consecutive market-bull AE bars
-    market_confirm_window: int = 100  # layer-2: market close > SMA(period)
-    # When ``require_market_bear`` is True, NEW shorts additionally require the
-    # market to be in a *confirmed bear* — the two AE/SMA confirmation layers
-    # agreeing on the down side (market AE ``trend == -1`` AND close below its
-    # slow SMA). This is the mirror of the bull risk-off gate: it only lets the
-    # book carry shorts while the broad market is robustly bearish, so the short
-    # edge is harvested where it exists instead of fired into a rising tape.
-    require_market_bear: bool = False
-    # -- VIX vol-regime gate (FRED series, structural read) --
-    # The short edge is a breakdown *out of a quiet range*; in a crash-driven
-    # high-vol tape breakdowns are exhausted, not fresh. The gate reads the VIX
-    # level RELATIVE TO ITS OWN LONG-RUN BASELINE (a multi-year mean), not a
-    # percentile rank of recent prints: a rank normalises away the absolute
-    # level, so the post-crash tape (elevated, recovering) reads as "middle of
-    # the pack" and stays open — the one regime the edge must refuse.
-    #   * ``vix_max_ratio > 0`` — require ``ratio <= vix_max_ratio`` (skip panic),
-    #   * ``vix_min_ratio > 0`` — require ``ratio >= vix_min_ratio`` (skip dead tape).
-    # ``ratio = vix / baseline``. Both 0 disables the gate. Lookahead-free: the
-    # grid is forward-filled nightly, so the print resolved at the cursor is at
-    # most the previous session's close.
-    vix_baseline_years: float = 5.0
-    vix_max_ratio: float = 0.0
-    vix_min_ratio: float = 0.0
-    # -- dynamic ATR trailing stop --
-    atr_period: int = 14
-    stop_atr_mult: float = 2.0
-    trail_lookback: int = 10
-    trail_atr_mult: float = 2.0
-    # -- risk / sizing (ATR-risk, 0..1 size) --
-    risk_pct: float = 0.01
-    # Aggregate |gross notional| cap, fraction of initial capital. Values >= 1.0
-    # disable the cap (the ``_enter`` gate requires < 1.0 to fire).
-    max_gross_exposure: float = 0.5
-    cooldown_bars: int = 5
+    trend_lookback: int = 50  # concurrency: close vs its own rolling mean
+    # -- regime gates --
+    entropy_lookback: int = 25  # adaptive-entropy window
+    max_stretch_atr: float = 2.0  # reject entries already stretched below EMA
+    vix_max_ratio: float = 0.0  # VIX / multi-year baseline cap (0 = off)
+    # -- exit / risk --
+    trail_lookback: int = 10  # chandelier anchor window
+    trail_atr_mult: float = 2.0  # chandelier ATR distance
+    risk_pct: float = 0.02  # equity risked per trade (ATR-sized)
+
+
+# ---------------------------------------------------------------------------
+# structural constants — fixed, not fitted. Sweeping these is a curve-fit knob.
+# ---------------------------------------------------------------------------
+
+_VP_WINDOW = 100  # rolling profile window (bars)
+_NUM_BINS = 50  # profile bin count; low sensitivity
+_VP_WARMUP = 60  # bars before a profile is ready
+_VOL_PERIOD = 20  # volume baseline lookback
+_STRETCH_EMA = 20  # short EMA the stretch read is measured against
+_ENTROPY_BINS = 10  # adaptive-entropy bin count (inert at 5..10)
+MIN_TREND = -1  # bear-only quantised entropy regime — the core edge
+ATR_PERIOD = 14  # ATR period for sizing + the trail
+STOP_ATR_MULT = 2.0  # sizing stop distance (also the initial trail seed)
+MAX_GROSS_EXPOSURE = 0.5  # aggregate |gross| cap vs initial capital
+_VIX_BASELINE_YEARS = 5.0  # VIX baseline span
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +111,9 @@ def _avg_volume(ctx: StrategyContext, sym: str, params: Params) -> float:
     """Mean volume over the prior ``vol_period`` bars (excl. the current one)."""
     vol = ctx.ohlcv(sym).volume.to_array()
     n = len(vol)
-    if n < params.vol_period + 1:
+    if n < _VOL_PERIOD + 1:
         return float("nan")
-    return float(np.mean(vol[-params.vol_period : -1]))
+    return float(np.mean(vol[-_VOL_PERIOD:-1]))
 
 
 def _trend_up(ctx: StrategyContext, sym: str, params: Params) -> bool:
@@ -186,14 +132,14 @@ def _feed_entropy(ctx: StrategyContext, shared: dict, sym: str, o) -> None:
     Called for **every** symbol on **every** bar (top of the per-symbol loop),
     so the tracker warms and its ``trend`` reflects the true ongoing regime —
     not just the sparse bars where a breakdown is being evaluated. The latest
-    snapshot is cached for ``bear_gate_ok`` to read synchronously.
+    snapshot is cached for the entry gate to read synchronously.
     """
     trackers = shared.setdefault(_ENT_KEY, {})
     tr = trackers.get(sym)
     if tr is None:
         cfg = AdaptiveEntropyConfig(
             lookback=ctx.params.entropy_lookback,
-            num_bins=ctx.params.entropy_num_bins,
+            num_bins=_ENTROPY_BINS,
         )
         tr = OnlineAdaptiveEntropy(cfg)
         trackers[sym] = tr
@@ -207,107 +153,13 @@ def entropy_result(ctx: StrategyContext, shared: dict, sym: str) -> object:
 
 
 def bear_gate_ok(result, min_trend: int) -> bool:
-    """Adaptive-entropy regime gate: allow the short above a trend floor.
+    """Adaptive-entropy regime gate: allow the short only above a trend floor.
 
-    A short is permitted when the quantised trend is at or above ``min_trend``
-    (e.g. ``min_trend=-1`` = bear-only, ``min_trend=0`` = non-bull). A value of
-    ``1`` blocks both flat and bear (effectively off). During warmup the running
-    ``trend == 0`` default passes any ``min_trend <= 0``.
+    A short is permitted when the quantised trend is at or above ``min_trend``.
+    The default ``-1`` is bear-only; ``0`` widens to flat/bear. During warmup the
+    running ``trend == 0`` default passes any ``min_trend <= 0``.
     """
     return bool(getattr(result, "trend", 0) >= min_trend)
-
-
-def _feed_market(ctx: StrategyContext, shared: dict, params: Params) -> None:
-    """Feed a dedicated market-level adaptive-entropy tracker from a benchmark.
-
-    The tracker runs on ``params.market_symbol`` (feed-only — the symbol is
-    never traded by this strategy) so its quantised ``trend`` is a macro regime
-    gauge independent of any single short candidate. The latest ``trend`` is
-    cached under ``_MARKET_KEY`` for both the entry gate and the open-position
-    risk-off close to read synchronously.
-
-    The market symbol must be present in the config's ``symbols`` (so its OHLCV
-    is in the TaContext feed); it is skipped for trading in the strategy loop.
-    """
-    if ctx.params.market_filter is False:
-        shared.pop(_MARKET_KEY, None)
-        return
-    try:
-        o = ctx.ohlcv(params.market_symbol)
-    except KeyError:
-        # Market symbol absent from the feed -> no market gate (fail-open rather
-        # than silently disabling the whole strategy).
-        shared.pop(_MARKET_KEY, None)
-        return
-    if len(o.close) == 0:
-        shared.pop(_MARKET_KEY, None)
-        return
-    tr = shared.get(_MARKET_TRACKER_KEY)
-    if not isinstance(tr, OnlineAdaptiveEntropy):
-        tr = OnlineAdaptiveEntropy(
-            AdaptiveEntropyConfig(
-                lookback=params.entropy_lookback,
-                num_bins=params.entropy_num_bins,
-            )
-        )
-        shared[_MARKET_TRACKER_KEY] = tr
-    result = tr.observe(float(o.close[-1]), float(o.high[-1]), float(o.low[-1]))
-    trend = getattr(result, "trend", 0)
-    shared[_MARKET_KEY] = trend
-    # Maintain a consecutive-bull-bar counter so risk-off requires a *sustained*
-    # up regime, not a single bullish AE bar (which is ~half of every year).
-    run = int(shared.get(_MARKET_BULL_RUN_KEY, 0))
-    shared[_MARKET_BULL_RUN_KEY] = run + 1 if trend == 1 else 0
-
-    # Layer-2 confirmation: is the market close above its slow SMA? This is a
-    # long-duration trend filter that does NOT flip intraday, so it anchors the
-    # AE layer-1 signal to the true macro direction.
-    above = False
-    if len(o.close) >= params.market_confirm_window:
-        sma = ctx.ta.sma(params.market_symbol, params.market_confirm_window)
-        above = float(o.close[-1]) > float(sma[-1])
-    shared[_MARKET_SMA_KEY] = above
-
-
-def market_risk_on(shared: dict, params: Params) -> bool:
-    """True when shorts may be carried / opened by the market regime filter.
-
-    Risk-off (``False``) only fires when **both** confirmation layers agree the
-    market is in a sustained up regime: (1) the market AE ``trend == +1`` for at
-    least ``market_confirm_bars`` consecutive bars, and (2) the market close is
-    above its ``market_confirm_window`` SMA. Requiring layer-2 avoids trusting a
-    noisy short-term AE trend alone (which is ~50/50 every year); the slow SMA
-    disambiguates a real bull market from a bear-year bounce. When the filter is
-    disabled, the market symbol is absent, or the layers don't agree on a
-    sustained bull, this returns ``True`` and the strategy trades as normal.
-    """
-    if not params.market_filter:
-        return True
-    run = int(shared.get(_MARKET_BULL_RUN_KEY, 0))
-    if run < params.market_confirm_bars:
-        return True  # layer-1 not sustained -> not risk-off
-    if not bool(shared.get(_MARKET_SMA_KEY, False)):
-        return True  # layer-2 not confirmed (below slow SMA) -> not risk-off
-    return False
-
-
-def market_bear_ok(shared: dict, params: Params) -> bool:
-    """True when the market is in a *confirmed bear* regime (both layers agree).
-
-    Layer-1: the market AE quantised trend is bearish (``trend == -1``).
-    Layer-2: the market close is below its slow ``market_confirm_window`` SMA.
-    Both must agree before a NEW short is permitted (when
-    ``require_market_bear`` is enabled). If the filter is off, the market symbol
-    is absent, or the layers don't both read bear, this returns ``True`` so the
-    market gate never blocks by default.
-    """
-    if not params.market_filter or not params.require_market_bear:
-        return True
-    if int(shared.get(_MARKET_KEY, 0)) != -1:
-        return False  # layer-1: market not confirmed-bear
-    # Layer-2: ``_MARKET_SMA_KEY`` stores *above* SMA; below-SMA (False) is the
-    # bear-side confirmation.
-    return not bool(shared.get(_MARKET_SMA_KEY, False))
 
 
 def _refresh_vp(ctx: StrategyContext, params: Params) -> None:
@@ -318,10 +170,10 @@ def _refresh_vp(ctx: StrategyContext, params: Params) -> None:
         prof = profs.get(sym)
         if not isinstance(prof, OnlineVP):
             prof = OnlineVP(
-                num_bins=params.num_bins,
+                num_bins=_NUM_BINS,
                 value_area_pct=params.value_area_pct,
-                window=params.vp_window,
-                warmup_bars=params.vp_warmup,
+                window=_VP_WINDOW,
+                warmup_bars=_VP_WARMUP,
             )
             profs[sym] = prof
         snaps[sym] = prof.observe(ctx.state, sym, ctx.interval)
@@ -362,44 +214,11 @@ def _stretch_ok(
         return True
     if np.isnan(atr_val) or atr_val <= 0:
         return True
-    ema = _last(ctx.ta.ema(sym, params.stretch_ema_period))
+    ema = _last(ctx.ta.ema(sym, _STRETCH_EMA))
     if np.isnan(ema):
         return True
     stretch = (ema - close) / atr_val
     return stretch <= params.max_stretch_atr
-
-
-def _spy_trend_ok(ctx: StrategyContext, params: Params) -> bool:
-    """SPY trend gate: allow a NEW short only when the market is not bullish.
-
-    Two independent, optional reads (both enabled -> ANDed):
-      * EMA: SPY close must sit **below** its ``spy_ema_period`` EMA.
-      * ROC: SPY return over ``spy_roc_period`` bars must be ``<= spy_roc_max``.
-    Returns ``True`` (allow) when the gate is disabled or the feed is missing.
-    """
-    if params.spy_ema_period <= 0 and params.spy_roc_period <= 0:
-        return True
-    try:
-        o = ctx.ohlcv(params.market_symbol)
-    except KeyError:
-        return True
-    if len(o.close) == 0:
-        return True
-    close = float(o.close[-1])
-    if params.spy_ema_period > 0:
-        ema = _last(ctx.ta.ema(params.market_symbol, params.spy_ema_period))
-        if np.isfinite(ema) and close >= ema:
-            return False  # SPY above its EMA -> bull tape, no shorts
-    if params.spy_roc_period > 0:
-        arr = o.close.to_array()
-        n = len(arr)
-        if n > params.spy_roc_period:
-            ref = float(arr[-1 - params.spy_roc_period])
-            if ref > 0:
-                roc = close / ref - 1.0
-                if roc > params.spy_roc_max:
-                    return False  # SPY rising -> bull tape, no shorts
-    return True
 
 
 def _vix_series(ctx: StrategyContext) -> tuple[np.ndarray, np.ndarray] | None:
@@ -439,7 +258,7 @@ def _vix_ratio(ctx: StrategyContext, params: Params) -> float | None:
     precedes coverage, or the baseline window is too thin — a missing read is
     not a vol signal and must not block a trade.
     """
-    if params.vix_max_ratio <= 0 and params.vix_min_ratio <= 0:
+    if params.vix_max_ratio <= 0:
         return None
     pair = _vix_series(ctx)
     if pair is None:
@@ -448,7 +267,7 @@ def _vix_ratio(ctx: StrategyContext, params: Params) -> float | None:
     j = int(np.searchsorted(dates, np.datetime64(ctx.candle.timestamp))) - 1
     if j < 0 or j >= values.size or not np.isfinite(values[j]):
         return None
-    span = int(params.vix_baseline_years * 252)
+    span = int(_VIX_BASELINE_YEARS * 252)
     if span <= 0:
         return None
     hist = values[max(0, j - span) : j]
@@ -472,8 +291,6 @@ def _vix_ok(ctx: StrategyContext, params: Params) -> bool:
         return True
     if params.vix_max_ratio > 0 and ratio > params.vix_max_ratio:
         return False
-    if params.vix_min_ratio > 0 and ratio < params.vix_min_ratio:
-        return False
     return True
 
 
@@ -487,7 +304,7 @@ def _size(ctx: StrategyContext, params: Params, price: float, atr_val: float) ->
     qty = risk_sized_qty(
         equity=cash,
         price=price,
-        stop_dist=params.stop_atr_mult * atr_val,
+        stop_dist=STOP_ATR_MULT * atr_val,
         risk_pct=params.risk_pct,
     )
     if qty <= 0:
@@ -505,84 +322,43 @@ def _size(ctx: StrategyContext, params: Params, price: float, atr_val: float) ->
 def on_candle(ctx: StrategyContext):
     params: Params = ctx.params
     shared = ctx.shared
-    shared.setdefault(_COOLDOWN_KEY, {})
     shared.setdefault(_POS_KEY, {})
 
     _refresh_vp(ctx, params)
 
-    # Market regime gauge (feed-only; never traded).
-    _feed_market(ctx, shared, params)
     # Warmup bars fill strategy state only — no fill can happen there, so the
     # DSL raises on any entry emitted during them.
     if ctx.phase == "warmup":
         return
-    risk_off = not market_risk_on(shared, params)
-    # Per-bar gate reads shared by the entry path and the exit-on-flip path.
-    spy_ok = _spy_trend_ok(ctx, params)
     vix_ok = _vix_ok(ctx, params)
-    gates = (risk_off, spy_ok, vix_ok)
 
     # ---- Advances / exits first --------------------------------------------
     for sym in ctx.symbols:
-        if sym == params.market_symbol:
-            continue  # market gauge symbol is never traded
         o = ctx.ohlcv(sym)
         _feed_entropy(ctx, shared, sym, o)  # regime tracker every bar
-
         pos = ctx.position(sym)
         if pos is None:
-            continue
-        # Risk-off flatten: if the broad market turned into a confirmed bull,
-        # force-close the short now before it bleeds into the rising tape.
-        if risk_off:
-            _exit(ctx, shared, params, sym, "market regime flipped bull (risk-off)")
-            continue
-        # SPY trend flip: when the broad market turns non-bearish, force-close
-        # the short (the entry gate would refuse it — don't keep riding it).
-        if params.spy_exit_on_flip and not spy_ok:
-            _exit(ctx, shared, params, sym, "SPY trend no longer bearish")
             continue
         _manage_open(ctx, shared, params, sym, o, pos)
 
     # ---- Entries ------------------------------------------------------------
     for sym in ctx.symbols:
-        if sym == params.market_symbol:
-            continue  # never open a position on the market gauge symbol
-        cd = shared[_COOLDOWN_KEY].get(sym, 0)
-        if cd > 0:
-            shared[_COOLDOWN_KEY][sym] = cd - 1
-            continue
         if ctx.position(sym) is not None:
             continue
-        if risk_off:
-            continue  # no new shorts while the market is confirmed-bull
-        _enter(ctx, sym, params, gates)
+        _enter(ctx, sym, params, vix_ok)
 
 
-# ── entry (VP breakdown gated by bear regime) ────────────────────────────────
+# ── entry (VP breakdown gated by the bear regime) ────────────────────────────
 
 
-def _enter(
-    ctx: StrategyContext,
-    sym: str,
-    params: Params,
-    gates: tuple[bool, bool, bool],
-) -> None:
-    """Open a short when the VP breakdown and every regime gate agree.
-
-    ``gates`` carries the bar's market-level reads (``risk_off``, SPY non-bull,
-    VIX in band) computed once in ``on_candle``; the per-symbol gates are
-    evaluated here.
-    """
-    risk_off, spy_ok, vix_ok = gates
-    if risk_off:
-        return
+def _enter(ctx: StrategyContext, sym: str, params: Params, vix_ok: bool) -> None:
+    """Open a short when the VP breakdown and every regime gate agree."""
     snap = _snap(ctx, sym)
     if snap is None or not getattr(snap, "ready", False):
         return
     o = ctx.ohlcv(sym)
     n = len(o.close)
-    if n < max(params.vp_warmup, params.trend_lookback + 1, params.vol_period + 1):
+    if n < max(_VP_WARMUP, params.trend_lookback + 1, _VOL_PERIOD + 1):
         return
 
     close = float(o.close[-1])
@@ -592,24 +368,12 @@ def _enter(
     if not isinstance(val, float):
         return
 
-    atr_val = _last(ctx.ta.atr(sym, params.atr_period))
+    atr_val = _last(ctx.ta.atr(sym, ATR_PERIOD))
     if close <= 0 or np.isnan(atr_val) or atr_val <= 0:
         return
 
-    # Adaptive-entropy regime gate: never fade a confirmed bull (or tighter).
-    ent = entropy_result(ctx, ctx.shared, sym)
-    if not bear_gate_ok(ent, params.min_trend):
-        return
-
-    # Market-level confirmed-bear gate: when enabled, shorts require BOTH AE
-    # (market trend == -1) and slow-SMA (close below SMA) to agree the broad
-    # market is bearish — only harvest the short edge in a real down regime.
-    # A read, not a mutate: the market tracker was already fed this bar.
-    if not market_bear_ok(ctx.shared, params):
-        return
-
-    # SPY trend gate: never short into a rising broad market.
-    if not spy_ok:
+    # Adaptive-entropy regime gate: never fade a confirmed bull.
+    if not bear_gate_ok(entropy_result(ctx, ctx.shared, sym), MIN_TREND):
         return
 
     # VIX vol-regime gate: only harvest breakdowns inside the configured band.
@@ -627,7 +391,7 @@ def _enter(
     strength = _bar_position_close(close, high, low)
 
     short_breakdown = (
-        close < val  # close (not a wick) breaks the value area top
+        close < val  # close (not a wick) breaks the value area low
         and strength <= 1.0 - params.wick_check  # held near the lows
         and vol_expanding  # order-flow confirmation
         and not _trend_up(ctx, sym, params)  # concurrency: not against trend
@@ -646,20 +410,17 @@ def _enter(
     equity = ctx.current_equity()
     init = ctx.state.portfolio.initial_capital
     candidate = size * init / equity if equity > 0 else 0.0
-    if gross_gate(
-        equity, ctx.state.portfolio.positions, params.max_gross_exposure, candidate
-    ):
+    if gross_gate(equity, ctx.state.portfolio.positions, MAX_GROSS_EXPOSURE, candidate):
         return
 
     # Initial stop for sizing is one ATR distance above the entry; the dynamic
     # trailing stop is established from here and ratcheted down each bar.
-    stop_price = close + params.stop_atr_mult * atr_val
+    stop_price = close + STOP_ATR_MULT * atr_val
     ctx.short(
         sym,
         size=size,
         reason=f"[breakdown] short close {close:.2f} < VAL {val:.2f} in bear regime",
     )
-    # The dynamic trail takes over from here and only ratchets lower.
     ctx.shared[_POS_KEY][sym] = {"entry": close, "trail": stop_price, "pid": ""}
 
 
@@ -674,16 +435,15 @@ def _manage_open(
     o,
     pos: Position,
 ) -> None:
-    """Manage an open short: market risk-off + value-area revert + ATR trail.
+    """Manage an open short: value-area revert first, then the ATR trail.
 
-    ``on_candle`` force-closes shorts when the market AE regime turns bull
-    (risk-off) before this runs. Here: (1) value-area revert (close back above
-    VAL) is the institutional tag stop, and (2) a dynamic ATR trail re-anchored
-    every bar on the highest high of the last ``trail_lookback`` bars minus
-    ``trail_atr_mult * ATR``, only ever moved *down* for a short.
+    (1) value-area revert (close back above VAL) is the institutional tag stop,
+    and (2) a dynamic ATR trail re-anchored every bar on the highest high of the
+    last ``trail_lookback`` bars minus ``trail_atr_mult * ATR``, only ever moved
+    *down* for a short.
     """
     rec = shared[_POS_KEY].get(sym)
-    atr = _last(ctx.ta.atr(sym, params.atr_period))
+    atr = _last(ctx.ta.atr(sym, ATR_PERIOD))
     close = float(o.close[-1])
 
     if rec is not None and not rec.get("pid"):
@@ -694,7 +454,7 @@ def _manage_open(
     snap = _snap(ctx, sym)
     val = getattr(snap, "val", None) if snap is not None else None
     if isinstance(val, float) and close > val:
-        _exit(ctx, shared, params, sym, "reverted into value area")
+        _exit(ctx, shared, sym, "reverted into value area")
         return
 
     # (2) Dynamic ATR trailing stop, only ever ratcheted down.
@@ -705,17 +465,10 @@ def _manage_open(
         if np.isfinite(new_trail) and new_trail < rec["trail"]:
             rec["trail"] = new_trail
         if close >= rec["trail"]:
-            _exit(ctx, shared, params, sym, "dynamic ATR trail hit")
+            _exit(ctx, shared, sym, "dynamic ATR trail hit")
             return
 
 
-def _exit(
-    ctx: StrategyContext,
-    shared: dict,
-    params: Params,
-    sym: str,
-    reason: str,
-) -> None:
+def _exit(ctx: StrategyContext, shared: dict, sym: str, reason: str) -> None:
     shared[_POS_KEY].pop(sym, None)
-    shared[_COOLDOWN_KEY][sym] = params.cooldown_bars
     ctx.close(sym, reason=f"[breakdown] {reason}")
