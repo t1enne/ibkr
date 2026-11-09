@@ -64,6 +64,7 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         "_ta",
         "_strategy_state",
         "_fundamentals",
+        "_macro",
         "_phase",
         "_htf_intervals",
     )
@@ -79,6 +80,7 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
         self._ta: Any = None  # optional prefetched TaContext (DSL)
         self._strategy_state: dict | None = None  # optional per-run DSL holder
         self._fundamentals: Any = None  # optional Fundamentals store (DSL)
+        self._macro: Any = None  # optional Macro store (DSL)
         # Intervals whose rows aggregate the base bar. A row for one of these is
         # labelled by its bucket START but carries the WHOLE bucket (see
         # ``resample_ohlcv``), so it must stay hidden until its bucket has
@@ -112,6 +114,24 @@ class CandleStore(Mapping[tuple[str, str], "DataFrame"]):
     def fundamentals(self) -> Any:
         """The prefetched Fundamentals store for DSL strategies, or None."""
         return self._fundamentals
+
+    def attach_macro(self, macro: Any, interval: str) -> None:
+        """Bind a per-run ``Macro`` store to this store (DSL).
+
+        ``Any`` for the same decoupling reason as ``attach_fundamentals``.
+        Binding also hands the store the cursor reader and the BASE bar's
+        interval, because the macro lookahead rule depends on whether the
+        signal bar is a completed daily bucket or an intraday bar — visibility
+        is read from this store's cursor on every access, never snapshotted.
+        """
+        self._macro = macro
+        if macro is not None:
+            macro.bind_cursor(self.cursor_timestamp, interval)
+
+    @property
+    def macro(self) -> Any:
+        """The prefetched Macro store for DSL strategies, or None."""
+        return self._macro
 
     def cursor_timestamp(self) -> Timestamp | None:
         """The engine's current cursor (None before the first ``advance``).

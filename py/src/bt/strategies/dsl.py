@@ -46,6 +46,7 @@ from typing import Any, Callable, Literal, TYPE_CHECKING, cast
 
 from src.bt.state import ActionType, TradeSignal, BacktestState, Candle, Position
 from src.bt.strategies.fundamentals_context import Fundamentals
+from src.bt.strategies.macro_context import Macro
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.ta_context import OhlcvView, TaContext
 
@@ -89,6 +90,7 @@ class StrategyContext:
         "_candle",
         "_ta",
         "_fundamentals",
+        "_macro",
         "_params",
         "_symbols",
         "_interval",
@@ -107,11 +109,13 @@ class StrategyContext:
         symbols: tuple[str, ...],
         interval: str,
         fundamentals: Fundamentals | None = None,
+        macro: Macro | None = None,
     ) -> None:
         self._state = state
         self._candle = candle
         self._ta = ta
         self._fundamentals = fundamentals
+        self._macro = macro
         self._params = params
         self._symbols = symbols
         self._interval = interval
@@ -174,6 +178,7 @@ class StrategyContext:
             symbols=symbols_from(state),
             interval=interval,
             fundamentals=None,
+            macro=None,
         )
         ctx.shared = data.strategy_state or {}
         ctx._readonly = True
@@ -279,6 +284,22 @@ class StrategyContext:
                 "set) so `state.candles.fundamentals` is set."
             )
         return self._fundamentals
+
+    @property
+    def macro(self) -> Macro:
+        """Cursor-safe macro print accessor (``ctx.macro``).
+
+        Raises when the run attached no macro store, rather than serving an
+        empty one: an empty series would look like "this macro series has no
+        prints yet" and silently disable a regime filter.
+        """
+        if self._macro is None:
+            raise RuntimeError(
+                "ctx.macro requires a macro store; run through "
+                "`src.bt.engine.backtest.run` (it loads one per run) so "
+                "`state.candles.macro` is set."
+            )
+        return self._macro
 
     # -- data access -----------------------------------------------------------
 
@@ -706,6 +727,18 @@ class _StrategyAdapter:
                     f"(got {type(raw_fundamentals).__name__})."
                 )
             fundamentals = raw_fundamentals
+        # Macro store is optional and arrives as a loose `Any` like
+        # fundamentals; narrow it here so a wrong object fails instead of being
+        # silently served.
+        raw_macro = getattr(state.candles, "macro", None)
+        macro: Macro | None = None
+        if raw_macro is not None:
+            if not isinstance(raw_macro, Macro):
+                raise RuntimeError(
+                    "state.candles.macro is not a Macro store "
+                    f"(got {type(raw_macro).__name__})."
+                )
+            macro = raw_macro
         holder = None
         if self.stateful:
             holder = getattr(state.candles, "strategy_state", None)
@@ -735,6 +768,7 @@ class _StrategyAdapter:
             symbols=symbols_from(state),
             interval=candle.interval,
             fundamentals=fundamentals,
+            macro=macro,
         )
         if holder is not None:
             ctx.shared = holder

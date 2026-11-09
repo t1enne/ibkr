@@ -1,8 +1,9 @@
 """Macro asset indicators — data loaders and the one public factory.
 
 This module is the single implementation for the ``src.indicators.macro``
-package. The **only** public API for reading a macro series at a cursor is the
-factory :func:`init_macro_indicator`:
+package. The public APIs are the factory :func:`init_macro_indicator` (a
+lookahead-free ``f(ts)`` cursor reader) and :func:`load_macro_series` (the one
+loader, shared with the DSL's ``ctx.macro``):
 
     from src.indicators.macro import init_macro_indicator
 
@@ -45,8 +46,16 @@ from typing import BinaryIO
 import numpy as np
 import pandas as pd
 
-_DEFAULT_DIR = Path("assets")
-_DEFAULT_CPI_PATH = Path("assets/cpi.csv")
+#: Repo root, resolved file-relative so a macro read never depends on the
+#: process cwd (``src/db/path.py``'s rule: never read the wrong file because
+#: the process started elsewhere). ``parents[3]`` = the ``py/`` package root.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+#: Directory holding the asset CSVs, exported so the DSL's ``ctx.macro`` reads
+#: the same place this module does.
+DEFAULT_ASSETS_DIR = _REPO_ROOT / "assets"
+
+_DEFAULT_DIR = DEFAULT_ASSETS_DIR
+_DEFAULT_CPI_PATH = DEFAULT_ASSETS_DIR / "cpi.csv"
 _USA = "USA"
 
 # Cursor timestamp type accepted by :func:`init_macro_indicator` accessors.
@@ -73,10 +82,16 @@ def load_daily(
 
     Args:
         name: on-disk series stem, e.g. ``"payems"``.
-        source_dir: directory holding ``<name>.csv`` (default ``assets/``).
+        source_dir: directory holding ``<name>.csv`` (default
+            :data:`DEFAULT_ASSETS_DIR` — repo-relative, never cwd-relative).
 
     Returns:
         Daily ``pd.Series`` named ``name``, forward-filled over its span.
+
+    Raises:
+        FileNotFoundError: the asset file does not exist (the message names the
+            fetch script).
+        ValueError: the file is not the two-column FRED shape.
     """
     src = source_dir if source_dir is not None else _DEFAULT_DIR
     path = Path(src) / f"{name}.csv"
@@ -92,6 +107,13 @@ def load_daily(
         parse_dates=["date"],
         date_format="%Y-%m-%d",
     )
+    if df.shape[1] > 2:
+        # The FRED contract is two columns. A wider file read positionally would
+        # silently truncate to the first two, turning an unrelated CSV into a
+        # plausible-looking series -- refuse instead.
+        raise ValueError(
+            f"macro asset {path} has {df.shape[1]} columns; expected 2 (date,{name})"
+        )
     df = df.dropna(subset=["date"])
     s = pd.to_numeric(df[name], errors="coerce").dropna()
     s.index = pd.DatetimeIndex(df.loc[s.index, "date"])
@@ -231,19 +253,26 @@ def init_macro_indicator(
         Callable ``f(ts)`` returning the latest ``float`` known at or before
         ``ts``, or ``None`` when ``ts`` precedes the series coverage.
     """
-    s = _resolve_series(name, series, source_dir, country)
+    s = series if series is not None else load_macro_series(name, source_dir, country)
     return MacroIndicatorLambda(s)
 
 
-def _resolve_series(
+def load_macro_series(
     name: str,
-    series: pd.Series | None,
-    source_dir: str | Path | None,
-    country: str,
+    source_dir: str | Path | None = None,
+    country: str = _USA,
 ) -> pd.Series:
-    """Bind a pre-loaded Series or load the named asset once (dispatch by name)."""
-    if series is not None:
-        return series
+    """Load one macro asset as a daily forward-filled Series (dispatch by name).
+
+    The single loader behind :func:`init_macro_indicator` and the DSL's
+    ``ctx.macro``, so both read the same series. ``"cpi"`` uses the World Bank
+    chained-index loader; any other name reads ``<source_dir>/<name>.csv``
+    (FRED two-column format) via :func:`load_daily`.
+
+    Raises:
+        FileNotFoundError: the named asset file does not exist (the message
+            names the fetch script).
+    """
     if name == "cpi":
         # World Bank chained-index loader takes a file path (or None for default).
         src = Path(source_dir) / "cpi.csv" if source_dir is not None else None
@@ -302,4 +331,4 @@ def at_cursor(
     return None if pd.isna(val) else float(val)
 
 
-__all__ = ["init_macro_indicator", "deflated_log_prices"]
+__all__ = ["init_macro_indicator", "deflated_log_prices", "load_macro_series"]

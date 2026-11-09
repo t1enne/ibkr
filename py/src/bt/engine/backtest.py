@@ -139,6 +139,7 @@ def run_backtest(
     ta: Optional[TaContext] = None,
     strategy_state: Optional[dict] = None,
     fundamentals: Any = None,
+    macro: Any = None,
     signal_observer: Optional[Callable] = None,
     htf_intervals: Optional[frozenset[str]] = None,
 ) -> Tuple[BacktestResults, BacktestState]:
@@ -171,6 +172,10 @@ def run_backtest(
             fiscal series loaded once from the local DB). Typed ``Any`` like
             ``ta`` — the engine layer stays decoupled from the strategy layer and
             the DSL narrows it via isinstance.
+        macro: Optional prefetched ``Macro`` store (FRED print series loaded once
+            per run). Unlike ``fundamentals`` it is global, not per symbol.
+            Attached with the BASE bar's interval, which the lookahead rule
+            needs. Typed ``Any`` for the same decoupling reason.
         htf_intervals: Higher-timeframe intervals (``config.bars[1:]``). The
             CandleStore hides each one's forming bucket from every read so the
             raw ``state.candles`` HTF path cannot leak the future. ``None``
@@ -231,6 +236,11 @@ def run_backtest(
         # same cursor the TaContext uses — publication-time and bar-time
         # visibility come from one clock.
         store.attach_fundamentals(fundamentals)
+    if macro is not None:
+        # Same attach-then-bind sequence as fundamentals: the macro series
+        # reads visibility from this store's cursor, and the base interval
+        # picks the intraday vs completed-daily-bar lookahead rule.
+        store.attach_macro(macro, config.bars[0])
     state = merge_bt_state(state, dict(candles=store))
 
     # Timestamp-grouped drain: candles are buffered by timestamp and the whole
@@ -1026,6 +1036,7 @@ def run(
     benchmark_curves: Optional[Mapping[str, pd.Series]] = None,
     signal_observer: Optional[Callable] = None,
     fundamentals: Any = None,
+    macro: Any = None,
     *,
     initial_state: Optional[BacktestState] = None,
     evaluation_clock_check: bool = True,
@@ -1039,6 +1050,10 @@ def run(
     ``load_fundamentals``); it is attached to the CandleStore so decorated
     strategies reach it via ``ctx.fundamentals``. Typed ``Any`` on purpose:
     the engine never imports the concrete DSL context.
+
+    ``macro`` is the sibling for ``ctx.macro``: one FRED print store per run
+    (global, not per symbol), attached with the base bar's interval so the
+    series' lookahead rule matches the bar the strategy is running on.
 
     ``initial_state`` seeds the run with a book that already holds lots (e.g. a
     live book) instead of the config's empty one, so a strategy that gates its
@@ -1096,6 +1111,13 @@ def run(
         from src.bt.strategies.fundamentals_context import load_fundamentals
 
         fundamentals = load_fundamentals(bt.config.symbols)
+    if macro is None:
+        # Load the FRED print series once per run. Macro is global (no symbol
+        # axis) and lazy: nothing is read until a strategy asks for a stem, so a
+        # run that reads no macro never touches the assets directory.
+        from src.bt.strategies.macro_context import load_macro
+
+        macro = load_macro()
 
     results, _ = run_backtest(
         bt,
@@ -1107,6 +1129,7 @@ def run(
         ta=ta,
         strategy_state=strategy_state,
         fundamentals=fundamentals,
+        macro=macro,
         signal_observer=signal_observer,
         initial_state=initial_state,
         htf_intervals=frozenset(htf_intervals),

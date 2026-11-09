@@ -335,3 +335,65 @@ def test_candle_generator_prebuilt_feeds_equals_internal():
             b.close,
             b.volume,
         )
+
+
+@strategy()
+def _macro_visibility_probe(ctx: StrategyContext):
+    """Enter only when the macro series has NO visible print.
+
+    Intraday bars hide the same-day print, so a 1h run on the print's own day
+    fires; a completed daily bar dated that day sees it and stays flat. That
+    difference is entirely the interval ``run`` binds at attach time.
+    """
+    if len(ctx.macro.vix) == 0:
+        ctx.long(ctx.candle.symbol, size=0.05, reason="macro hidden")
+
+
+def _macro_fixture(tmp_path):
+    """Two-print FRED asset spanning the 2025-01-06 feed day."""
+    (tmp_path / "vix.csv").write_text("2025-01-06,20.0\n2025-01-07,21.0\n", "utf-8")
+    from src.bt.strategies.macro_context import Macro
+
+    return Macro(source_dir=tmp_path)
+
+
+def _daily_df_from(start: str, symbols: list[str], n: int = 3) -> pd.DataFrame:
+    """Daily feed starting at ``start`` (the macro fixture's own print day)."""
+    idx = pd.date_range(start, periods=n, freq="D")
+    data: dict = {}
+    for sym in symbols:
+        data.update(
+            {
+                (sym, "open"): [100] * n,
+                (sym, "high"): [105] * n,
+                (sym, "low"): [95] * n,
+                (sym, "close"): [102] * n,
+                (sym, "volume"): [1000] * n,
+            }
+        )
+    df = pd.DataFrame(data, index=idx)
+    df.columns = pd.MultiIndex.from_tuples(df.columns)
+    return df
+
+
+def _run_macro_probe(cfg, df, macro):
+    mod = _FixtureMod(on_candle=_macro_visibility_probe)
+    return run(Backtest(cfg), df, strat_mod=mod, macro=macro)
+
+
+def test_run_binds_the_base_interval_into_the_macro_rule(tmp_path):
+    """REGRESSION: ``run`` must attach the base bar's interval to ctx.macro.
+
+    Dropping or mistyping the interval argument at the attach site leaves every
+    unit test of ``visible_prints`` green while every strategy silently reads
+    the wrong arm of the lookahead rule.
+    """
+    macro = _macro_fixture(tmp_path)
+
+    intraday = _run_macro_probe(_cfg_1h(["SPY"]), _hourly_df(["SPY"]), macro)
+    daily = _run_macro_probe(
+        _cfg(["SPY"]), _daily_df_from("2025-01-06", ["SPY"]), macro
+    )
+
+    assert len(intraday.pf.trades) >= 1
+    assert len(daily.pf.trades) == 0

@@ -1,7 +1,9 @@
 """Macro asset indicators.
 
-The **only** public API is :func:`init_macro_indicator`. It returns a
-lookahead-free callable bound to one macro series:
+Two public APIs: :func:`init_macro_indicator` (a lookahead-free callable bound
+to one macro series) and :func:`load_macro_series` (the shared loader that also
+backs the DSL's ``ctx.macro``). The indicator returns a lookahead-free callable
+bound to one macro series:
 
     from src.indicators.macro import init_macro_indicator
 
@@ -31,8 +33,15 @@ ln(cpi)``) used by the RDD strategy; it is not part of the cursor-indicator API.
 from __future__ import annotations
 
 from src.indicators.macro._shared import (
+    DEFAULT_ASSETS_DIR,
     deflated_log_prices,
     init_macro_indicator,
+    load_macro_series,
 )
 
-__all__ = ["init_macro_indicator", "deflated_log_prices"]
+__all__ = [
+    "DEFAULT_ASSETS_DIR",
+    "deflated_log_prices",
+    "init_macro_indicator",
+    "load_macro_series",
+]

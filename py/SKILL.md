@@ -436,7 +436,31 @@ into a 1.0-based daily level — **not** from FRED, different loader). All serie
 are forward-filled onto a daily grid on load, so every value is the latest
 known print.
 
-**Read in a strategy — lookahead-free factory:**
+**Read in a strategy — `ctx.macro` (preferred):**
+
+```python
+@strategy()
+def on_candle(ctx):
+    vix = ctx.macro.vix          # assets/vix.csv, loaded once per run
+    if len(vix) and vix.rank(250) > 0.6:
+        ...                      # stress regime
+```
+
+`ctx.macro.<stem>` resolves `assets/<stem>.csv` (the on-disk FRED stem read
+verbatim — `ctx.macro.dgs10`, `ctx.macro.t10y2y`). Surface: `[-1]`, `[-2]`,
+`slices`, `len()`, `.last()`, `.date`, `.rank(window)`. An unknown stem raises
+naming the available stems; `getattr(ctx.macro, stem, None)` silently disables a
+filter and is not the idiom.
+
+**Lookahead rule (why `.rank()` and `[-1]` are safe):** a print dated `D` is
+`D`'s close, so on an INTRADAY base bar dated `D` visible prints are strictly
+`< D` (one session of lag), while a COMPLETED bar of `1d` or larger dated `D`
+sees `<= D`. The engine binds `config.bars[0]` at attach time. Two consequences:
+`bars: ["1d"]` is only sound on settled data (a forming daily bar is not
+covered), and macro is a static file, so a live strategy gates freshness itself
+on `ctx.macro.<stem>.date` (a forward-filled grid row, which may be a weekend).
+
+**Lower level (pre-`ctx.macro`, no cursor safety you'd have to re-derive):**
 
 ```python
 from src.indicators.macro import init_macro_indicator
@@ -449,9 +473,11 @@ level = vix(ts)                       # latest VIX print with release date <= ts
 `Series.asof`, structurally unable to leak a future observation. Out-of-span or
 missing asset → `None` (treat as neutral). Bind **once** per run.
 
-Hot path (percentile / rolling reads): cache the loaded arrays in `ctx.shared`
-and index with `searchsorted` — the pattern behind `vwatr_div_dsl.py`
-`risk_scale="fred"` (VIX percentile vs prior 250 prints, scaled to [0.5, 1.5]):
+The `ctx.shared` + `searchsorted` idiom below is what `ctx.macro` replaced; it
+is kept only for `vwatr_div_dsl.py` `risk_scale="fred"` (VIX percentile vs
+prior 250 prints, scaled to [0.5, 1.5]) — its `side="left"` cutoff lags a FULL
+bar more than the `ctx.macro` rule on a `1d` base bar, so do not copy it into new
+work:
 
 ```python
 from src.indicators.macro._shared import load_daily
