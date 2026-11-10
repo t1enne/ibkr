@@ -500,10 +500,12 @@ def _close_position(portfolio: PortfolioState, fill: FillEvent) -> PortfolioStat
             break
 
     if target is None:
-        raise ValueError(
-            f"Position {pid} not found for symbol {symbol}. "
-            f"Available: {[p.position_id for p in positions_tuple]}"
-        )
+        # The signal outlived its position: it was emitted while the lot was
+        # live but settles after that lot was closed (a same-bar stop, or an
+        # earlier close in the same cohort). Closing an already-closed position
+        # is a no-op by intent, not an error — raising here aborts the whole
+        # cohort and turns a harmless stale signal into a dead backtest.
+        return portfolio
 
     # Calculate PnL
     is_long = target.type == ActionType.long
@@ -604,10 +606,9 @@ def _rebalance_position(
             break
 
     if target is None:
-        raise ValueError(
-            f"Position {pid} not found for symbol {symbol}. "
-            f"Available: {[p.position_id for p in positions_tuple]}"
-        )
+        # Stale target — see _close_position. A reduce/add for a lot that no
+        # longer exists has nothing to act on; the surviving lots are untouched.
+        return portfolio
 
     delta = round(fill.signal.qty, 4)
     if delta == 0:
