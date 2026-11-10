@@ -8,9 +8,18 @@ What this module adds on top of that shared layer:
 
 * **Leader persistence** -- an impulse only becomes a signal on the SECOND
   consecutive bar the same name leads, so a one-bar spike elects nobody.
-* **Gap-proportional sizing** -- gross exposure is held fixed and redistributed
-  in proportion to each name's catch-up gap, letting the ranking (not a flat
-  fraction) decide how much each leg carries.
+* **Gap-proportional sizing** -- a baseline gross is redistributed in proportion
+  to each name's catch-up gap, letting the gap (not a flat fraction) decide how
+  much each leg carries.
+* **Rank amplification** (`amp`) -- each leg's weight is multiplied by
+  `1 + amp * rank_score`, `rank_score` being the name's ordinal position in the
+  RISK-NORMALISED gap ranking, `|gap| / (sigma * sqrt(k))` (top = 1, last = 0).
+  `amp = 0` is the flat-gross book; `amp > 0` raises gross AND tilts it toward
+  the names that owe the most catch-up per unit of their own volatility, so it
+  doubles as the leverage dial of an otherwise under-invested book. Ranking on
+  the normalised gap rather than raw |gap| is what keeps the tilt from simply
+  preferring the loudest follower: at matched leverage it held return and cut
+  drawdown against the raw-gap order.
 * **Close-checked stop** -- the ``SL_ATR`` level is checked on the close and the
   lot closed explicitly, instead of an intrabar engine stop that could retire a
   lot on the same bar a clock exit names it.
@@ -28,6 +37,7 @@ from src.bt.strategies._leader_follower_common import (
     ATR_PERIOD,
     HISTORY_MIN,
     SL_ATR,
+    VOL_WINDOW,
     BaseParams,
     Book,
     Lot,
@@ -35,6 +45,7 @@ from src.bt.strategies._leader_follower_common import (
     fcf_positive,
     gate_threshold,
     leader_rank,
+    log_returns,
     panel,
     vix_stress,
 )
@@ -54,6 +65,7 @@ class Params(BaseParams):
     vix_rank: float = 0.70  # VIX rank at/above which the book turns short
     hold_bars: int = 12  # hard time exit
     harvest_atr: float = 2.5  # partial exit once up this many entry ATRs
+    amp: float = 0.0  # rank amplification of weight (and of gross); 0 = flat
 
 
 @strategy(stateful=True)
@@ -89,7 +101,7 @@ def on_candle(ctx: StrategyContext):
         rows.append((sym, gap, float(atr), float(px)))
     if not rows:
         return
-    for sym, gap, atr, px, weight in _weights(rows, params):
+    for sym, gap, atr, px, weight in _weights(rows, params, closes, k):
         if abs(ctx.quantity(sym)) > 1e-6 or sym in book.closed:
             continue
         _open(ctx, book, sym, side, atr, px, weight, sig.leader, gap)
@@ -167,18 +179,83 @@ def _select(
 
 
 def _weights(
-    rows: list[tuple[str, float, float, float]], params: Params
+    rows: list[tuple[str, float, float, float]],
+    params: Params,
+    closes: dict[str, np.ndarray],
+    k: int,
 ) -> list[tuple[str, float, float, float, float]]:
-    """``(sym, gap, atr, px, weight)`` with gross held at ``size * n``.
+    """``(sym, gap, atr, px, weight)``, gap-proportional gross times rank amplification.
 
-    Weight is proportional to |gap|, so the ranking decides the mix; a bar whose
-    gaps are all zero falls back to a flat ``size``.
+    The base book holds gross at ``size * n`` split by |gap|, so the gap decides
+    the mix; a bar whose gaps are all zero falls back to a flat ``size``. Each
+    weight is then multiplied by ``1 + amp * rank_score``, ``rank_score`` being
+    the leg's ordinal position in the risk-normalised gap ranking, so ``amp``
+    both raises gross and shifts it toward the preferred names. ``amp = 0``
+    leaves the base book untouched.
     """
+    n = len(rows)
     total = sum(abs(gap) for _s, gap, _a, _p in rows)
-    if total <= 0:
-        return [(sym, gap, atr, px, params.size) for sym, gap, atr, px in rows]
-    gross = params.size * len(rows)
-    return [(sym, gap, atr, px, gross * abs(gap) / total) for sym, gap, atr, px in rows]
+    gross = params.size * n
+    base = (
+        [params.size] * n
+        if total <= 0
+        else [gross * abs(gap) / total for _s, gap, _a, _p in rows]
+    )
+    scores = _rank_scores(rows, closes, k)
+    return [
+        (sym, gap, atr, px, w * (1.0 + params.amp * score))
+        for (sym, gap, atr, px), w, score in zip(rows, base, scores, strict=True)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# ranking
+# ---------------------------------------------------------------------------
+
+
+def _ordinal_scores(raw: list[float]) -> list[float]:
+    """Ordinal rank in [0, 1], 1 = highest raw score; NaN sorts to the bottom."""
+    n = len(raw)
+    span = max(n - 1, 1)
+    order = sorted(range(n), key=lambda i: (np.nan_to_num(raw[i], nan=-np.inf), i))
+    scores = [0.0] * n
+    for pos, i in enumerate(order):
+        scores[i] = pos / span
+    return scores
+
+
+def _sigma(own_r: np.ndarray) -> float:
+    """Trailing ``VOL_WINDOW`` daily sigma of a name's own log returns."""
+    if own_r.size < VOL_WINDOW:
+        return float("nan")
+    return float(np.std(own_r[-VOL_WINDOW:]))
+
+
+def _rank_scores(
+    rows: list[tuple[str, float, float, float]],
+    closes: dict[str, np.ndarray],
+    k: int,
+) -> list[float]:
+    """Ordinal [0, 1] score per row from the RISK-NORMALISED catch-up gap.
+
+    Raw score is ``|gap| / (sigma * sqrt(k))`` -- how many of the name's own
+    ``k``-bar sigmas the catch-up still owes -- so a big gap in a quiet name
+    outranks the same gap in a noisy one. Normalising by each name's own sigma
+    is what makes the tilt a risk tilt rather than a volatility tilt: the
+    dispersion gap already carries risk, and ranking on raw |gap| prefers the
+    loudest names. Ordinal reduction keeps ``amp`` comparable for any ``n``
+    (scores average 0.5), and every read is at the signal bar.
+    """
+    raw: list[float] = []
+    for sym, gap, _atr, _px in rows:
+        c = closes.get(sym)
+        sig = _sigma(log_returns(c)) if c is not None else float("nan")
+        raw.append(
+            abs(gap) / (sig * np.sqrt(k))
+            if np.isfinite(sig) and sig > 0
+            else float("nan")
+        )
+    return _ordinal_scores(raw)
 
 
 # ---------------------------------------------------------------------------

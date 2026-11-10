@@ -19,9 +19,10 @@
     "top_n": 4,
     "gate_rank": 0.8,
     "vix_rank": 0.7,
-    "size": 0.06,
+    "size": 0.03,
     "hold_bars": 12,
-    "harvest_atr": 2.5
+    "harvest_atr": 2.5,
+    "amp": 4.0
   },
   "symbols": [
     "ABBV",
