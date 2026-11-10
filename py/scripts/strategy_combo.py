@@ -9,6 +9,10 @@ alongside the blend so both are visible.
 
 Method (stated, not implied):
 
+* Each leg's curve is first resampled to one point per trading DAY (last value
+  of the day), because a leg's curve carries its own base-bar grid (a ``1h``
+  strategy reports hourly points). Without this step two legs on different base
+  bars intersect to almost nothing.
 * Each leg's daily return is ``equity_curve.pct_change()``, exactly as the run
   reported it.
 * The blend at weight ``w`` is ``sum(w_i * r_i)`` — daily rebalanced to the
@@ -42,6 +46,15 @@ def load_run(path: Path) -> tuple[str, dict[str, Any], pd.Series]:
     ).sort_index()
     label = payload.get("config", {}).get("name") or path.stem
     return str(label), dict(payload.get("metrics", {})), series
+
+
+def _to_daily(series: pd.Series) -> pd.Series:
+    """One point per calendar day (last value), so legs on different base bars align.
+
+    Empty days become NaN and the caller's ``dropna`` removes them, so the blend
+    still intersects the two legs' real trading days.
+    """
+    return series.resample("1D").last().dropna()
 
 
 def stats(returns: pd.Series) -> dict[str, float]:
@@ -80,12 +93,15 @@ def main() -> None:
 
     (l_name, l_metrics, l_eq) = load_run(args.runs[0])
     (s_name, s_metrics, s_eq) = load_run(args.runs[1])
-    frame = pd.concat({"long": l_eq, "short": s_eq}, axis=1).dropna()
+    l_eq, s_eq = _to_daily(l_eq), _to_daily(s_eq)
+    frame = pd.concat({"long": l_eq, "short": s_eq}, axis=1, sort=True).dropna()
     rl = frame["long"].pct_change().dropna()
     rs = frame["short"].pct_change().dropna()
 
-    print(f"common window: {frame.index.min().date()} -> {frame.index.max().date()}"
-          f"  ({len(frame)} bars)")
+    print(
+        f"common window: {frame.index.min().date()} -> {frame.index.max().date()}"
+        f"  ({len(frame)} bars)"
+    )
     print("\nreported by bt (each run's own report):")
     for name, m in ((l_name, l_metrics), (s_name, s_metrics)):
         print(
@@ -95,8 +111,10 @@ def main() -> None:
             f"beta {m.get('beta', float('nan')):5.2f}"
         )
 
-    print("\ndaily-return correlation long/short: "
-          f"{float(np.corrcoef(rl, rs)[0, 1]):+.3f}")
+    print(
+        "\ndaily-return correlation long/short: "
+        f"{float(np.corrcoef(rl, rs)[0, 1]):+.3f}"
+    )
     print("\ncombiner arithmetic (this script, daily rebalanced):")
     print(row("long 100%", stats(rl)))
     print(row("short 100%", stats(rs)))

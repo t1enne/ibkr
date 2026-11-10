@@ -1,0 +1,55 @@
+{
+  "name": "leader-follower-bio-persist",
+  "warmup": "400d",
+  "trading_start": "2020-01-02",
+  "trading_end": "2026-11-01",
+  "commission": 0.05,
+  "initial_capital": 50000,
+  "strategy_type": "leader_follower_persist_dsl",
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "SPY",
+    "QQQ",
+    "XBI"
+  ],
+  "strategy_params": {
+    "impulse_bars": 5,
+    "top_n": 4,
+    "gate_rank": 0.8,
+    "vix_rank": 0.7,
+    "size": 0.06,
+    "hold_bars": 12,
+    "harvest_atr": 2.5
+  },
+  "symbols": [
+    "ABBV",
+    "ALKS",
+    "ALNY",
+    "AMGN",
+    "ARGX",
+    "BIIB",
+    "BMRN",
+    "BMY",
+    "DXCM",
+    "EXEL",
+    "GILD",
+    "IDXX",
+    "ISRG",
+    "JAZZ",
+    "LLY",
+    "MRK",
+    "MRNA",
+    "NVO",
+    "PFE",
+    "REGN",
+    "SANA",
+    "SNY",
+    "SRPT",
+    "TMO",
+    "UNH",
+    "VRTX",
+    "XBI"
+  ]
+}
