@@ -75,8 +75,9 @@ make test                                  # all tests
 make test-fast                             # quick tests
 
 # Sweep/split/optimize parallelize their independent units (grid combos or
-# folds) over a process pool. Add --workers N (>1) to speed up CPU-bound runs:
-uv run ibkr bt sweep strats/trend.json '{...grid...}' --workers 8
+# folds) over a process pool. Add --workers N (>1) to speed up CPU-bound runs --
+# N is capped at 4 (MAX_WORKERS in src/bt/parallel.py; the CLI refuses more):
+uv run ibkr bt sweep strats/trend.json '{...grid...}' --workers 4
 uv run ibkr bt split strats/trend.json --folds 4 --workers 4
 uv run ibkr bt optimize strats/trend.json '{...grid...}' --folds 4 --workers 4
 # WHEN to use --workers: it is a throughput knob, never a correctness one (all
@@ -84,13 +85,15 @@ uv run ibkr bt optimize strats/trend.json '{...grid...}' --folds 4 --workers 4
 # run, so keep --workers 1 for trivial workloads (a few combos/folds on a small
 # feed) — the spawn overhead then exceeds the savings. Prefer --workers when a
 # run would take more than a few seconds: many combos (sweep benefits most;
-# a ~200-combo sweep measured ~3x faster at --workers 8), many folds (split /
+# a ~200-combo sweep measured ~3x faster at --workers 4), many folds (split /
 # optimize, esp. --folds 10+), or heavy intraday feeds. Memory scales with
 # worker count (each pooled worker holds its own copy of the loaded feed), so
 # measure actual per-run RSS before raising --workers on a large universe and
 # size from a fresh measurement -- available RAM varies widely between runs.
-# Effective workers are capped at the unit count, so oversized --workers is
-# harmless (it only costs spawn time).
+# Stop at 4: past that the CPU is oversubscribed and each extra worker is just
+# another feed copy, so it costs RAM and spawn time to finish no sooner.
+# Effective workers are also capped at the unit count, so an oversized request
+# is harmless -- it only costs spawn time.
 ```
 
 ### Fills: rejected or scaled = results not solid

@@ -547,8 +547,8 @@ OOS→IS degradation. `-F json` emits the same per-run metric dict per fold's
 `is`/`oos`. Useful to check whether a strategy's edge survives out-of-sample
 rather than being curve-fit to the training window.
 
-Run folds in parallel with `--workers N` — each IS/OOS window pair is an
-independent unit of work.
+Run folds in parallel with `--workers N` (max `4`) — each IS/OOS window pair is
+an independent unit of work.
 
 ### `bt optimize` — per-fold IS tune → OOS validate
 
@@ -602,8 +602,8 @@ visible next to Sharpe/Kurt instead of buried in a stderr warning.
 comparable across symbol permutations or config edits. Fix sizing before
 quoting numbers.
 
-Run folds in parallel with `--workers N` — each fold tunes its IS and
-validates its OOS independently (combos inside a fold stay sequential).
+Run folds in parallel with `--workers N` (max `4`) — each fold tunes its IS
+and validates its OOS independently (combos inside a fold stay sequential).
 
 ### `bt screen` — current-bar intent from a real strategy
 
@@ -666,12 +666,18 @@ its cash and its fills.
 ### Parallelism (`--workers`)
 
 `bt sweep`, `bt split` and `bt optimize` each accept `--workers N` (default `1` =
-sequential) to parallelize their independent units of work — grid combos
-(sweep) or folds (split, optimize) — over a **process pool** via
+sequential, **hard cap `4`**) to parallelize their independent units of work —
+grid combos (sweep) or folds (split, optimize) — over a **process pool** via
 `concurrent.futures.ProcessPoolExecutor`, not threads (`src/bt/parallel.py`).
 The engine is pure over immutable inputs, so separate worker processes get
 isolation for free; the shared candle feed pickles once per worker, and
 streaming output order is preserved.
+
+**The cap is `MAX_WORKERS = 4`** in `src/bt/parallel.py` — the single truth. The
+CLI refuses a larger request (usage error, exit `2`); the pool clamps any
+programmatic one. Past 4 the pool oversubscribes the host: cores are already
+saturated and each extra worker is another full copy of the feed, so it burns
+RAM and spawn time for no time saved.
 
 **When to use `--workers`** (every count returns identical results; it is a
 throughput knob, not a correctness one):
@@ -681,8 +687,9 @@ throughput knob, not a correctness one):
   by comparison — so keep `--workers 1` for trivial runs (a few combos/folds on
   a small daily feed), where the spawn cost exceeds any savings.
 - **`bt sweep`: biggest win** — parallelizes the cartesian grid. A 198-combo
-  sweep measured **≈3x faster with `--workers 8`** (41s → 14s). Use it whenever
-  the grid has dozens of combos or a large feed.
+  sweep measured **≈3x faster at `--workers 8`** (41s → 14s) before the cap
+  landed; `--workers 4` is the ceiling now. Use it whenever the grid has dozens
+  of combos or a large feed.
 - **`bt split`: only with many folds / heavy feeds** — each fold is just an
   IS+OOS pair, and the spawn overhead dwarfs a few folds (a 4-fold daily split
   was _slower_ pooled: 3s → 6s). Reach for `--workers` at `--folds 10+` or on
@@ -698,7 +705,7 @@ throughput knob, not a correctness one):
   **fresh measurement** — available RAM varies widely between runs on the same
   machine, so a remembered figure is not a budget.
 
-Effective workers are capped at the unit count, so `--workers` much larger
-than the number of combos/folds wastes nothing (it only costs spawn time).
-Rule of thumb: raise `--workers` only once a single run would take more than a
-few seconds.
+Effective workers are capped at `min(MAX_WORKERS, unit count)`, so a request
+larger than the number of combos/folds wastes nothing (it only costs spawn
+time). Rule of thumb: raise `--workers` only once a single run would take more
+than a few seconds, and never past `4`.

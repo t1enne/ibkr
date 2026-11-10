@@ -50,8 +50,9 @@ agent burning a session rebuilding machinery the toolkit already has.
 4. **Never mangle output.** No `grep`/`head` when reporting, no re-deriving
    metrics in scratch code. Read the full output; the risk story (kurtosis,
    skewness, stability, per-symbol bleed) is in the tail. Name any trim.
-5. **`--workers` is throughput, not correctness.** Raise it for many combos or
-   folds; keep `1` for trivial runs.
+5. **`--workers` is throughput, not correctness, and is capped at `4`.** Raise
+   it for many combos or folds; keep `1` for trivial runs. Higher requests are
+   refused — pooling past 4 oversubscribes the host.
 
 ## Architecture
 
@@ -222,7 +223,7 @@ uv run ibkr bt optimize <strategy.json> '{...grid...}' --folds 4  # per-fold IS 
 uv run ibkr bt screen <strategy.json>                   # current-bar intent (opens AND closes)
 uv run ibkr bt screen <strategy.json> --trades          # + executed-trade table (default off)
 # All three parallelize units across worker processes with:
-#   --workers N   (default 1 = sequential)
+#   --workers N   (default 1 = sequential, hard cap 4)
 
 # Inspect what's on disk (recap: date range, rows, gaps >48h) — no Gateway needed
 uv run ibkr data query AAPL
@@ -312,9 +313,9 @@ hold up out-of-sample?"_ The wide table pairs IS/OOS columns for every
 canonical metric (incl. Kurt, Skew, Scaled); `-F json` emits the same per-run
 metric dict per fold's `is`/`oos`.
 
-Run folds in parallel across worker processes with `--workers N`. Each fold
-(IS+OOS window pair) is independent; the shared candle + benchmark feeds pickle
-once per worker, not per fold.
+Run folds in parallel across worker processes with `--workers N` (max `4`).
+Each fold (IS+OOS window pair) is independent; the shared candle + benchmark
+feeds pickle once per worker, not per fold.
 
 ### `bt optimize` — walk-forward parameter optimization
 
@@ -337,9 +338,9 @@ fitting noise. Reports per-fold chosen params + IS/OOS metrics (same canonical
 columns as `bt split`, incl. Scaled), and an aggregate of mean/min OOS Sharpe.
 `-F json` emits the canonical per-run metric dict for both `is` and `oos`.
 
-Run folds in parallel across worker processes with `--workers N` — each fold
-tunes its own IS window and validates its OOS independently (combos inside a
-fold stay sequential).
+Run folds in parallel across worker processes with `--workers N` (max `4`) —
+each fold tunes its own IS window and validates its OOS independently (combos
+inside a fold stay sequential).
 
 ### Parallelism (`--workers`)
 
@@ -349,8 +350,14 @@ sequential) to parallelize their independent units of work — grid combos
 / `concurrent.futures`), not threads. Backtests are CPU-bound, and because
 their engine is pure over immutable inputs, separate worker processes get
 isolation for free. The shared candle feed is pickled once per worker, and
-deterministic streaming order is preserved for `--format text`. Effective
-workers are capped at the unit count, so `--workers` larger than the number of
+deterministic streaming order is preserved for `--format text`.
+
+**Hard cap: `N` ≤ 4.** `MAX_WORKERS` in `src/bt/parallel.py` is the single
+truth. The CLI refuses a larger number (usage error, exit `2`) and the pool
+clamps any programmatic request, because pooling past 4 oversubscribes the
+host — the CPU is saturated and every extra worker is another full copy of the
+feed, so it costs RAM and spawn time to finish no sooner. Effective workers
+are additionally capped at the unit count, so `--workers` above the number of
 combos/folds wastes nothing.
 
 #### When to use `--workers`
@@ -364,9 +371,9 @@ are cheap by comparison. Roughly: if total compute is under a few seconds, keep
 many-fold splits over heavy feeds.
 
 - **`bt sweep` — biggest win.** Parallelize the cartesian grid of combos. On a
-  198-combo sweep this measured **≈3x faster with `--workers 8`** (41s → 14s).
-  Reach for `--workers` whenever the grid has dozens of combos or the feed is
-  large.
+  198-combo sweep this measured **≈3x faster with `--workers 8`** (41s → 14s)
+  before the cap landed; `--workers 4` is the ceiling now. Reach for
+  `--workers` whenever the grid has dozens of combos or the feed is large.
 - **`bt split` — only with many folds / heavy feeds.** It parallelizes across
   folds, and each fold is just an IS+OOS pair. With a handful of folds on a
   small daily feed the ~2s spawn cost exceeds the compute, so `--workers 4`
@@ -388,9 +395,9 @@ runs, so a remembered number is not a budget.
 **Rule of thumb:** default `--workers 1`; raise it when a single unrunnable run
 would take more than a few seconds (many combos, many folds, or heavy
 per-candle data). When in doubt, time `--workers 1` first — if it is already
-fast (<~2s), more workers will only add overhead. Effective workers are capped
-at the unit count, so an oversized `--workers` is harmless — it just costs
-spawn time.
+fast (<~2s), more workers will only add overhead. Stop at `4`: that is the
+host budget, and the CLI refuses more. Effective workers are also capped at the
+unit count, so an oversized `--workers` is harmless — it just costs spawn time.
 
 All commands usable via `make run <subcommand> <args>`.
 
