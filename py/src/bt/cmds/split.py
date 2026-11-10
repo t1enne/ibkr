@@ -7,6 +7,7 @@ import json
 import click
 
 from src.bt.cmds._shared import cli_ts
+from src.bt.parallel import MAX_WORKERS
 
 
 @click.command(name="split")
@@ -31,9 +32,11 @@ from src.bt.cmds._shared import cli_ts
 )
 @click.option(
     "--workers",
-    type=int,
+    type=click.IntRange(1, MAX_WORKERS),
     default=1,
-    help="Parallelize folds across N worker processes (default 1).",
+    help=(
+        f"Parallelize folds across N worker processes (default 1, max {MAX_WORKERS})."
+    ),
 )
 @click.option(
     "--format",

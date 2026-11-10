@@ -46,8 +46,10 @@ per-worker figure: measure actual RSS before raising ``workers`` on a large
 universe, and note that available RAM on a given host varies between runs, so
 size from a fresh measurement rather than a remembered number.
 
-``effective_workers`` is capped at the task count, so an oversized ``workers``
-never spawns idle processes — it only wastes spawn time.
+Two hard caps bound ``effective_workers``: ``MAX_WORKERS`` (a host budget —
+pooling past it contends for cores and RAM rather than finishing sooner) and
+the task count. An oversized ``workers`` therefore never spawns idle
+processes; it only costs spawn time.
 
 Worker functions must be *module-level* (picklable by qualified name) and read
 shared inputs from ``WORKER_STATE``.
@@ -62,6 +64,24 @@ from typing import Any, Callable
 # module-level worker functions. Keeps shared feeds/config off the task queue
 # (pickled once per worker, not once per task).
 WORKER_STATE: dict[str, Any] = {}
+
+# Hard ceiling on pooled process count. Beyond this the pool oversubscribes the
+# host — extra workers contend for cores and multiply per-worker feed copies
+# without buying throughput — so requests are clamped, never honoured.
+MAX_WORKERS: int = 4
+
+
+def effective_worker_count(workers: int, n: int) -> int:
+    """Clamp ``workers`` to the host budget (``MAX_WORKERS``) and the task count.
+
+    Args:
+        workers: requested process count (``<= 1`` means sequential).
+        n: number of units of work available.
+
+    Returns:
+        At least 1, at most ``min(MAX_WORKERS, n)``.
+    """
+    return max(1, min(workers, MAX_WORKERS, n))
 
 
 def pool_init(state: dict[str, Any]) -> None:
@@ -88,8 +108,9 @@ def run_in_processes(
         fn: module-level, picklable worker that reads shared inputs from
             ``WORKER_STATE`` and returns a picklable result.
         tasks: one payload per unit of work (parallelism granularity).
-        workers: max worker processes (capped at the task count so no pool is
-            ever started with more workers than units of work). ``<= 1`` runs
+        workers: max worker processes, clamped to ``MAX_WORKERS`` and to the
+            task count so no pool is ever started with more workers than units
+            of work (or than the host budget allows). ``<= 1`` runs
             sequentially (no pool).
         init_data: shared read-only inputs broadcast to every worker once
             (feeds, base config, ...). Empty by default.
@@ -104,9 +125,10 @@ def run_in_processes(
     if n == 0:
         return []
 
-    # Never spawn more processes than there are tasks — a capped pool of N
-    # workers running N jobs gets no further speedup from idle extra workers.
-    effective_workers = max(1, min(workers, n))
+    # Never spawn more processes than there are tasks, and never more than the
+    # host budget — a capped pool of N workers running N jobs gets no further
+    # speedup from idle extra workers, and past MAX_WORKERS they only contend.
+    effective_workers = effective_worker_count(workers, n)
 
     if effective_workers <= 1 or n == 1:
         # Sequential fallback: mirror the worker cache contract so the same
@@ -151,7 +173,9 @@ def run_in_processes(
 
 
 __all__ = [
+    "MAX_WORKERS",
     "WORKER_STATE",
+    "effective_worker_count",
     "pool_init",
     "run_in_processes",
 ]

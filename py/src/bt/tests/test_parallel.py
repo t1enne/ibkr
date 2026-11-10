@@ -6,6 +6,7 @@ Validates that `run_in_processes`:
 - runs `fn(task)` for each task and returns results in input order,
 - invokes `on_complete(index, result)` in input order,
 - handles the empty-tasks, single-task and sequential (`workers=1`) paths.
+- clamps a request to `MAX_WORKERS` and to the task count.
 
 Real-process (workers > 1) equivalence against the backtest engine is covered
 by ``test_sweep_pooled_matches_sequential_engine`` in the sweep suite — we
@@ -20,7 +21,12 @@ import time
 
 import pytest
 
-from src.bt.parallel import WORKER_STATE, run_in_processes
+from src.bt.parallel import (
+    MAX_WORKERS,
+    WORKER_STATE,
+    effective_worker_count,
+    run_in_processes,
+)
 
 
 def _echo_worker(task: tuple[int, str]) -> tuple[str, int]:
@@ -50,15 +56,35 @@ def test_worker_state_broadcast_to_clean_worker():
     assert res == _expected(_tasks(), 5)
 
 
-@pytest.mark.slow
-# process-pool-spawning (capitalized to 2 workers) — skipped via `-m not slow`.
+@pytest.mark.slow  # spawns a process pool (forkserver) — skipped via `-m not slow`.
 def test_workers_capped_at_task_count():
     """Requesting more workers than tasks must not error or change results."""
     tasks = [(1, "a"), (2, "b")]  # 2 tasks
-    # workers=8 far exceeds the task count -> effectively 2 workers.
-    res = run_in_processes(_echo_worker, tasks, workers=8, init_data={"byte": 0})
+    # An oversized request is clamped to the task count -> effectively 2 workers.
+    res = run_in_processes(
+        _echo_worker, tasks, workers=MAX_WORKERS, init_data={"byte": 0}
+    )
     assert res == [("a", 1), ("b", 2)]
 
     # And equals the sequential result.
     seq = run_in_processes(_echo_worker, tasks, workers=1, init_data={"byte": 0})
     assert res == seq
+
+
+def test_effective_worker_count_clamps_to_host_budget():
+    """The pool never grows past MAX_WORKERS, whatever the caller asks for."""
+    assert effective_worker_count(999, 1000) == MAX_WORKERS
+    assert effective_worker_count(MAX_WORKERS + 1, 1000) == MAX_WORKERS
+    assert effective_worker_count(MAX_WORKERS, MAX_WORKERS) == MAX_WORKERS
+
+
+def test_effective_worker_count_clamps_to_task_count():
+    """Fewer tasks than workers -> exactly one worker per task."""
+    assert effective_worker_count(4, 2) == 2
+    assert effective_worker_count(4, 1) == 1
+
+
+def test_effective_worker_count_floor_is_sequential():
+    """Zero/negative requests fall back to the sequential loop, never a pool."""
+    assert effective_worker_count(0, 10) == 1
+    assert effective_worker_count(-3, 10) == 1

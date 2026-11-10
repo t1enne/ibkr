@@ -7,6 +7,7 @@ import json
 import click
 
 from src.bt.cmds._shared import cli_ts, parse_param_grid
+from src.bt.parallel import MAX_WORKERS
 
 
 @click.command(name="optimize")
@@ -37,9 +38,11 @@ from src.bt.cmds._shared import cli_ts, parse_param_grid
 )
 @click.option(
     "--workers",
-    type=int,
+    type=click.IntRange(1, MAX_WORKERS),
     default=1,
-    help="Parallelize folds across N worker processes (default 1).",
+    help=(
+        f"Parallelize folds across N worker processes (default 1, max {MAX_WORKERS})."
+    ),
 )
 @click.option(
     "--format",
