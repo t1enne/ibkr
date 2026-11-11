@@ -16,6 +16,7 @@ Usage:
 
 import numpy as np
 import pandas as pd
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pandas import Timestamp
 from typing import List, cast
@@ -23,6 +24,7 @@ from typing import List, cast
 from src.bt.state import Candle
 from src.utils import get_local_candles
 from src.data import sync_data
+from src.data.symbols import market_for_ticker
 from src.data.xcal import is_non_trading_day
 
 # Maximum tolerated discontinuity between consecutive bars of a symbol.
@@ -41,18 +43,23 @@ class GapBreak:
     duration: pd.Timedelta
 
 
-def _trading_days_between(prev_ts: pd.Timestamp, next_ts: pd.Timestamp) -> int:
-    """NYSE trading days strictly between two bar timestamps.
+def _trading_days_between(
+    prev_ts: pd.Timestamp,
+    next_ts: pd.Timestamp,
+    market: str | None = None,
+) -> int:
+    """Trading days strictly between two bar timestamps.
 
     A multi-day hole that lands entirely on weekends/holidays (e.g. the
     Christmas/Thanksgiving long weekend) is a normal market closure, not
-    missing data, so the gap guard must not flag it.
+    missing data, so the gap guard must not flag it. *market* picks the holiday
+    calendar (see :mod:`src.data.xcal`); ``None`` is the New York one.
     """
     day = cast(pd.Timestamp, prev_ts + pd.Timedelta(days=1)).normalize()
     end = next_ts.normalize()
     missing = 0
     while day < end:
-        if not is_non_trading_day(day.to_pydatetime()):
+        if not is_non_trading_day(day.to_pydatetime(), market):
             missing += 1
         day = cast(pd.Timestamp, day + pd.Timedelta(days=1))
     return missing
@@ -62,6 +69,7 @@ def detect_gaps(
     df: pd.DataFrame,
     symbols: List[str],
     max_gap: pd.Timedelta = DEFAULT_MAX_GAP,
+    markets: Mapping[str, str] | None = None,
 ) -> dict[str, tuple[GapBreak, ...]]:
     """Return, per symbol, the gaps (delta between consecutive bars) > max_gap.
 
@@ -72,13 +80,18 @@ def detect_gaps(
         df: MultiIndex-column frame (symbol, field) as produced by load_candles.
         symbols: Symbols whose columns to inspect.
         max_gap: Threshold; only gaps strictly greater than this are reported.
+        markets: Per-symbol venue whose holiday calendar applies. A symbol
+            absent from the map (or ``None`` for the whole map) falls back to
+            the New York calendar — the historical US-only behaviour.
 
     Returns:
         Mapping ``symbol -> tuple[GapBreak, ...]``. Symbols with no gaps do not
         appear as keys (use ``.get(symbol, ())`` for a safe default).
     """
+    venues = markets or {}
     report: dict[str, tuple[GapBreak, ...]] = {}
     for symbol in symbols:
+        venue = venues.get(symbol)
         try:
             block = df.xs(symbol, axis=1)
         except KeyError:
@@ -102,7 +115,7 @@ def detect_gaps(
             # Time threshold AND a genuinely skipped trading day: a long
             # weekend (or holiday cluster) can exceed max_gap without any data
             # being missing.
-            if _trading_days_between(prev_ts, next_ts) == 0:
+            if _trading_days_between(prev_ts, next_ts, venue) == 0:
                 continue
             breaks.append(
                 GapBreak(
@@ -123,6 +136,22 @@ class DataIntegrityError(Exception):
     """Raised when a symbol's candle series contains a gap > the limit."""
 
 
+def _markets_for(symbols: List[str]) -> dict[str, str]:
+    """The stored venue of each symbol, read ONCE here at the load boundary.
+
+    Resolving at the boundary (not inside :func:`detect_gaps`) keeps the
+    detector pure and testable without a DB, while each symbol still gets its
+    own holiday calendar. A symbol with no stored row is absent from the map and
+    falls back to the New York calendar.
+    """
+    found: dict[str, str] = {}
+    for symbol in symbols:
+        venue = market_for_ticker(symbol)
+        if venue:
+            found[symbol] = venue
+    return found
+
+
 def load_candles(
     symbols: List[str],
     start: pd.Timestamp,
@@ -137,8 +166,10 @@ def load_candles(
     strictly greater than ``max_gap`` (default 96h) between consecutive bars,
     a :class:`DataIntegrityError` is raised and loading aborts — a hole that
     wide is presumed to be missing/corrupt data, and indicators computed across
-    it would be meaningless. Pass ``max_gap`` as ``pd.Timedelta.max`` (or a
-    large sentinel) to skip the check.
+    it would be meaningless. Each symbol is judged on ITS OWN venue's calendar
+    (the stored ``symbol.market``), so a pan-European universe does not report
+    a Ferragosto hole that is really a market closure. Pass ``max_gap`` as
+    ``pd.Timedelta.max`` (or a large sentinel) to skip the check.
 
     Args:
         symbols: List of ticker symbols
@@ -167,7 +198,9 @@ def load_candles(
     if max_gap == pd.Timedelta.max:
         return df
 
-    report = detect_gaps(df, list(symbols), max_gap=max_gap)
+    report = detect_gaps(
+        df, list(symbols), max_gap=max_gap, markets=_markets_for(list(symbols))
+    )
     if report:
         lines = [
             f"{sym}: {', '.join(f'{b.prev_ts} -> {b.next_ts} (gap {b.duration})' for b in breaks)}"

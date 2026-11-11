@@ -119,10 +119,20 @@ class IbkrClient:
             )
         self.account = account if account is not None else _default_account()
         self._verify = verify
+        self._timeout = timeout
         self._http = httpx.AsyncClient(
             base_url=self.base_url, timeout=timeout, verify=verify
         )
-        self._rest = _RestClient(base_url=self.base_url, verify_ssl=verify)
+        # The generated client carries its OWN httpx pool, so it needs its own
+        # timeout: without one, a saturated gateway (many concurrent history
+        # calls) accepts the connection and never answers, and every `rest` call
+        # — secdef search, candle history — waits forever instead of failing as a
+        # typed `transport` error.
+        self._rest = _RestClient(
+            base_url=self.base_url,
+            verify_ssl=verify,
+            timeout=httpx.Timeout(timeout),
+        )
 
     @property
     def http(self) -> httpx.AsyncClient:
@@ -131,8 +141,13 @@ class IbkrClient:
 
     @property
     def rest(self) -> _RestClient:
-        """The generated REST client, on the SAME url/verify policy."""
+        """The generated REST client, on the SAME url/verify/TIMEOUT policy."""
         return self._rest
+
+    @property
+    def timeout_s(self) -> float:
+        """The per-request timeout both clients were built with."""
+        return self._timeout
 
     async def aclose(self) -> None:
         """Close the underlying pool. The generated client holds no socket."""

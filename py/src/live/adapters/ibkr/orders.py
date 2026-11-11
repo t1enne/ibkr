@@ -251,12 +251,16 @@ def build_ticket(
     conid: int,
     side: OrderSide,
     order_ref: str,
+    exchange: str | None = None,
 ) -> Ticket:
     """Pure: intent + resolved conid + resolved side -> the IBKR ticket body.
 
     ``order_ref`` is the ``cOID`` the CALLER minted (``identity.order_ref`` or
-    ``protect.protective_ref``). ``tif`` is kind-driven (the spec's ticket
-    table, Step 3): an entry is ``DAY``, a protective child is ``GTC`` (it must
+    ``protect.protective_ref``). ``exchange`` is the venue the conid was resolved
+    ON; the body carries it so a non-US order names its listing instead of
+    defaulting to SMART routing (``None`` = the US path, where the field is
+    omitted and today's body is unchanged). ``tif`` is kind-driven (the spec's
+    ticket table, Step 3): an entry is ``DAY``, a protective child is ``GTC`` (it must
     outlive the session; there is no rollover rule because nothing local
     remembers it). A protective body carries the level on ``price`` — the STP
     trigger field is ``price`` (spec §0), never ``auxPrice``. Quantities are
@@ -281,6 +285,10 @@ def build_ticket(
             if intent.order_type is OrderType.STP
             else intent.take_profit
         )
+    if exchange:
+        # A BVME/IBIS listing must never be routed as a naked SMART order: the
+        # venue is part of the instruction, not a default the broker guesses.
+        body["exchange"] = exchange
     return Ticket(
         order_ref=order_ref,
         side=side,

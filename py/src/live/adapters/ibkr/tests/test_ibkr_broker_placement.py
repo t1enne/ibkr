@@ -27,6 +27,7 @@ from src.live.adapters.ibkr.tests.conftest import (
     mock_no_working_orders,
     ok_result,
     open_intent,
+    sized_open,
 )
 from src.live.identity import intent_key, order_ref
 
@@ -255,3 +256,52 @@ async def test_dry_run_broker_never_posts() -> None:
     assert error.kind == "auth"
     assert "refuses to place" in error.message
     assert len(respx.calls) == 0  # not a single request left the process
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_foreign_order_carries_its_venue() -> None:
+    """A BVME listing must never go out as a naked SMART order.
+
+    The series key names the venue, so the ticket carries ``exchange`` — the one
+    instruction that says WHICH listing of a cross-listed ticker to trade.
+    """
+    asked: list[tuple[str, str | None]] = []
+
+    async def _lookup(ticker: str, venue: str | None) -> int:
+        asked.append((ticker, venue))
+        return CONID
+
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=filled_status()))
+    mock_no_working_orders()
+
+    placed = ok_result(
+        await broker(exchange="BVME", conid_lookup=_lookup).place(
+            sized_open("ENI.MI", 1.0, 100.0, 1000.0)
+        )
+    )
+
+    assert placed.ok
+    # The gateway is asked for the BARE ticker ON the venue — never "ENI.MI".
+    assert asked == [("ENI", "BVME")]
+    ticket = json.loads(submit.calls[0].request.content.decode())["orders"][0]
+    assert ticket["exchange"] == "BVME"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_us_order_carries_no_venue() -> None:
+    """The US path is unchanged: no ``exchange`` field, so SMART routing stands."""
+    submit = respx.post(SUBMIT).mock(
+        return_value=httpx.Response(200, json=[{"order_id": ORDER_ID}])
+    )
+    respx.get(STATUS).mock(return_value=httpx.Response(200, json=filled_status()))
+    mock_no_working_orders()
+
+    await broker().place(open_intent())
+
+    ticket = json.loads(submit.calls[0].request.content.decode())["orders"][0]
+    assert "exchange" not in ticket

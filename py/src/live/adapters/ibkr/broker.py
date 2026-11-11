@@ -53,8 +53,13 @@ from src.bt.state import (
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.data.ibkr.lookup import search_contracts
 from src.data.types import SymbolSchema
+from src.data.venue import UnmappedVenueError, series_key, venue_for_key
 from src.exec.types import Fill, OrderSide, OrderState
-from src.live.adapters.ibkr.mapping import parse_executions, parse_positions
+from src.live.adapters.ibkr.mapping import (
+    SeriesSymbols,
+    parse_executions,
+    parse_positions,
+)
 from src.live.adapters.ibkr.orders import (
     OrderMappingError,
     ReplyOutcome,
@@ -127,7 +132,10 @@ _OPEN_CASH_TOLERANCE = 0.02
 #: cannot hide under it.
 _EXPOSURE_TOLERANCE = 1e-6
 
-ConidLookup = Callable[[str], Awaitable[int]]
+#: A conid resolver: the BARE broker symbol, and the venue it must list on
+#: (``None`` = the US set). Both halves are needed — one ticker can be listed on
+#: several venues, so the symbol alone does not name a contract.
+ConidLookup = Callable[[str, "str | None"], Awaitable[int]]
 Sleeper = Callable[[float], Awaitable[None]]
 
 #: The kind on an OPEN the cohort's STRUCTURAL rules dropped (``_refuse_opens``/
@@ -156,33 +164,44 @@ def _names_the_ticker(candidate: SecdefSearchResponseItem, ticker: str) -> bool:
     return isinstance(symbol, str) and symbol.strip().upper() == ticker.strip().upper()
 
 
-def _db_conid_for_ticker(ticker: str) -> int | None:
-    """The conid our candle DB ``symbol`` table pairs with *ticker*, if any.
+def _db_conid_for_listing(ticker: str, venue: str | None) -> int | None:
+    """The conid the DB ``symbol`` row pairs with *ticker* ON *venue*, if any.
+
+    The row is looked up by SERIES KEY (``ENI.MI``), never by the bare ticker: the
+    key is what one listing of one ticker is stored under, so a cross-listed
+    ticker cannot be tie-broken onto another venue's contract.
 
     A PREFERENCE, never an override: used only as a tie-break among secdef
-    candidates that share a ticker. ``None`` when the ticker is unknown to the
-    DB or the table is unreadable (a read-only helper, so a missing fixture DB
-    degrades to no preference rather than a raise).
+    candidates that share a ticker. ``None`` when the ticker is unknown to the DB,
+    the venue has no key rule, or the table is unreadable (a read-only helper, so a
+    missing fixture DB degrades to no preference rather than a raise).
     """
     try:
-        s = SymbolSchema.get_or_none(SymbolSchema.ticker == ticker.strip().upper())
+        key = series_key(ticker, venue)
+    except UnmappedVenueError, ValueError:
+        return None
+    try:
+        s = SymbolSchema.get_or_none(SymbolSchema.ticker == key)
     except Exception:
         return None
     return int(s.conid) if s is not None else None
 
 
 def _prefer_db_conid(
-    matches: tuple[SecdefSearchResponseItem, ...], ticker: str
+    matches: tuple[SecdefSearchResponseItem, ...],
+    ticker: str,
+    venue: str | None,
 ) -> SecdefSearchResponseItem:
     """Pick one candidate when several share *ticker*, preferring the DB's conid.
 
     The secdef search routinely returns multiple listings of one ticker (e.g.
     SHOP — two US STK rows, only one of which is the contract our data/backtest
     treats as SHOP). The candle DB ``symbol`` row is the authoritative local
-    answer: among the candidates, the one whose conid matches it wins. If none
-    does, we fail closed — a live order must never land on a guess.
+    answer: among the candidates, the one whose conid matches the row for THIS
+    venue's series key wins. If none does, we fail closed — a live order must
+    never land on a guess.
     """
-    known = _db_conid_for_ticker(ticker)
+    known = _db_conid_for_listing(ticker, venue)
     preferred = [c for c in matches if known is not None and str(c.conid) == str(known)]
     if preferred:
         return preferred[0]
@@ -191,21 +210,25 @@ def _prefer_db_conid(
         for c in sorted(matches, key=lambda c: str(c.conid))
     )
     raise ValueError(
-        f"ambiguous contract for {ticker}: candidates {hosts} "
-        f"(none matches DB conid {known or 'unknown'})"
+        f"ambiguous contract for {ticker} on {venue or 'the US set'}: candidates "
+        f"{hosts} (none matches DB conid {known or 'unknown'})"
     )
 
 
-async def _default_conid_lookup(ticker: str) -> int:
-    """Resolve *ticker* to its IBKR conid, VERIFYING it is the intended contract.
+async def _default_conid_lookup(ticker: str, venue: str | None = None) -> int:
+    """Resolve *ticker* to its conid ON *venue*, VERIFYING it is the intended contract.
 
-    The search is by ticker, so an unverified first hit can put a real order on
-    the wrong instrument. Refuses (``ValueError`` -> a typed ``FeedError``) when
-    no candidate names the ticker, when the candidates share no single conid AND
-    none matches the candle DB's conid for the ticker (ambiguous), or when the
-    chosen contract is ``restricted``.
+    Both halves matter: the search is by ticker, so an unverified first hit can
+    put a real order on the wrong instrument, and one ticker can list on several
+    venues (``ENI`` on ``BVME`` and on ``SBF``), so the venue is what makes the
+    answer a single contract. ``venue=None`` keeps the historical US-only filter.
+
+    Refuses (``ValueError`` -> a typed ``FeedError``) when no candidate names the
+    ticker, when the candidates share no single conid AND none matches the candle
+    DB's conid for this venue's series key (ambiguous), or when the chosen
+    contract is ``restricted``.
     """
-    candidates = await search_contracts(ticker)
+    candidates = await search_contracts(ticker, venue)
     matches = tuple(c for c in candidates if _names_the_ticker(c, ticker))
     if not matches:
         raise ValueError(
@@ -215,7 +238,7 @@ async def _default_conid_lookup(ticker: str) -> int:
     if len(conids) == 1:
         chosen = matches[0]
     elif len(conids) > 1:
-        chosen = _prefer_db_conid(matches, ticker)
+        chosen = _prefer_db_conid(matches, ticker, venue)
     else:
         raise ValueError(f"secdef search for {ticker} returned no conid")
     if chosen.restricted is True:
@@ -235,6 +258,11 @@ class IbkrBroker(BracketProtectionMixin):
     Protective brackets (spec Steps 4–5) are added by :class:`BracketProtectionMixin`:
     a confirmed entry fill places + confirms the OCA pair in the same cycle; a
     close cancels-and-confirms the pair first; a level tighten REPLACEs both legs.
+
+    ``exchange`` is the universe's default venue and ``symbols`` the series-key
+    translation; together they make a non-US scope routable. ``exchange=None`` and
+    an empty ``symbols`` map are the historical US path — bare tickers, US
+    contract search, no ``exchange`` on the order body.
     """
 
     def __init__(
@@ -248,6 +276,8 @@ class IbkrBroker(BracketProtectionMixin):
         dry_run: bool = False,
         allow_oth: bool = False,
         conid_lookup: ConidLookup | None = None,
+        exchange: str | None = None,
+        symbols: SeriesSymbols | None = None,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         sleep: Sleeper | None = None,
@@ -265,6 +295,8 @@ class IbkrBroker(BracketProtectionMixin):
         self._conid_lookup = (
             conid_lookup if conid_lookup is not None else _default_conid_lookup
         )
+        self._exchange = exchange
+        self._symbols = symbols if symbols is not None else SeriesSymbols()
         self._poll_interval_s = poll_interval_s
         self._timeout_s = timeout_s
         self._sleep = sleep if sleep is not None else asyncio.sleep
@@ -757,12 +789,29 @@ class IbkrBroker(BracketProtectionMixin):
             )
         return Ok((side, conid))
 
+    def _venue_of(self, symbol: str) -> str | None:
+        """The venue *symbol* (a SERIES KEY) lists on.
+
+        A key that names a venue (``ENI.PA``) wins over the universe default, so a
+        mixed universe routes each leg to its own listing; an unsuffixed key falls
+        back to ``exchange`` (``None`` = the US path).
+        """
+        return venue_for_key(symbol, self._exchange)
+
     async def _conid(self, symbol: str) -> int:
-        """The IBKR conid for *symbol*, resolved once and cached for the run."""
+        """The IBKR conid for *symbol*, resolved once and cached for the run.
+
+        The lookup is handed the BARE broker symbol and the venue that key names:
+        the gateway knows ``ENI``, not ``ENI.MI``, and only the venue pair makes it
+        one contract. Both are derived from the key, so the same key always asks
+        the same question.
+        """
         cached = self._conid_cache.get(symbol)
         if cached is not None:
             return cached
-        conid = await self._conid_lookup(symbol)
+        conid = await self._conid_lookup(
+            self._symbols.broker_of(symbol), self._venue_of(symbol)
+        )
         self._conid_cache[symbol] = conid
         return conid
 
@@ -1089,7 +1138,13 @@ class IbkrBroker(BracketProtectionMixin):
         its real status to wait on. A missing working order here means the read
         changed under us: whether it is live is unknown, reported ``unresolved``.
         """
-        ticket = build_ticket(intent, conid=conid, side=side, order_ref=found.order_ref)
+        ticket = build_ticket(
+            intent,
+            conid=conid,
+            side=side,
+            order_ref=found.order_ref,
+            exchange=self._venue_of(intent.symbol),
+        )
         result = await self.wait_filled(found.order_id, intent, ticket)
         return self._settle_wait(result, found.order_id, adopted=True)
 
@@ -1110,7 +1165,11 @@ class IbkrBroker(BracketProtectionMixin):
         """
         try:
             ticket = build_ticket(
-                intent, conid=conid, side=side, order_ref=order_ref(key)
+                intent,
+                conid=conid,
+                side=side,
+                order_ref=order_ref(key),
+                exchange=self._venue_of(intent.symbol),
             )
         except OrderMappingError as exc:
             return Err(feed_error("rejected", f"{intent.symbol}: {exc}", intent.symbol))

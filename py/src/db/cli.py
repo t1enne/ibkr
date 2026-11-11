@@ -1,15 +1,17 @@
 """``ibkr db`` — schema migrations for both sqlite files.
 
-Three commands:
+Four commands:
 
 * ``ibkr db migrate``          — apply pending migrations to BOTH files.
 * ``ibkr db migrate --down``   — unwind (requires ``--yes``; refuses an
   irreversible target rather than partially applying).
+* ``ibkr db migrate --dry-run``— list what WOULD run; write nothing.
 * ``ibkr db status``           — report every migration and whether it is applied.
+* ``ibkr db preflight``        — report the data file's series-key problems.
 
-``--dry-run`` on ``migrate`` writes nothing at all: it lists what WOULD run, on
-which file, and exits. That is the same contract the live cycle's ``--dry-run``
-carries — no lease, no DDL, no rows.
+``--dry-run`` on ``migrate`` writes nothing at all: it lists names only, so it
+cannot reveal a preflight refusal — ``db preflight`` runs the same checks and
+prints the offending rows, also writing nothing.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import click
 from peewee import SqliteDatabase
 
+from src.db.migrations import preflight
 from src.db.migrations.runner import pending, run_down, run_pending, status
 from src.db.migrations.types import MigrationRefused, Registry
 from src.db.migrations.versions import DATA_MIGRATIONS, LIVE_MIGRATIONS
@@ -122,7 +125,36 @@ def db_status() -> None:
             db.close()
 
 
+@db_group.command("preflight")
+def db_preflight() -> None:
+    """Report the data file's series-key problems; write nothing.
+
+    The same check ``data_0003`` refuses on, printed instead of raised: an
+    operator sees the offending rows before deciding what to fix. Exits non-zero
+    when anything is found, so it also works as a gate.
+    """
+    # Lazy on purpose: ``src.db`` must not import ``src.data`` at module scope
+    # (see src/db/__init__). This command is the composition edge that reads the
+    # LIVE venue vocabulary, so it asks for it only when it runs.
+    from src.data.venue import try_series_key
+
+    path = _path_for("data")
+    db = _connect(path)
+    try:
+        findings = preflight.report(db, try_series_key)
+    finally:
+        db.close()
+
+    if findings.ok:
+        click.echo(f"data {path}: series keys clean")
+        return
+    for line in findings.lines():
+        click.echo(f"data {path}: {line}")
+    raise SystemExit(1)
+
+
 db_group.add_command(db_migrate)
 db_group.add_command(db_status)
+db_group.add_command(db_preflight)
 
 __all__ = ["db_group"]

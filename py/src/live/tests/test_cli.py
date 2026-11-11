@@ -657,3 +657,55 @@ def test_live_format_comes_from_the_file(
     # The report is followed by the run's log line, so parse the document only.
     document = out.output[: out.output.index("\n}") + 2]
     assert json.loads(document)["scope"]
+
+
+# --- venue wiring (P5) ------------------------------------------------------
+
+
+def test_a_live_config_declares_its_universe_venue(tmp_path: Path) -> None:
+    """``exchange`` is a live-only key: it reaches ``LiveConfig`` from the JSON."""
+    path = write_config(tmp_path, symbols=["ENI.MI"], exchange="bvme")
+
+    cfg = load_strat_config(path)
+
+    assert cfg.exchange == "BVME"
+    assert cfg.symbols == ("ENI.MI",)
+
+
+def test_a_config_without_a_venue_is_the_us_path(tmp_path: Path) -> None:
+    assert load_strat_config(write_config(tmp_path)).exchange is None
+
+
+def test_an_empty_venue_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exchange must be a non-empty venue code"):
+        load_strat_config(write_config(tmp_path, exchange="  "))
+
+
+def test_the_ibkr_adapter_wires_the_venue_into_both_edges(tmp_path: Path) -> None:
+    """Broker and source get the SAME venue + symbol map: one translation truth."""
+    from src.data.ibkr.client import IbkrClient
+    from src.live.adapters.ibkr.adapter import build_ibkr_adapter
+    from src.live.ledger import SqliteLedger
+
+    cfg = LiveConfig(
+        strategy_type="vwatr_div_dsl",
+        symbols=("ENI.MI", "AAPL"),
+        initial_capital=50000.0,
+        strategy_params={},
+        bars=("1d",),
+        warmup="300d",
+        exchange="BVME",
+    )
+    adapter = build_ibkr_adapter(
+        cfg,
+        scope="s",
+        ledger=SqliteLedger(tmp_path / "l.sqlite"),
+        client=IbkrClient(base_url="https://localhost:5000/v1/api/"),
+        dry_run=True,
+        log=lambda _m: None,
+    )
+
+    assert adapter.broker._venue_of("ENI.MI") == "BVME"  # suffix's venue
+    assert adapter.broker._venue_of("AAPL") == "BVME"  # the universe default
+    assert adapter.broker._symbols.broker_of("ENI.MI") == "ENI"
+    assert adapter.source._symbols.key_of("ENI") == "ENI.MI"

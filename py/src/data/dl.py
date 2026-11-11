@@ -28,7 +28,7 @@ from src.bt.table import Col, Table, render as render_table
 from src.data._shared import resolve_symbol_list
 from src.data.fundamentals.dl import download as download_fundamentals
 from src.data.ibkr.candles import candles_batch, gap_range
-from src.data.symbols import resolve_symbols
+from src.data.symbols import resolve_symbols, validate_tickers
 from src.data.types import CandleDict, ISymbol, ProgressFn, SymbolOutcome, SyncResult
 from src.shared.runtime_log import info as _log_info
 from src.shared.runtime_log import set_verbose as _set_verbose
@@ -84,16 +84,19 @@ async def _get_candles(
     bar: str = "1h",
     on_chunk: Optional[ChunkSink] = None,
     on_item: Optional[ItemFn] = None,
-) -> dict[int, list[tuple[datetime, datetime]] | None]:
+) -> dict[str, list[tuple[datetime, datetime]] | None]:
     """Fetch missing candle data for resolved symbols.
 
-    Returns ``{conid: gaps still missing or None if the fetch raised}`` — the
-    gaps ``candles()`` already computed, so no caller re-scans the DB.
+    Returns ``{series key: gaps still missing or None if the fetch raised}``, so
+    the result is addressed the same way a strategy addresses a series. The
+    fetch itself is per conid, and a conid-keyed dict would collapse two listings
+    of one contract into a single silent outcome; the key is the series, which
+    cannot be shared (``symbol.ticker`` is unique).
     """
     from_dt = datetime.combine(from_date, datetime.min.time())
     to_dt = datetime.combine(to_date, datetime.max.time()) if to_date else None
 
-    return await candles_batch(
+    by_conid = await candles_batch(
         [symbol.conid for symbol in symbols],
         from_datetime=from_dt,
         to_datetime=to_dt,
@@ -101,6 +104,8 @@ async def _get_candles(
         on_chunk=on_chunk,
         on_item=on_item,
     )
+    key_of = {symbol.conid: symbol.ticker for symbol in symbols}
+    return {key_of[conid]: gaps for conid, gaps in by_conid.items()}
 
 
 def _report(result: SyncResult, *, file: TextIO | None = None) -> None:
@@ -155,6 +160,7 @@ async def download(
     bar: str = "1h",
     on_progress: Optional[ProgressFn] = None,
     on_chunk: Optional[ChunkSink] = None,
+    exchange: Optional[str] = None,
 ) -> SyncResult:
     """Sync historical candle data for the given tickers.
 
@@ -165,22 +171,29 @@ async def download(
         bar: Bar size (e.g. "1h", "1d")
         on_progress: Optional progress callback (I/O boundary)
         on_chunk: Optional sink for fetched candles (default: write to the DB)
+        exchange: IBKR venue code the tickers list on (``None`` = US path). A
+            ticker carrying its own known suffix keeps it, so one list can span
+            venues.
 
     Returns:
         SyncResult with per-symbol outcomes — failures, remaining gaps and
-        unresolved tickers all land here rather than in the log stream.
+        unresolved tickers all land here rather than in the log stream. Symbols
+        are addressed by series key throughout.
 
     Raises:
         ValueError: If no symbols could be resolved
+        UnmappedVenueError: If the venue has no series-key rule
     """
     if on_progress:
         on_progress("Resolving symbols...", 0, len(tickers))
 
-    symbols = await resolve_symbols(tickers)
-    resolved_tickers = {s.ticker for s in symbols}
-    unresolved = tuple(
-        t for t in (x.upper() for x in tickers) if t not in resolved_tickers
-    )
+    # The KEYS the caller asked for: an input named bare (``ENI``) resolves to a
+    # keyed row (``ENI.MI``), so the unresolved set must be compared in key space
+    # or every such symbol would be reported missing.
+    wanted = validate_tickers(tickers, exchange)
+    symbols = await resolve_symbols(tickers, exchange)
+    resolved_keys = {s.ticker for s in symbols}
+    unresolved = tuple(k for k in wanted if k not in resolved_keys)
 
     if on_progress:
         on_progress(
@@ -208,14 +221,14 @@ async def download(
 
     outcomes = tuple(
         SymbolOutcome(sym.ticker, sym.conid, error="fetch failed")
-        if fetched.get(sym.conid) is None
-        else SymbolOutcome(sym.ticker, sym.conid, gaps=tuple(fetched[sym.conid] or ()))
+        if fetched.get(sym.ticker) is None
+        else SymbolOutcome(sym.ticker, sym.conid, gaps=tuple(fetched[sym.ticker] or ()))
         for sym in symbols
     )
 
     result = SyncResult(
         resolved=len(symbols),
-        fetched=[c for c, gaps in fetched.items() if gaps is not None],
+        fetched=[o.conid for o in outcomes if o.ok],
         gaps_found=sum(len(o.gaps) for o in outcomes),
         symbols=outcomes,
         unresolved=unresolved,
@@ -232,6 +245,7 @@ async def run_candles(
     from_date: date,
     to_date: Optional[date] = None,
     bar: str = "1h",
+    exchange: Optional[str] = None,
 ) -> SyncResult:
     """Candle phase: one ``candles`` bar, then the outcome table.
 
@@ -242,7 +256,12 @@ async def run_candles(
 
     async def _body(progress: ProgressFn) -> SyncResult:
         result = await download(
-            tickers, from_date=from_date, to_date=to_date, bar=bar, on_progress=progress
+            tickers,
+            from_date=from_date,
+            to_date=to_date,
+            bar=bar,
+            on_progress=progress,
+            exchange=exchange,
         )
         _report(result)
         return result
@@ -329,17 +348,18 @@ def dl_cmd(
 
     async def _run() -> None:
         await run_fundamentals(
-            symbols_list,
+            list(symbols_list.tickers),
             from_date=_opt_date(fundamentals_from),
             to_date=_opt_date(fundamentals_to),
             refresh=refresh_fundamentals,
             cache=fundamentals_cache,
         )
         result = await run_candles(
-            symbols_list,
+            list(symbols_list.tickers),
             from_date=date.fromisoformat(from_date),
             to_date=_opt_date(to_date),
             bar=bar,
+            exchange=symbols_list.exchange,
         )
         if result.unresolved:
             _log_info(f"unresolved: {', '.join(result.unresolved)}")

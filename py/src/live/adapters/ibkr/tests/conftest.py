@@ -23,7 +23,8 @@ import respx
 from src.bt.state import ActionType, ExecutionParams, PortfolioState, Position
 from src.data.ibkr.client import IbkrClient
 from src.exec.types import FixedCommission
-from src.live.adapters.ibkr.broker import IbkrBroker
+from src.live.adapters.ibkr.broker import ConidLookup, IbkrBroker
+from src.live.adapters.ibkr.mapping import SeriesSymbols
 from src.live.ports import BookExposure
 from src.live.pure import OrderResult
 from src.live.result import Err, Ok, Result
@@ -127,7 +128,8 @@ class FakeExposure:
         return self._net
 
 
-async def _conid(_ticker: str) -> int:
+async def _conid(_ticker: str, _venue: str | None = None) -> int:
+    """A fixed conid for every (bare symbol, venue) a test routes."""
     return CONID
 
 
@@ -145,12 +147,16 @@ def broker(
     log: Callable[[str], None] | None = None,
     exposure: BookExposure | None = None,
     params: ExecutionParams | None = None,
+    conid_lookup: ConidLookup | None = None,
+    exchange: str | None = None,
+    symbols: SeriesSymbols | None = None,
 ) -> IbkrBroker:
     """An ``IbkrBroker`` wired to the captured-fixture respx routes.
 
     There is no durable open-order store to inject: the broker itself decides an
     order's existence from its reads (working orders, then the executions
-    sweep).
+    sweep). ``conid_lookup``, ``exchange`` and ``symbols`` are the venue seam: a
+    default broker is the US path (fixed conid, no venue, no translation).
     """
     return IbkrBroker(
         IbkrClient(base_url=BASE, account=ACCOUNT),
@@ -160,7 +166,9 @@ def broker(
         exposure=exposure if exposure is not None else FakeExposure(),
         dry_run=dry_run,
         allow_oth=allow_oth,
-        conid_lookup=_conid,
+        conid_lookup=conid_lookup if conid_lookup is not None else _conid,
+        exchange=exchange,
+        symbols=symbols,
         poll_interval_s=0.0,
         timeout_s=timeout_s,
         sleep=_no_sleep,

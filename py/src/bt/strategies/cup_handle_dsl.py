@@ -1,31 +1,28 @@
 """Cup and Handle breakout — DSL-native, self-contained port.
 
-Same economic logic as the removed ``cup_handle`` strategy (pure geometric
-detector + breakout entry + ratcheting ATR trail), expressed on the
-declarative :class:`StrategyContext` DSL.
+A pure geometric detector on confirmed swing pivots (true base low, symmetric
+base, rim-matched rims), a breakout that must be the bar that *crosses* the rim
+on expanding volume, and a chandelier exit.
 
-* The pure geometric detector + trend helpers (``detect_cup_and_handle``,
-  ``cap_stop_dist``, ``is_uptrend``, ``uptrend_aligned``,
-  ``is_bull_market``) are inlined here so the module is self-contained.
-* Data is read cursor-safe through ``ctx.ohlcv`` (cursor-truncated numpy
-  arrays -> ``pd.Series`` for the pure detector) and ``ctx.ta.atr`` (one
-  full-series ATR compute, O(1) per-candle reads).
-* Cross-candle state (cooldowns, handle_lows, trail_stops) lives in
-  ``ctx.shared`` via ``@strategy(stateful=True)`` — the DSL replacement for
-  the ``GLOBAL`` dict.
+* The detector (``detect_cup_and_handle``) and the trend gate
+  (``is_bull_market`` / ``uptrend_aligned``) are inlined so the module is
+  self-contained; shape invariants are module constants, not parameters.
+* Data is read cursor-safe through ``ctx.ohlcv`` (cursor-truncated arrays ->
+  ``pd.Series`` for the pure detector) and ``ctx.ta.atr`` (one full-series ATR
+  compute, O(1) per-candle reads).
+* Cross-candle state (cooldowns, swings, chandelier highs/stops) lives in
+  ``ctx.shared`` via ``@strategy(stateful=True)`` — the DSL replacement for a
+  module-level ``GLOBAL`` dict.
 
-Sizing / SL-TP semantics (DSL convention):
+Sizing / exit semantics (DSL convention):
 
 * ``ctx.long(...)`` omits ``size`` so the engine's **shared sizing layer**
-  (``SizingParams``: ``sizing_mode`` / ``size`` / ``max_symbol_allocation`` in
-  ``strategy_params``) computes the equity-based share count
-  (``qty = base*size/price``, capped by cash and per-symbol allocation). The
-  strategy still bounds its stop distance to the risk budget via
-  ``cap_stop_dist`` against the equity-scaled notional.
-* ``ctx.long(sl=, tp=)`` takes ABSOLUTE PRICES (same convention as
-  ``ctx.set_stops``). The original computes absolute ``stop_loss``/``target``
-  levels, so those are passed straight through:
-  ``sl = entry - stop_dist`` and ``tp = target`` (``None`` when unarmed).
+  (``SizingParams``: ``sizing_mode`` / ``size`` / ``max_symbol_allocation``)
+  derives the share count; the strategy bounds its stop distance to the risk
+  budget via ``cap_stop_dist`` against that same equity-scaled notional.
+* ``ctx.long(sl=)`` takes an ABSOLUTE price (same convention as
+  ``ctx.set_stops``). No take-profit is armed: a level fixed at entry caps the
+  advance the pattern exists to capture, so the chandelier owns the exit.
 """
 
 from __future__ import annotations
@@ -39,6 +36,7 @@ import pandas as pd
 import src.indicators.ta as ta
 
 from src.bt.strategies.dsl import strategy, StrategyContext
+from src.bt.strategies.fundamentals_context import SeriesPIT
 from src.bt.strategies.types import StrategyParams
 
 
@@ -69,6 +67,7 @@ class Handle:
     breakout_level: float  # sell above this
     cup_depth: float  # absolute price depth of the parent cup
     rim_level: float  # right-rim price (for reference / target calc)
+    cup_left_idx: int  # left-rim index (volume baseline for the breakout)
 
 
 @dataclass(frozen=True)
@@ -92,38 +91,6 @@ def cap_stop_dist(
     cap_dist = risk_cap_dollars / qty if qty > 0 else float("inf")
     dist = min(natural_dist, cap_dist)
     return max(dist, min_stop_atr * atr_val)
-
-
-def trend_strength(
-    highs: pd.Series,
-    lows: pd.Series,
-    closes: pd.Series,
-    *,
-    adx_window: int = 14,
-) -> float:
-    """Latest ADX reading (0..100); >= ``adx_trend_threshold`` = trending."""
-    adx_series = ta.adx(highs, lows, closes, adx_window)
-    val = float(adx_series.iloc[-1])
-    return val if val == val else 0.0  # NaN guard
-
-
-def is_uptrend(
-    highs: pd.Series,
-    lows: pd.Series,
-    closes: pd.Series,
-    *,
-    adx_window: int = 14,
-    threshold: float = 25.0,
-    ma_span: int = 50,
-) -> bool:
-    """Trending up? ADX >= threshold AND close above a slow moving average."""
-    if len(closes) < ma_span + 1:
-        return False
-    adx_val = trend_strength(highs, lows, closes, adx_window=adx_window)
-    if adx_val < threshold:
-        return False
-    ma = float(ta.sma(closes, ma_span).iloc[-1])
-    return float(closes.iloc[-1]) > ma
 
 
 def is_bull_market(
@@ -251,8 +218,32 @@ def _swings_incremental(
     return (n, out)
 
 
+# Structural geometry constants. Shape invariants of the pattern, not fitted
+# knobs, so they are hard-coded instead of exposed as parameters.
+MIN_CUP_BARS = 20  # a base narrower than this is a flag, not a cup
+MIN_BASE_POS = 0.25  # the base low must sit in the middle half of the base
+HANDLE_MAX_WIDTH_FRAC = 0.5  # handle width <= half the cup width
+HANDLE_MAX_DEPTH_FRAC = 0.5  # handle retrace <= half the cup depth
+BREAKOUT_VOLUME_MULT = 1.5  # breakout volume vs the cup-body average
+VIX_WINDOW = 200  # prints in the volatility-regime baseline
+VIX_MIN_PRINTS = 60  # fewer visible prints -> the gate cannot be read
+ANNUAL_MIN_DAYS = 300  # span length that marks a full-year fundamental
+
+
+def _lowest_low(swings: Sequence[Swing], start: int, stop: int) -> Optional[Swing]:
+    """Lowest pivot low strictly between two swing positions, or ``None``."""
+    lowest: Optional[Swing] = None
+    for b in range(start, stop):
+        swing = swings[b]
+        if swing.high:
+            continue
+        if lowest is None or swing.level < lowest.level:
+            lowest = swing
+    return lowest
+
+
 def _check_cup(
-    swings: Sequence[Swing],
+    seg_low: float,
     left: Swing,
     bottom: Swing,
     right: Swing,
@@ -260,96 +251,100 @@ def _check_cup(
     max_cup_depth_pct: float,
     min_cup_depth_pct: float,
     rim_tolerance_pct: float,
-    min_mid_pivots: int,
 ) -> bool:
-    """Validate a cup's geometry between a left rim, a bottom low and a right rim."""
+    """Validate a cup's geometry between a left rim, a bottom low and a right rim.
+
+    Three invariants the depth/rim gates alone did not catch:
+
+    * **the base low is the TRUE low of the base.** A pivot low that merely sits
+      some percentage under the left rim is a shelf on the way down, not a cup
+      bottom. Accepting one declares a fictional depth and defeats
+      ``max_cup_depth_pct`` -- the real decline can be anything.
+    * **the base is wide enough** to be a base at all.
+    * **the base low is roughly centred**, so a cliff-then-crawl or a
+      ramp-then-spike is not read as a cup.
+    """
+    if not (left.idx < bottom.idx < right.idx):
+        return False
+    span = right.idx - left.idx
+    if span < MIN_CUP_BARS:
+        return False
+    if bottom.level > seg_low + 1e-9:
+        return False
     depth = (left.level - bottom.level) / left.level
     if not (min_cup_depth_pct <= depth <= max_cup_depth_pct):
         return False
-    if not (left.idx < bottom.idx < right.idx):
-        return False
     if abs(right.level - left.level) / left.level > rim_tolerance_pct:
         return False
-
-    mid = [s for s in swings if bottom.idx < s.idx < right.idx]
-    if len(mid) < min_mid_pivots:
-        return False
-    after_bottom_lows = [s for s in mid if not s.high]
-    if not any(s.level > bottom.level for s in after_bottom_lows):
-        return False  # no upturn on the right wall -> V bottom
-    return True
+    pos = (bottom.idx - left.idx) / span
+    return MIN_BASE_POS <= pos <= 1.0 - MIN_BASE_POS
 
 
 def _find_handle(
-    swings: Sequence[Swing],
+    closes_np: np.ndarray,
+    lows_np: np.ndarray,
     right: Swing,
     n: int,
     *,
+    cup_left_idx: int,
+    cup_depth: float,
     max_handle_bars: int,
     max_handle_drop_pct: float,
-    cup_bars: int = 0,  # parent cup width in bars (left_-> right_ rim)
-    cup_depth: float = 0.0,  # absolute price depth of the parent cup
-    handle_width_scale: float = 0.0,  # >0: cap width at frac of cup width
-    handle_depth_scale: float = 0.0,  # >0: cap drop at frac of cup depth
-    handle_width_floor: int = 3,  # min handle search window when scaled
 ) -> Optional[Handle]:
-    """Locate the small pullback (handle) following the right rim.
+    """Locate the pullback (handle) that coils under the right rim before now.
 
-    Two optional cup-size scalings gate the handle so it is not declared on
-    the first blip above the rim:
+    Measured on raw bars over ``[rim + 2, n - 1)`` -- the current bar is the
+    breakout candidate and is excluded, so a post-breakout pivot low can never
+    be mistaken for a handle. Rejected when:
 
-    * width: the search horizon is bounded to a fraction of the parent cup's
-      bar-width (``handle_width_scale``), so a handle must carve out of a base
-      proportionate to the cup rather than trigger on a 1-2 bar retrace.
-    * depth: the allowed retrace off the rim is bounded to a fraction of the
-      cup's price depth (``handle_depth_scale``) and combined with the fixed
-      ``max_handle_drop_pct`` cap. Deeper bowls tolerate proportionally
-      deeper handles, but a handle still cannot slice into the lower half of
-      the cup.
+    * a close inside the window is at or above the rim (the coil is over),
+    * there is no pullback at all (the low is the rim itself), or
+    * the retrace exceeds half the cup depth or ``max_handle_drop_pct`` -- a
+      handle may not cut into the lower half of the base.
+
+    Width is capped by ``max_handle_bars`` and by half the parent cup's width.
     """
-    window = (
-        max_handle_bars
-        if cup_bars <= 0 or handle_width_scale <= 0
-        else min(
-            max_handle_bars, max(handle_width_floor, int(handle_width_scale * cup_bars))
-        )
-    )
-    end = min(right.idx + window, n)
-    seg = [s for s in swings if right.idx < s.idx < end]
-
-    seg_lows = [s for s in seg if not s.high]
-    if not seg_lows:
+    if cup_depth <= 0 or right.level <= 0:
         return None
-    handle_low = min(seg_lows, key=lambda s: s.level)
-
-    drop = (right.level - handle_low.level) / right.level
-    # Depth scaling: a cup that dropped deep allows, at most, a handle that
-    # pulls ``handle_depth_scale`` of that bowl back -- still tight vs rim.
-    cap = max_handle_drop_pct
-    if cup_depth > 0 and handle_depth_scale > 0 and right.level > 0:
-        cap = min(cap, handle_depth_scale * cup_depth / right.level)
-    if drop > cap:
+    cup_bars = max(1, n - 1 - cup_left_idx)
+    window = min(max_handle_bars, max(2, int(HANDLE_MAX_WIDTH_FRAC * cup_bars)))
+    start = right.idx + 2
+    end = min(right.idx + window, n - 1)
+    if end <= start:
         return None
-
+    if float(closes_np[start:end].max()) > right.level:
+        return None  # already back above resistance: nothing coiled
+    lo_seg = lows_np[start:end]
+    lo_idx = start + int(lo_seg.argmin())
+    lo_level = float(lo_seg.min())
+    retrace = right.level - lo_level
+    if retrace <= 0:
+        return None  # no pullback off the rim -> nothing to call a handle
+    if retrace > HANDLE_MAX_DEPTH_FRAC * cup_depth:
+        return None  # handle sliced into the lower half of the base
+    if retrace / right.level > max_handle_drop_pct:
+        return None
     return Handle(
         start_idx=right.idx,
-        low_idx=handle_low.idx,
-        low=handle_low.level,
+        low_idx=lo_idx,
+        low=lo_level,
         breakout_level=right.level,
-        cup_depth=0.0,  # filled by the caller
+        cup_depth=cup_depth,
         rim_level=right.level,
+        cup_left_idx=cup_left_idx,
     )
 
 
-def _volume_picks_up(volumes: pd.Series, rim_idx: int, n: int) -> bool:
-    """Breakout bar volume should exceed the cup-body average."""
+def _volume_picks_up(volumes: pd.Series, left_idx: int, n: int) -> bool:
+    """Breakout bar volume should expand over the cup-body average."""
     vol = volumes.to_numpy()
     if n < 2 or vol[-1] != vol[-1]:  # NaN guard
         return False
-    base = vol[rim_idx : n - 1]
+    base = vol[left_idx : n - 1]
     if len(base) == 0:
         return False
-    return float(vol[-1]) > float(np.mean(base))
+    avg = float(np.mean(base))
+    return avg > 0 and float(vol[-1]) >= BREAKOUT_VOLUME_MULT * avg
 
 
 def detect_cup_and_handle(
@@ -362,13 +357,9 @@ def detect_cup_and_handle(
     max_cup_depth_pct: float = 0.40,
     min_cup_depth_pct: float = 0.10,
     rim_tolerance_pct: float = 0.05,
-    min_mid_pivots: int = 1,
     max_cup_bars: int = 260,
     max_handle_bars: int = 40,
     max_handle_drop_pct: float = 0.12,
-    handle_width_scale: float = 0.0,  # cap handle width as frac of cup bars
-    handle_depth_scale: float = 0.0,  # cap handle retrace as frac of cup depth
-    handle_width_floor: int = 3,
     volume_confirm_breakout: bool = True,
     # Incremental hook: precomputed swing list for the FULL history ``highs``
     # (valid at this exact length). When supplied the O(n) re-fractal scan is
@@ -393,6 +384,8 @@ def detect_cup_and_handle(
     best: Optional[Handle] = None
     cup_found = False
 
+    lows_np = lows.to_numpy()
+
     # Iterate candidate right rims from most recent backwards.
     for j in range(len(swings) - 1, -1, -1):
         right = swings[j]
@@ -400,55 +393,49 @@ def detect_cup_and_handle(
             continue
         if right.idx > n - 1 - swing_lookback - 1:
             continue
+        # Running raw low over ``[left.idx, right.idx]``. The left rims are
+        # visited right-to-left, so each step only absorbs the newly covered
+        # slice -- giving the true base low without re-scanning per candidate.
+        seg_low = right.level
+        seg_from = right.idx + 1
         for i in range(j - 1, -1, -1):
             left = swings[i]
+            if left.idx < seg_from:
+                seg_low = min(seg_low, float(lows_np[left.idx : seg_from].min()))
+                seg_from = left.idx
             if not left.high:
                 continue
             if right.idx - left.idx > max_cup_bars:
                 break
-            for b in range(i + 1, j):
-                bottom = swings[b]
-                if bottom.high:
-                    continue
-                if not _check_cup(
-                    swings,
-                    left,
-                    bottom,
-                    right,
-                    max_cup_depth_pct=max_cup_depth_pct,
-                    min_cup_depth_pct=min_cup_depth_pct,
-                    rim_tolerance_pct=rim_tolerance_pct,
-                    min_mid_pivots=min_mid_pivots,
-                ):
-                    continue
+            bottom = _lowest_low(swings, i + 1, j)
+            if bottom is None:
+                continue
+            if not _check_cup(
+                seg_low,
+                left,
+                bottom,
+                right,
+                max_cup_depth_pct=max_cup_depth_pct,
+                min_cup_depth_pct=min_cup_depth_pct,
+                rim_tolerance_pct=rim_tolerance_pct,
+            ):
+                continue
 
-                cup_found = True
-                depth = left.level - bottom.level
-                handle = _find_handle(
-                    swings,
-                    right,
-                    n,
-                    max_handle_bars=max_handle_bars,
-                    max_handle_drop_pct=max_handle_drop_pct,
-                    cup_bars=right.idx - left.idx,
-                    cup_depth=depth,
-                    handle_width_scale=handle_width_scale,
-                    handle_depth_scale=handle_depth_scale,
-                    handle_width_floor=handle_width_floor,
-                )
-                if handle is None:
-                    continue
-                handle = Handle(
-                    start_idx=handle.start_idx,
-                    low_idx=handle.low_idx,
-                    low=handle.low,
-                    breakout_level=handle.breakout_level,
-                    cup_depth=depth,
-                    rim_level=right.level,
-                )
-
-                if best is None or right.idx > best.start_idx:
-                    best = handle
+            cup_found = True
+            handle = _find_handle(
+                closes_np,
+                lows_np,
+                right,
+                n,
+                cup_left_idx=left.idx,
+                cup_depth=left.level - bottom.level,
+                max_handle_bars=max_handle_bars,
+                max_handle_drop_pct=max_handle_drop_pct,
+            )
+            if handle is None:
+                continue
+            if best is None or right.idx > best.start_idx:
+                best = handle
 
     if best is None:
         reason = "handle" if cup_found else "no valid cup"
@@ -456,9 +443,15 @@ def detect_cup_and_handle(
 
     if last_close <= best.breakout_level:
         return CupHandleResult(True, True, False, best, "no breakout yet")
+    # The breakout is the bar that CROSSES the rim, not any later bar in the
+    # same advance. Without this the trigger fires on an already-extended move
+    # (the cached formation stays valid for as long as price holds above the
+    # rim), which turns the entry into a chase.
+    if float(closes_np[-2]) > best.breakout_level:
+        return CupHandleResult(True, True, False, best, "already above the rim")
 
     if volume_confirm_breakout and volumes is not None:
-        if not _volume_picks_up(volumes, best.start_idx, n):
+        if not _volume_picks_up(volumes, best.cup_left_idx, n):
             return CupHandleResult(True, True, False, best, "no volume confirmation")
 
     return CupHandleResult(True, True, True, best, "breakout")
@@ -472,32 +465,103 @@ class Params(StrategyParams):
     max_cup_depth_pct: float = 0.40
     min_cup_depth_pct: float = 0.10
     rim_tolerance_pct: float = 0.05
-    min_mid_pivots: int = 1
     max_cup_bars: int = 260
     # Handle geometry
     max_handle_bars: int = 40
     max_handle_drop_pct: float = 0.12
-    handle_width_scale: float = 0.0  # cap handle width as frac of cup bars
-    handle_depth_scale: float = 0.0  # cap handle retrace as frac of cup depth
-    handle_width_floor: int = 3
     # Volume confirmation
     volume_confirm_breakout: bool = True
+    # Confirmations convert to SIZE, not to a filter: a signal is never dropped,
+    # it is sized between 1x and (1 + size_boost_max)x by how many enabled gates
+    # agree. All off by default (mult stays 1x).
+    boost_volume_dryup: bool = False
+    boost_vix_calm: bool = False
+    boost_fundamentals: bool = False
+    size_boost_max: float = 2.0
     # Sizing / risk
     per_symbol_size: float = 0.30
     max_risk_pct: float = 0.02
     min_stop_atr: float = 0.5
-    # Exit / trail
-    trail_atr_period: int = 14
-    trail_atr_mult: float = 2.5
-    adx_window: int = 14
-    adx_trend_threshold: float = 25.0
-    trend_trail_atr_mult: float = 3.0
-    chop_trail_atr_mult: float = 2.0
-    trend_tp_mult: float = 1.2
+    # Exit — chandelier only
+    chandelier_period: int = 22
+    chandelier_atr_mult: float = 3.0
     # Warmup & cooldown
     warmup_bars: int = 60
     cooldown_bars: int = 5
-    profit_target_mult: float = 1.0
+
+
+# ---------------------------------------------------------------------------
+# entry confirmations (volume contraction, volatility regime, fundamentals)
+# ---------------------------------------------------------------------------
+
+
+def _volume_contracts(volumes: pd.Series, left_idx: int, rim_idx: int, n: int) -> bool:
+    """Handle volume must dry up relative to the cup body.
+
+    The breakout test already demands expansion ON the breakout bar. This is the
+    other half of the volume story: the coil under the rim trades quieter than
+    the base it came out of. A handle on *rising* volume is distribution, not
+    accumulation.
+    """
+    vol = volumes.to_numpy()
+    cup = vol[left_idx : rim_idx + 1]
+    handle = vol[rim_idx + 2 : n - 1]
+    if len(cup) == 0 or len(handle) == 0:
+        return False
+    return float(np.mean(handle)) < float(np.mean(cup))
+
+
+def _vix_calm(ctx: StrategyContext) -> bool:
+    """Volatility regime: the latest VIX print at or under its own average.
+
+    Cheap insurance against breaking out into a volatility spike, which is where
+    a breakout's failure rate lives. Unreadable (too few visible prints) rejects
+    rather than passing silently.
+    """
+    vix = ctx.macro.vix
+    if len(vix) < VIX_MIN_PRINTS:
+        return False
+    window = vix[-VIX_WINDOW:]
+    return vix.last() <= float(np.mean(window))
+
+
+def _annual_values(series: SeriesPIT, years: int) -> list[float]:
+    """Most recent ``years`` full-year values of a cursor-safe fiscal series.
+
+    Filters on span length, not the SEC form string: ``period_start ->
+    period_end`` is what decides whether a number is a full year.
+    """
+    spans = series.spans()
+    values = series.values()
+    annual = [
+        float(value)
+        for value, (start, end) in zip(values, spans)
+        if (end - start).days >= ANNUAL_MIN_DAYS
+    ]
+    return annual[-years:]
+
+
+def _fundamentals_grow(ctx: StrategyContext, sym: str) -> bool:
+    """Revenue must be growing year over year on as-first-stated filings.
+
+    Cursor-safe by construction: ``ctx.fundamentals`` hides every filing filed
+    after the current bar. Fewer than two annual points means the growth cannot
+    be read, which rejects — a confirmation that cannot be evaluated is not a
+    confirmation.
+    """
+    # The statement object is memoised per symbol: building it walks the whole
+    # filing history, and it is read for every breakout. Safe to hold across
+    # bars because a ``SeriesPIT`` re-derives which periods are visible from the
+    # live cursor on every read — the memo caches the rows, never the visibility.
+    memo = ctx.shared.setdefault("_fund_revenue", {})
+    revenue = memo.get(sym)
+    if revenue is None:
+        revenue = ctx.fundamentals.income(sym).revenue
+        memo[sym] = revenue
+    annual = _annual_values(revenue, 2)
+    if len(annual) < 2:
+        return False
+    return annual[-1] > annual[0]
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +621,16 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
     # bar's swings instead of re-fractaling the whole history. ``detect`` then
     # skips its internal cold ``_find_swings``. ``ctx.shared`` is per-run, so
     # warm-up across bars is safe and nothing bleeds between split/sweep runs.
+    # Cheap NECESSARY condition for any breakout, before the detector runs.
+    # The rim is a confirmed pivot high at ``<= n - 5``, so bars ``n-4 .. n-2``
+    # are all at or right of ``rim + 1``: inside the pivot window or the handle
+    # coil, where every close is below the rim level. A breakout bar (the only
+    # bar that can trigger an entry) must therefore close above all three. A bar
+    # that fails this cannot be a breakout, so nothing is lost by skipping it —
+    # and the O(rims x lefts) geometry scan is skipped on most bars.
+    if float(closes.iloc[-1]) <= float(arr["close"].iloc[-4:-1].max()):
+        return
+
     cache = ctx.shared.setdefault("_cup_swings", {})
     entry = cache.get(sym)
     _, swings = _swings_incremental(
@@ -573,13 +647,9 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
         max_cup_depth_pct=params.max_cup_depth_pct,
         min_cup_depth_pct=params.min_cup_depth_pct,
         rim_tolerance_pct=params.rim_tolerance_pct,
-        min_mid_pivots=params.min_mid_pivots,
         max_cup_bars=params.max_cup_bars,
         max_handle_bars=params.max_handle_bars,
         max_handle_drop_pct=params.max_handle_drop_pct,
-        handle_width_scale=params.handle_width_scale,
-        handle_depth_scale=params.handle_depth_scale,
-        handle_width_floor=params.handle_width_floor,
         volume_confirm_breakout=params.volume_confirm_breakout,
         swings=swings,
     )
@@ -590,9 +660,35 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
     if not _symbol_market_aligned(ctx, closes):
         return
 
+    # Confirmations size the bet instead of gating it: every signal still
+    # trades, and the number of agreeing gates scales the notional from 1x up to
+    # 1 + size_boost_max. A signal no gate agrees with is a 1x trade, never a
+    # dropped one — so the setup count is unchanged and only capital allocation
+    # moves.
+    gates_enabled = 0
+    gates_passed = 0
+    if params.boost_volume_dryup:
+        gates_enabled += 1
+        gates_passed += int(
+            _volume_contracts(
+                arr["volume"], handle.cup_left_idx, handle.start_idx, len(closes)
+            )
+        )
+    if params.boost_vix_calm:
+        gates_enabled += 1
+        gates_passed += int(_vix_calm(ctx))
+    if params.boost_fundamentals:
+        gates_enabled += 1
+        gates_passed += int(_fundamentals_grow(ctx, sym))
+    size_mult = (
+        1.0
+        if gates_enabled == 0
+        else 1.0 + params.size_boost_max * gates_passed / gates_enabled
+    )
+
     entry_price = float(closes.iloc[-1])
 
-    atr_val = _atr_val(ctx, sym, params.trail_atr_period)
+    atr_val = _atr_val(ctx, sym, params.chandelier_period)
     if atr_val <= 0:
         atr_val = max(handle.cup_depth * 0.1, 1e-9)
 
@@ -603,12 +699,12 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
     equity = ctx.state.portfolio.cash  # conservative proxy post-commit
     if equity <= 0 or entry_price <= 0:
         return
-    qty = equity * params.per_symbol_size / entry_price
+    qty = equity * params.per_symbol_size * size_mult / entry_price
     if qty <= 0 or ctx.state.portfolio.cash <= 0:
         return
 
     natural_dist = max(
-        params.trail_atr_mult * atr_val, (entry_price - handle.low) * 1.05
+        params.chandelier_atr_mult * atr_val, (entry_price - handle.low) * 1.05
     )
     risk_cap_dollars = initial * params.max_risk_pct
     stop_dist = cap_stop_dist(
@@ -619,83 +715,73 @@ def _maybe_enter(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> N
         min_stop_atr=params.min_stop_atr,
     )
 
-    trending = is_uptrend(
-        arr["high"],
-        arr["low"],
-        closes,
-        adx_window=params.adx_window,
-        threshold=params.adx_trend_threshold,
-    )
-    target = 0.0
-    if not trending and params.trend_tp_mult > 0 and handle.cup_depth > 0:
-        target = entry_price + params.trend_tp_mult * handle.cup_depth
-
-    # ``ctx.long`` takes ABSOLUTE SL/TP levels: the stop is the primitive
-    # absolute level ``entry_price - stop_dist``; the optional trend TP is
-    # ``target`` itself (None when disabled).
+    # No take-profit: the cup's whole edge is the post-breakout advance, and a
+    # level armed at entry caps it. The chandelier (``_manage_position``) owns
+    # the exit; ``sl`` is only the initial protective stop.
     sl_abs = entry_price - stop_dist if stop_dist > 0 else None
-    tp_abs = target if target > 0 else None
 
-    ctx.shared["handle_lows"][sym] = handle.low
     ctx.shared["cooldowns"][sym] = params.cooldown_bars
     # No explicit ``size``: the engine's shared sizing layer (``SizingParams``)
     # computes the equity-based share count from ``sizing_mode``/``size``/
     # ``max_symbol_allocation`` in the strategy config.
     ctx.long(
         sym,
+        size=params.per_symbol_size * size_mult,
+        size_mode="equity",
         sl=sl_abs,
-        tp=tp_abs,
         reason=(
             f"breakout above {handle.breakout_level:.2f} "
-            f"(depth={handle.cup_depth:.2f} · {result.reason})"
+            f"(depth={handle.cup_depth:.2f} · {result.reason} · {size_mult:.2f}x)"
         ),
     )
 
 
 def _manage_position(ctx: StrategyContext, sym: str, arr: dict[str, pd.Series]) -> None:
+    """Chandelier exit: trail ``chandelier_atr_mult`` ATRs under the highest high.
+
+    The stop is ``running_high - mult * ATR`` where ``running_high`` is the
+    highest high since entry (never the pre-breakout history, so a spike before
+    the rim cannot park the stop above the entry price). It ratchets up only and
+    is floored by the entry stop the engine already holds. A close at or below
+    the stop exits, filled at the next open.
+
+    No ADX branch and no take-profit: one exit rule, so a trend that keeps
+    making highs keeps the position — which is the whole point of the pattern.
+    """
     pos = ctx.position(sym)
     if pos is None:
         return
-    # Chop entries carry a fixed TP; the engine's TP/SL handles those — the
-    # ratchet is reserved for trend (no-TP) entries.
-    if pos.take_profit is not None:
-        return
-
     params = ctx.params
-    closes = arr["close"]
-    close_price = float(closes.iloc[-1])
-
-    handle_low = ctx.shared["handle_lows"].get(sym)
-    atr_val = _atr_val(ctx, sym, params.trail_atr_period)
-    if atr_val <= 0:
-        atr_val = max(float(closes.iloc[-1]) * 0.01, 1e-9)
-
-    trending = is_uptrend(
-        arr["high"],
-        arr["low"],
-        closes,
-        adx_window=params.adx_window,
-        threshold=params.adx_trend_threshold,
-    )
-    trail_mult = params.trend_trail_atr_mult if trending else params.chop_trail_atr_mult
-
     pid = pos.position_id
-    candidate = close_price - trail_mult * atr_val
-    floor = handle_low * 0.99 if handle_low else -float("inf")
+    close_price = float(arr["close"].iloc[-1])
+    high_price = float(arr["high"].iloc[-1])
+
+    atr_val = _atr_val(ctx, sym, params.chandelier_period)
+    if atr_val <= 0:
+        atr_val = max(close_price * 0.01, 1e-9)
+
+    highs_seen = ctx.shared["trail_highs"]
+    run_high = max(highs_seen.get(pid, -float("inf")), high_price)
+    highs_seen[pid] = run_high
+
+    candidate = run_high - params.chandelier_atr_mult * atr_val
     seed = float(pos.stop_loss) if pos.stop_loss else -float("inf")
-    base = max(candidate, floor, seed)
-    saved = ctx.shared["trail_stops"].get(pid)
-    trail_stop = base if saved is None else max(base, saved)
+    saved = ctx.shared["trail_stops"].get(pid, -float("inf"))
+    trail_stop = max(candidate, seed, saved)
     ctx.shared["trail_stops"][pid] = trail_stop
 
     if close_price > trail_stop:
         return
 
     ctx.shared["trail_stops"].pop(pid, None)
+    highs_seen.pop(pid, None)
     ctx.shared["cooldowns"][sym] = params.cooldown_bars
     ctx.close(
         sym,
-        reason=(f"ratchet trail hit (close {close_price:.2f} <= {trail_stop:.2f})"),
+        reason=(
+            f"chandelier exit (close {close_price:.2f} <= {trail_stop:.2f}, "
+            f"high {run_high:.2f} - {params.chandelier_atr_mult:g}xATR)"
+        ),
     )
 
 
@@ -713,8 +799,8 @@ def on_candle(ctx: StrategyContext):
         return
     shared = ctx.shared
     shared.setdefault("cooldowns", {})
-    shared.setdefault("handle_lows", {})
     shared.setdefault("trail_stops", {})
+    shared.setdefault("trail_highs", {})
 
     symbols = sorted(ctx.symbols)
 

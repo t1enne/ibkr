@@ -35,6 +35,7 @@ __all__ = [
     "PreviewResult",
     "ProgressFn",
     "SymbolOutcome",
+    "SymbolRequest",
     "SymbolSchema",
     "SyncResult",
     "UniverseConf",
@@ -47,7 +48,12 @@ __all__ = [
 
 @dataclass
 class ISymbol:
-    """Dataclass matching SymbolSchema Peewee model."""
+    """Dataclass matching SymbolSchema Peewee model.
+
+    ``ticker`` is the listing's SERIES KEY (see :mod:`src.data.venue`): the
+    string a strategy names its price history by, and the one ``candle.ticker``
+    holds. ``market`` is the venue that key was derived for.
+    """
 
     conid: int
     ticker: str
@@ -97,6 +103,11 @@ class CandleDict(TypedDict, total=True):
 class UniverseConf:
     """Configuration loaded from universe .json.
 
+    ``exchange`` is the IBKR venue code the tickers are listed on (``BVME`` for
+    Borsa Italiana). It is what makes ticker resolution work outside the US: a
+    bare ticker can be listed on several venues, and without this the lookup
+    would only ever find the US one. ``None`` means the US path.
+
     Frozen — configuration is immutable after loading.
     """
 
@@ -104,6 +115,15 @@ class UniverseConf:
     from_date: Optional[date] = None
     to_date: Optional[date] = None
     bar: str = "1h"
+    exchange: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SymbolRequest:
+    """A tickers-to-load request: the symbols plus the venue they live on."""
+
+    tickers: tuple[str, ...]
+    exchange: Optional[str] = None
 
 
 # ── Results ──────────────────────────────────────────────────────

@@ -15,13 +15,17 @@ import respx
 from src.data.ibkr.client import IbkrClient
 from src.exec.refs import scope_tag
 from src.exec.types import OrderSide
-from src.live.adapters.ibkr.mapping import IbkrPosition
+from src.live.adapters.ibkr.mapping import IbkrPosition, series_symbols
 from src.live.adapters.ibkr.portfolio_source import (
     IbkrPortfolioSource,
     build_snapshot,
 )
 from src.live.adapters.ibkr.trades import BookRow, Execution, StrategyBook, reconcile
+from src.live.divergence import book_from_executions, guard_divergence
 from src.live.ledger import SqliteLedger
+from src.live.result import Ok
+from src.live.types import PortfolioSnapshot
+from src.live.tests.ledgers import live_ledger
 
 BASE = "https://localhost:5000/v1/api/"
 SCOPE = "momentum"
@@ -146,3 +150,65 @@ def _mock_reads(
 
 
 pytestmark = pytest.mark.db
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_foreign_book_is_keyed_by_series_key_and_never_diverges(
+    tmp_path: Path,
+) -> None:
+    """The gateway names the lot ``ENI``; the scope must book it as ``ENI.MI``.
+
+    Without the translation the strategy (whose symbols are series keys) would
+    never see its own lot, and the divergence oracle — which compares the stored
+    fills against this same book — would report BOTH sides missing. One read must
+    therefore translate once, before the fold and before the persist, so the
+    lot is one key everywhere.
+    """
+    _mock_reads(
+        positions=[
+            {
+                "acctId": "DU1",
+                "conid": 200,
+                "contractDesc": "ENI",
+                "position": 10,
+                "avgCost": 15.0,
+                "mktPrice": 15.5,
+                "currency": "EUR",
+            }
+        ],
+        trades=[
+            {
+                "execution_id": "e1",
+                "order_id": "o1",
+                "order_ref": f"{scope_tag(SCOPE)}-1a2b3c4d",
+                "conid": 200,
+                "symbol": "ENI",
+                "side": "B",
+                "size": 10,
+                "price": 15.0,
+                "commission": 1.0,
+                "trade_time_r": 1704191400000,
+            }
+        ],
+        summary={"netliquidation": {"amount": 0.0}, "totalcashvalue": {"amount": 0.0}},
+    )
+    ledger = live_ledger(tmp_path / "l.sqlite")
+    source = IbkrPortfolioSource(
+        IbkrClient(base_url=BASE, account="DU1"),
+        scope=SCOPE,
+        ledger=ledger,
+        initial_capital=51000.0,
+        now=AS_OF,
+        symbols=series_symbols(["ENI.MI"]),
+    )
+
+    fetched = await source.fetch()
+
+    assert isinstance(fetched, Ok)
+    snapshot = cast("PortfolioSnapshot", fetched.value)
+    assert list(snapshot.portfolio.positions) == ["ENI.MI"]
+    assert snapshot.portfolio.positions["ENI.MI"][0].last_price == 15.5
+    # The persisted fills carry the KEY too, so the oracle sees one lot, not two.
+    ours = book_from_executions(ledger.executions_of(SCOPE))
+    assert guard_divergence(ours, snapshot.portfolio) == ()

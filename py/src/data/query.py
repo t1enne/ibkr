@@ -31,7 +31,7 @@ def query_cmd(
     Shows a recap with date range, row count, and gaps >48h.
     """
     symbols_list = resolve_symbol_list(symbols, universe)
-    print_recap(tuple(symbols_list), from_date or "", to_date, bar)
+    print_recap(symbols_list.tickers, from_date or "", to_date, bar)
 
 
 def register(group: click.Group) -> None:

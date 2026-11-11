@@ -49,3 +49,19 @@ async def test_happy_path_parses_each_endpoint() -> None:
     assert await client.portfolio_summary() == {"netliquidation": {"amount": 1}}
     assert await client.positions() == [{"conid": 265598}]
     assert await client.trades() == [{"execution_id": "e1"}]
+
+
+def test_both_clients_carry_the_same_timeout() -> None:
+    """A wedged gateway must fail as a transport error, not hang forever.
+
+    The generated REST client opens its OWN httpx pool, so the httpx client's
+    timeout says nothing about secdef search or candle history. A saturated
+    gateway otherwise accepts the connection and never answers, and every `rest`
+    call waits indefinitely.
+    """
+    client = IbkrClient(base_url=BASE, account="DU1234567", timeout=7.5)
+
+    assert client.timeout_s == 7.5
+    assert client.http.timeout.read == 7.5
+    # The generated client keeps its timeout on the pool it builds lazily.
+    assert client.rest._timeout == httpx.Timeout(7.5)

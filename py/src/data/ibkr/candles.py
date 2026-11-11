@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, date, timezone
 from typing import Callable, Optional, cast
 
 from peewee import fn
-from src.data.types import CandleSchema, db
+from src.data.types import CandleSchema, SymbolSchema, db
 from ib_rest_api_client.api.trading_market_data import get_iserver_marketdata_history
 from ib_rest_api_client.models import IserverHistoryBidAskResponse
 from ib_rest_api_client.models import GetIserverMarketdataHistoryDirection
@@ -40,10 +40,40 @@ CHUNK_DELAY_S = 1.0
 CHUNK_DELAY_MAX_S = 60.0
 
 
+def _refuse_foreign_conid(batch: list[CandleDict]) -> None:
+    """Refuse a batch whose series key already holds a DIFFERENT conid's bars.
+
+    ``on_conflict_ignore`` drops the incoming row on the ``(ticker, timestamp)``
+    unique index, so a cross-venue mix-up would look exactly like a successful
+    re-download: the fetch reports done and the bar count never moves. The stored
+    row names the series' real owner, so compare against it and fail loud.
+
+    Raises:
+        ValueError: the batch spans more than one series, or the series belongs
+            to another conid.
+    """
+    series = {(c["ticker"], c["conid"]) for c in batch}
+    if len(series) != 1:
+        raise ValueError(f"one candle batch must be one series, got {sorted(series)}")
+    ticker, conid = next(iter(series))
+    owner = (
+        CandleSchema.select(CandleSchema.conid)
+        .where(CandleSchema.ticker == ticker, CandleSchema.conid != conid)
+        .limit(1)
+        .first()
+    )
+    if owner is not None:
+        raise ValueError(
+            f"candle series {ticker} already belongs to conid {owner.conid}; "
+            f"refusing to write conid {conid}"
+        )
+
+
 def _chunked_insert(insert_data: list[CandleDict], batch_size: int = 500) -> None:
     """Insert candles in batches to avoid SQLite's variable limit."""
     for i in range(0, len(insert_data), batch_size):
         batch = insert_data[i : i + batch_size]
+        _refuse_foreign_conid(batch)
         with db.atomic():
             CandleSchema.insert_many(batch).on_conflict_ignore().execute()
 
@@ -57,7 +87,21 @@ def timestamp_to_datetime(ts: int) -> datetime:
     return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).replace(tzinfo=None)
 
 
-def _is_all_non_trading(gap_start: datetime, gap_end: datetime) -> bool:
+def _stored_market(ticker: str) -> str | None:
+    """The venue recorded for *ticker* in the `symbol` table, if any.
+
+    Reading the row directly (rather than through ``resolve_symbols``) keeps this
+    module free of a cycle: ``src.data.symbols`` imports this package.
+    """
+    row = SymbolSchema.get_or_none(SymbolSchema.ticker == ticker)
+    return row.market if row is not None else None
+
+
+def _is_all_non_trading(
+    gap_start: datetime,
+    gap_end: datetime,
+    market: str | None = None,
+) -> bool:
     """Check if every date in [gap_start, gap_end] is a non-trading day.
 
     The boundaries are partial by construction, so neither end is judged as a
@@ -70,6 +114,9 @@ def _is_all_non_trading(gap_start: datetime, gap_end: datetime) -> bool:
     - **Any day from today onward** is skipped. Such a day may still be trading,
       or may have closed hours ago without the vendor settling it — neither is
       missing history.
+
+    *market* selects the holiday calendar (see :mod:`src.data.xcal`); ``None``
+    keeps the historical New York one.
 
     Examples (today = Mon, last bar Fri 15:30, gap runs to Tue):
       → Sun 10:23:  Sat+Sun are non-trading, nothing else in range → True
@@ -95,7 +142,7 @@ def _is_all_non_trading(gap_start: datetime, gap_end: datetime) -> bool:
         if d >= settled_before:
             d += timedelta(days=1)
             continue
-        if not is_non_trading_day(dt):
+        if not is_non_trading_day(dt, market):
             return False
         d += timedelta(days=1)
     return True
@@ -116,6 +163,7 @@ def calculate_gaps(
     requested_to: datetime,
     oldest_existing: Optional[int],
     newest_existing: Optional[int],
+    market: str | None = None,
 ) -> list[tuple[datetime, datetime]]:
     """Calculate gaps between requested date range and existing data.
 
@@ -138,6 +186,7 @@ def calculate_gaps(
         requested_to: End of the requested datetime range
         oldest_existing: Oldest timestamp in DB (ms), or None if empty
         newest_existing: Newest timestamp in DB (ms), or None if empty
+        market: Venue whose holiday calendar filters the edges (``None`` = US)
 
     Returns:
         List of (start_datetime, end_datetime) tuples for gaps to fetch,
@@ -161,12 +210,12 @@ def calculate_gaps(
 
     # 1. Backward gap: strictly before the oldest existing candle
     if requested_from < existing_from:
-        if not _is_all_non_trading(requested_from, existing_from):
+        if not _is_all_non_trading(requested_from, existing_from, market):
             gaps.append((requested_from, existing_from))
 
     # 2. Forward gap: strictly after the newest existing candle
     if existing_to < requested_to:
-        if not _is_all_non_trading(existing_to, requested_to):
+        if not _is_all_non_trading(existing_to, requested_to, market):
             gaps.append((existing_to, requested_to))
 
     return gaps
@@ -177,6 +226,7 @@ def find_internal_gaps(
     requested_from: datetime,
     requested_to: datetime,
     max_gap_hours: float = 48.0,
+    market: str | None = None,
 ) -> list[tuple[datetime, datetime]]:
     """Find missing data INTERNAL to the existing range by scanning
     consecutive candle timestamps.
@@ -197,6 +247,8 @@ def find_internal_gaps(
         requested_to: Upper bound for gap detection
         max_gap_hours: Max allowed hours between consecutive candles.
                         Default 48h (covers weekend Fri 21:00 → Mon 15:30).
+        market: Venue whose holiday calendar decides which missing days are
+                        real gaps (``None`` = New York).
 
     Returns:
         List of (gap_start, gap_end) tuples for internal gaps found.
@@ -237,7 +289,7 @@ def find_internal_gaps(
 
         for offset in range(1, gap_days):
             missing_day = curr + timedelta(days=offset)
-            if is_non_trading_day(missing_day):
+            if is_non_trading_day(missing_day, market):
                 # If we were tracking a gap range, close it before the holiday
                 if missing_start is not None:
                     if missing_end is not None:
@@ -445,6 +497,7 @@ async def candles(
     force_fetch: bool = False,
     ticker: Optional[str] = None,
     on_chunk: Optional[Callable[[list[CandleDict]], None]] = None,
+    market: Optional[str] = None,
 ) -> list[tuple[datetime, datetime]]:
     """Fetch candles from IBKR API with rate limiting and retry support.
 
@@ -458,6 +511,9 @@ async def candles(
         on_chunk: Called with each fetched chunk as it arrives, so a caller can
             write candles without buffering a multi-year backfill. ``None``
             writes each chunk to the DB (the default, standalone behaviour).
+        market: Venue whose holiday calendar filters the gaps. Defaults to the
+            symbol row's stored market, so a European listing is not asked for
+            bars on its own holidays.
 
     Returns:
         The merged gap ranges still missing AFTER the fetch — empty means the
@@ -470,6 +526,8 @@ async def candles(
     if ticker is None:
         symbol_info = await get_contract_info(conid)
         ticker = symbol_info.ticker
+    if market is None:
+        market = _stored_market(ticker)
 
     oldest_existing, newest_existing = await get_existing_range(ticker)
 
@@ -479,11 +537,11 @@ async def candles(
     else:
         # Edge gaps: before oldest / after newest
         gaps = calculate_gaps(
-            from_datetime, to_datetime, oldest_existing, newest_existing
+            from_datetime, to_datetime, oldest_existing, newest_existing, market
         )
         # Internal gaps: missing days BETWEEN existing candles
         internal_gaps = await asyncio.to_thread(
-            find_internal_gaps, ticker, from_datetime, to_datetime
+            find_internal_gaps, ticker, from_datetime, to_datetime, 48.0, market
         )
         gaps.extend(internal_gaps)
         # Deduplicate and sort
@@ -509,19 +567,27 @@ async def candles(
             conid, ticker, bar, gap_start, gap_end, on_chunk=sink
         )
 
-    return await remaining_gaps(ticker, from_datetime, to_datetime)
+    return await remaining_gaps(ticker, from_datetime, to_datetime, market)
 
 
 async def remaining_gaps(
     ticker: str,
     from_datetime: datetime,
     to_datetime: datetime,
+    market: str | None = None,
 ) -> list[tuple[datetime, datetime]]:
     """Gaps still missing for *ticker* over the window, after a fetch.
 
     Re-reads the stored edges and re-scans internals, so it reports what a
     later reader would actually find rather than what a fetch claimed to write.
+    *market* is the venue whose holidays are not owed bars.
     """
+    oldest, newest = await get_existing_range(ticker)
+    edge = calculate_gaps(from_datetime, to_datetime, oldest, newest, market)
+    internal = await asyncio.to_thread(
+        find_internal_gaps, ticker, from_datetime, to_datetime, 48.0, market
+    )
+    return _merge_and_sort_gaps(edge + internal)
     oldest, newest = await get_existing_range(ticker)
     edge = calculate_gaps(from_datetime, to_datetime, oldest, newest)
     internal = await asyncio.to_thread(

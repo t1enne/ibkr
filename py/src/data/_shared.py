@@ -15,32 +15,42 @@ import json
 import pandas as pd
 
 from src.timestamps import to_optional_ts
-from src.data.symbols import load_universe_config
+from src.data.symbols import load_universe_config, market_for_ticker
 from src.data.db import query_candles
-from src.data.types import PreviewResult
+from src.data.types import PreviewResult, SymbolRequest
 from src.data.xcal import is_non_trading_day
 
 
-def _all_non_trading(gap_start: datetime, gap_end: datetime) -> bool:
+def _all_non_trading(
+    gap_start: datetime,
+    gap_end: datetime,
+    market: str | None = None,
+) -> bool:
     """Check if every date in (gap_start, gap_end) is a non-trading day."""
     d = gap_start.date() + timedelta(days=1)
     end = gap_end.date()
     while d < end:
         dt = datetime.combine(d, datetime.min.time())
-        if not is_non_trading_day(dt):
+        if not is_non_trading_day(dt, market):
             return False
         d += timedelta(days=1)
     return True
 
 
-def find_gaps_48h(df: pd.DataFrame) -> list[tuple[datetime, datetime]]:
+def find_gaps_48h(
+    df: pd.DataFrame,
+    market: str | None = None,
+) -> list[tuple[datetime, datetime]]:
     """Find gaps >48h between consecutive candles in a DataFrame.
 
-    Filters out gaps that consist entirely of non-trading days
-    (weekends + NYSE holidays).
+    Filters out gaps that consist entirely of non-trading days on *market*'s
+    calendar (weekends + that venue's holidays). *market* is the IBKR venue code
+    from the `symbol` row; ``None`` keeps the historical New York calendar, and
+    using it for a European listing reports every Italian holiday as a gap.
 
     Args:
         df: DataFrame with DatetimeIndex, sorted chronologically.
+        market: Venue whose calendar decides holidays (``None`` = New York).
 
     Returns:
         List of (gap_start, gap_end) tuples for real data gaps.
@@ -55,20 +65,20 @@ def find_gaps_48h(df: pd.DataFrame) -> list[tuple[datetime, datetime]]:
         if delta > timedelta(hours=48):
             gap_start = idx[i].to_pydatetime()
             gap_end = idx[i + 1].to_pydatetime()
-            if not _all_non_trading(gap_start, gap_end):
+            if not _all_non_trading(gap_start, gap_end, market):
                 gaps.append((gap_start, gap_end))
     return gaps
 
 
-def recap(df: pd.DataFrame, label: str) -> str:
+def recap(df: pd.DataFrame, label: str, market: str | None = None) -> str:
     """Build a recap string for a symbol's data.
 
-    Shows: start, end, total rows, and any gaps >48h.
+    Shows: start, end, total rows, and any gaps >48h on *market*'s calendar.
     """
     if df.empty:
         return f"{label}: no data"
 
-    gaps = find_gaps_48h(df)
+    gaps = find_gaps_48h(df, market)
     gap_lines = ""
     if gaps:
         pieces = "\n  ".join(
@@ -91,12 +101,16 @@ def print_recap(
     to_date: Optional[str],
     bar: str = "1h",
 ) -> None:
-    """Query each symbol from DB and print its recap to stderr."""
+    """Query each symbol from DB and print its recap to stderr.
+
+    The venue comes from the symbol's own row, so a European listing is measured
+    against its own holiday calendar rather than New York's.
+    """
     for sym in symbols:
         start_ts = to_optional_ts(from_date)
         end_ts = to_optional_ts(to_date)
         df = query_candles(sym.upper(), start_ts, end_ts, bar)
-        click.echo(recap(df, sym.upper()), err=True)
+        click.echo(recap(df, sym.upper(), market_for_ticker(sym)), err=True)
 
 
 def read_ohlcv_stdin() -> pd.DataFrame:
@@ -129,12 +143,19 @@ def read_ohlcv_stdin() -> pd.DataFrame:
     return df
 
 
-def resolve_symbol_list(symbols: tuple[str, ...], universe: Optional[str]) -> list[str]:
-    """Resolve CLI symbol args — universe name or inline list."""
+def resolve_symbol_list(
+    symbols: tuple[str, ...], universe: Optional[str]
+) -> SymbolRequest:
+    """Resolve CLI symbol args to the tickers to load and their venue.
+
+    An inline list carries no venue, so it takes the historical US path; a
+    universe file may declare one (``"exchange": "BVME"``).
+    """
     if universe:
-        return load_universe_config(universe).symbols
+        conf = load_universe_config(universe)
+        return SymbolRequest(tickers=tuple(conf.symbols), exchange=conf.exchange)
     if symbols:
-        return list(map(str.upper, symbols))
+        return SymbolRequest(tickers=tuple(map(str.upper, symbols)))
     raise click.UsageError("provide SYMBOLS or --universe/-U")
 
 
@@ -167,7 +188,7 @@ def display_preview(
         end_ts = to_optional_ts(to_date)
         df = query_candles(ticker.upper(), start_ts, end_ts)
         if not df.empty:
-            gaps = find_gaps_48h(df)
+            gaps = find_gaps_48h(df, market_for_ticker(ticker))
             if gaps:
                 for g in gaps:
                     click.echo(

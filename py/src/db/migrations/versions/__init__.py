@@ -21,6 +21,7 @@ from src.db.migrations.types import Migration, Registry
 from src.db.migrations.versions import (
     data_0001_baseline,
     data_0002_drop_migrated_live_tables,
+    data_0003_symbol_ticker_unique,
     live_0001_baseline,
     live_0002_drop_order_intent,
 )
@@ -37,6 +38,12 @@ LIVE_MIGRATIONS: Registry = (
 )
 
 #: The candle/research file's history, oldest first.
+#:
+#: ``data_0003`` refuses to build its index over a mis-keyed row and names the
+#: offending listing instead (see :mod:`src.db.migrations.preflight`). Fixing such
+#: a row is OPERATOR work — a data fix on one file, run once, not a step in the
+#: history every future file must replay. Widening what a key means is a
+#: migration; renaming one listing's key is not.
 DATA_MIGRATIONS: Registry = (
     Migration(
         name=data_0001_baseline.NAME,
@@ -47,6 +54,11 @@ DATA_MIGRATIONS: Registry = (
         name=data_0002_drop_migrated_live_tables.NAME,
         up=data_0002_drop_migrated_live_tables.up,
         down=None,
+    ),
+    Migration(
+        name=data_0003_symbol_ticker_unique.NAME,
+        up=data_0003_symbol_ticker_unique.up,
+        down=data_0003_symbol_ticker_unique.down,
     ),
 )
 

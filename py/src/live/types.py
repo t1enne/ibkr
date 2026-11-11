@@ -420,6 +420,13 @@ class LiveConfig:
     max_symbol_allocation: float = 1.0
     #: The config's ``name`` — the ``<config_name>`` scope segment.
     config_name: str = ""
+    #: Default venue for the universe's symbols, named exactly as the data layer
+    #: names it (``symbol.market`` / a universe's ``exchange``) — an IBKR exchange
+    #: code such as ``BVME``. A symbol whose series key carries a venue suffix
+    #: resolves against that suffix's venue instead, so a mixed universe works
+    #: from one config. ``None`` is the historical US path: bare tickers routed
+    #: the way they always were.
+    exchange: str | None = None
 
 
 def exec_params_of(config: LiveConfig) -> ExecutionParams:

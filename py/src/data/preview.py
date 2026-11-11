@@ -31,6 +31,7 @@ async def preview(
     tickers: list[str],
     from_date: date,
     to_date: Optional[date] = None,
+    exchange: Optional[str] = None,
 ) -> PreviewResult:
     """Dry-run: show what gaps exist without making any API fetch calls.
 
@@ -41,11 +42,12 @@ async def preview(
         tickers: List of ticker symbols to preview
         from_date: Start date for gap analysis
         to_date: End date for gap analysis (defaults to now)
+        exchange: IBKR venue code the tickers list on (``None`` = US path)
 
     Returns:
         PreviewResult with per-symbol FetchPlans and total gap count.
     """
-    symbols = await resolve_symbols(tickers)
+    symbols = await resolve_symbols(tickers, exchange)
 
     to_dt = (
         datetime.combine(to_date, datetime.max.time()) if to_date else datetime.now()
@@ -54,9 +56,9 @@ async def preview(
 
     async def _plan_for(symbol: ISymbol) -> FetchPlan:
         oldest, newest = await get_existing_range(symbol.ticker)
-        edge_gaps = calculate_gaps(from_dt, to_dt, oldest, newest)
+        edge_gaps = calculate_gaps(from_dt, to_dt, oldest, newest, symbol.market)
         internal_gaps = await asyncio.to_thread(
-            find_internal_gaps, symbol.ticker, from_dt, to_dt
+            find_internal_gaps, symbol.ticker, from_dt, to_dt, 48.0, symbol.market
         )
         all_gaps = _merge_and_sort_gaps(edge_gaps + internal_gaps)
         return FetchPlan(
@@ -105,7 +107,12 @@ def preview_cmd(
     t_date = date.fromisoformat(to_date) if to_date else None
 
     async def _run() -> PreviewResult:
-        return await preview(symbols_list, from_date=f_date, to_date=t_date)
+        return await preview(
+            list(symbols_list.tickers),
+            from_date=f_date,
+            to_date=t_date,
+            exchange=symbols_list.exchange,
+        )
 
     result = asyncio.run(_run())
     display_preview(result, from_date, to_date)

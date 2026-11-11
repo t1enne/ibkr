@@ -245,12 +245,15 @@ def _write_strategy_config(strategy: StrategyConfig, tmp: str) -> str:
 
 
 def load_strat_config(path: str) -> LiveConfig:
-    """Parse + validate the live JSON -> ``LiveConfig`` (strategy + sizing).
+    """Parse + validate the live JSON -> ``LiveConfig`` (strategy + sizing + venue).
 
-    Strategy fields go through ``StrategyConfig``; the live-only sizing keys are
-    read from the raw dict (a key neither knows is ignored). Sizing accepts a
-    nested ``"sizing"`` object OR flat keys (top-level, then
-    ``strategy_params``); flat wins when both are given.
+    Strategy fields go through ``StrategyConfig``; the live-only keys are read
+    from the raw dict (a key neither knows is ignored). Sizing accepts a nested
+    ``"sizing"`` object OR flat keys (top-level, then ``strategy_params``); flat
+    wins when both are given. ``exchange`` — the universe's default venue, exactly
+    as the data layer names it — is read the same way, so one live config can
+    trade a non-US universe. It is absent from every existing config, which is
+    the US path.
     """
     raw = _read_json(path)
     strategy = _strategy_config(path, raw)
@@ -266,6 +269,7 @@ def load_strat_config(path: str) -> LiveConfig:
     commission_max_pct = _float_or_none(
         (raw, params), "commission_max_pct", strategy.commission_max_pct
     )
+    exchange = _venue_or_none((raw, params))
     return LiveConfig(
         strategy_type=strategy.strategy_type,
         symbols=tuple(strategy.symbols),
@@ -283,6 +287,7 @@ def load_strat_config(path: str) -> LiveConfig:
         size=size,
         max_symbol_allocation=alloc,
         config_name=strategy.name,
+        exchange=exchange,
     )
 
 
@@ -564,6 +569,23 @@ def _float_or(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number, got {value!r}")
     return float(value)
+
+
+def _venue_or_none(sources: Sequence[Mapping[str, object]]) -> str | None:
+    """The optional ``exchange`` venue code, upper-cased; ``None`` when absent.
+
+    Validated as a non-empty string only: whether the venue can derive a series
+    key is the data layer's call (``src.data.venue``), and duplicating that rule
+    here would let the two drift.
+    """
+    value = _pick(sources, ("exchange",), None)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"exchange must be a non-empty venue code (e.g. 'BVME'), got {value!r}"
+        )
+    return value.strip().upper()
 
 
 def _float_or_none(

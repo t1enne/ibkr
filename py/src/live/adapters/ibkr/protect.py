@@ -94,6 +94,10 @@ class _BracketHost(Protocol):
 
     async def _working_index(self) -> Result[dict[str, WorkingOrder], FeedError]: ...
 
+    def _venue_of(self, symbol: str) -> str | None:
+        """The venue a SERIES KEY lists on (the host owns the resolution rule)."""
+        ...
+
 
 class BracketProtectionMixin(_BracketHost):
     """Protective bracket placement/replace/cancel over ``IbkrBroker`` internals.
@@ -348,7 +352,13 @@ class BracketProtectionMixin(_BracketHost):
         for child in children:
             side = _wire_side(child)
             ref = child_ref(scope_tag(self._scope), child, conid=conid, anchor=fill_ts)
-            ticket = build_ticket(child, conid=conid, side=side, order_ref=ref)
+            ticket = build_ticket(
+                child,
+                conid=conid,
+                side=side,
+                order_ref=ref,
+                exchange=self._venue_of(child.symbol),
+            )
             body = dict(ticket.body)
             body["isSingleGroup"] = True
             tickets.append(TicketLite(order_ref=ref, side=side, body=body))

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from src.bt.state import PortfolioState
 from src.data.ibkr.client import IbkrClient
 from src.live.adapters.ibkr.broker import IbkrBroker
+from src.live.adapters.ibkr.mapping import series_symbols
 from src.live.adapters.ibkr.portfolio_source import IbkrPortfolioSource
 from src.live.pure import OrderResult
 from src.live.ledger import SqliteLedger
@@ -95,9 +96,16 @@ def build_ibkr_adapter(
     caller's guard were dropped.
     ``allow_oth`` when true, the broker may auto-confirm orders placed outside
     trading hours.
+
+    The config's ``exchange`` and symbols reach BOTH edges as the same pair: the
+    broker translates a series key to the bare broker symbol on the way out, the
+    source translates it back on the way in, so a non-US lot is booked under the
+    key the strategy names. ``series_symbols`` refuses a universe whose keys share
+    one broker symbol — a wiring error, not a runtime condition.
     """
     if client is None:
         raise ValueError("the ibkr adapter requires a gateway client")
+    symbols = series_symbols(cfg.symbols)
     return IbkrAdapter(
         scope=scope,
         source=IbkrPortfolioSource(
@@ -106,6 +114,7 @@ def build_ibkr_adapter(
             ledger=ledger,
             initial_capital=cfg.initial_capital,
             dry_run=dry_run,
+            symbols=symbols,
         ),
         broker=IbkrBroker(
             client,
@@ -115,6 +124,8 @@ def build_ibkr_adapter(
             dry_run=dry_run,
             log=log,
             allow_oth=allow_oth,
+            exchange=cfg.exchange,
+            symbols=symbols,
         ),
     )
 

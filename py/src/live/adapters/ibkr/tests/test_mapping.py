@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.mapping import (
+    executions_in_keys,
     parse_executions,
     parse_positions,
     parse_summary,
+    series_symbols,
 )
 
 
@@ -190,3 +193,55 @@ def test_parse_executions_skips_malformed_rows() -> None:
     )
     assert records == ()
     assert len(warnings) == 4
+
+
+# ── series key <-> broker symbol ───────────────────────────────────────
+def test_a_series_key_round_trips_through_its_broker_symbol() -> None:
+    """The gateway reports the BARE ticker; the book must be keyed by the key."""
+    symbols = series_symbols(["ENI.MI", "AAPL"])
+
+    assert symbols.broker_of("ENI.MI") == "ENI"
+    assert symbols.key_of("ENI") == "ENI.MI"
+    # A US key IS its own broker symbol, and a dotted US name keeps its dot.
+    assert symbols.broker_of("AAPL") == "AAPL"
+    assert symbols.key_of("AAPL") == "AAPL"
+    assert series_symbols(["BRK.B"]).broker_of("BRK.B") == "BRK.B"
+
+
+def test_an_unlisted_symbol_is_passed_through_unchanged() -> None:
+    # A manual trade or a drifted lot must keep its own name: renaming it onto a
+    # series it is not would book a lot nobody owns.
+    symbols = series_symbols(["ENI.MI"])
+
+    assert symbols.key_of("MSFT") == "MSFT"
+    assert symbols.broker_of("SAP.DE") == "SAP"
+
+
+def test_one_broker_symbol_for_two_keys_is_refused() -> None:
+    # ENI.MI and ENI.PA both arrive as "ENI", so their fills could not be told
+    # apart — refuse the universe rather than mislabel a lot.
+    with pytest.raises(ValueError, match="share the broker symbol"):
+        series_symbols(["ENI.MI", "ENI.PA"])
+
+
+def test_executions_are_rewritten_to_series_keys() -> None:
+    executions, _ = parse_executions(
+        [
+            {
+                "execution_id": "e1",
+                "order_id": "o1",
+                "order_ref": "momentum-1a2b",
+                "conid": 200,
+                "symbol": "ENI",
+                "side": "B",
+                "size": 10,
+                "price": 15.0,
+                "trade_time_r": 1704191400000,
+            }
+        ]
+    )
+
+    (keyed,) = executions_in_keys(executions, series_symbols(["ENI.MI"]))
+
+    assert keyed.symbol == "ENI.MI"
+    assert (keyed.conid, keyed.qty) == (200, 10.0)

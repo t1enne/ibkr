@@ -30,6 +30,8 @@ from src.bt.state import ActionType, PortfolioState, Position
 from src.data.ibkr.client import IbkrClient, IbkrError
 from src.live.adapters.ibkr.mapping import (
     IbkrPosition,
+    SeriesSymbols,
+    executions_in_keys,
     parse_executions,
     parse_positions,
     parse_summary,
@@ -152,6 +154,13 @@ class IbkrPortfolioSource:
     The book advances from the trades window via ``trades.reconcile`` and is
     persisted to the scope's sqlite rows (``_persist_advanced_book``). A dry run
     persists nothing.
+
+    ``symbols`` translates the gateway's BARE ``contractDesc``/trade symbols to the
+    scope's series keys (``ENI`` -> ``ENI.MI``) at this read boundary, BEFORE the
+    fold and BEFORE the persist. So a book row, a stored fill and the replayed
+    account book name a lot exactly as the strategy does — a foreign lot is then
+    visible to its own exits instead of reading as a divergence. The default map
+    is the identity, which is the historical US path.
     """
 
     owns_book = False
@@ -166,6 +175,7 @@ class IbkrPortfolioSource:
         account: str | None = None,
         dry_run: bool = False,
         now: pd.Timestamp | None = None,
+        symbols: SeriesSymbols | None = None,
     ) -> None:
         self._client = client
         self._scope = scope
@@ -174,6 +184,7 @@ class IbkrPortfolioSource:
         self._account = account
         self._dry_run = dry_run
         self._now = now
+        self._symbols = symbols if symbols is not None else SeriesSymbols()
 
     def _persist_advanced_book(
         self, advanced: StrategyBook, executions: tuple[Execution, ...]
@@ -204,19 +215,22 @@ class IbkrPortfolioSource:
 
         positions, position_warnings = parse_positions(positions_raw)
         executions, execution_warnings = parse_executions(trades_raw)
+        # Both the fold and the persisted rows must name a lot by SERIES KEY, so
+        # the translation happens once, here, before either consumes it.
+        keyed = executions_in_keys(executions, self._symbols)
         summary, summary_warnings = parse_summary(summary_raw)
 
         book = self._ledger.load_book(self._scope)
-        advanced, reconcile_warnings = reconcile(self._scope, executions, book)
+        advanced, reconcile_warnings = reconcile(self._scope, keyed, book)
         new_ids = advanced.applied - book.applied
-        self._persist_advanced_book(advanced, executions)
+        self._persist_advanced_book(advanced, keyed)
 
         seed = self._ledger.initial_capital_of(self._scope) or self._initial_capital
         cash = self._ledger.cash_of(self._scope, self._initial_capital)
         if self._dry_run:
             # Nothing was persisted, so fold this window's new fills in by hand.
             cash += sum(
-                execution_cash_delta(e) for e in executions if e.execution_id in new_ids
+                execution_cash_delta(e) for e in keyed if e.execution_id in new_ids
             )
         marks = {p.conid: p.mkt_price for p in positions if p.mkt_price > 0}
         as_of = self._now if self._now is not None else pd.Timestamp.now(tz="UTC")

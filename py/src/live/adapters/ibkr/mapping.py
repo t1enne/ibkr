@@ -10,16 +10,25 @@ the skip visible instead of silent.
 
 Nothing here decides ownership or trades — it only turns JSON into the typed
 records :mod:`~src.live.adapters.ibkr.trades` and the portfolio source consume.
+
+It also carries :class:`SeriesSymbols`, the ONE translation between a series key
+(``ENI.MI`` — what a strategy, a candle and a book row are named by) and the
+BARE symbol the gateway reports (``ENI`` in ``contractDesc`` and trade rows).
+Without it every foreign lot would be booked under a symbol the strategy never
+mentions, so its exits would never see the lot and the divergence oracle would
+report both sides missing.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import cast
 
 import pandas as pd
 
+from src.data.venue import bare_ticker
 from src.exec.types import OrderSide
 from src.live.adapters.ibkr.trades import Execution
 
@@ -45,6 +54,79 @@ class IbkrSummary:
     net_liquidation: float
     total_cash: float
     currency: str = ""
+
+
+@dataclass(frozen=True)
+class SeriesSymbols:
+    """Series key <-> the BARE symbol the IBKR gateway reports for it.
+
+    ``by_key`` maps a configured series key to the symbol the gateway's
+    ``contractDesc`` and trade rows carry (``ENI.MI`` -> ``ENI``); ``by_broker`` is
+    its inverse, used to key a READ book by series key. Both directions fall back
+    to the input unchanged, so an empty map IS the historical US-only path (where
+    a key and a broker symbol are the same string).
+
+    The fallbacks make the translation TOTAL: a broker row for a symbol the config
+    does not list (a manual trade, a drifted lot) keeps its own name instead of
+    being dropped or renamed onto a series it is not.
+    """
+
+    by_key: Mapping[str, str] = MappingProxyType({})
+    by_broker: Mapping[str, str] = MappingProxyType({})
+
+    def broker_of(self, key: str) -> str:
+        """The gateway symbol for series key *key* (the key itself when unlisted)."""
+        return self.by_key.get(key.strip().upper(), bare_ticker(key.strip()))
+
+    def key_of(self, broker: str) -> str:
+        """The series key a broker symbol names (the symbol itself when unlisted)."""
+        return self.by_broker.get(broker.strip().upper(), broker.strip())
+
+
+def series_symbols(symbols: Iterable[str]) -> SeriesSymbols:
+    """Build the key <-> broker-symbol map for one live universe (pure).
+
+    A series key's broker symbol is its bare ticker (``ENI.MI`` -> ``ENI``), the
+    same spelling rule the data layer resolves by, so the two cannot drift.
+
+    Raises:
+        ValueError: two series keys share one broker symbol (``ENI.MI`` and
+            ``ENI.PA`` both report ``ENI``). Their fills would be attributable to
+            neither lot, so that universe is refused rather than mislabelled.
+    """
+    by_key: dict[str, str] = {}
+    by_broker: dict[str, str] = {}
+    for raw in symbols:
+        key = raw.strip().upper()
+        if not key:
+            raise ValueError("a series key must not be empty")
+        broker = bare_ticker(key)
+        owner = by_broker.get(broker)
+        if owner is not None and owner != key:
+            raise ValueError(
+                f"series keys {owner} and {key} share the broker symbol {broker!r}; "
+                f"a live universe cannot book their fills apart"
+            )
+        by_key[key] = broker
+        by_broker[broker] = key
+    return SeriesSymbols(
+        by_key=MappingProxyType(by_key), by_broker=MappingProxyType(by_broker)
+    )
+
+
+def executions_in_keys(
+    executions: Iterable[Execution], symbols: SeriesSymbols
+) -> tuple[Execution, ...]:
+    """Rewrite every execution's broker symbol to its series key.
+
+    Applied ONCE at the read boundary, before the fold AND before the rows are
+    persisted, so the durable book, the stored fills and the replayed account book
+    all name a lot by the SAME string the strategy does.
+    """
+    return tuple(
+        replace(execution, symbol=symbols.key_of(execution.symbol))
+        for execution in executions
+    )
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -249,10 +331,13 @@ def parse_executions(
 __all__ = [
     "IbkrPosition",
     "IbkrSummary",
+    "SeriesSymbols",
     "canonical_order_id",
+    "executions_in_keys",
     "parse_executions",
     "parse_positions",
     "parse_summary",
+    "series_symbols",
     "num",
     "opt_str",
 ]

@@ -89,6 +89,20 @@ def test_detect_gaps_ignores_market_closures():
     assert detect_gaps(_frame(["A"], template), ["A"]) == {}
 
 
+def test_a_us_listing_reports_a_hole_an_italian_listing_does_not():
+    # Easter 2026: Good Friday (4/3) shut in both, Easter Monday (4/6) shut only
+    # in Milan. So 4/2 -> 4/7 skips one New York session and NO Milan one: the
+    # same frame is a real hole for the US series and complete for the BVME one.
+    def template(_s: str) -> list[str]:
+        return _hourly("2026-04-02 15:00", "2026-04-07 07:00")
+
+    df = _frame(["US", "IT"], template)
+    report = detect_gaps(df, ["US", "IT"], markets={"US": "SMART", "IT": "BVME"})
+
+    assert "US" in report, "a skipped New York session is missing data"
+    assert "IT" not in report, "both Milan closures are holidays, not a hole"
+
+
 # ── load_candles guard ─────────────────────────────────────────────────
 def _load_df(*, hourly_spans: dict):
     def factory(symbol):
@@ -154,3 +168,27 @@ def test_load_candles_max_gap_disables_guard(monkeypatch):
         max_gap=pd.Timedelta.max,
     )
     assert len(df["A"].index) == 2
+
+
+def test_load_candles_uses_the_stored_venue_of_each_symbol(monkeypatch):
+    """The venue is resolved at the load boundary, from the ``symbol`` row.
+
+    ``IT`` holds only the two bars straddling a Milan-only closure, so the load
+    must pass on ITS calendar even though the same two stamps are a hole for a
+    New York series.
+    """
+
+    def template(_s: str) -> list[str]:
+        return _hourly("2026-04-02 15:00", "2026-04-07 07:00")
+
+    def fake_get_local_candles(symbol, start=None, end=None, bar="1h"):
+        return _frame([symbol], template).xs(symbol, axis=1)
+
+    monkeypatch.setattr(feed, "get_local_candles", fake_get_local_candles)
+    monkeypatch.setattr(
+        feed, "market_for_ticker", lambda symbol: {"IT": "BVME"}.get(symbol)
+    )
+
+    df = load_candles(["IT"], _ts("2026-04-02"), _ts("2026-04-07"), "1h")
+
+    assert len(df["IT"].index) == 2
