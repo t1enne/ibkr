@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
-from typing import List, Optional, Any, cast
+from typing import Any, List, Literal, Optional, cast
 from scipy import stats
 
 from src.bt.types import PortfolioResult, ActionType
@@ -23,6 +23,16 @@ class PerformanceMetrics:
     kurtosis: float
     alpha: float
     beta: float
+
+
+@dataclass
+class PeriodDrawdown:
+    """Deepest within-period peak-to-trough drawdown (prop-firm style)."""
+
+    period: str
+    net_drawdown_pct: float
+    peak_date: pd.Timestamp
+    valley_date: pd.Timestamp
 
 
 @dataclass
@@ -204,6 +214,47 @@ def drawdown_periods(
         _close_episode(recovery=None)
 
     return sorted(periods, key=lambda x: x.net_drawdown_pct, reverse=True)
+
+
+def period_drawdowns(
+    equity_curve: pd.Series,
+    period: Literal["day", "month"],
+    top: int = 3,
+) -> List[PeriodDrawdown]:
+    """Deepest within-period peak-to-trough drawdowns, worst first.
+
+    The running maximum is reset at every period boundary, so a period is
+    scored against its OWN peak (seeded with the period's first mark) -- the
+    reference a prop firm's daily/monthly loss limit uses. This is not the
+    worst period return: a session that opens at its high and bleeds scores
+    deep here and shallow by close-to-close return.
+
+    ``net_drawdown_pct`` is a positive magnitude. Returns ``[]`` for an empty
+    curve or a non-datetime index (no calendar to bucket on).
+    """
+    if len(equity_curve) < 2 or not isinstance(equity_curve.index, pd.DatetimeIndex):
+        return []
+    code = "D" if period == "day" else "M"
+    keys = equity_curve.index.to_period(code)
+    out: List[PeriodDrawdown] = []
+    for key, group in equity_curve.groupby(keys):
+        values = group.to_numpy(dtype=float)
+        drawdown = values / np.maximum.accumulate(values) - 1.0
+        valley = int(drawdown.argmin())
+        worst = float(drawdown[valley])
+        if worst >= 0.0:
+            continue
+        peak = int(values[: valley + 1].argmax())
+        out.append(
+            PeriodDrawdown(
+                period=str(key),
+                net_drawdown_pct=abs(worst) * 100.0,
+                peak_date=group.index[peak],
+                valley_date=group.index[valley],
+            )
+        )
+    out.sort(key=lambda p: p.net_drawdown_pct, reverse=True)
+    return out[:top]
 
 
 def sortino_ratio(equity_curve: pd.Series, risk_free_rate: float = 0.0) -> float:
@@ -570,6 +621,55 @@ def build_symbol_attribution(
     return tuple(sorted(results, key=lambda x: x.total_pnl, reverse=True))
 
 
+def _safe_ts_str(ts: pd.Timestamp) -> str:
+    """Minute-precision stamp -- one bar's valley is not tellable by date alone."""
+    return cast(Any, ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _max_bars_per_period(equity_curve: pd.Series, code: str) -> int:
+    """Most marks the curve carries in any one calendar bucket."""
+    if not isinstance(equity_curve.index, pd.DatetimeIndex):
+        return 0
+    counts = equity_curve.groupby(equity_curve.index.to_period(code)).size()
+    return int(cast(Any, counts.max())) if len(counts) else 0
+
+
+def _render_period_drawdowns(equity_curve: pd.Series) -> list[str]:
+    """Worst day / worst month peak-to-trough table (run-only detail).
+
+    A period the curve never samples twice (a daily-base run's day) has no
+    within-period path, so its row is omitted rather than reported as zero.
+    """
+    rows: list[tuple[str, ...]] = []
+    for label, period, code in (("Day", "day", "D"), ("Month", "month", "M")):
+        if _max_bars_per_period(equity_curve, code) < 2:
+            continue
+        worst = period_drawdowns(equity_curve, period, top=1)
+        if not worst:
+            rows.append((label, "—", "—", "—"))
+            continue
+        rows.append(
+            (
+                label,
+                f"{worst[0].net_drawdown_pct:.2f}%",
+                _safe_ts_str(worst[0].peak_date),
+                _safe_ts_str(worst[0].valley_date),
+            )
+        )
+    if not rows:
+        return []
+    cols = (
+        Col("Period", "<"),
+        Col("Max DD", ">"),
+        Col("Peak", ">"),
+        Col("Valley", ">"),
+    )
+    return [
+        "\nPeriod Drawdowns (peak-to-trough within period)",
+        *render(Table(columns=cols, rows=tuple(rows))),
+    ]
+
+
 def _safe_date_str(date: object | None) -> str:
     if date is None:
         return "NaT"
@@ -691,6 +791,8 @@ def get_backtest_results_analysis(
     else:
         lines.append("\nWorst Drawdown Periods")
         lines.append("  (none)")
+
+    lines.extend(_render_period_drawdowns(equity_curve))
 
     # --- Trades ---
     lines.extend(_render_trades_section(trades, include_trades))

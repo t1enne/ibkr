@@ -11,6 +11,7 @@ from src.bt.metrics import (
     drawdown_periods,
     get_backtest_results_analysis,
     kurtosis,
+    period_drawdowns,
     skewness,
     trade_count,
     win_rate,
@@ -326,3 +327,84 @@ def test_positional_index_uses_per_step_returns() -> None:
     per_step = curve.pct_change().dropna()
     assert kurtosis(curve) == pytest.approx(float(per_step.kurt()))
     assert skewness(curve) == pytest.approx(float(per_step.skew()))
+
+
+# ---------------------------------------------------------------------------
+# period_drawdowns (prop-firm style: peak-to-trough WITHIN a day / month)
+# ---------------------------------------------------------------------------
+
+
+def _hourly(values: list[float], start: str = "2024-03-11 09:00") -> pd.Series:
+    idx = pd.date_range(start, periods=len(values), freq="h")
+    return pd.Series(values, index=idx, dtype=float)
+
+
+def test_period_drawdowns_empty_and_positional() -> None:
+    assert period_drawdowns(pd.Series([], dtype=float), "day") == []
+    assert period_drawdowns(pd.Series([100.0, 90.0]), "day") == []
+
+
+def test_period_drawdowns_day_peak_to_trough() -> None:
+    curve = _hourly([100.0, 104.0, 96.0, 100.0])
+    (worst,) = period_drawdowns(curve, "day")
+    assert worst.net_drawdown_pct == pytest.approx((1.0 - 96.0 / 104.0) * 100.0)
+    assert worst.peak_date == curve.index[1]
+    assert worst.valley_date == curve.index[2]
+
+
+def test_period_drawdowns_resets_at_period_boundary() -> None:
+    """A bleed carried overnight is not a second day's drawdown."""
+    day1 = _hourly([100.0, 80.0], start="2024-03-11 20:00")
+    day2 = _hourly([80.0, 79.0], start="2024-03-12 09:00")
+    curve = pd.concat([day1, day2])
+    days = period_drawdowns(curve, "day")
+    assert [d.period for d in days] == ["2024-03-11", "2024-03-12"]
+    assert days[0].net_drawdown_pct == pytest.approx(20.0)
+    # day 2 is flat-then-slightly-down from its own open, not 21% from day 1's peak
+    assert days[1].net_drawdown_pct == pytest.approx((1.0 - 79.0 / 80.0) * 100.0)
+
+
+def test_period_drawdowns_month_worst_first_and_top_trims() -> None:
+    mar = _hourly([100.0, 90.0, 100.0], start="2024-03-30 22:00")  # 10% inside Mar
+    apr = _hourly([100.0, 60.0, 100.0], start="2024-04-01 22:00")  # 40% inside Apr
+    may = _hourly([100.0, 70.0, 100.0], start="2024-05-01 22:00")  # 30% inside May
+    months = period_drawdowns(pd.concat([mar, apr, may]), "month")
+    assert [m.period for m in months] == ["2024-04", "2024-05", "2024-03"]
+    assert months[0].net_drawdown_pct == pytest.approx(40.0)
+    assert len(period_drawdowns(pd.concat([mar, apr, may]), "month", top=2)) == 2
+
+
+def test_period_drawdowns_monotonic_rise_has_none() -> None:
+    assert period_drawdowns(_hourly([100.0, 101.0, 102.0, 103.0]), "day") == []
+
+
+def test_report_renders_period_drawdown_rows() -> None:
+    curve = _hourly([100.0, 90.0, 100.0])
+    pf = PortfolioResult(
+        total_return=-0.1,
+        sharpe_ratio=0.0,
+        trades=(),
+        equity_curve=curve,
+        max_drawdown=-0.1,
+    )
+    text = get_backtest_results_analysis(pf, include_trades=False)
+    assert "Period Drawdowns" in text
+    assert "10.00%" in text
+
+
+def test_report_omits_day_row_on_daily_base() -> None:
+    """One bar per day -> no intraday path, so the Day row is simply absent."""
+    idx = pd.date_range("2024-01-01", periods=40, freq="D")
+    curve = pd.Series([100.0] * 20 + [80.0] * 20, index=idx, dtype=float)
+    pf = PortfolioResult(
+        total_return=-0.2,
+        sharpe_ratio=0.0,
+        trades=(),
+        equity_curve=curve,
+        max_drawdown=-0.2,
+    )
+    text = get_backtest_results_analysis(pf, include_trades=False)
+    section = text.split("Period Drawdowns")[1].split("\nTrades")[0]
+    assert "\nDay " not in section
+    assert "\nMonth" in section
+    assert "undefined" not in text
