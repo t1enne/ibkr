@@ -13,9 +13,13 @@ the ONLY switch:
 =============  ===================  ====================================
 
 Entry: rising VWATR expansion on a breakout above the prior ``breakout_look``
-highs, taken only while the universe is in a breadth leg up. Within that gate
-the trigger is unconditional by design -- entry-side features carry no
-measurable edge here, so name selection lives in sizing instead.
+highs, taken only while the universe is in a breadth leg up, and only when the
+expansion RELEASES a coil: ``_squeezed`` requires VWATR to have been compressed
+against the name's own baseline in the bars immediately before the expansion.
+That precondition is load-bearing -- without it the rule buys every extension of
+an already-elevated vol regime, which is where the drawdowns came from. Within
+those gates the trigger carries no further entry-side edge, so name selection
+otherwise lives in sizing.
 
 Exit, in order:
 
@@ -230,6 +234,16 @@ _TREND_LOOK: int = 50
 _TREND_GATE_LO: float = 0.5
 _TREND_CACHE_KEY = "vwatr_div_trend"
 _COHORT_CACHE_KEY = "vwatr_div_cohort"
+#: Squeeze-before-expansion (STRUCTURAL, no params): the expansion must be the
+#: RELEASE of a coil, not another step of an already-elevated vol regime. Over
+#: the ``_SQUEEZE_LOOK`` bars immediately BEFORE the ``slope_bars`` expansion
+#: being tested, the minimum VWATR must sit at or below ``_SQUEEZE_RATIO`` x the
+#: symbol's own ``vwatr_base_win`` baseline. The window stops short of the
+#: expansion so the release cannot satisfy its own compression test.
+_SQUEEZE_LOOK: int = 10
+_SQUEEZE_RATIO: float = 1.00
+
+
 #: Book-slot cap: per-name risk scales by ``_BOOK_SLOTS / book`` once the book
 #: (open names + this bar's cohort) exceeds it, so a dense tape throttles size
 #: BEFORE the engine silently cohort-scales.
@@ -277,6 +291,24 @@ def _daily_reads(
     return close, vwatr, base
 
 
+def _squeezed(vwatr: np.ndarray, base_now: float, p: Params, n: int) -> bool:
+    """True when VWATR was COMPRESSED in the bars before the current expansion.
+
+    ``n`` is the signal-feed length. The window is the ``_SQUEEZE_LOOK`` bars
+    ending just before the ``slope_bars`` expansion bars, so the expansion itself
+    is excluded. False when the window is short or non-finite -- a missing
+    compression read is not a coil.
+    """
+    hi = n - p.slope_bars
+    lo = hi - _SQUEEZE_LOOK
+    if lo < 0 or hi <= lo:
+        return False
+    coil = vwatr[lo:hi]
+    if coil.size < _SQUEEZE_LOOK or not np.all(np.isfinite(coil)):
+        return False
+    return float(np.min(coil)) <= _SQUEEZE_RATIO * base_now
+
+
 def _breakout_count(ctx: StrategyContext, p: Params) -> int:
     """Number of flat symbols whose entry rule is true on this bar.
 
@@ -313,8 +345,19 @@ def _breakout_count(ctx: StrategyContext, p: Params) -> int:
         prior = close[n - 1 - p.breakout_look : n - 1]
         if prior.size < p.breakout_look or not np.all(np.isfinite(prior)):
             continue
-        if px > float(np.max(prior)):
-            count += 1
+        if not (px > float(np.max(prior))):
+            continue
+        b = ctx.ta.vwatr_baseline(
+            sym, p.vwatr_period, p.vwatr_base_win, interval=_state_interval(ctx)
+        ).to_array()
+        if b.size < n:
+            continue
+        base_now = float(b[n - 1])
+        if not np.isfinite(base_now) or base_now <= 0:
+            continue
+        if not _squeezed(v, base_now, p, n):
+            continue
+        count += 1
     if len(cache) > 8:
         cache.clear()
     cache[ts] = count
@@ -678,6 +721,11 @@ def _entry(
         return
     prior_high = float(np.max(prior))
     if not (float(close_d[nd - 1]) > prior_high):
+        return
+
+    # Squeeze-before-expansion: the breakout must release a coil. Structural,
+    # no param -- see ``_SQUEEZE_LOOK`` / ``_SQUEEZE_RATIO``.
+    if not _squeezed(v_d, base_now, p, nd):
         return
 
     # Breadth gate: only take breakouts while the universe is in a leg up
