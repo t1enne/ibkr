@@ -237,11 +237,13 @@ def _rows_for_tag(
 def sec_payload_to_rows(ticker: str, payload: dict[str, Any]) -> list[FundamentalRow]:
     """Map a companyfacts payload to sparse rows for ``ticker``.
 
-    For every ``(statement, field)`` in :data:`TAG_MAP` the first tag with any
-    usable facts supplies that field's rows; later tags are ignored, so a filer
-    reporting both a specific and a coarse revenue tag does not double-count the
-    same period. Free cash flow is derived per period (``ocf - |capex|``) rather
-    than shipped as a separate tag, since SEC has no FCF concept.
+    For every ``(statement, field)`` in :data:`TAG_MAP` the most specific tag
+    that reports a fiscal period supplies that period's row, with coarser tags
+    filling the periods it does not cover (see :func:`_first_tag_rows`); a
+    period reported by two tags is emitted once, and a filer whose preferred tag
+    is complete is unaffected. Free cash flow is derived per period
+    (``ocf - |capex|``) rather than shipped as a separate tag, since SEC has no
+    FCF concept.
 
     Returns rows in tag-map order (stable, and independent of payload key order
     for the statement/field pairs we read).
@@ -261,12 +263,30 @@ def _first_tag_rows(
     statement: Statement,
     field: str,
 ) -> list[FundamentalRow]:
-    """Rows for the first tag in ``tags`` that reports any usable fact."""
+    """Rows for ``field``, resolving the tag **per fiscal period**.
+
+    Each period takes the most specific tag that reports it, falling back to
+    coarser tags only for periods the preferred one does not cover. First-match
+    over the whole tuple (the old rule) silently dropped every period after a
+    filer re-tagged itself mid-history — e.g. a company that stopped tagging
+    ``RevenueFromContractWithCustomerExcludingAssessedTax`` kept only the stale
+    pre-switch revenue rows forever.
+
+    Dedupe is on the ``(start, end, filed)`` natural key with the earliest
+    (most specific) tag winning, so a filer reporting both a specific and a
+    coarse tag for the SAME period still yields exactly one row. A complete
+    preferred tag therefore produces exactly its own rows, unchanged.
+    """
+    seen: set[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = set()
+    out: list[FundamentalRow] = []
     for tag in tags:
-        rows = _rows_for_tag(ticker, payload, tag, statement, field)
-        if rows:
-            return rows
-    return []
+        for row in _rows_for_tag(ticker, payload, tag, statement, field):
+            key = (row.period_start, row.period_end, row.filed)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+    return out
 
 
 def _free_cash_flow_rows(

@@ -6,6 +6,7 @@ import pandas as pd
 
 
 from src.data.fundamentals.normalize import TAG_MAP, sec_payload_to_rows
+from src.data.fundamentals.schema import FundamentalRow
 from src.utils import parse_timestamp
 
 
@@ -293,3 +294,146 @@ def test_tag_map_targets_are_valid_statement_fields() -> None:
         assert field in field_names(statement), (
             f"{statement}.{field} is not a dataclass field"
         )
+
+
+def _multi_facts(*facts: dict) -> dict:
+    """A tag body carrying several facts (the ``_fact`` helper holds only one)."""
+    return {"units": {"USD": list(facts)}}
+
+
+def test_retag_mid_history_keeps_later_periods_via_coarse_fallback() -> None:
+    """A filer that RE-TAGS mid-history must not lose the periods after the switch.
+
+    The specific revenue tag stops covering new periods (NVDA's real shape: its
+    facts end at the FY2022 10-K) while the coarse ``Revenues`` tag carries
+    everything after it. First-match-over-the-whole-tuple resolution kept only
+    the stale pre-switch rows and dropped every later quarter forever.
+    """
+    specific = _multi_facts(
+        {
+            "start": "2021-01-01",
+            "end": "2021-03-31",
+            "val": 100.0,
+            "form": "10-Q",
+            "filed": "2021-05-01",
+        }
+    )
+    coarse = _multi_facts(
+        *(
+            {
+                "start": start,
+                "end": end,
+                "val": value,
+                "form": "10-Q",
+                "filed": filed,
+            }
+            for start, end, value, filed in (
+                ("2021-01-01", "2021-03-31", 111.0, "2021-05-01"),
+                ("2024-01-01", "2024-03-31", 200.0, "2024-05-01"),
+                ("2024-04-01", "2024-06-30", 210.0, "2024-08-01"),
+            )
+        )
+    )
+    payload = _payload(
+        ("RevenueFromContractWithCustomerExcludingAssessedTax", specific),
+        ("Revenues", coarse),
+    )
+    revenue = [r for r in sec_payload_to_rows("DEMO", payload) if r.field == "revenue"]
+
+    # (a) the post-switch periods survive.
+    assert [r.period_end for r in revenue] == [
+        ts("2021-03-31"),
+        ts("2024-03-31"),
+        ts("2024-06-30"),
+    ]
+    # The overlap period keeps the specific value; the fallback covers the rest.
+    assert [r.value for r in revenue] == [100.0, 200.0, 210.0]
+
+
+def test_overlap_period_emits_one_row_with_the_more_specific_tag() -> None:
+    """Both tags state the SAME period -> exactly one row, specific tag's value."""
+    specific = _multi_facts(
+        {
+            "start": "2024-01-01",
+            "end": "2024-03-31",
+            "val": 1000.0,
+            "form": "10-Q",
+            "filed": "2024-05-01",
+        }
+    )
+    coarse = _multi_facts(
+        {
+            "start": "2024-01-01",
+            "end": "2024-03-31",
+            "val": 9999.0,
+            "form": "10-Q",
+            "filed": "2024-05-01",
+        }
+    )
+    payload = _payload(
+        ("RevenueFromContractWithCustomerExcludingAssessedTax", specific),
+        ("Revenues", coarse),
+    )
+    revenue = [r for r in sec_payload_to_rows("DEMO", payload) if r.field == "revenue"]
+    assert len(revenue) == 1
+    assert revenue[0].value == 1000.0
+
+
+def test_complete_preferred_tag_is_unchanged_by_the_period_fallback() -> None:
+    """The ~289 filers whose preferred tag is complete must see a no-op.
+
+    Pinned as exact row equality (value, span, ``filed``, ``form``, order), not
+    a count: a fallback that merged or reordered a complete series would be a
+    silent data change for every untouched symbol.
+    """
+    tag = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    periods = (
+        ("2024-01-01", "2024-03-31", 100.0, "2024-05-01"),
+        ("2024-04-01", "2024-06-30", 110.0, "2024-08-01"),
+    )
+    specific = _multi_facts(
+        *(
+            {
+                "start": start,
+                "end": end,
+                "val": value,
+                "form": "10-Q",
+                "filed": filed,
+            }
+            for start, end, value, filed in periods
+        )
+    )
+    # The coarse tag states the same periods at a different value: it must be
+    # fully shadowed, not merged in.
+    coarse = _multi_facts(
+        *(
+            {
+                "start": start,
+                "end": end,
+                "val": value + 1.0,
+                "form": "10-Q",
+                "filed": filed,
+            }
+            for start, end, value, filed in periods
+        )
+    )
+    revenue = [
+        r
+        for r in sec_payload_to_rows(
+            "DEMO", _payload((tag, specific), ("Revenues", coarse))
+        )
+        if r.field == "revenue"
+    ]
+    assert revenue == [
+        FundamentalRow(
+            ticker="DEMO",
+            statement="income",
+            field="revenue",
+            value=value,
+            period_start=ts(start),
+            period_end=ts(end),
+            filed=ts(filed),
+            form="10-Q",
+        )
+        for start, end, value, filed in periods
+    ]
