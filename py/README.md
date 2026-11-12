@@ -252,10 +252,54 @@ bound the _filing_ date, `--refresh-fundamentals` bypasses the SEC payload
 cache, `--fundamentals-cache` sets its directory. The candle window is
 deliberately not applied to filings.
 
+#### Non-US markets
+
+A universe declares the venue its tickers list on. Without it resolution is
+US-only: Borsa Italiana, Xetra and friends are invisible to a bare-ticker
+lookup, and one ticker can be listed on several venues at once.
+
+```json
+{ "symbols": ["ENI.MI", "ISP.MI"], "exchange": "BVME", "from_date": "2019-01-01" }
+```
+
+- `exchange` is an IBKR venue code (`BVME` Borsa Italiana, `IBIS` Xetra, `SBF`
+  Paris, `LSE`, `AEB`, `BM`, `VSE`…). It filters the gateway's contract search
+  and is stored as the symbol's `market`, which selects its holiday calendar —
+  without it every foreign holiday is reported as a data gap.
+- A market suffix in the symbol (`ENI.MI`) is a LOCAL namespace label: it keeps a
+  foreign listing from colliding with a same-named US ticker in `symbol`/`candle`
+  (`DIA`, `TIP`, `WBD` exist on both sides). The gateway search strips it, the
+  stored ticker keeps it, and a suffix always WINS over `exchange` — so a mixed
+  venue universe is one plain list, with no second spelling of the venue:
+
+  ```json
+  { "symbols": ["ENI.MI", "AI.PA", "SAP.DE"], "exchange": "BVME" }
+  ```
+
+  The suffix→venue rule is canonical and one-way: an unmapped venue is a config
+  error, never an invented suffix.
+
+  | suffix | venue | suffix | venue | suffix | venue |
+  |---|---|---|---|---|---|
+  | `MI` | `BVME`/`MIL` | `PA` | `SBF` | `DE` | `IBIS`/`FWB` |
+  | `AS` | `AEB` | `L` | `LSE` | `MC` | `BM` |
+  | `VI` | `VSE` | `SW` | `EBS` | `MX` | `MEXI` |
+
+  A key never states which venue it was STORED under (see the alias column); the
+  `symbol` row is the authority, the suffix only picks which venue to ASK when a
+  symbol is unresolved.
+- A `symbol` row is written on first resolution, so a fresh DB needs no seeding.
+- Backtests run each symbol's gap guard on ITS venue's calendar, and live orders
+  carry `exchange = venue` (never a naked SMART order for a BVME listing).
+
+`universes/ftse_italia.json` is a ready 100-name Borsa Italiana universe (FTSE
+MIB + Italia Mid Cap). SEC EDGAR covers US filers only, so the fundamentals pass
+SKIPS non-US series (summary: `Skipped (not US-listed): N`) instead of reporting
+them as not found.
+
 `--from` sets the history floor — earlier = deeper backfill plus the trailing
 tail in one call. Its `0 fetch gaps`/`up to date` tail is _post-download_ output
 and can print even on a successful fill; always confirm with:
-
 ```bash
 uv run ibkr data query AAPL        # max date should advance
 ```

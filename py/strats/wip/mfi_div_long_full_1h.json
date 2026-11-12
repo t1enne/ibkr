@@ -1,45 +1,15 @@
 {
-  "name": "mfi_pivotdiv_long",
+  "name": "mfi-div-long-full-1h",
   "warmup": "250d",
   "trading_start": "2020-01-01",
   "trading_end": "2026-09-08",
   "commission": 0.0,
   "initial_capital": 50000,
-  "strategy_type": "mfi_pivotdiv_dsl",
+  "strategy_type": "mfi_divergence_dsl",
   "bars": [
+    "1h",
     "1d"
   ],
-  "strategy_params": {
-    "mfi_period": 14,
-    "pivot_bars": 3,
-    "lookback": 90,
-    "min_gap_bars": 5,
-    "max_gap_bars": 0,
-    "max_age_bars": 0,
-    "min_osc_gap": 5.0,
-    "min_osc_gap_frac": 0.0,
-    "require_intervening": true,
-    "min_intervening_atr": 0.5,
-    "min_price_ext": 0.03,
-    "max_price_ext": 0.06,
-    "osc_extreme_side": false,
-    "osc_extreme_floor": 35.0,
-    "osc_extreme_ceil": 65.0,
-    "allow_longs": true,
-    "allow_shorts": false,
-    "need_trend": true,
-    "trend_ma_period": 100,
-    "bench_gate": true,
-    "benchmark": "SPY",
-    "bench_ma_period": 150,
-    "atr_period": 7,
-    "trail_atr_mult": 1.2,
-    "entry_stop_atr": 3.0,
-    "risk_pct": 0.1,
-    "warmup_bars": 60,
-    "cooldown_bars": 5,
-    "max_gross_exposure": 1.0
-  },
   "symbols": [
     "AAPL",
     "ABBV",
@@ -153,5 +123,22 @@
     "XBI",
     "XEL",
     "SPY"
-  ]
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
+  "strategy_params": {
+    "mfi_period": 14,
+    "div_look": 30,
+    "div_min_gap": 8.0,
+    "allow_longs": true,
+    "allow_shorts": false,
+    "sym_roc_look": 0,
+    "sym_roc_min": 0.0,
+    "atr_period": 7,
+    "trail_atr_mult": 3.5,
+    "entry_stop_atr": 3.0,
+    "risk_pct": 0.01,
+    "warmup_bars": 60
+  }
 }
