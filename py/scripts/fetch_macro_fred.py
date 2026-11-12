@@ -70,6 +70,10 @@ DEFAULT_SERIES: dict[str, dict] = {
         "id": "VIXCLS",
         "title": "CBOE Volatility Index: VIX",
     },
+    "vix3m": {
+        "id": "VXVCLS",
+        "title": "CBOE 3-Month Volatility Index (VIX3M): term structure",
+    },
 }
 
 
