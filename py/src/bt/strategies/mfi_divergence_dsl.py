@@ -24,25 +24,52 @@ chop) -- pass the appropriate look per config rather than assuming one default.
 
 Per-side chandelier ATR trailing exits and structural entry stops. Per-symbol
 state in ``ctx.shared``; every read is cursor-truncated (no lookahead).
+
+ONE module, TWO execution venues; ``config.bars`` is the only switch:
+``["1d"]`` reads the base feed (daily venue, reads and fills both daily);
+``["1h","1d"]`` reads completed daily buckets and uses the base bar only to time
+the fill. Params keep their DAILY-bar units either way. On the intraday venue an
+entry is a daily decision emitted once per completed bucket and fills at the next
+base bar's open, since a signal-bar-close fill is not achievable live. The trail
+is why the hourly grid exists: between buckets the daily rule cannot be
+re-evaluated, so the trail level is armed as a PRICE STOP and the risk layer
+checks it on every base bar, pricing gaps through the level.
+
+Measured layers that did NOT survive on either payoff shape, so they are absent
+by design: volume participation at the divergence extreme (flat to inverted), and
+a VIX-percentile size amplifier (helped nothing at a clipped or a wide trail).
+Do not re-add them without new evidence.
 """
 
 from __future__ import annotations
 
-import dataclasses
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from src.bt.strategies.dsl import strategy, StrategyContext
+from src.bt.strategies.ta_context import OhlcvView
 from src.bt.strategies.types import StrategyParams
 from src.bt.strategies.utils import gross_gate
 
 STRATEGY_TYPE = "mfi_divergence_dsl"
 _STATE_KEY = "mfi_divergence_state"
 
+#: Signal read interval. ``["1d"]`` reads the base feed (daily venue, fill on
+#: the signal bar); ``["1h","1d"]`` reads COMPLETED daily buckets and uses the
+#: base bar only to time the fill.
+_SIGNAL_INTERVAL = "1d"
+_BASE_INTERVAL_1D = "1d"
+
+#: Per-symbol state writer: replaces the call-scoped state with ``**kw`` applied.
+_Put = Callable[..., None]
+
 
 @dataclass(frozen=True)
 class _State:
+    """Per-symbol cross-call state (``ctx.shared``, minted per run)."""
+
     # running best (lowest) close since a long entry; None while flat/long-off
     best_long: float | None = None
     # running worst (highest) close since a short entry; None while flat/short-off
@@ -54,10 +81,15 @@ class _State:
     # means never / no cooldown armed. Entry is blocked while
     # ``n - last_exit_bar < cooldown_bars``.
     last_exit_bar: int = -1
+    #: Visible signal-feed length at the last base bar -- the once-per-bucket
+    #: guard's baseline. Only consulted when the read is an HTF feed.
+    daily_count: int | None = None
 
 
 @dataclass(frozen=True)
 class Params(StrategyParams):
+    """Strategy parameters. Bar counts are in DAILY bars on both venues."""
+
     # -- MFI / divergence --
     mfi_period: int = 14
     div_look: int = 30  # divergence swing window (split prior|recent halves)
@@ -113,8 +145,41 @@ class Params(StrategyParams):
     )
 
 
+def _state_interval(ctx: StrategyContext) -> str | None:
+    """Signal read interval; ``None`` means the base feed is itself daily."""
+    return None if ctx.interval == _BASE_INTERVAL_1D else _SIGNAL_INTERVAL
+
+
+def _is_htf(ctx: StrategyContext) -> bool:
+    """True when the base bar only times the fill (signal is a daily bucket)."""
+    return _state_interval(ctx) is not None
+
+
+def _new_daily_bucket(
+    ctx: StrategyContext,
+    holder: dict[str, _State],
+    sym: str,
+    n_daily: int,
+) -> bool:
+    """True on the FIRST base bar of a newly completed daily bucket.
+
+    A daily rule stays true for the rest of its session, so without this guard
+    an intraday base would re-emit the same daily entry on every hourly bar.
+    Always True on the daily venue, where each bar is its own bucket.
+    """
+    if not _is_htf(ctx):
+        return True
+    state = holder.get(sym) or _State()
+    last = state.daily_count
+    if last is None:  # first base bar this run processed for ``sym``
+        holder[sym] = replace(state, daily_count=n_daily)
+        return False
+    holder[sym] = replace(state, daily_count=max(last, n_daily))
+    return n_daily > last
+
+
 @strategy(stateful=True)
-def on_candle(ctx: StrategyContext):
+def on_candle(ctx: StrategyContext) -> None:
     # Warmup bars fill strategy state only — no fill can happen there, so the
     # DSL raises on any entry emitted during them. Accumulators above/below
     # still receive warmup bars because the engine feeds the store regardless.
@@ -125,26 +190,8 @@ def on_candle(ctx: StrategyContext):
         _process_symbol(ctx, p, sym)
 
 
-def _roc(ctx: StrategyContext, sym: str, look: int) -> float:
-    """Trailing ``look``-bar rate of change of ``sym``'s close (fraction).
-
-    Cursor-truncated. NaN when history is short or the reference close is
-    non-finite, so every caller fails closed.
-    """
-    if look <= 0:
-        return float("nan")
-    o = ctx.ohlcv(sym)
-    if o is None or len(o.close) <= look:
-        return float("nan")
-    arr = o.close.to_array()
-    ref = float(arr[-1 - look])
-    cur = float(arr[-1])
-    if not (np.isfinite(ref) and np.isfinite(cur)) or ref <= 0:
-        return float("nan")
-    return cur / ref - 1.0
-
-
 def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
+    """Advance one symbol on this bar: manage an open lot or seek an entry."""
     holder: dict[str, _State] = ctx.shared.setdefault(_STATE_KEY, {})
     state = holder.get(sym)
     if state is None:
@@ -152,10 +199,23 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         holder[sym] = state
 
     def put(**kw: object) -> None:
-        holder[sym] = dataclasses.replace(state, **kw)
+        holder[sym] = replace(state, **kw)
 
-    o = ctx.ohlcv(sym)
+    si = _state_interval(ctx)
+    o = ctx.ohlcv(sym, si)
     if o is None or len(o.close) <= p.warmup_bars:
+        return
+
+    # The once-per-bucket guard is evaluated on the SIGNAL feed length, and it
+    # is consumed for every symbol on every base bar so the baseline is adopted
+    # on the first bar of the run and never re-baselines later.
+    new_bucket = _new_daily_bucket(ctx, holder, sym, len(o.close))
+    state = holder[sym]
+    if not new_bucket:
+        # Between daily reads the base bar owns NO action: the entry stop and
+        # the trail level armed on the previous bucket already cover the
+        # position, and re-deciding off a partly-formed session would be a
+        # different rule. Also keeps the intraday venue O(1) per base bar.
         return
 
     closes = o.close.to_array()
@@ -164,40 +224,132 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         return
     close = float(closes[-1])
 
-    mfi_vals = ctx.ta.mfi(sym, period=p.mfi_period).to_array()
-    if n != len(mfi_vals) or n <= 0:
+    mfi_vals = ctx.ta.mfi(sym, period=p.mfi_period, interval=si).to_array()
+    if n != len(mfi_vals):
         return
 
-    atr = ctx.ta.atr(sym, period=p.atr_period).last()
+    atr = ctx.ta.atr(sym, period=p.atr_period, interval=si).last()
     if not np.isfinite(atr):
         atr = 0.0
 
-    # ---- manage an open position: chandelier ATR trail on the active side ----
     qty = ctx.quantity(sym)
     if qty != 0:
-        put(was_in_position=True)
-        if qty > 0:
-            _trail_long(ctx, p, state, put, sym, close, atr)
-        else:
-            _trail_short(ctx, p, state, put, sym, close, atr)
+        _manage_open(ctx, p, sym, state, put, close, atr, qty > 0)
         return
+    _maybe_enter(ctx, p, sym, state, put, o, mfi_vals, n, si, close, atr)
 
-    # Flat. If the previous bar held a position, the close happened since then
-    # (trail, stop, or end): stamp this bar and start the cooldown window.
-    if state.was_in_position:
-        state = dataclasses.replace(state, was_in_position=False, last_exit_bar=n)
-        holder[sym] = state
-    # ---- flat: decide the admissible side from the symbol's own trend ----
-    sym_roc = _roc(ctx, sym, p.sym_roc_look) if p.sym_roc_look > 0 else 0.0
-    if p.sym_roc_look > 0 and not np.isfinite(sym_roc):
+
+def _manage_open(
+    ctx: StrategyContext,
+    p: Params,
+    sym: str,
+    state: _State,
+    put: _Put,
+    close: float,
+    atr: float,
+    is_long: bool,
+) -> None:
+    """Trail an open lot on its active side; emit the exit once breached."""
+    put(was_in_position=True)
+    level = _trail_level(p, state, put, close, atr, is_long)
+    if level is not None:
+        _fire_trail(ctx, sym, level, is_long)
+
+
+def _trail_level(
+    p: Params,
+    state: _State,
+    put: _Put,
+    close: float,
+    atr: float,
+    is_long: bool,
+) -> float | None:
+    """Advance the high-water mark; return the trail level once it is breached.
+
+    ``None`` means no exit: the mark moved further in the trade's favour, or ATR
+    is unusable. The caller decides HOW that level becomes an exit (see
+    ``_fire_trail``), because the two venues emit it differently.
+    """
+    best = state.best_long if is_long else state.best_short
+    if best is None or not (best > 0):
+        put(best_long=close) if is_long else put(best_short=close)
+        return None
+    sign = 1.0 if is_long else -1.0
+    if (close - best) * sign > 1e-9:  # a new extreme in the trade's favour
+        put(best_long=close) if is_long else put(best_short=close)
+        return None
+    if atr > 0 and (best - close) * sign >= p.trail_atr_mult * atr:
+        put(best_long=None) if is_long else put(best_short=None)
+        return best - sign * p.trail_atr_mult * atr
+    return None
+
+
+def _fire_trail(ctx: StrategyContext, sym: str, level: float, is_long: bool) -> None:
+    """Emit the trail exit on the venue in use.
+
+    Daily venue: the trail decision and the fill are the same bar, so a close
+    signal is exact. Intraday venue: the daily read cannot be re-evaluated
+    between buckets, so the level is armed as a PRICE STOP instead and the
+    engine's risk layer checks it on every base bar -- the whole point of having
+    the hourly grid. That also gets gap-through pricing from the risk path
+    instead of a plain next-open close.
+    """
+    if _is_htf(ctx):
+        if is_long:
+            ctx.set_stops(sym, sl=level)
+        else:
+            ctx.set_stops(sym, tp=level)
         return
+    side = "long" if is_long else "short"
+    ctx.close(
+        sym,
+        reason=(
+            f"[mfi_div] trail tp {side} {sym}: close crossed the trail level "
+            f"{level:.2f}"
+        ),
+    )
+
+
+def _maybe_enter(
+    ctx: StrategyContext,
+    p: Params,
+    sym: str,
+    state: _State,
+    put: _Put,
+    o: OhlcvView,
+    mfi_vals: np.ndarray,
+    n: int,
+    si: str | None,
+    close: float,
+    atr: float,
+) -> None:
+    """Emit an entry when an admissible side's divergence trigger fires."""
+    if state.was_in_position:
+        # The close happened since the last bar (trail, stop, or end): stamp
+        # this bar so the cooldown window starts here.
+        put(was_in_position=False, last_exit_bar=n)
+    long_ok, short_ok = _admissible_sides(ctx, p, sym, si)
+    if _cooling(n, state.last_exit_bar, p.cooldown_bars):
+        return
+    if long_ok and _divergence(o, p, mfi_vals, n, is_long=True):
+        _enter(ctx, p, sym, close, atr, is_long=True)
+        return
+    if short_ok and _divergence(o, p, mfi_vals, n, is_long=False):
+        _enter(ctx, p, sym, close, atr, is_long=False)
+
+
+def _admissible_sides(
+    ctx: StrategyContext, p: Params, sym: str, si: str | None
+) -> tuple[bool, bool]:
+    """``(long_ok, short_ok)`` after the trend-sign and MA-regime gates."""
+    sym_roc = _roc(ctx, sym, p.sym_roc_look, si) if p.sym_roc_look > 0 else 0.0
+    if p.sym_roc_look > 0 and not np.isfinite(sym_roc):
+        return False, False
     long_ok = p.allow_longs and ((p.sym_roc_look == 0) or (sym_roc >= p.sym_roc_min))
     short_ok = p.allow_shorts and ((p.sym_roc_look == 0) or (sym_roc <= -p.sym_roc_min))
-
-    # ---- moving-average regime gates ----
-    spy_up = _above_ma(ctx, p.benchmark, p.spy_ma_period)
-    sym_up = _above_ma(ctx, sym, p.symbol_ma_period)
-    long_ok, short_ok = _ma_side_ok(
+    spy_up = _above_ma(ctx, p.benchmark, p.spy_ma_period, si)
+    sym_up = _above_ma(ctx, sym, p.symbol_ma_period, si)
+    return _ma_side_ok(
         long_ok,
         short_ok,
         spy_up,
@@ -207,70 +359,24 @@ def _process_symbol(ctx: StrategyContext, p: Params, sym: str) -> None:
         p.need_ma_alignment,
     )
 
-    # ---- cooldown: block re-entry too soon after the last exit on this name ----
-    if _cooling(n, state.last_exit_bar, p.cooldown_bars):
-        return
 
-    # ---- entry: whichever divergence trigger fires for an admissible side ----
-    if long_ok and _bull_divergence(o, p, mfi_vals, n):
-        _enter(ctx, p, sym, close, atr, side="long")
-        return
-    if short_ok and _bear_divergence(o, p, mfi_vals, n):
-        _enter(ctx, p, sym, close, atr, side="short")
+def _roc(ctx: StrategyContext, sym: str, look: int, interval: str | None) -> float:
+    """Trailing ``look``-bar rate of change of ``sym``'s close (fraction).
 
-
-def _trail_long(
-    ctx: StrategyContext,
-    p: Params,
-    state: _State,
-    put,
-    sym: str,
-    close: float,
-    atr: float,
-) -> None:
-    best = state.best_long
-    if best is None or not (best > 0):
-        put(best_long=close)
-        return
-    if close > best + 1e-9:
-        put(best_long=close)
-        return
-    if atr > 0 and close <= best - p.trail_atr_mult * atr:
-        put(best_long=None)
-        ctx.close(
-            sym,
-            reason=(
-                f"[mfi_div] trail tp long {sym}: close {close:.2f} "
-                f"{p.trail_atr_mult:.1f}ATR under best {best:.2f}"
-            ),
-        )
-
-
-def _trail_short(
-    ctx: StrategyContext,
-    p: Params,
-    state: _State,
-    put,
-    sym: str,
-    close: float,
-    atr: float,
-) -> None:
-    best = state.best_short
-    if best is None or not (best > 0):
-        put(best_short=close)
-        return
-    if close < best - 1e-9:
-        put(best_short=close)
-        return
-    if atr > 0 and close >= best + p.trail_atr_mult * atr:
-        put(best_short=None)
-        ctx.close(
-            sym,
-            reason=(
-                f"[mfi_div] trail tp short {sym}: close {close:.2f} "
-                f"{p.trail_atr_mult:.1f}ATR over best {best:.2f}"
-            ),
-        )
+    Cursor-truncated. NaN when history is short or the reference close is
+    non-finite, so every caller fails closed.
+    """
+    if look <= 0:
+        return float("nan")
+    o = ctx.ohlcv(sym, interval)
+    if o is None or len(o.close) <= look:
+        return float("nan")
+    arr = o.close.to_array()
+    ref = float(arr[-1 - look])
+    cur = float(arr[-1])
+    if not (np.isfinite(ref) and np.isfinite(cur)) or ref <= 0:
+        return float("nan")
+    return cur / ref - 1.0
 
 
 def _cooling(now: int, last_exit_bar: int, cooldown_bars: int) -> bool:
@@ -286,7 +392,9 @@ def _cooling(now: int, last_exit_bar: int, cooldown_bars: int) -> bool:
     return now - last_exit_bar < cooldown_bars
 
 
-def _above_ma(ctx: StrategyContext, sym: str, period: int) -> bool | None:
+def _above_ma(
+    ctx: StrategyContext, sym: str, period: int, interval: str | None
+) -> bool | None:
     """True when ``sym``'s latest close is above its ``period``-bar SMA.
 
     Returns ``None`` when history is too short or either value is non-finite,
@@ -294,11 +402,11 @@ def _above_ma(ctx: StrategyContext, sym: str, period: int) -> bool | None:
     """
     if period <= 0:
         return None
-    o = ctx.ohlcv(sym)
+    o = ctx.ohlcv(sym, interval)
     if o is None or len(o.close) < period:
         return None
     cur = float(o.close.to_array()[-1])
-    ma = ctx.ta.sma(sym, period=period).last()
+    ma = ctx.ta.sma(sym, period=period, interval=interval).last()
     if not (np.isfinite(cur) and np.isfinite(ma)) or ma <= 0:
         return None
     return cur > ma
@@ -333,87 +441,67 @@ def _ma_side_ok(
     return long_ok, short_ok
 
 
-def _bull_divergence(o, p: Params, mfi_vals: np.ndarray, n: int) -> bool:
-    """Long trigger: price lower-low while MFI higher-low (bullish absorption).
+def _divergence(
+    o: OhlcvView, p: Params, mfi_vals: np.ndarray, n: int, is_long: bool
+) -> bool:
+    """Price/flow divergence trigger for one side (pure).
 
-    Splits the last ``div_look`` bars into prior|recent halves and demands the
-    recent half's price low is *below* the prior half's while its MFI low is
-    *above* (by at least ``div_min_gap``) -- sellers are being absorbed. The
-    price low must also clear ``div_min_price_ext`` below the prior low, so a
-    divergence against an essentially flat low does not fire.
+    Long: over the last ``div_look`` bars the recent half's price low is *below*
+    the prior half's while its MFI low is *above* it by ``div_min_gap`` --
+    sellers are being absorbed. Short mirrors it on highs. Either way
+    ``div_min_price_ext`` makes the price itself thrust past the prior extreme,
+    so a divergence against an essentially flat one does not fire.
     """
-    look = p.div_look
-    if n < p.warmup_bars + 2 or look < 2:
+    halves = _divergence_halves(o, p, mfi_vals, n, is_long)
+    if halves is None:
         return False
-    closes = o.close.to_array()
-    if len(closes) != n or len(mfi_vals) != n:
+    thrust, flow_lead, prior_ext = halves
+    if not (thrust > 0.0 and flow_lead > p.div_min_gap):
         return False
-    half = look // 2
-    prior_lo = closes[n - look : n - half]
-    rec_lo = closes[n - half : n]
-    prior_mo = mfi_vals[n - look : n - half]
-    rec_mo = mfi_vals[n - half : n]
-    if not (len(prior_lo) and len(rec_lo)):
-        return False
-    if not (
-        np.all(np.isfinite(prior_lo))
-        and np.all(np.isfinite(rec_lo))
-        and np.all(np.isfinite(prior_mo))
-        and np.all(np.isfinite(rec_mo))
-    ):
-        return False
-    pl = float(np.nanmin(prior_lo))
-    rl = float(np.nanmin(rec_lo))
-    pm = float(np.nanmin(prior_mo))
-    rm = float(np.nanmin(rec_mo))
-    if not (rl < pl and rm > pm + p.div_min_gap):
-        return False
-    # Price must actually extend below the prior low by the required fraction:
-    # a divergence against a barely-lower low is noise, not absorption.
-    if p.div_min_price_ext > 0:
-        ext = (pl - rl) / pl if pl > 0 else 0.0
-        if ext < p.div_min_price_ext:
+    if p.div_min_price_ext > 0 and prior_ext > 0:
+        if thrust / abs(prior_ext) < p.div_min_price_ext:
             return False
     return True
 
 
-def _bear_divergence(o, p: Params, mfi_vals: np.ndarray, n: int) -> bool:
-    """Short trigger: price higher-high while MFI lower-high (bearish distribution).
+def _divergence_halves(
+    o: OhlcvView, p: Params, mfi_vals: np.ndarray, n: int, is_long: bool
+) -> tuple[float, float, float] | None:
+    """``(thrust, flow_lead, prior price extreme)``, or None when unmeasurable.
 
-    Mirrors the bull gate, including the ``div_min_price_ext`` requirement.
+    ``thrust`` is how far the recent half's price extreme runs past the prior
+    half's and ``flow_lead`` how far MFI refuses to follow it -- the thesis in
+    two numbers. Long reads extremes as lows, short as highs. None on short
+    history, a misaligned series, or any non-finite value in the windows, so the
+    caller fails closed rather than trading an unmeasurable window.
     """
     look = p.div_look
     if n < p.warmup_bars + 2 or look < 2:
-        return False
+        return None
     closes = o.close.to_array()
     if len(closes) != n or len(mfi_vals) != n:
-        return False
+        return None
     half = look // 2
-    prior_hi = closes[n - look : n - half]
-    rec_hi = closes[n - half : n]
+    prior_px = closes[n - look : n - half]
+    rec_px = closes[n - half : n]
     prior_mo = mfi_vals[n - look : n - half]
     rec_mo = mfi_vals[n - half : n]
-    if not (len(prior_hi) and len(rec_hi)):
-        return False
+    if not (prior_px.size and rec_px.size):
+        return None
     if not (
-        np.all(np.isfinite(prior_hi))
-        and np.all(np.isfinite(rec_hi))
+        np.all(np.isfinite(prior_px))
+        and np.all(np.isfinite(rec_px))
         and np.all(np.isfinite(prior_mo))
         and np.all(np.isfinite(rec_mo))
     ):
-        return False
-    ph = float(np.nanmax(prior_hi))
-    rh = float(np.nanmax(rec_hi))
-    pm = float(np.nanmax(prior_mo))
-    rm = float(np.nanmax(rec_mo))
-    if not (rh > ph and rm < pm - p.div_min_gap):
-        return False
-    # Price must actually extend above the prior high by the required fraction.
-    if p.div_min_price_ext > 0:
-        ext = (rh - ph) / ph if ph > 0 else 0.0
-        if ext < p.div_min_price_ext:
-            return False
-    return True
+        return None
+    if is_long:
+        prior_ext, rec_ext = float(np.min(prior_px)), float(np.min(rec_px))
+        prior_flow, rec_flow = float(np.min(prior_mo)), float(np.min(rec_mo))
+        return prior_ext - rec_ext, rec_flow - prior_flow, prior_ext
+    prior_ext, rec_ext = float(np.max(prior_px)), float(np.max(rec_px))
+    prior_flow, rec_flow = float(np.max(prior_mo)), float(np.max(rec_mo))
+    return rec_ext - prior_ext, prior_flow - rec_flow, prior_ext
 
 
 def _enter(
@@ -422,19 +510,22 @@ def _enter(
     sym: str,
     close: float,
     atr: float,
-    side: str,
+    is_long: bool,
 ) -> None:
+    """Size and emit the entry, with its structural stop."""
     if not (atr > 0 and close > 0 and ctx.state.portfolio.cash > 0):
         return
     # -- drawdown control: aggregate gross-notional cap vs live equity --
     # The candidate lot is ``risk_pct`` of live equity, already equity-relative.
-    equity = ctx.current_equity()
     if gross_gate(
-        equity, ctx.state.portfolio.positions, p.max_gross_exposure, p.risk_pct
+        ctx.current_equity(),
+        ctx.state.portfolio.positions,
+        p.max_gross_exposure,
+        p.risk_pct,
     ):
         return
     stop_dist = p.entry_stop_atr * atr
-    if side == "long":
+    if is_long:
         ctx.long(
             sym,
             size=p.risk_pct,
