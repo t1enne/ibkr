@@ -31,13 +31,21 @@ MAX_PERIOD_DAYS = 365
 # Pause (seconds) between chunked history requests in _fetch_candles_iterative.
 # IBKR caps each response at ~2000 bars, so a multi-year hourly backfill issues
 # many back-to-back calls that can trip the gateway's server-side rate limiter
-# (HTTP 503). This delay spreads the requests to stay under that threshold.
+# (HTTP 429/503). This delay spreads the requests to stay under that threshold.
 CHUNK_DELAY_S = 1.0
 
 # Upper bound (seconds) for the adaptive inter-chunk delay. Doubled on repeated
-# HTTP 503 (rate-limit) responses so a sustained burst backs off up to this cap
-# before giving up, then decays back toward CHUNK_DELAY_S once requests succeed.
+# throttling responses so a sustained burst backs off up to this cap before
+# giving up, then decays back toward CHUNK_DELAY_S once requests succeed.
 CHUNK_DELAY_MAX_S = 60.0
+
+# Statuses the gateway serves when we must slow down: 429 (pacing violation) and
+# 503 (server-side rate limiter). Both retry the SAME window after backoff; only
+# exhausting CHUNK_THROTTLE_ATTEMPTS aborts the symbol.
+CHUNK_THROTTLE_STATUSES = frozenset({429, 503})
+
+#: Throttled retries one window may burn before the symbol is reported failed.
+CHUNK_THROTTLE_ATTEMPTS = 6
 
 
 def _refuse_foreign_conid(batch: list[CandleDict]) -> None:
@@ -397,9 +405,11 @@ async def _fetch_candles_iterative(
     # Adaptive pacing. A multi-year backfill issues many sequential history calls
     # (IBKR caps each response at 2000 bars and/or 365d), and a burst of
     # back-to-back requests trips the gateway's server-side rate limiter (HTTP
-    # 503). We keep a short base delay between chunks and throttle it up on a 503
-    # so a sustained burst backs off instead of aborting the whole symbol.
+    # 429/503). We keep a short base delay between chunks and throttle it up on a
+    # throttled response so a sustained burst backs off instead of aborting the
+    # whole symbol.
     delay = CHUNK_DELAY_S
+    throttled = 0
 
     while current_to > from_datetime:
         if not first_chunk:
@@ -414,7 +424,7 @@ async def _fetch_candles_iterative(
         days_to_fetch = min(days_to_fetch, MAX_PERIOD_DAYS)
 
         resp = await get_iserver_marketdata_history.asyncio_detailed(
-            client=default_client().rest,
+            client=default_client().history_rest,
             conid=conid,
             bar=bar,
             period=f"{days_to_fetch}d",
@@ -423,14 +433,22 @@ async def _fetch_candles_iterative(
         )
         r = resp.parsed
 
-        if resp.status_code == 503:
-            # Gateway rate-limit throttle: grow the inter-chunk delay and retry
-            # the same window after backing off, rather than aborting the whole
-            # multi-year backfill over a transient burst.
+        if resp.status_code in CHUNK_THROTTLE_STATUSES:
+            # Pacing violation (429) or gateway rate limit (503): grow the
+            # inter-chunk delay and retry the SAME window after backing off. The
+            # retries are bounded — a gateway that throttles past the cap fails
+            # the symbol instead of sleeping forever.
+            throttled += 1
+            if throttled > CHUNK_THROTTLE_ATTEMPTS:
+                raise Exception(f"throttled {throttled}x at status={resp.status_code}")
             delay = min(delay * 2.0, CHUNK_DELAY_MAX_S)
-            _log_warn(f"{ticker} 503 throttled to {delay}s, retry window {current_to}")
-            await asyncio.sleep(delay)
+            _log_warn(
+                f"{ticker} {resp.status_code} throttled to {delay}s, "
+                f"retry window {current_to}"
+            )
             continue
+
+        throttled = 0
 
         if (
             resp.status_code != 200

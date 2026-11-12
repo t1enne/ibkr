@@ -65,3 +65,17 @@ def test_both_clients_carry_the_same_timeout() -> None:
     assert client.http.timeout.read == 7.5
     # The generated client keeps its timeout on the pool it builds lazily.
     assert client.rest._timeout == httpx.Timeout(7.5)
+
+
+def test_candle_history_gets_the_long_read_timeout() -> None:
+    """Candle history must NOT inherit the fast lookup timeout.
+
+    One history chunk walks years of bars and legitimately outlives the secdef
+    timeout; under it, a backfill dies as a message-less ``ReadTimeout`` that
+    reads like a rate limit.
+    """
+    client = IbkrClient(base_url=BASE, account="DU1234567", timeout=7.5)
+
+    assert client.history_timeout_s > client.timeout_s
+    assert client.history_rest._timeout == httpx.Timeout(client.history_timeout_s)
+    assert client.history_rest is not client.rest

@@ -34,6 +34,13 @@ from ib_rest_api_client import Client as _RestClient
 DEFAULT_BASE_URL = "https://localhost:5000/v1/api/"
 DEFAULT_TIMEOUT_S = 10.0
 
+#: Read timeout for the CANDLE HISTORY endpoint. A history call is not a read of
+#: small JSON: the gateway walks its own store, and a multi-year hourly window
+#: (the ``period=365d`` chunk a backfill issues) takes far longer than a secdef
+#: lookup. Under the short default those calls die as ``ReadTimeout`` — an empty
+#: message that looks like a throttle but is only a too-eager timeout.
+DEFAULT_HISTORY_TIMEOUT_S = 30.0
+
 #: Failure kinds this seam distinguishes. Kept deliberately small — the live
 #: ``FeedError`` vocabulary is mapped from these at the port boundary.
 ErrorKind = Literal["auth", "rate_limit", "transport"]
@@ -95,9 +102,10 @@ class IbkrClient:
     """Async read client for the gateway. Owns the httpx + generated REST clients.
 
     ``http`` is the raw ``httpx.AsyncClient`` (used by the prose endpoints below);
-    ``rest`` is the generated ``ib_rest_api_client.Client`` the candle fetcher
-    drives (``get_iserver_marketdata_history``). Both are configured from ONE
-    base url / verify policy, so a change here moves both.
+    ``rest`` is the generated ``ib_rest_api_client.Client`` the secdef lookups
+    drive; ``history_rest`` is the same client with the long history read
+    timeout, for candle history only. All three share ONE base url / verify
+    policy, so a change here moves them all.
     """
 
     def __init__(
@@ -105,6 +113,7 @@ class IbkrClient:
         base_url: str | None = None,
         account: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
+        history_timeout: float = DEFAULT_HISTORY_TIMEOUT_S,
         verify: bool = False,
     ) -> None:
         self.base_url = base_url or _default_base_url()
@@ -133,6 +142,15 @@ class IbkrClient:
             verify_ssl=verify,
             timeout=httpx.Timeout(timeout),
         )
+        # Candle history gets its OWN pool with a long read timeout: one history
+        # chunk walks years of bars. A separate client keeps the fast fail-closed
+        # timeout on secdef lookup while letting a slow backfill finish.
+        self._history_timeout = history_timeout
+        self._history_rest = _RestClient(
+            base_url=self.base_url,
+            verify_ssl=verify,
+            timeout=httpx.Timeout(history_timeout),
+        )
 
     @property
     def http(self) -> httpx.AsyncClient:
@@ -143,6 +161,16 @@ class IbkrClient:
     def rest(self) -> _RestClient:
         """The generated REST client, on the SAME url/verify/TIMEOUT policy."""
         return self._rest
+
+    @property
+    def history_rest(self) -> _RestClient:
+        """Generated REST client with the long read timeout, for candle history."""
+        return self._history_rest
+
+    @property
+    def history_timeout_s(self) -> float:
+        """The read timeout the candle-history client was built with."""
+        return self._history_timeout
 
     @property
     def timeout_s(self) -> float:
