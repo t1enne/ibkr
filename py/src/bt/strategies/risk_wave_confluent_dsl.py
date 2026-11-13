@@ -31,6 +31,7 @@ from src.bt.strategies._risk_wave_common import closes_for_legs, composite_smoot
 from src.bt.strategies.dsl import strategy, StrategyContext
 from src.bt.strategies.types import StrategyParams
 from src.indicators.adaptive_entropy import AdaptiveEntropyConfig, OnlineAdaptiveEntropy
+from src.indicators.adaptive_entropy.validate import NonFiniteBarError
 
 STRATEGY_TYPE = "risk_wave_confluent_dsl"
 
@@ -152,6 +153,11 @@ def on_candle(ctx: StrategyContext):
             lo = float(v.low[-1])
             res = es.observe(c, h, lo)
             trend = int(res.trend) if es.ready else 0
+    except NonFiniteBarError:
+        # Never swallow this one: a non-finite bar poisons the running EMA/ATR,
+        # so the fallback `trend = 0` would permanently disable the very gate
+        # this block computes (deployment needs `trend == 1`) with no signal.
+        raise
     except Exception:
         trend = 0
 

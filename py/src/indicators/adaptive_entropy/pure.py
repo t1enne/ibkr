@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from src.indicators.adaptive_entropy.types import AdaptiveEntropyConfig
+from src.indicators.adaptive_entropy.validate import require_finite_series
 
 
 def _rolling_entropy(
@@ -110,6 +111,16 @@ def adaptive_entropy(
 
     Returns
     -------
+    Raises
+    ------
+    NonFiniteBarError
+        If any input price is not finite.  The post-warmup columns are derived
+        from a running ATR/EMA, so a single blank row (a union-calendar feed
+        where the symbol did not trade) would silently freeze ``trend``; the
+        rejection is what keeps batch and online in step.
+
+    Returns
+    -------
     pd.DataFrame indexed as ``close`` with one row per bar.  Rows before the
     lookback window has filled carry ``nan`` for the rolling quantities, and
     the band/trend columns are ``nan`` / 0 until the EMA and ATR are defined.
@@ -125,6 +136,7 @@ def adaptive_entropy(
     high_arr = np.asarray(high, dtype=np.float64)
     low_arr = np.asarray(low, dtype=np.float64)
     n = close_arr.shape[0]
+    require_finite_series(close_arr, high_arr, low_arr)
 
     if n == 0:
         return pd.DataFrame(

@@ -6,10 +6,12 @@ from src.indicators.adaptive_entropy.types import (
     AdaptiveEntropyConfig,
     AdaptiveEntropyResult,
 )
+from src.indicators.adaptive_entropy.validate import NonFiniteBarError
 
 __all__ = [
     "adaptive_entropy",
     "OnlineAdaptiveEntropy",
     "AdaptiveEntropyConfig",
     "AdaptiveEntropyResult",
+    "NonFiniteBarError",
 ]

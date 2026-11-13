@@ -319,7 +319,7 @@ ATR is a per-bar *range*, and ranges scale with `sqrt(time)`. Multiplying an ATR
 multiple by the **bar count** treats a range as if it scaled linearly with time —
 it over-widens stops and under-risks.
 
-Observed on `entropy_vp_breakdown`, 6-symbol / 2022-H1 slice (daily target:
+Observed on `pop_fade_ae_short` (then `entropy_vp_breakdown`), 6-symbol / 2022-H1 slice (daily target:
 14 trades, Sharpe 2.62, Ann 35.32%, Capital Utilization 15.6%):
 
 | ATR conv. | trades | Sharpe | Ann%   | Cap Util% | Win%   |

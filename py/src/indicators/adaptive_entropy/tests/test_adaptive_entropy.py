@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.indicators.adaptive_entropy.online import OnlineAdaptiveEntropy
 from src.indicators.adaptive_entropy.pure import adaptive_entropy
@@ -11,6 +12,7 @@ from src.indicators.adaptive_entropy.types import (
     AdaptiveEntropyConfig,
     AdaptiveEntropyResult,
 )
+from src.indicators.adaptive_entropy.validate import NonFiniteBarError
 
 
 def _frame(closes: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -186,11 +188,65 @@ def test_online_reset_replays_identically():
 
 
 def test_config_validation():
-    import pytest  # local import to keep module-level deps light
-
     with pytest.raises(ValueError):
         AdaptiveEntropyConfig(lookback=3)
     with pytest.raises(ValueError):
         AdaptiveEntropyConfig(num_bins=1)
     with pytest.raises(ValueError):
         AdaptiveEntropyConfig(fast_multiplier=0)
+
+
+def test_online_rejects_non_finite_bar():
+    """A non-finite price raises instead of poisoning the running EMA/ATR.
+
+    Regression: the model's EMA and ATR are running scalars, so one ``nan`` bar
+    made every later band comparison ``False`` and froze ``trend`` at its last
+    value -- a regime gate that silently admitted or refused everything. The
+    error must name the offending field and leave state untouched.
+    """
+    model = OnlineAdaptiveEntropy(AdaptiveEntropyConfig(lookback=5))
+    model.observe(100.0, 101.0, 99.0)
+    before = model.n_bars
+
+    for kwargs, field in (
+        ({"close": float("nan")}, "close"),
+        ({"high": float("inf")}, "high"),
+        ({"low": float("-inf")}, "low"),
+    ):
+        bar = {"close": 100.0, "high": 101.0, "low": 99.0} | kwargs
+        with pytest.raises(NonFiniteBarError) as err:
+            model.observe(bar["close"], bar["high"], bar["low"])
+        assert field in str(err.value)
+        assert "non-finite" in str(err.value)
+    assert model.n_bars == before
+
+
+def test_batch_rejects_non_finite_series():
+    """The batch path refuses the same bars the online path refuses."""
+    closes = pd.Series([100.0] * 40)
+    high = closes * 1.01
+    low = closes * 0.99
+    high.iloc[7] = float("nan")
+    with pytest.raises(NonFiniteBarError) as err:
+        adaptive_entropy(closes, high, low, AdaptiveEntropyConfig(lookback=5))
+    assert "high" in str(err.value)
+    assert "index 7" in str(err.value)
+
+
+def test_online_and_batch_agree_on_rejection():
+    """Parity holds for the failure mode, not just the happy path."""
+    closes = pd.Series([100.0 * 1.001**i for i in range(40)])
+    high = closes * 1.01
+    low = closes * 0.99
+    bad_bar = 12
+    closes_bad = closes.copy()
+    closes_bad.iloc[bad_bar] = float("nan")
+
+    with pytest.raises(NonFiniteBarError):
+        adaptive_entropy(closes_bad, high, low, AdaptiveEntropyConfig(lookback=5))
+
+    model = OnlineAdaptiveEntropy(AdaptiveEntropyConfig(lookback=5))
+    with pytest.raises(NonFiniteBarError):
+        for i, (c, h, lo_) in enumerate(zip(closes_bad, high, low)):
+            model.observe(c, h, lo_)
+    assert model.n_bars == bad_bar

@@ -23,6 +23,7 @@ from src.indicators.adaptive_entropy.types import (
     AdaptiveEntropyConfig,
     AdaptiveEntropyResult,
 )
+from src.indicators.adaptive_entropy.validate import require_finite_bar
 
 
 class OnlineAdaptiveEntropy:
@@ -46,7 +47,7 @@ class OnlineAdaptiveEntropy:
         self._atr: float | None = None
         self._alpha_atr = 1.0 / self._w
 
-        # Adaptove EMA + trend are running scalars.
+        # Adaptive EMA + trend are running scalars.
         self._ema: float | None = None
         self._trend: int = 0
 
@@ -100,11 +101,20 @@ class OnlineAdaptiveEntropy:
             `inner_*`/`outer_*` bands are collapsed onto the EMA and ``trend``
             is the previous value, so callers should gate signals on
             :attr:`ready`.
+
+        Raises
+        ------
+        NonFiniteBarError
+            If any of ``close``/``high``/``low`` is not finite.  The model's
+            EMA and ATR are running scalars, so a junk bar would poison them
+            for the rest of the run and freeze ``trend`` without any signal to
+            the caller.  State is untouched when this raises.
         """
         cfg = self._cfg
         close = float(close)
         high = float(high)
         low = float(low)
+        require_finite_bar(close, high, low, bar=self._n)
 
         # ---- seed (first bar) ----
         if self._n == 0:
