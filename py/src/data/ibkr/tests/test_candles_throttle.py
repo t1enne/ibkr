@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import importlib
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from ib_rest_api_client.models.single_historical_bar_bid_ask import (
+    SingleHistoricalBarBidAsk,
+)
+
+from src.data.types import CandleDict
 
 _candles = importlib.import_module("src.data.ibkr.candles")
 
@@ -72,7 +77,7 @@ def throttle(monkeypatch: pytest.MonkeyPatch) -> Any:
     return _install
 
 
-async def _run() -> list[dict[str, Any]]:
+async def _run() -> list[CandleDict]:
     return await _candles._fetch_candles_iterative(
         conid=1, ticker="A2A.MI", bar="1h", from_datetime=_FROM, to_datetime=_TO
     )
@@ -88,7 +93,12 @@ async def test_throttled_status_retries_same_window_and_succeeds(
         [
             _Resp(status),
             _Resp(status),
-            _Resp(200, _candles.IserverHistoryBidAskResponse(data=[_Bar(_OLDEST_TS)])),
+            _Resp(
+                200,
+                _candles.IserverHistoryBidAskResponse(
+                    data=[cast(SingleHistoricalBarBidAsk, _Bar(_OLDEST_TS))]
+                ),
+            ),
         ]
     )
 
