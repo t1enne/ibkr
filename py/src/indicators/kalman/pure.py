@@ -2,7 +2,7 @@
 Functional Kalman filter for price smoothing and trend estimation.
 
 Uses filterpy.kalman.KalmanFilter internally with a constant-velocity
-state model: state = [price, velocity].
+state model on **log price**: state = [log price, drift per bar].
 
 All public helpers are plain functions — no custom classes.
 
@@ -43,6 +43,15 @@ def run_filter(
 ) -> FilterResult:
     """Run the Kalman filter over *prices* and return structured outputs.
 
+    **The filter runs in the log-price domain** (B3): ``measurement_noise`` and
+    ``process_noise`` are log-price variances, and the residual is a relative
+    mispricing. This is the same convention the pairs filter uses, and it is
+    what makes the signal scale-free — an absolute price² R gave a $586 asset
+    an innovation sigma of ~$0.047 against dollar residuals, so the
+    standardised residual ran to tens/hundreds instead of O(1). ``filtered`` /
+    ``predicted`` / the CI are exponentiated back to price units; ``residuals``
+    and ``velocity`` stay in log units.
+
     Parameters
     ----------
     prices : pd.Series
@@ -54,12 +63,13 @@ def run_filter(
     -------
     FilterResult with filtered, predicted, CI, residuals, gains, velocity.
     """
-    # Build filter matrices
+    # Build filter matrices, in the log-price domain.
     dt = 1.0  # each row is one time-step
     F = np.array([[1, dt], [0, 1]], dtype=float)  # state transition
     H = np.array([[1, 0]], dtype=float)  # observation matrix
     Q_base = _build_Q(config.process_noise, dt)
     R_base = np.array([[config.measurement_noise]], dtype=float)
+    log_prices = np.log(prices.to_numpy(dtype=float))
 
     kf = _KF(dim_x=2, dim_z=1)
     kf.F = F
@@ -68,12 +78,13 @@ def run_filter(
     kf.R = R_base
 
     # Initialise state to first observation, zero velocity
-    kf.x = np.array([[prices.iloc[0]], [0.0]])
+    kf.x = np.array([[log_prices[0]], [0.0]])
     # Wide initial uncertainty — let the filter converge from the data
     # rather than assuming we know the starting point precisely.
     kf.P = np.diag([1.0, 1.0])
 
-    # Pre-compute returns for adaptive R
+    # Pre-compute returns for adaptive R (log returns = log-price units, so the
+    # scale is now consistent with R)
     returns = np.log(prices / prices.shift(1))
     baseline_vol = 0.0
     if config.adaptive:
@@ -82,14 +93,15 @@ def run_filter(
 
     n = len(prices)
     filtered = np.empty(n)
-    predicted = np.empty(n)
+    predicted = np.empty(n)  # price units
+    predicted_log = np.empty(n)  # filter units (log price)
     cov_diag = np.empty(n)  # post-update P[0,0]
     pre_cov = np.empty(n)  # pre-update P[0,0] for prediction CI
     residuals = np.empty(n)
     kalman_gains = np.empty(n)
     velocity = np.empty(n)
 
-    for k, (ts, z) in enumerate(prices.items()):
+    for k, z in enumerate(log_prices):
         # --- adaptive measurement noise ---
         if config.adaptive and k >= config.vol_window:
             recent_vol = returns.iloc[k - config.vol_window + 1 : k + 1].std()
@@ -101,28 +113,29 @@ def run_filter(
 
         # predict (a-priori)
         kf.predict()
-        predicted[k] = kf.x[0, 0]
+        predicted_log[k] = kf.x[0, 0]
+        predicted[k] = np.exp(kf.x[0, 0])
 
-        # store pre-update covariance for prediction CI
+        # store pre-update covariance for prediction CI (log-variance)
         p00 = kf.P[0, 0]
         pre_cov[k] = p00
 
         # update (a-posteriori)
         kf.update(np.array([[z]]))
-        filtered[k] = kf.x[0, 0]
+        filtered[k] = np.exp(kf.x[0, 0])
         velocity[k] = kf.x[1, 0]
         cov_diag[k] = kf.P[0, 0]  # post-update, tighter
         kalman_gains[k] = kf.K[0, 0]
-        # Innovation residual: price minus one-step-ahead prediction.
+        # Innovation residual: log price minus its one-step-ahead prediction.
         # This is the standard definition — not (z − filtered), which is
         # the a-posteriori error and is always tiny.
-        residuals[k] = z - predicted[k]
+        residuals[k] = z - predicted_log[k]
 
-    # 95 % CI around the *prediction* using pre-update covariance.
-    # This answers "where will price be?" rather than "where is it now?"
-    # and is the right band for breakout / mean-reversion signals.
-    upper_ci = predicted + 2.0 * np.sqrt(pre_cov)
-    lower_ci = predicted - 2.0 * np.sqrt(pre_cov)
+    # 95 % CI around the *prediction* using pre-update covariance, mapped back
+    # to price units. This answers "where will price be?" rather than "where is
+    # it now?" and is the right band for breakout / mean-reversion signals.
+    upper_ci = np.exp(predicted_log + 2.0 * np.sqrt(pre_cov))
+    lower_ci = np.exp(predicted_log - 2.0 * np.sqrt(pre_cov))
 
     idx = prices.index
     return FilterResult(
@@ -137,7 +150,12 @@ def run_filter(
 
 
 def compute_stats(prices: pd.Series, result: FilterResult) -> KalmanStats:
-    """Compute summary statistics for a filter run."""
+    """Compute summary statistics for a filter run.
+
+    ``rmse``/``mae`` are expressed in the residual's units — log price, i.e. a
+    relative error — and ``coverage_95`` is the share of closes inside the
+    price-unit CI, so it stays a plain count.
+    """
     resid = result.residuals
     n = len(resid)
     rmse = float(np.sqrt((resid**2).mean()))

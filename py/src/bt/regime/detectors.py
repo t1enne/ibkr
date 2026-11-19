@@ -139,6 +139,11 @@ def create_hmm_vol_detector(
     Uses src.indicators.hmm.MarketRegimeHMM under the hood.
 
     Caches the fitted model and only refits every retrain_interval bars.
+
+    Warmup: the rolling vol/momentum features drop ``max(vol_window,
+    momentum_window)`` rows, so a frame needs ``min_train_size +
+    max(vol_window, momentum_window)`` bars before it can be fitted; shorter
+    frames return -1 rather than raising from inside ``fit``.
     """
 
     from src.indicators.hmm import MarketRegimeHMM
@@ -146,10 +151,17 @@ def create_hmm_vol_detector(
     _model: MarketRegimeHMM | None = None
     _last_len: int = 0
 
+    # ``_create_features`` drops ``max(vol_window, momentum_window)`` rows to the
+    # rolling warmup, and ``fit`` needs ``min_train_size`` *features*. The guard
+    # must therefore admit ``min_train_size + feature_warmup`` bars: guarding on
+    # ``min_train_size`` alone raised ValueError inside ``fit`` for every length
+    # in [min_train_size, min_train_size + feature_warmup).
+    min_bars = min_train_size + max(vol_window, momentum_window)
+
     def detect(prices: pd.DataFrame) -> pd.Series:
         nonlocal _model, _last_len
 
-        if price_col not in prices.columns or len(prices) < min_train_size:
+        if price_col not in prices.columns or len(prices) < min_bars:
             return pd.Series(np.full(len(prices), -1), index=prices.index)
 
         n = len(prices)

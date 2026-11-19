@@ -189,28 +189,58 @@ class OnlinePairs:
 
 @dataclass(frozen=True)
 class OnlineLevelResult:
-    """One observation's constant-velocity Kalman outputs."""
+    """One observation's constant-velocity Kalman outputs.
 
-    residual: float | None  # z - predicted (one-step-ahead innovation)
-    sigma: float | None  # prediction std dev sqrt(P_pred[0,0])
+    ``residual``/``sigma``/``velocity`` are log-price quantities (the filter's
+    domain); ``predicted`` is the equivalent price level."""
+
+    residual: float | None  # log(price) - predicted log level (innovation)
+    sigma: float | None  # sqrt(V): realised scale of that residual
     z_stat: float | None  # residual / sigma — the online fade signal
-    predicted: float | None  # a-priori price prediction
-    velocity: float | None  # estimated d(price)/dt (state[1])
+    predicted: float | None  # a-priori price prediction, exp(stated log level)
+    velocity: float | None  # estimated d(log price)/dt (state[1])
     n_steps: int
     ready: bool
 
 
+# EWMA weight for the recursive squared-residual mean that standardises
+# ``z_stat``. A hard-coded structural constant (~60-bar memory), not a knob:
+# the scale estimate only has to track volatility, not be tuned per symbol.
+_Z_VAR_ALPHA = 1.0 / 60.0
+# Floor for that scale, in log units (~a 1e-6 % move per bar). Keeps the
+# division defined on a dead-flat series.
+_Z_VAR_FLOOR = 1e-12
+
+
 class OnlineLevel:
-    """Online constant-velocity [price, velocity] Kalman for one symbol.
+    """Online constant-velocity Kalman for one symbol — scale-free (B3).
 
     Matches ``src.indicators.kalman.pure.run_filter`` numerically but steps one
-    observation per :meth:`observe` call instead of sweeping a full Series. The
-    standardized residual ``z_stat`` is a true online signal.
+    observation per :meth:`observe` call instead of sweeping a full Series.
 
-    ``process_noise`` (q) controls how freely the level/velocity may change —
-    lower q = smoother level = more persistent residuals (a stronger fade
-    signal but slower to adapt); higher q = level hugs price (weaker signals).
-    The interaction with the regime/hold horizon is left to the caller.
+    **The filter runs in the log-price domain**, the same convention the pairs
+    filter already uses (``run_pairs_kalman`` / ``OnlinePairs``), so the
+    residual is a *relative* mispricing: invariant to the price level, to a
+    split, and comparable across a $5 and a $586 asset. Consequences:
+
+    * ``measurement_noise`` (r) is a **log-price variance**, not a dollar
+      variance: 1e-3 ≈ 3.2% per-bar observation noise. Reading it as price²
+      was the original defect — on a $586 asset it made sigma ≈ $0.047 while
+      residuals were dollars, so ``z_stat`` had sd 75-245 and any ``z_entry=2``
+      gate passed on 95-99% of bars.
+    * ``z_stat`` standardises the residual by its **realised** scale (a
+      recursive mean of squared log-residuals), not by the model-implied
+      ``S = H·P·H' + R``. The model S is pinned by the configured q/r and does
+      not track the asset's volatility: with the shipped q=1e-4/r=1e-3 it sits
+      ~4x the realised sigma, so standardising by it alone would leave
+      ``z_entry=2`` passing ~0% of bars — inert in the other direction.
+
+    Consequence for the shipped ``z_entry=2.0`` / ``z_exit=0.5``: ``|z_stat|``
+    has sd ≈ 1 and |z| > 2 on ~5% of real 1d bars (measured 5.0-5.9% for
+    AAPL/MSFT/NVDA/AMZN/TSLA/SPY), so the entry is a genuine ~2-sigma event and
+    the exit a genuine 0.5-sigma convergence — the textbook reading of those
+    defaults. ``process_noise`` (q) now only sets smoothing: lower q = smoother
+    level = more persistent residuals (stronger fade signal, slower to adapt).
     """
 
     def __init__(
@@ -223,14 +253,12 @@ class OnlineLevel:
         self._r = measurement_noise
         self._warmup_bars = warmup_bars
 
-        # State [price, velocity]; F/H/Q/R per run_filter (dt=1).
+        # State [log price, drift per bar]; F/H/Q/R per run_filter (dt=1).
         self._x: np.ndarray = np.array([0.0, 0.0])
         self._P: np.ndarray = np.eye(2)
         self._n: int = 0
         self._residual: float = 0.0
-        self._pred_cov: float = 1.0  # P_pred[0,0]
-        self._innov_S: float = 1e-3  # H·P_pred·H' + R
-        self._init_p = 1.0
+        self._var_resid: float = 0.0  # recursive mean of squared log-residuals
 
     @property
     def residual(self) -> float:
@@ -238,12 +266,12 @@ class OnlineLevel:
 
     @property
     def sigma(self) -> float:
-        # Innovation std dev sqrt(H·P_pred·H' + R); the standardization scale.
-        return float(np.sqrt(max(self._innov_S, 1e-24)))
+        # Standardisation scale: sqrt of the recursive squared-residual mean.
+        return float(np.sqrt(max(self._var_resid, _Z_VAR_FLOOR)))
 
     @property
     def predicted(self) -> float:
-        return float(self._x[0])
+        return float(np.exp(self._x[0]))
 
     @property
     def velocity(self) -> float:
@@ -258,7 +286,6 @@ class OnlineLevel:
         self._x = F @ self._x
         Q = self._q * np.array([[1.0 / 3.0, 0.5], [0.5, 1.0]])
         self._P = F @ self._P @ F.T + Q
-        self._pred_cov = float(self._P[0, 0])
 
     def _update(self, z: float) -> None:
         H = np.array([[1.0, 0.0]])
@@ -276,35 +303,54 @@ class OnlineLevel:
         if price <= 0:
             return OnlineLevelResult(None, None, None, None, None, self._n, False)
 
+        # Log domain (see the class docstring): a non-positive price is the only
+        # domain error, and every quantity below is relative to the price level.
+        log_p = float(np.log(price))
+
         if self._n == 0:
-            self._x = np.array([price, 0.0])
+            self._x = np.array([log_p, 0.0])
             self._P = np.diag([1.0, 1.0])
-            self._init_p = price
-            self._residual = 0.0
-            self._pred_cov = 1.0
-            self._innov_S = 1.0 + self._r
             self._n = 1
+            self._residual = 0.0
+            # Mirror the batch reference, which predicts+updates the first bar
+            # too: its innovation is zero by construction (the state starts at
+            # the observation) but P shrinks the same way, so both paths then
+            # evolve identically instead of drifting apart by one update.
+            self._predict()
+            self._update(log_p)
             return OnlineLevelResult(
                 0.0, self.sigma, 0.0, price, 0.0, self._n, self._n >= self._warmup_bars
             )
 
         self._predict()
-        # Innovation variance S = H·P_pred·H' + R (standardization scale).
-        self._innov_S = float(
-            (np.array([[1.0, 0.0]]) @ self._P @ np.array([[1.0], [0.0]]))[0, 0]
-            + self._r
-        )
-        self._residual = float(price - float(self._x[0]))
-        zstat = self._residual / self.sigma
-        self._update(price)
+        self._residual = float(log_p - float(self._x[0]))
+        zstat = self._standardize(self._residual)
+        self._update(log_p)
         self._n += 1
         ready = self._n >= self._warmup_bars
         return OnlineLevelResult(
             residual=self._residual,
             sigma=self.sigma,
             z_stat=zstat,
-            predicted=float(self._x[0]),
-            velocity=float(self._x[1]),
+            predicted=self.predicted,
+            velocity=self.velocity,
             n_steps=self._n,
             ready=ready,
         )
+
+    def _standardize(self, residual: float) -> float:
+        """Residual / sqrt(recursive squared-residual mean), then fold it in.
+
+        The scale is taken from the residuals *before* this one, so ``z_stat``
+        is a one-step-ahead quantity and carries no look-ahead. The first
+        residual only seeds the scale (no estimate exists yet) and is reported
+        as 0. The EWMA is recursive with a slow ``_Z_VAR_ALPHA``, so the seed
+        still carries a small residual weight at ``warmup_bars`` — the scale is
+        an approximation there, not a converged estimate.
+        """
+        if self._var_resid <= 0.0:
+            self._var_resid = max(residual * residual, _Z_VAR_FLOOR)
+            return 0.0
+        z = residual / self.sigma
+        self._var_resid += _Z_VAR_ALPHA * (residual * residual - self._var_resid)
+        return z

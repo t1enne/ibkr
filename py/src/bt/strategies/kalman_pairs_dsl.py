@@ -14,6 +14,14 @@ of *initial* capital. The migration back-solves ``size`` from
 hedge ``size * abs(beta)`` for the second leg is unchanged. The pair, warmup,
 stop/target params all come from ``Params`` via ``strategy_params`` (the config
 no longer carries a ``model_updater`` block).
+
+Exit behaviour (three regimes; anything else HOLDS the pair):
+
+* ``|z| > z_exit_stop`` — divergence stop, the spread kept widening.
+* ``z_exit > 0`` — convergence band: close once ``|z| < z_exit``; between the
+  band and the stop the pair is held.
+* ``z_exit <= 0`` — band disabled; zero-cross: hold until ``z`` flips sign
+  against its value at entry (the spread reverted through zero).
 """
 
 from __future__ import annotations
@@ -28,6 +36,10 @@ STRATEGY_TYPE = "kalman_pairs_dsl"
 
 # Key under which the strategy-owned OnlinePairs filter is held in ctx.shared.
 _KF_SHARED_KEY = "kf"
+# Key holding the sign of ``z`` at pair entry (+1/-1). The zero-cross exit
+# (``z_exit <= 0``) needs it: without the entry side there is no way to tell a
+# reversion through zero from a further divergence.
+_ENTRY_SIGN_KEY = "kf_entry_sign"
 
 
 @dataclass(frozen=True)
@@ -119,9 +131,11 @@ def on_candle(ctx: StrategyContext):
         return
 
     if z > 0:
+        ctx.shared[_ENTRY_SIGN_KEY] = 1.0
         ctx.short(s1, size=ctx.params.position_size, reason="kalman overpriced")
         ctx.long(s2, size=ctx.params.position_size * abs(beta), reason="kalman hedge")
     else:
+        ctx.shared[_ENTRY_SIGN_KEY] = -1.0
         ctx.long(s1, size=ctx.params.position_size, reason="kalman underprice")
         ctx.short(s2, size=ctx.params.position_size * abs(beta), reason="kalman hedge")
 
@@ -129,21 +143,45 @@ def on_candle(ctx: StrategyContext):
 def _exit_if_due(
     ctx: StrategyContext, s1: str, s2: str, z: float, has_pos: bool
 ) -> None:
-    """Close the pair on divergence-stop or convergence."""
+    """Apply the pair's exit regimes; **hold** when none of them fires.
+
+    Three regimes, in order:
+
+    1. Divergence stop — ``|z| > z_exit_stop``: the spread kept widening, the
+       relationship is broken; close.
+    2. Convergence band — ``z_exit > 0`` and ``|z| < z_exit``: the spread
+       returned inside the exit band; close. Inside the stop band but outside
+       the exit band the pair holds.
+    3. Zero-cross — ``z_exit <= 0`` (band exit disabled): hold until ``z`` flips
+       sign relative to its value at entry, i.e. the spread has reverted
+       through zero; then close. The entry-side sign lives in ``ctx.shared``.
+
+    Every path that is not an exit returns explicitly: there is no
+    fall-through close (B1 — the unconditional close made every pair a one-bar
+    round trip).
+    """
     if not has_pos:
         return
     if abs(z) > ctx.params.z_exit_stop:
         _close_pair(ctx, s1, s2, f"kalman divergence stop z={z:.2f}")
         return
-    if ctx.params.z_exit > 0 and abs(z) < ctx.params.z_exit:
-        _close_pair(ctx, s1, s2, f"kalman convergence z={z:.2f}")
+    if ctx.params.z_exit > 0:
+        if abs(z) < ctx.params.z_exit:
+            _close_pair(ctx, s1, s2, f"kalman convergence z={z:.2f}")
+            return
+        return  # between the exit band and the stop: hold
+
+    entry_sign = ctx.shared.get(_ENTRY_SIGN_KEY)
+    if entry_sign is None:
+        return  # entry side unknown (position predates this run): hold, never blind-close
+    if z * entry_sign < 0.0:
+        _close_pair(ctx, s1, s2, f"kalman zero-cross z={z:.2f}")
         return
-    # z_exit <= 0 -> zero-cross exit: exit when the held direction reverts
-    # toward zero. Close when current z crossed the zero line from the entry
-    # side; the DSL close() is a no-op if already flat.
-    _close_pair(ctx, s1, s2, f"kalman zero-cross z={z:.2f}")
+    return  # same side of zero as entry: hold
 
 
 def _close_pair(ctx: StrategyContext, s1: str, s2: str, reason: str) -> None:
     for sym in (s1, s2):
         ctx.close(sym, reason=reason)
+    # The pair is flat again: the next entry re-records its own z sign.
+    ctx.shared.pop(_ENTRY_SIGN_KEY, None)

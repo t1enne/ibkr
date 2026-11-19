@@ -27,7 +27,8 @@ Three layers:
       One :class:`src.indicators.kalman.strategy.OnlineLevel` constant-velocity
       Kalman filter per tradeable symbol is held in ``ctx.shared``, fed the
       latest close **once per candle**, and exposes a standardized
-      one-step-ahead residual ``z_stat = (price - predicted)/sigma`` — a fully
+      one-step-ahead residual ``z_stat`` of the **log** price (scale-free: sd ≈ 1
+      on any symbol, so ``z_entry`` is a true sigma threshold) — a fully
       **online** signal (state-only, no rolling window over a fixed history).
       Fade-short when ``z_stat > z_entry``, fade-long when ``z_stat < -z_entry``.
 
@@ -59,6 +60,7 @@ import numpy as np
 
 from src.indicators.kalman.strategy import OnlineLevel
 from src.bt.size.pure import risk_sized_qty
+from src.bt.state import ActionType
 from src.bt.strategies.dsl import strategy, StrategyContext
 from src.bt.strategies.series import SeriesView
 from src.bt.strategies.types import StrategyParams
@@ -327,7 +329,11 @@ def on_candle(ctx: StrategyContext):
         pos = ctx.position(sym)
         if pos is None:
             continue
-        is_long = pos.qty >= 0
+        # The lot's own side. ``Position.qty`` is stored UNSIGNED
+        # (portfolio.pure._close_position does ``qty = abs(target.qty)``), so
+        # ``pos.qty >= 0`` was always True and every short got long-side
+        # stop/exit logic.
+        is_long = pos.type is ActionType.long
         reasons: list[str] = []
 
         if not regime_ok:

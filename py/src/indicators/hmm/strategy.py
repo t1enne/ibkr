@@ -62,6 +62,7 @@ class OnlineRegime:
         retrain_interval: int = 50,
         random_state: int = 42,
         bars_per_year: int = 252,
+        fit_once: bool = False,
     ) -> None:
         self._models: dict[str, MarketRegimeHMMOnline] = {}
         self._n_regimes = n_regimes
@@ -71,6 +72,9 @@ class OnlineRegime:
         self._retrain_interval = retrain_interval
         self._random_state = random_state
         self._bars_per_year = bars_per_year
+        #: Fit each symbol's model once and freeze it (see
+        #: ``MarketRegimeHMMOnline(fit_once=...)``).
+        self._fit_once = fit_once
 
     def observe(
         self,
@@ -99,6 +103,7 @@ class OnlineRegime:
                 retrain_interval=self._retrain_interval,
                 random_state=self._random_state,
                 bars_per_year=self._bars_per_year,
+                fit_once=self._fit_once,
             )
             self._models[symbol] = model
 

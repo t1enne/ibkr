@@ -144,6 +144,30 @@ def test_hmm_too_short():
     assert (regimes == -1).all()
 
 
+def test_hmm_warmup_boundary_accounts_for_feature_warmup():
+    """The guard must cover the feature warmup, not just ``min_train_size``.
+
+    ``_create_features`` drops ``max(vol_window, momentum_window)`` rows, so the
+    band ``[min_train_size, min_train_size + feature_warmup)`` used to pass the
+    guard and then raise ValueError inside ``fit``. One bar below the boundary
+    must return -1; at and above it the fit must run.
+    """
+    feature_warmup = 20  # max(vol_window=20, momentum_window=10)
+    boundary = 252 + feature_warmup
+
+    below = _make_bull(boundary - 1)
+    assert (create_hmm_vol_detector(min_train_size=252)(below) == -1).all()
+
+    # At the boundary the model fits; every bar is still inside the
+    # min_train_size label mask, so the output is unlabelled but not an error.
+    at = _make_bull(boundary)
+    assert (create_hmm_vol_detector(min_train_size=252)(at) == -1).all()
+
+    # One bar past the mask, labels start appearing.
+    past = _make_bull(boundary + 1)
+    assert (create_hmm_vol_detector(min_train_size=252)(past) >= 0).any()
+
+
 # ── Mapping consistency ─────────────────────────────────────────
 
 

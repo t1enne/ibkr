@@ -6,12 +6,19 @@ import pandas as pd
 class KalmanConfig:
     """Configuration for the Kalman filter.
 
-    State vector: [price, velocity] (constant-velocity model).
-    Transition:   x_{k+1} = F * x_k + w,  w ~ N(0, Q)
-    Observation:  z_k     = H * x_k + v,  v ~ N(0, R)
+    The filter runs in the **log-price domain**, so every noise term below is a
+    log-price variance (a relative, price-level-free quantity), never a
+    price² variance.
 
-    process_noise (q)  controls how fast the state is allowed to change
-    measurement_noise (r) controls how much the filter trusts observations.
+    State vector: [log price, drift] — the classic constant-velocity model,
+    with the level observed in log price.
+    Transition:   x_{k+1} = F * x_k + w,  w ~ N(0, Q)
+    Observation:  z_k     = H * x_k + v,  v ~ N(0, R),  z_k = log(close_k)
+
+    process_noise (q)  log-price variance controlling how fast the state is
+                       allowed to change
+    measurement_noise (r) log-price variance controlling how much the filter
+                       trusts each log-price observation.
 
     When adaptive=True, R is rescaled at each step by
     (recent_vol / baseline_vol)^2 so the filter automatically becomes
@@ -29,17 +36,22 @@ class KalmanConfig:
 class FilterResult:
     """Outputs of a single Kalman-filter pass over a price series.
 
+    The filter itself runs in log price; the level series are exponentiated
+    back to price units, while the residual/drift series stay in log units.
+
     filtered    — a-posteriori smoothed price (best estimate given all
                   observations up to and including the current one)
     predicted   — a-priori one-step prediction (before the current
                   observation is incorporated)
-    upper_ci / lower_ci — 2-sigma confidence band around the filtered
-                  estimate, derived from the a-posteriori covariance
-    residuals   — (actual price − filtered), useful as a mean-reversion
-                  signal
+    upper_ci / lower_ci — 2-sigma confidence band around the *prediction*,
+                  derived from the a-priori covariance, in price units
+    residuals   — log innovation: log(actual) − its one-step-ahead log
+                  prediction, i.e. a relative mispricing (dimensionless),
+                  useful as a mean-reversion signal
     kalman_gains — scalar Kalman gain K[0,0] at each step; spikes
                    indicate the filter is reacting to new information
-    velocity    — estimated d(price)/dt from the second state component
+    velocity    — estimated d(log price)/dt (relative drift) from the second
+                  state component, in log units
     """
 
     filtered: pd.Series
