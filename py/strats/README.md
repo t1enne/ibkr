@@ -278,6 +278,54 @@ pass and is worth keeping on its own terms: the online per-bar label now equals 
 prefix-Viterbi (**308/308 bars**; it disagreed on **42%** before) at lower cost, and the HMM warmup
 `ValueError` band is gone.
 
+### `hmm_gas_allocation` — Nystrup et al. (2017) GAS regime allocator does not reproduce (negative)
+
+Isolated variable: **the regime forecast → mean-variance weight mechanism itself** — the paper's
+single-risky-asset variant, SPY against 0% cash, 2005-02-14 → 2026-11-10, **5469 decision bars**. The
+paper's two-asset SAA is out of reach: **no bond proxy older than 2016-12 exists in the DB**, so the
+31% the static control puts in a bond leg is 0%-interest cash here. Cited as Nystrup, Madsen &
+Lindstrøm (2017), *Quantitative Finance* **18(1) 83-95**.
+
+**Claim table on the final build** (all three arms `fail/hmm_gas_spy*.json`; Scaled 0 / Rejected 0 on
+every arm, so the weight path is complete and permutable):
+
+| id | claim | this build | status |
+|---|---|---|---|
+| **F1** | MPC Sharpe > buy-and-hold, net of costs and the 1-day delay | **0.314 vs 0.463 AR/vol (-0.149)** | **FAILED**, sign reversed |
+| **F2** | maxDD < buy-and-hold | **-24.02% vs -56.49%, ratio 0.425** against the paper's own **0.456** | **MET** on the stated criterion |
+| **F3** | beats rule-based RBAA on Sharpe | RBAA arm is structurally inert: 1 lot, 100% of bars at w≈1.000, max filtered `change_prob` **0.5890** over 21.7 y against a **0.9998** threshold | **UNTESTABLE** |
+| **F4** | annual turnover ≤ ~2 with rho = 0.02 | **2.289/yr** fill-level (2.243 excluding the forced final liquidation; intent 2.304) | **FAILED** — 1.15x the gate, 1.96x the paper's **1.17** |
+| **F5** | filtered state prob must move, no multi-year pin | no pin — longest single-label stretch **152 bars** — but **389 argmax flips = 17.9/yr** against the paper's **~0.9** | **MET** on its wording |
+| **F6** | window must contain the drawdowns it claims | 2005-02-14 → 2026-11-10 contains 2008 and 2020, and the arm de-risks in both | **in scope** |
+
+**The mechanism finding — the actual deliverable.** Not "just holds less": mean held weight **0.741**
+with maxDD **-24.02%**, against a static 69/31 control at **0.690** and **-42.95%** — 19 pp less
+drawdown on 5 pp *more* exposure. A constant-weight counterfactual at the arm's own 0.741 predicts
+**-45.5%** (linear method calibrated x1.012 against the engine-run static arm), so average exposure
+explains none of the 24.02%: **~21.5 pp is genuine time variation**. But that variation **lags**: the
+forecast mean is **0.655**-correlated with the **trailing** 60-day market return and **-0.024** with the
+**forward** 20-day, and the de-risks land **12-22% into each drawdown** — GFC first w<0.1 **+101 days**
+into the drawdown at **-15.6%** already taken, COVID **+9 days** at **-12.5%**, 2022 **+161 days** at
+**-21.8%**. Only **22** round-trip lots, one lot 31.9% of |PnL|, two years 58.8%.
+
+Conclusion: the paper's forward-looking regime-probability mechanism is **not supported** — what
+survives is a lagging, momentum-like de-risking overlay whose only advantage (the 0.425 DD ratio) rests
+on **four episodes inside one 0.8-SE-wide confidence interval**, paid for with 0.15 Sharpe. Do not
+re-probe a GAS-HMM mean-variance overlay on a single equity index expecting it to anticipate drawdowns.
+The static and RBAA arms travel with the paper arm into `fail/` because they *are* the evidence: the
+static arm is the exposure control that kills "it just holds less", the RBAA arm is the control that
+cannot fire.
+
+**Why the negative is trustworthy — the estimator moved three times under correction.** Crisis `sd_hi`
+went **102 → 224.7 → 244.0 bp** (241.2 on this build's own bar set, both below the 250 bp band floor);
+a **backwards window weighting** held the **oldest** bar **2.71x** the newest against the docstring's
+`w_n = f**(t-n)`; an **under-scaled Newton step** (realised-outer-product curvature, then a step damped
+by **1/164**) froze the recursion; and a **parameter box that clipped `mu`** at ±100 bp/day pinned the
+high-vol drift instead of estimating it. Each correction was re-measured, not tuned. The final build
+takes **two declared deviations** from the paper: the **conditional-expectation information matrix**
+(the paper's matrix-inversion-lemma recursion implies the realised outer product) and **A = 1** on the
+emission blocks instead of **1/N_eff**.
+
 ## Naming and layout
 
 ```
