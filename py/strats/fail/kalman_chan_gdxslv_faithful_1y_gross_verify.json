@@ -1,0 +1,34 @@
+{
+  "name": "kalman-chan-gdxslv-faithful-gross",
+  "warmup": "0d",
+  "trading_start": "2014-11-14",
+  "trading_end": "2015-12-31",
+  "commission": 0.0,
+  "initial_capital": 100000,
+  "strategy_type": "kalman_chan_pairs_dsl",
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "SLV",
+    "GDX"
+  ],
+  "symbols": [
+    "SLV",
+    "GDX"
+  ],
+  "strategy_params": {
+    "pair": [
+      "GDX",
+      "SLV"
+    ],
+    "k": 1.0,
+    "exit_mode": "band",
+    "price_domain": "absolute",
+    "ve": 0.001,
+    "ve_mode": "absolute",
+    "size": 0.3
+  },
+  "spread_bps": 0.0,
+  "slippage_bps": 0.0
+}

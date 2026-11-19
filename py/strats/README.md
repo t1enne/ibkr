@@ -326,6 +326,65 @@ takes **two declared deviations** from the paper: the **conditional-expectation 
 (the paper's matrix-inversion-lemma recursion implies the realised outer product) and **A = 1** on the
 emission blocks instead of **1/N_eff**.
 
+### `kalman_chan_pairs_dsl` — Chan (2013) Example 3.3 reproduces mechanically, not economically (negative)
+
+Isolated variable: **the economics of the rule set on a substituted pair**. Window, filter
+hyper-parameters (`delta`, `Ve`, `k`), friction and fill model are held at the faithful
+configuration; what moves between rows is only the **exit convention** (band vs zero) and the
+**price domain** (absolute vs log). Three rule variants × two windows = six configs, all filed.
+
+**Reference.** Chan, *Algorithmic Trading: Winning Strategies and Their Rationale* (Wiley
+2013), ch. 3, Example 3.3 — Kalman-filter pairs trade, EWA/EWC. **Provenance caveat, stated
+honestly:** the chapter text could not be opened (no scan on archive.org or Open Library, the
+Wiley full text is paywalled), so the rules were reconstructed from three secondary sources
+that read it; the rule set is itemised with per-item provenance in
+`/tmp/kalman_ref/reference.md` §2.
+
+**Not a literal reproduction.** EWA/EWC have **zero rows** in the local DB and TLT/IEI has no
+2009-2016 history, so the pair was chosen **before any strategy existed**, on the reference's
+own falsifiers, from a bounded economically-motivated candidate set: **GDX/SLV** (x = GDX
+regressor, y = SLV observed leg). ADF passes, beta stable, non-degenerate trade sample.
+
+**FINAL numbers** (post hedge fix, repo fill model, 2014-11-14 → 2026-11-11, net):
+
+| arm | Ann | Sharpe | MaxDD | net P&L | round trips | Scaled / Rejected |
+|---|---|---|---|---|---|---|
+| faithful, band exit | **-0.74%** | -0.13 | -17.57% | **-8,501** | 460 | 0 / 0 |
+| faithful, zero exit | **+0.42%** | 0.11 | -9.37% | **+5,189** | 406 | 0 / 0 |
+| repaired, log domain, zero exit | **+0.67%** | 0.26 | -4.53% | **+8,274** | 17 | 0 / 0 |
+
+Scaled 0 / Rejected 0 on every arm. 1-year faithful band: net **-605** on **75** round trips.
+
+**Statistical power — the decisive qualifier.** The faithful-zero mean trade is **+16.74** USD
+with SE **32.94** (t = **0.51**); SE(annual) is **±1.35%** on the 460/406-trade arms and
+**±0.72%** on the 17-trade arm, so **no annual return is distinguishable from zero**. The
+17-trade arm's +8,274 is **74% one trade and 67% one calendar year**; it licenses no edge claim.
+
+**THE STRUCTURAL FINDING, which is the real deliverable.** Measured on the traded pair,
+conditional on an entry, `|z_{t+1}| <= k` is satisfied **82.9%** of the time for long entries and
+**84.1%** for short (band), and **49.1% / 52.6%** (zero exit) — because the update drags the
+fitted level onto the price, so **the EXIT test, not the entry, sets the holding period**.
+Median hold is **1 bar** at **34-39 round trips/yr**, and the **frictionless** band arm earns
+**0.09 bps per round trip**: it cannot pay for its own turnover at any cost assumption. No
+parameter, price domain or hedge convention changes that.
+
+**Mechanics DID reproduce.** Trade counts matched an independent implementation exactly
+(**460 / 406 / 17**), the filter matches reference items 2-8 including the `R = 0` first-bar
+case, and the hedge is now `floor(beta*N)` **SHARES** — a notional hedge under-hedged by
+**0.73x at the median** and was caught in review before filing. Two declared deviations:
+next-open fills instead of same-bar close, and the sizing expressed as a capital fraction.
+
+Conclusion: the published family is a **turnover machine whose edge is inside the noise on
+substituted instruments**. Do not re-probe a **single-sigma innovation-band exit on daily
+bars** expecting it to clear friction, and do not read the repaired log-domain variant's
+**+0.67%** as a fix — at **17 round trips** it has no power.
+
+The six arms travel as the evidence: `fail/kalman_chan_gdxslv_faithful.json`,
+`fail/kalman_chan_gdxslv_faithful_zero.json`, `fail/kalman_chan_gdxslv_repaired.json`, and their
+`_full` window twins beside them — plus the four frictionless `*_gross_verify.json` re-runs
+(commission / spread / slippage = 0, all else identical), which are the control behind the
+0.09 bps/RT figure and are filed with the arms for the same reason.
+
 ## Naming and layout
 
 ```
