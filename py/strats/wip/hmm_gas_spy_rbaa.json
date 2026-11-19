@@ -1,0 +1,28 @@
+{
+  "name": "hmm-gas-spy-rbaa",
+  "warmup": "378d",
+  "trading_start": "2005-02-14",
+  "trading_end": "2026-11-11",
+  "commission": 0.05,
+  "initial_capital": 100000,
+  "strategy_type": "hmm_gas_allocation",
+  "bars": [
+    "1d"
+  ],
+  "symbols": [
+    "SPY"
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
+  "spread_bps": 20.0,
+  "slippage_bps": 0.0,
+  "strategy_params": {
+    "risk_aversion": 2.0,
+    "kappa": 0.001,
+    "trading_aversion": 0.02,
+    "horizon": 100,
+    "control": "rbaa",
+    "rbaa_threshold": 0.9998
+  }
+}
