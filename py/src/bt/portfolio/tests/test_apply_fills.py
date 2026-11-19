@@ -289,3 +289,81 @@ def test_next_position_id_shape_and_uniqueness():
     assert next_position_id("SPY", ts, 0) == f"SPY_{ts.timestamp()}_0"
     assert next_position_id("SPY", ts, 0) == next_position_id("SPY", ts, 0)
     assert next_position_id("SPY", ts, 0) != next_position_id("SPY", ts, 1)
+
+
+# ---------------------------------------------------------------------------
+# The cash guard covers net-delta ADDS, not just opens (blocker B2)
+# ---------------------------------------------------------------------------
+
+
+def _add(symbol: str, qty: float, price: float, pid: str) -> FillEvent:
+    """A ``rebalance`` fill with a POSITIVE delta: a cash-consuming add."""
+    return FillEvent(
+        signal=TradeSignal(
+            action=ActionType.rebalance,
+            symbol=symbol,
+            timestamp=_ts("2024-01-03"),
+            price=price,
+            qty=qty,
+            position_id=pid,
+        ),
+        filled_qty=qty,
+        executed_price=price,
+        commission=0.0,
+        slippage=0.0,
+        timestamp=_ts("2024-01-03"),
+    )
+
+
+def test_rebalance_add_that_does_not_fit_is_rejected_not_applied():
+    """An unfundable ADD must be refused and reported, never drive cash < 0.
+
+    ``_rebalance_position``'s add branch does ``cash -= qty*price`` with no
+    clamp, and ``describe_open_rejection`` used to return ``None`` for anything
+    that was not a long/short, so an add could lever the book while the report
+    still showed ``Rejected = 0``. Measured pre-fix: cash ends at -1,000.50 on
+    a 1,000 book with zero rejections.
+    """
+    funded, _, _ = apply_fills(_portfolio(cash=1_000.0), (_open("AAA", 10.0, 100.0),))
+    pid = funded.positions["AAA"][0].position_id
+    assert funded.cash == pytest.approx(0.0)
+    result, rejections, _ = apply_fills(funded, (_add("AAA", 10.0, 100.0, pid),))
+    assert result.cash == funded.cash, "an unfundable add must not spend cash"
+    assert result.cash >= 0.0
+    assert result.positions["AAA"][0].qty == 10.0, "the add must not be applied"
+    assert len(rejections) == 1
+    assert rejections[0].symbol == "AAA"
+
+
+def test_two_rebalance_adds_share_one_cash_pool():
+    """Two adds in ONE cohort cannot both spend the same cash."""
+    funded, _, _ = apply_fills(
+        _portfolio(cash=2_100.0),
+        (_open("AAA", 10.0, 100.0), _open("BBB", 10.0, 100.0)),
+    )
+    pid_a = funded.positions["AAA"][0].position_id
+    pid_b = funded.positions["BBB"][0].position_id
+    # 100 of cash left; each add asks for 75, so the second cannot be funded.
+    assert funded.cash == pytest.approx(100.0)
+    adds = (_add("AAA", 0.75, 100.0, pid_a), _add("BBB", 0.75, 100.0, pid_b))
+    result, rejections, _ = apply_fills(funded, adds)
+    assert result.cash >= 0.0, "the cohort must not lever the book"
+    assert len(rejections) == 1, "one add fits, the second is refused"
+    total = sum(p.qty for lots in result.positions.values() for p in lots)
+    assert total == pytest.approx(20.75), "exactly one add landed"
+
+
+def test_reduce_frees_cash_for_an_add_in_the_same_cohort():
+    """A reduce settles BEFORE the add that needs its proceeds."""
+    funded, _, _ = apply_fills(
+        _portfolio(cash=2_100.0),
+        (_open("AAA", 10.0, 100.0), _open("BBB", 10.0, 100.0)),
+    )
+    pid_a = funded.positions["AAA"][0].position_id
+    pid_b = funded.positions["BBB"][0].position_id
+    reduce_a = _add("AAA", -10.0, 100.0, pid_a)  # sells the lot: +1,000 cash
+    add_b = _add("BBB", 10.0, 100.0, pid_b)  # needs 1,000
+    result, rejections, _ = apply_fills(funded, (add_b, reduce_a))
+    assert rejections == (), "the reduce's proceeds must fund the add"
+    assert result.cash >= 0.0
+    assert result.positions["BBB"][0].qty == pytest.approx(20.0)

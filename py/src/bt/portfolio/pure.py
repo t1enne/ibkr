@@ -68,17 +68,29 @@ def describe_open_rejection(
     portfolio: PortfolioState,
     fill: FillEvent,
 ) -> Optional[FillRejection]:
-    """Report a fill that ``_open_position`` would reject for insufficient cash.
+    """Report a fill that would spend cash the account does not have.
 
     Pure and side-effect-free — it only *describes* the rejection; the engine
     owns the stderr write. Single source of truth for the cash guard, shared
-    with ``_open_position`` so the two can never drift apart.
+    with ``_open_position``/``_rebalance_position`` so the two can never drift.
 
-    Returns ``None`` when the fill would apply (non-open signal, non-positive
-    qty, or enough cash).
+    Covers every CASH-CONSUMING fill, not just an open: a ``rebalance`` with a
+    POSITIVE qty is a net-delta ADD (``_rebalance_position``'s ``delta > 0``
+    branch pays ``qty * price + commission`` out of cash, on a long or as a
+    short cover), so it needs the same guard as an open. A negative qty
+    releases cash and is never checked. Leaving the add path unguarded let a
+    ``ctx.resize`` buy drive cash negative without a ``Rejected`` row — the
+    report's only cash story — so the hole was invisible as well as real.
+
+    Returns ``None`` when the fill would apply (a non-cash-consuming signal, a
+    non-positive qty, or enough cash).
     """
     signal = fill.signal
-    if signal.action not in (ActionType.long, ActionType.short):
+    if signal.action not in (
+        ActionType.long,
+        ActionType.short,
+        ActionType.rebalance,
+    ):
         return None
     qty = round(signal.qty, 4)
     if qty <= 0:
@@ -252,10 +264,28 @@ def apply_fills(
     opens = tuple(
         f for f in fills if f.signal.action in (ActionType.long, ActionType.short)
     )
+
     # Canonical order (symbol) so the resulting book is byte-identical for every
     # permutation of the input cohort — ``positions`` is a dict (order-free), but
     # ``trades`` is an append-ordered tuple, so the APPLY order must be fixed.
-    for fill in sorted(non_opens, key=lambda f: f.signal.symbol):
+    # Cash-RELEASING non-opens (close / rebalance reduce) settle before
+    # cash-CONSUMING ones (a rebalance add), so capital a reduce frees within the
+    # cohort is visible to the add that needs it.
+    def _consumes_cash(fill: FillEvent) -> bool:
+        return round(fill.signal.qty, 4) > 0.0
+
+    releases = tuple(f for f in non_opens if not _consumes_cash(f))
+    adds = tuple(f for f in non_opens if _consumes_cash(f))
+    for fill in sorted(releases, key=lambda f: f.signal.symbol):
+        portfolio = apply_fill(portfolio, fill)
+    rejections: list[FillRejection] = []
+    for fill in sorted(adds, key=lambda f: f.signal.symbol):
+        # A net-delta ADD is cash-consuming exactly like an open; without this
+        # the book could be levered silently (negative cash, Rejected = 0).
+        rejected = describe_open_rejection(portfolio, fill)
+        if rejected is not None:
+            rejections.append(rejected)
+            continue
         portfolio = apply_fill(portfolio, fill)
     # ``scale_cohorts=False`` is the research counterfactual: skip the shared
     # cash scale and let the sorted opens settle one by one, rejecting any that
@@ -265,7 +295,6 @@ def apply_fills(
         opens, record = _scale_opens(portfolio, opens, commission_model)
         if record is not None:
             scales.append(record)
-    rejections: list[FillRejection] = []
     for fill in sorted(opens, key=lambda f: f.signal.symbol):
         rejected = describe_open_rejection(portfolio, fill)
         if rejected is not None:

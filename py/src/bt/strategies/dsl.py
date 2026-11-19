@@ -40,6 +40,7 @@ them.
 
 from __future__ import annotations
 
+import math
 import sys
 from types import FunctionType, MappingProxyType
 from typing import Any, Callable, Literal, TYPE_CHECKING, cast
@@ -52,6 +53,29 @@ from src.bt.strategies.ta_context import OhlcvView, TaContext
 
 if TYPE_CHECKING:
     pass
+
+#: Headroom a :meth:`StrategyContext.resize` BUY leaves inside cash. The engine
+#: cash-guards only ``long``/``short`` opens, so a net-delta add has to size
+#: itself off cash. It is not merely a spread haircut: the qty is computed at the
+#: DECISION bar's close and the fill lands at the NEXT OPEN, so the dollar cost
+#: of a fully-funded order is ``cash * (1 - reserve) * (1 + gap)``. 1% therefore
+#: rejects on any overnight gap above 1% -- measured on SPY daily, three entries
+#: at +1.10%, +1.11% and +1.83% were dropped for exactly that. 2% covers the
+#: largest gap seen on that feed with margin, and costs at most 2% of the entry
+#: weight (a capped fill lands UNDER the requested weight, never over).
+_RESIZE_CASH_RESERVE = 0.02
+#: Cash an add must leave UNTOUCHED, in dollars. The proportional reserve above
+#: cannot bound a FIXED per-fill cost: 1% of a 3-cent stub is nothing, so an add
+#: capped at 99% of a sub-cent surplus still costs more than the cash it has
+#: (qty*price + commission > cash) and the engine rejects that same order on
+#: every following bar -- cash never moves, so neither does the request. One
+#: dollar is 1e-5 of a 100k book (economically zero) and ~20x a 5-cent
+#: commission, so a surplus under it buys nothing worth a fill.
+_RESIZE_MIN_ADD_NOTIONAL = 1.0
+#: The share quantum the portfolio layer rounds a fill's qty to
+#: (``portfolio.pure._open_position``/``_rebalance_position``). An emitted qty is
+#: truncated to a whole number of these so the order never exceeds its budget.
+_QTY_TICK = 0.0001
 
 
 class WarmupTradeError(RuntimeError):
@@ -358,13 +382,23 @@ class StrategyContext:
         Flat book -> equals cash (grows/shrinks with realized PnL). Used as the
         base for ``size_mode="equity"`` sizing so a ``size`` is a live fraction
         of the current book rather than a fixed amount of seed capital.
+
+        A short lot is valued exactly as the engine values it
+        (``portfolio.pure.calculate_positions_value``): ``qty * (2*entry -
+        last)`` -- the mirror basis the open required plus the unrealized PnL --
+        NOT ``qty * last``, which would mark a losing short UP and inflate the
+        equity base (and hence every ``size_mode="equity"`` order).
         """
         portfolio = self._state.portfolio
-        positions_value = sum(
-            pos.qty * pos.last_price
-            for lots in portfolio.positions.values()
-            for pos in lots
-        )
+        positions_value = 0.0
+        for lots in portfolio.positions.values():
+            for pos in lots:
+                if pos.type == ActionType.long:
+                    positions_value += pos.qty * pos.last_price
+                else:
+                    positions_value += pos.qty * (
+                        2.0 * pos.entry_price - pos.last_price
+                    )
         return float(portfolio.cash + positions_value)
 
     # -- lot-targeted mutation -------------------------------------------------
@@ -409,6 +443,142 @@ class StrategyContext:
                 position_id=target.position_id,
             )
         )
+
+    def resize(
+        self,
+        sym: str,
+        size: float,
+        reason: str = "resize",
+        tag: str = "",
+        cash_reserve: float = _RESIZE_CASH_RESERVE,
+    ) -> None:
+        """Set ``sym``'s net LONG exposure to ``size`` (0..1) of live equity.
+
+        CONTRACT (one paragraph). ``resize`` is a *long-only target-weight*
+        primitive: it drives this symbol's NET LONG share count to
+        ``size * current_equity() / price`` at the decision bar's close and
+        emits the difference as fills. It never shorts, never leverages and
+        never expresses a dollar target -- ``size`` is a fraction of live MTM
+        equity in ``[0, 1]``, so a flat book emits one ordinary cash-guarded
+        ``long`` and a held book emits ``rebalance`` DELTAS against the existing
+        lots (``portfolio.pure._rebalance_position``: TWAC, same
+        ``position_id``, a reduce when the target is smaller), which is why a
+        daily allocator holds ONE lot and pays friction on the traded delta
+        only. Reduces walk the lots newest-first; an add lands on the newest
+        lot. Every fill lands at the next open (the engine's one-day delay), and
+        a BUY is capped so it cannot spend cash the account does not have -- and
+        the engine's own cash guard refuses a net-delta add that still does not
+        fit (``describe_open_rejection`` covers positive rebalance deltas), so
+        an unfundable add shows up in ``Rejected`` instead of silently borrowing.
+        Three things it does NOT do, all of which the caller owns: it arms no
+        ``sl``/``tp`` (a lot opened here is unprotected until ``set_stops``); it
+        does not distinguish "we chose to be flat" from "a stop closed the lot",
+        so a resize strategy re-enters at the next bar's open after any stop-out;
+        and it is once-per-symbol-per-bar by contract -- two calls on one bar
+        each see the pre-call book, so two flat-book calls emit two full lots.
+        A SHORT book raises ``ValueError``: ``Position.qty`` is a positive
+        magnitude whose side lives in ``Position.type``, so summing it is only
+        a signed exposure for an all-long book, and a silent wrong-direction
+        move on a mixed book is worse than a refusal.
+
+        Ordering: reduces walk the lots newest-first (the same order as
+        :meth:`partial_close`); adds land on the newest lot. Both fill at the
+        next open like every other signal.
+
+        ``cash_reserve`` bounds a BUY so the fill cannot overspend cash: the
+        dollar delta is capped at ``cash - max(cash * cash_reserve,
+        _RESIZE_MIN_ADD_NOTIONAL)``, i.e. it is sized off cash rather than equity
+        when cash is the binding constraint. Two things make the cap an
+        INVARIANT rather than a heuristic: an add whose fundable surplus is
+        under one dollar is a NO-OP (it is economically zero -- 1e-5 of a 100k
+        book -- and a fixed per-fill commission alone would exceed it), and the
+        capped qty is truncated to the ``0.0001`` share tick instead of rounded,
+        so the emitted qty can never exceed the budget it was capped to. A
+        ``rebalance`` add is cash-guarded by the engine too; this cap is the
+        sizing decision, the engine's guard is the invariant, and the cap lands
+        a buy at most ``cash_reserve`` under the requested weight.
+        """
+        assert not self._readonly, "plot() must be read-only"
+        assert 0.0 <= size <= 1.0, f"resize takes a 0..1 weight, got {size}"
+        assert 0.0 <= cash_reserve < 0.5
+        lots = self._state.portfolio.positions.get(sym, ())
+        if any(lot.type != ActionType.long for lot in lots):
+            raise ValueError(
+                f"ctx.resize is long-only and {sym!r} holds a short lot; "
+                "cover it explicitly (ctx.close/ctx.partial_close) instead"
+            )
+        equity = self.current_equity()
+        assert equity > 0.0, "resize needs a positive equity base"
+        price = self.price(sym)
+        assert price > 0.0, f"resize needs a price for {sym!r}"
+
+        target = round(size * equity / price, 4)
+        delta = round(target - sum(lot.qty for lot in lots), 4)
+        if delta == 0.0:
+            return
+
+        if delta > 0.0:
+            cash = self._state.portfolio.cash
+            # Reserve the proportional headroom OR the absolute floor, whichever
+            # is larger: the floor is what stops a dust-stub add loop.
+            budget = cash - max(cash * cash_reserve, _RESIZE_MIN_ADD_NOTIONAL)
+            if budget <= 0.0:
+                return
+            # TRUNCATE to the share tick, never ``round``: rounding a sub-tick
+            # surplus UP (round(0.000259, 4) == 0.0003) emits an order the fill
+            # cannot pay for, which is a guaranteed rejection.
+            cap = math.floor(budget / price / _QTY_TICK + 1e-9) * _QTY_TICK
+            delta = min(delta, round(cap, 4))
+            if delta <= 0.0:
+                return
+            if not lots:
+                # Flat book: a fresh lot, sized explicitly off equity. This is
+                # the only position-OPENING emission, so it is the only branch
+                # the warmup guard applies to (a reduce is not an open).
+                self._assert_tradable(ActionType.long, sym)
+                self._emit(
+                    ActionType.long,
+                    sym,
+                    delta * price / equity,
+                    None,
+                    None,
+                    reason,
+                    tag,
+                    size_mode="equity",
+                )
+                return
+            self._signals.append(
+                TradeSignal(
+                    action=ActionType.rebalance,
+                    symbol=sym,
+                    timestamp=self._candle.timestamp,
+                    price=price,
+                    qty=delta,
+                    reason=reason,
+                    position_id=lots[-1].position_id,
+                )
+            )
+            return
+
+        remaining = -delta
+        for lot in reversed(lots):
+            if remaining <= 0.0:
+                break
+            if lot.qty <= 0.0:
+                continue
+            take = min(remaining, lot.qty)
+            self._signals.append(
+                TradeSignal(
+                    action=ActionType.rebalance,
+                    symbol=sym,
+                    timestamp=self._candle.timestamp,
+                    price=price,
+                    qty=-round(take, 4),
+                    reason=reason,
+                    position_id=lot.position_id,
+                )
+            )
+            remaining = round(remaining - take, 4)
 
     # -- signal emission ---------------------------------------------------------
 
