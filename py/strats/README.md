@@ -144,6 +144,140 @@ need a different **exit** rule to be worth revisiting. Arms are reproducible by
 flipping `allow_shorts` / `allow_longs` on the filed config; the probes were
 retired.
 
+### `kalman_pairs_dsl` — XLE/TLT is not a pair (negative)
+
+Isolated variable: the **symbol pair**. Same config, same window, same params; the
+only thing that changed between the two rows below is the engine (B1 hold path
+reachable, see the code-defect note under the third entry).
+
+`fail/kalman_pairs_dsl.json` (XLE/TLT, 2018-11-12 → 2024-12-31, `1d`). Pre-fix: 138
+trades, gross **+2,295.50**, spread+slippage 5,465.00 + commission 13.80 = friction
+**5,478.80**, net **-3,183.29**, Sharpe -0.09, MaxDD -11.93%, kurt 70.98. Cost per
+round trip (69 of them): gross $33.3 vs friction $79.4 → **-$46/round trip**. Post-fix,
+hold path reachable: 120 trades, gross **-3,344.17**, friction 4,728.48 + 12.00 =
+**4,740.48**, net **-8,084.65**, Sharpe -0.08, MaxDD -21.10%, kurt 113.91, holds 2-10
+bars (was a 1-bar floor), Scaled 18 → **advisory**. Split post-fix: mean OOS **+0.20**,
+min **-0.50**, OOS folds -0.50 / -0.06 / +0.25 / +1.11, IS folds +0.10 / -0.33 / -0.26 /
+-0.19 (3 of 4 negative) — and the positive mean sits inside the advisory band, so it is
+not quotable either way.
+
+Why the pair was never a pair: log-OLS β of `log(XLE) ~ log(TLT)` = **-1.311**, and the
+same-filter diagnostic shows the fade paying **-6.6 bps at h=1** against +75.5 bps at
+h=5 and +358.3 bps at h=20 (t≈1.9 on a sd-1756 2020 tail).
+
+Conclusion: the pre-fix gross-positive number was an artifact of a bar-flat round-trip
+loop — once the spread is actually held, gross is **negative** (-3,344.17), i.e. there is
+no reversion edge to capture. Do not re-probe XLE/TLT as a cointegrated pair; β = -1.31
+makes it an energy-vs-long-bonds macro spread, and no exit rule can fix a sign-wrong
+hedge.
+
+### `kalman_pairs_goog_googl` — Kalman convergence is not P&L convergence (negative)
+
+Isolated variable: the **pair**, selected on stability alone (β CV 0.010, 60% of rolling
+2y windows cointegrated, eg_p 0.002, residual sd 67 bps, half-life 19.9 td) rather than on
+p-value. Four declared params, all round numbers, no sweeps; every filter hyper-parameter
+left at its default.
+
+`wip/kalman_pairs_goog_googl.json`, one year (2024-01-01 → 2024-12-31): 20 trades / 10
+round trips, gross **+313.90**, commission 2.00 + spread+slippage 475.88, net **-163.98**,
+Sharpe **-0.80**, kurt 13.10, Scaled 0 / Rejected 0 (quotable). Per round trip: gross
+**+$31.4** vs friction **$47.6**, i.e. **12.6 bps gross vs 19.1 bps of friction**. Six of
+ten round trips lost money *after* converging in z — the exit is measured against a
+drifting Kalman level. Split (`--folds 4`): all four **IS** folds negative (-0.64, -0.95,
+-0.59, -0.41), mean OOS **-1.08**, min **-2.08**, 3/4 OOS negative. `z_entry 2.0` is a
+real threshold post-B3 (4.0% of bars, 96.0th percentile), while `z_exit_stop 3.5` is
+unreachable (max observed |z| 2.72).
+
+Conclusion: even a genuinely cointegrated dual-class pair does not clear friction at
+daily bars. The binding constraint is **residual amplitude vs cost**, not filter quality —
+67 bps of spread does not survive four fills. Do not re-probe daily Kalman spread-fade
+unless the selected pair's residual sd is an order of magnitude above the friction floor.
+
+### `kalman_mr_regime_dsl` — single-name residual fade is sign-wrong (negative)
+
+Isolated variable: **`z_stat` scaling** (absolute price² units → scale-free). The
+threshold then becomes a threshold: 2.0 sits at the 96th percentile instead of passing on
+95-99% of bars.
+
+Pre-fix (337 trades, Sharpe 0.53, net +15,534.00): `z_entry 2.0` was inert against a
+z_stat with sd 75-245 per symbol and |z|>2 on 95.4-99.2% of bars, so entry was fully
+delegated to the regime gate. Post-fix (2021-12-31 → 2025-12-31): **46 trades** over four
+years, gross **-5,050.94** before friction (friction 890.49 + 4.60, net **-5,946.03**),
+Sharpe **-0.68**, MaxDD -9.01%, kurt 32.12, Scaled 0. Split: mean OOS **-1.18**, min
+**-1.54**, OOS folds -1.26 / -1.09 / -0.84 / -1.54 (all four negative). Exit census moved
+from 236 long-side exits + 1 stop in 337 to 18 short fades / 17 long fades / 10 regime
+flattens / 1 ATR stop (on a short).
+
+Conclusion: a constant-velocity Kalman residual is a **momentum** proxy; fading its upper
+tail loses at every horizon tested. The pre-fix +15.5k was a regime-gated long/short book
+wearing a Kalman label, not a Kalman strategy. Do not re-probe residual fade on single
+names.
+
+### Code defects behind the numbers above (fixed, not evidence changes)
+
+Four CODE defects, all fixed and reviewed OK before any of the post-fix figures were
+produced — they are engine repairs, not revisions to the evidence, and both sides of each
+before/after pair are negatives, so every verdict stands either way: **B1**
+`kalman_pairs_dsl._exit_if_due` had no hold path (every pair closed on the next bar) —
+`src/bt/strategies/kalman_pairs_dsl.py`; **B2** `is_long` was inferred from the unsigned
+`Position.qty`, so it was always true and shorts got the long-side stop —
+`src/bt/strategies/kalman_mr_regime_dsl.py`; **B3** Kalman noise was absolute (price²), so
+`z_stat` was not scale-free and the batch/online filters disagreed —
+`src/indicators/kalman/strategy.py` and `src/indicators/kalman/pure.py`; **B4** the HMM
+detector's warmup guard ignored feature warmup, so the fit raised on 251-272 bars —
+`src/bt/regime/detectors.py`. Do not re-derive these from a fresh run; the pinning tests
+fail on the pre-fix code and pass on the current code.
+
+### `hmm_regime_filter` — a frozen HMM regime gate vs its own SMA control (negative)
+
+Isolated variable: **the HMM regime gate** — `use_regime` on vs off — in front of an otherwise
+identical SMA 10/30 entry. Same symbol (SPY, `1d`), same feed, same costs (4.5 bps/side +
+$0.05/fill), same size (`0.99` equity, next-open fills). The control is the same config with
+`use_regime=false`, so the HMM is never constructed and the label is the only thing that differs.
+The fit is frozen (`fit_once=True`, one fit strictly before `trading_start`), so no trading bar is
+labelled from its own future. The configs are filed in `fail/`, the control beside them because
+the control is the evidence.
+
+**Stage 1 — SPY, 2010, one year, n=5:** filter **+0.97%** vs SMA control **−0.02%** vs SPY B&H
+**+10.99%**; max DD **−12.64% / −13.81% / −16.05%**. The HMM's marginal **1.17 pp** of DD cost
+**10.18 pp of CAGR**, and 74% of the filter's net was the year-end mark (rule-only **−1,813.37**).
+
+**Stage 2 — SPY, 2008-01-02 → 2012-12-31, 1258 bars, n=8, one frozen fit 2004-02 → 2007-10:**
+
+| metric | HMM filter | SMA 10/30 control | SPY B&H |
+|---|---|---|---|
+| total return | **+2.70%** | +19.35% | −3.39% |
+| CAGR | **0.54%** | 3.61% | −0.69% |
+| max DD | **−8.41%** | −16.78% | −53.04% |
+| Sharpe | **0.12** | 0.34 | −0.03 |
+| Calmar | **0.06** | 0.22 | — |
+| profit factor | **1.36** | 1.54 | — |
+
+Rule-only (excluding the window-end mark): filter **+4,524.76** on n=7.
+
+**Where the drawdown goes.** Of the 44.63 pp of DD reduction from B&H, the SMA base supplies
+**36.26 pp (81.2%)**; the HMM's marginal **8.37 pp (18.8%)** — the −16.78% → −8.41% step — costs
+**3.07 pp of CAGR**.
+
+**The gate's mechanism did not do the crisis work.** 502 of 510 would-be entry bars blocked
+(**98.4%**), one state-1 spell of 502 bars (2008-01-02 → 2009-12-28), **zero trades in 2008 and
+zero in 2009**. Between 2008-09-05 and 2008-12-15 the crash core had **0 trend-up bars**, so both
+books were already flat while SPY fell. Net cost of the two-year risk-off spell ≈ **8,542.80**
+(8.5% of starting capital): avoided −5,656.09 of control P&L, forgone +14,198.89. Split: filter
+mean OOS Sharpe **−0.10** (min **−0.76**) vs control **0.44** (min **−0.55**).
+
+Conclusion: the reference's claim — no longs opened in the high-vol regime, so the crisis is dodged
+— transfers only as a **mechanical side effect** of a frozen pre-crisis fit labelling the whole
+period high-vol (label 1 on 82.3% of the window's bars), not as an economic edge; and the marginal
+DD it buys is beaten by not having the HMM at all (control +19.35%, Calmar 0.22 vs filter +2.70%,
+0.06). Do not re-probe **a frozen-fit HMM regime gate in front of an SMA trend entry, on SPY
+daily**. A rolling/retrained variant is a DIFFERENT, unprobed test — nothing here measures it.
+
+**The code is kept regardless of the negative.** The underlying implementation was fixed in this
+pass and is worth keeping on its own terms: the online per-bar label now equals batch
+prefix-Viterbi (**308/308 bars**; it disagreed on **42%** before) at lower cost, and the HMM warmup
+`ValueError` band is gone.
+
 ## Naming and layout
 
 ```

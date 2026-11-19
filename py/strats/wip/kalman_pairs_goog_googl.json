@@ -1,0 +1,26 @@
+{
+  "name": "kalman-pairs-goog-googl-dsl",
+  "warmup": "250d",
+  "trading_start": "2024-01-01",
+  "trading_end": "2025-01-01",
+  "commission": 0.05,
+  "initial_capital": 100000,
+  "strategy_type": "kalman_pairs_dsl",
+  "bars": [
+    "1d"
+  ],
+  "benchmark_symbols": [
+    "GOOG",
+    "GOOGL"
+  ],
+  "symbols": [
+    "GOOG",
+    "GOOGL"
+  ],
+  "strategy_params": {
+    "z_entry": 2.0,
+    "z_exit": 0.5,
+    "z_exit_stop": 3.5,
+    "position_size": 0.25
+  }
+}

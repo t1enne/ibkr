@@ -1,0 +1,22 @@
+{
+  "name": "hmm-spy-regime",
+  "warmup": "5y",
+  "trading_start": "2010-01-04",
+  "trading_end": "2010-12-31",
+  "commission": 0.05,
+  "initial_capital": 100000,
+  "strategy_type": "hmm_regime_filter",
+  "bars": [
+    "1d"
+  ],
+  "symbols": [
+    "SPY"
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
+  "strategy_params": {
+    "size": 0.99,
+    "window_size": 1200
+  }
+}

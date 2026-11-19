@@ -1,0 +1,23 @@
+{
+  "name": "hmm-spy-regime-crisis",
+  "warmup": "1430d",
+  "trading_start": "2008-01-02",
+  "trading_end": "2012-12-31",
+  "commission": 0.05,
+  "initial_capital": 100000,
+  "strategy_type": "hmm_regime_filter",
+  "bars": [
+    "1d"
+  ],
+  "symbols": [
+    "SPY"
+  ],
+  "benchmark_symbols": [
+    "SPY"
+  ],
+  "strategy_params": {
+    "size": 0.99,
+    "window_size": 928,
+    "use_regime": true
+  }
+}
