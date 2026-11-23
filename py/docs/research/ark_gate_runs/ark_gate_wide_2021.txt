@@ -1,0 +1,84 @@
+
+Backtest Results
+================================================================================
+
+Worst Drawdown Periods
+Net DD %   Peak Date  Valley Date    Recovery  Days
+---------------------------------------------------
+  37.32%  2021-02-17   2021-05-13           —   316
+  13.20%  2021-01-19   2021-01-27  2021-02-08    20
+
+Period Drawdowns (peak-to-trough within period)
+Period  Max DD              Peak            Valley
+--------------------------------------------------
+Month   23.58%  2021-04-05 00:00  2021-04-22 00:00
+
+Trades
+  35 trades — list omitted (pass --trades to print)
+
+Trading Statistics
+Metric                      Value
+---------------------------------
+Starting Capital       100,000.00
+Total Trades                   35
+Closed Trades                  35
+Win Rate                   45.71%
+Total P&L (Net)          8,314.61
+Gross P&L                8,666.46
+Commission Costs             3.50
+Spread+Slippage Costs      348.34
+Net P&L                  8,314.61
+Capital Utilization         65.2%
+
+Return Drivers (per Symbol)
+Symbol        P&L  Trades  Win Rate  % of Total
+-----------------------------------------------
+RIOT     7,542.16       2       50%       90.7%
+MARA     4,539.99       3       33%       54.6%
+CELH     3,801.35       2      100%       45.7%
+MRNA     3,697.83       1      100%       44.5%
+AXSM     3,186.01       1      100%       38.3%
+JAZZ       975.78       2      100%       11.7%
+BMRN       914.05       1      100%       11.0%
+AMBA       563.06       1      100%        6.8%
+DXCM       557.88       1      100%        6.7%
+ASML       533.10       1      100%        6.4%
+XEL        269.48       1      100%        3.2%
+SYNA      -160.65       1        0%       -1.9%
+WDC       -344.86       1        0%       -4.1%
+FTNT      -370.15       1        0%       -4.5%
+ALKS      -372.03       1        0%       -4.5%
+MRK       -420.28       1        0%       -5.1%
+MSTR      -528.18       1        0%       -6.4%
+URGN      -749.14       4       50%       -9.0%
+GILD      -774.48       1        0%       -9.3%
+BE        -963.85       1        0%      -11.6%
+LULU      -999.89       1        0%      -12.0%
+FORM    -1,120.26       1        0%      -13.5%
+LTBR    -1,930.42       1        0%      -23.2%
+FSLR    -2,413.97       1        0%      -29.0%
+UEC     -3,281.81       1        0%      -39.5%
+PLUG    -3,836.09       2       50%      -46.1%
+
+Data: 2021-01-01 → 2021-12-30
+Duration: 252 periods · 11.9 months
+
+Performance Metrics
+Metric             Strategy     SPY
+-----------------------------------
+Total Return          8.31%  29.08%
+Annual Return         8.37%  29.57%
+Annual Volatility    49.18%  13.06%
+Sharpe Ratio           0.41    2.26
+Max Drawdown        -37.32%  -5.41%
+                                   
+Calmar Ratio           0.22       —
+Sortino Ratio          0.26       —
+Omega Ratio            1.08       —
+Stability              0.20       —
+Skewness               0.54       —
+Kurtosis               3.61       —
+Scaled Trades             0       —
+Rejected Trades           0       —
+Alpha                     —   -0.08
+Beta                      —    1.07

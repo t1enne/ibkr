@@ -1,0 +1,77 @@
+
+Backtest Results
+================================================================================
+
+Worst Drawdown Periods
+Net DD %   Peak Date  Valley Date  Recovery  Days
+-------------------------------------------------
+  21.38%  2021-02-17   2021-07-16         —   316
+
+Period Drawdowns (peak-to-trough within period)
+Period  Max DD              Peak            Valley
+--------------------------------------------------
+Month   13.03%  2021-02-09 00:00  2021-02-26 00:00
+
+Trades
+  29 trades — list omitted (pass --trades to print)
+
+Trading Statistics
+Metric                      Value
+---------------------------------
+Starting Capital       100,000.00
+Total Trades                   29
+Closed Trades                  29
+Win Rate                   34.48%
+Total P&L (Net)         -2,752.17
+Gross P&L               -2,483.82
+Commission Costs             2.90
+Spread+Slippage Costs      265.45
+Net P&L                 -2,752.17
+Capital Utilization         64.2%
+
+Return Drivers (per Symbol)
+Symbol        P&L  Trades  Win Rate  % of Total
+-----------------------------------------------
+STNE     4,921.17       1      100%     -178.8%
+CGEN     4,581.49       1      100%     -166.5%
+HUYA     3,675.03       1      100%     -133.5%
+SRPT     2,308.46       1      100%      -83.9%
+HUBS     1,732.31       3       67%      -62.9%
+TREE     1,699.51       1      100%      -61.8%
+NET        362.38       1      100%      -13.2%
+BEKE       144.18       1      100%       -5.2%
+HDB       -227.60       1        0%        8.3%
+CAMT      -412.04       2        0%       15.0%
+U         -454.94       1        0%       16.5%
+NNDM      -607.93       2        0%       22.1%
+ALLT      -903.89       1        0%       32.8%
+EVGN    -1,178.68       2        0%       42.8%
+AUDC    -1,316.10       1        0%       47.8%
+IONS    -1,372.81       1        0%       49.9%
+GBTC    -1,998.07       2       50%       72.6%
+ACIC    -3,296.85       2        0%      119.8%
+NTLA    -3,544.10       2        0%      128.8%
+DDD     -6,863.68       2        0%      249.4%
+
+Data: 2021-01-01 → 2021-12-30
+Duration: 252 periods · 11.9 months
+
+Performance Metrics
+Metric             Strategy     SPY
+-----------------------------------
+Total Return         -2.75%  29.08%
+Annual Return        -2.77%  29.57%
+Annual Volatility    18.53%  13.06%
+Sharpe Ratio          -0.06    2.26
+Max Drawdown        -21.38%  -5.41%
+                                   
+Calmar Ratio          -0.13       —
+Sortino Ratio         -0.24       —
+Omega Ratio            0.99       —
+Stability              0.13       —
+Skewness               0.07       —
+Kurtosis               0.62       —
+Scaled Trades             0       —
+Rejected Trades           0       —
+Alpha                     —   -0.09
+Beta                      —    0.30

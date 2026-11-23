@@ -1,0 +1,154 @@
+{
+  "db_tickers": 659,
+  "flow_file_tickers": 435,
+  "etf_like_excluded": 189,
+  "excluded_ticker_reuse": [
+    {
+      "ticker": "BIDU",
+      "flow_span": [
+        "2020-08-31",
+        "2025-12-08"
+      ],
+      "candle_span": [
+        "2026-10-01",
+        "2026-11-19"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 212
+    },
+    {
+      "ticker": "XONE",
+      "flow_span": [
+        "2020-09-25",
+        "2021-09-30"
+      ],
+      "candle_span": [
+        "2022-09-16",
+        "2026-11-20"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 148
+    },
+    {
+      "ticker": "SI",
+      "flow_span": [
+        "2020-10-20",
+        "2023-01-23"
+      ],
+      "candle_span": [
+        "2025-07-31",
+        "2026-11-20"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 186
+    },
+    {
+      "ticker": "VOE",
+      "flow_span": [
+        "2021-03-05",
+        "2021-09-30"
+      ],
+      "candle_span": [
+        "2026-07-27",
+        "2026-11-19"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 32
+    },
+    {
+      "ticker": "TEVA",
+      "flow_span": [
+        "2021-03-10",
+        "2021-09-30"
+      ],
+      "candle_span": [
+        "2026-09-14",
+        "2026-11-19"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 24
+    },
+    {
+      "ticker": "DIS",
+      "flow_span": [
+        "2021-05-14",
+        "2022-06-24"
+      ],
+      "candle_span": [
+        "2026-07-27",
+        "2026-11-19"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 93
+    },
+    {
+      "ticker": "ETSY",
+      "flow_span": [
+        "2021-06-02",
+        "2022-06-24"
+      ],
+      "candle_span": [
+        "2026-08-20",
+        "2026-11-19"
+      ],
+      "flow_dates_inside_span": 0,
+      "flow_dates": 105
+    }
+  ],
+  "excluded_span_overlap": [
+    {
+      "ticker": "DSY",
+      "flow_span": [
+        "2020-10-20",
+        "2026-04-02"
+      ],
+      "candle_span": [
+        "2023-01-11",
+        "2026-11-20"
+      ],
+      "flow_dates_inside_span": 8,
+      "flow_dates": 199
+    },
+    {
+      "ticker": "KSPI",
+      "flow_span": [
+        "2020-12-16",
+        "2025-08-07"
+      ],
+      "candle_span": [
+        "2024-01-22",
+        "2026-11-20"
+      ],
+      "flow_dates_inside_span": 8,
+      "flow_dates": 162
+    }
+  ],
+  "eras": {
+    "2021": {
+      "window": [
+        "2021-01-01",
+        "2021-12-31"
+      ],
+      "ark_flow_active_in_era": 174,
+      "ark_member_at_era_start": 111,
+      "ark_screened": 158,
+      "ark_matched_sleeve": 57,
+      "ark_unmatched_dropped": 101,
+      "twins": 57,
+      "pool_wide": 100
+    },
+    "2022_2026": {
+      "window": [
+        "2022-01-01",
+        "2026-04-30"
+      ],
+      "ark_flow_active_in_era": 126,
+      "ark_member_at_era_start": 110,
+      "ark_screened": 119,
+      "ark_matched_sleeve": 54,
+      "ark_unmatched_dropped": 65,
+      "twins": 54,
+      "pool_wide": 106
+    }
+  }
+}

@@ -1,0 +1,108 @@
+
+Backtest Results
+================================================================================
+
+Worst Drawdown Periods
+Net DD %   Peak Date  Valley Date    Recovery  Days
+---------------------------------------------------
+  29.84%  2023-12-29   2025-12-18           —   852
+  15.66%  2022-07-15   2022-08-15  2023-03-27   255
+  12.74%  2023-04-12   2023-05-23  2023-07-13    92
+  10.83%  2022-03-11   2022-03-29  2022-05-18    68
+  10.58%  2023-08-16   2023-10-03  2023-12-27   133
+
+Period Drawdowns (peak-to-trough within period)
+Period  Max DD              Peak            Valley
+--------------------------------------------------
+Month   15.13%  2025-06-05 00:00  2025-06-30 00:00
+
+Trades
+  130 trades — list omitted (pass --trades to print)
+
+Trading Statistics
+Metric                      Value
+---------------------------------
+Starting Capital       100,000.00
+Total Trades                  130
+Closed Trades                 130
+Win Rate                   45.38%
+Total P&L (Net)          3,133.47
+Gross P&L                4,380.17
+Commission Costs            13.00
+Spread+Slippage Costs    1,233.71
+Net P&L                  3,133.47
+Capital Utilization         61.2%
+
+Return Drivers (per Symbol)
+Symbol         P&L  Trades  Win Rate  % of Total
+------------------------------------------------
+ELF      27,810.24       4       75%      887.5%
+RIOT     12,311.00       6       67%      392.9%
+UEC       5,782.34       6       83%      184.5%
+CELH      5,554.42       4       75%      177.3%
+AXON      4,214.81       4      100%      134.5%
+NXE       3,388.29       1      100%      108.1%
+PLUG      3,109.86       5       60%       99.2%
+MRNA      2,738.88       6       50%       87.4%
+MTCH      2,698.74       1      100%       86.1%
+RMBS      2,622.26       3       67%       83.7%
+ROP       1,990.76       1      100%       63.5%
+LLY       1,274.99       2      100%       40.7%
+CMCSA       964.35       1      100%       30.8%
+EXEL        462.05       3       67%       14.7%
+INTC        446.98       3       67%       14.3%
+ADP        -126.93       1        0%       -4.1%
+ARGX       -173.28       2       50%       -5.5%
+BIIB       -242.57       2       50%       -7.7%
+UNH        -380.13       2       50%      -12.1%
+ASML       -444.87       1        0%      -14.2%
+LULU       -626.45       3       33%      -20.0%
+CRUS       -654.53       2       50%      -20.9%
+BMRN       -667.39       1        0%      -21.3%
+COST       -728.43       1        0%      -23.2%
+AMAT     -1,002.05       2       50%      -32.0%
+JAZZ     -1,035.66       2        0%      -33.1%
+LRCX     -1,051.14       2        0%      -33.5%
+BYDDF    -1,291.02       5       40%      -41.2%
+ALKS     -1,367.91       1        0%      -43.7%
+FORM     -1,550.21       2       50%      -49.5%
+ALNY     -1,630.46       4       25%      -52.0%
+AXSM     -2,965.97       6       33%      -94.7%
+ONTO     -5,598.70       6       17%     -178.7%
+MARA     -6,407.63       6       33%     -204.5%
+ONON     -7,151.86       5       20%     -228.2%
+SANA     -9,783.46       8       38%     -312.2%
+URGN    -12,471.44       7       29%     -398.0%
+LTBR    -14,884.41       9       11%     -475.0%
+
+Return Drivers (per Year)
+Year         P&L  Trades  Win Rate  % of Total
+----------------------------------------------
+2022    4,765.09      24       50%      152.1%
+2023   -1,444.49      26       31%      -46.1%
+2024   -2,081.10      30       43%      -66.4%
+2025  -10,940.78      34       47%     -349.2%
+2026   12,834.75      16       62%      409.6%
+
+Data: 2022-01-01 → 2026-04-29
+Duration: 1085 periods · 4.3 years
+
+Performance Metrics
+Metric             Strategy      SPY
+------------------------------------
+Total Return          3.13%   48.95%
+Annual Return         0.72%    9.67%
+Annual Volatility    17.48%   17.48%
+Sharpe Ratio           0.13     0.55
+Max Drawdown        -29.84%  -25.37%
+                                    
+Calmar Ratio           0.02        —
+Sortino Ratio          0.06        —
+Omega Ratio            1.02        —
+Stability              0.33        —
+Skewness              -0.40        —
+Kurtosis               2.21        —
+Scaled Trades             0        —
+Rejected Trades           0        —
+Alpha                     —     0.03
+Beta                      —    -0.06

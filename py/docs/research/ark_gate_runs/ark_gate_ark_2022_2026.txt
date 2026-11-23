@@ -1,0 +1,115 @@
+
+Backtest Results
+================================================================================
+
+Worst Drawdown Periods
+Net DD %   Peak Date  Valley Date    Recovery  Days
+---------------------------------------------------
+  37.95%  2025-02-18   2026-02-12           —   435
+  15.01%  2022-06-07   2022-07-21  2023-06-23   381
+  13.97%  2024-06-21   2024-10-22  2024-11-20   152
+   8.55%  2023-09-21   2023-12-28  2024-02-01   133
+   8.28%  2024-04-12   2024-05-01  2024-05-22    40
+
+Period Drawdowns (peak-to-trough within period)
+Period  Max DD              Peak            Valley
+--------------------------------------------------
+Month   29.07%  2025-07-01 00:00  2025-07-21 00:00
+
+Trades
+  135 trades — list omitted (pass --trades to print)
+
+Trading Statistics
+Metric                      Value
+---------------------------------
+Starting Capital       100,000.00
+Total Trades                  135
+Closed Trades                 135
+Win Rate                   50.37%
+Total P&L (Net)          4,295.23
+Gross P&L                5,593.69
+Commission Costs            13.50
+Spread+Slippage Costs    1,284.95
+Net P&L                  4,295.23
+Capital Utilization         61.2%
+
+Return Drivers (per Symbol)
+Symbol         P&L  Trades  Win Rate  % of Total
+------------------------------------------------
+PTON     11,780.49       8       62%      274.3%
+GBTC     11,717.30       3      100%      272.8%
+AQB      10,063.90       5       80%      234.3%
+GENI      8,160.67       4       75%      190.0%
+DNA       8,128.24       4       75%      189.2%
+TXG       4,777.68       4      100%      111.2%
+DKNG      4,384.46       2      100%      102.1%
+SHOP      4,354.85       2       50%      101.4%
+RBLX      3,201.87       3       67%       74.5%
+SNAP      2,791.75       1      100%       65.0%
+CDNA      2,734.87       4       50%       63.7%
+EVGN      1,665.97       4       25%       38.8%
+ADPT      1,523.47       5       40%       35.5%
+AMGN      1,447.91       2       50%       33.7%
+NFLX      1,298.58       3       67%       30.2%
+BILL      1,167.24       2       50%       27.2%
+ACHR      1,155.20       5       60%       26.9%
+HEI       1,133.01       3      100%       26.4%
+CGEN        755.88       4       50%       17.6%
+ADBE        735.79       1      100%       17.1%
+TDOC        733.22       2       50%       17.1%
+LMT         297.81       2       50%        6.9%
+DOCU        187.65       1      100%        4.4%
+CLLS         85.86       3       67%        2.0%
+LHX        -131.59       1        0%       -3.1%
+OKTA       -180.54       2       50%       -4.2%
+MELI       -253.64       1        0%       -5.9%
+CRWD       -781.27       2       50%      -18.2%
+AIR      -1,182.63       2       50%      -27.5%
+PFE      -1,417.78       1        0%      -33.0%
+ROKU     -1,606.48       1        0%      -37.4%
+DE       -1,752.74       2        0%      -40.8%
+FATE     -1,844.50       5       40%      -42.9%
+BABA     -2,278.33       1        0%      -53.0%
+ISRG     -2,597.75       1        0%      -60.5%
+BFLY     -2,987.39       6       50%      -69.6%
+EDIT     -3,145.06       5       40%      -73.2%
+CERS     -4,183.86       3       33%      -97.4%
+SNPS     -4,436.87       3        0%     -103.3%
+BEAM     -4,478.71       1        0%     -104.3%
+AMD      -4,713.58       3        0%     -109.7%
+NTLA     -6,277.26       3       33%     -146.1%
+ARCT     -7,994.31       6       33%     -186.1%
+DDD     -11,228.16       4       25%     -261.4%
+OPEN    -16,516.01       5       40%     -384.5%
+
+Return Drivers (per Year)
+Year         P&L  Trades  Win Rate  % of Total
+----------------------------------------------
+2022   -3,623.30      31       45%      -84.4%
+2023   11,039.37      28       50%      257.0%
+2024   15,091.70      28       64%      351.4%
+2025  -36,037.11      31       35%     -839.0%
+2026   17,824.57      17       65%      415.0%
+
+Data: 2022-01-01 → 2026-04-29
+Duration: 1085 periods · 4.3 years
+
+Performance Metrics
+Metric             Strategy      SPY
+------------------------------------
+Total Return          4.30%   48.95%
+Annual Return         0.98%    9.67%
+Annual Volatility    24.10%   17.48%
+Sharpe Ratio           0.16     0.55
+Max Drawdown        -37.95%  -25.37%
+                                    
+Calmar Ratio           0.03        —
+Sortino Ratio          0.06        —
+Omega Ratio            1.03        —
+Stability              0.25        —
+Skewness               0.67        —
+Kurtosis              13.64        —
+Scaled Trades             0        —
+Rejected Trades           0        —
+Alpha                     —     0.03
+Beta                      —     0.05

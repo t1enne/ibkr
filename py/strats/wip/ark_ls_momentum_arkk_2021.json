@@ -1,0 +1,30 @@
+{
+  "name": "ark_ls_momentum_arkk_2021",
+  "warmup": "300d",
+  "trading_start": "2021-01-01",
+  "trading_end": "2021-12-31",
+  "commission": 0.05,
+  "initial_capital": 100000,
+  "strategy_type": "ark_ls_momentum_dsl",
+  "bars": [
+    "1d"
+  ],
+  "strategy_params": {
+    "lookback_bars": 126,
+    "rebalance_bars": 21,
+    "k": 3,
+    "size": 0.1
+  },
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "AVGO",
+    "NFLX",
+    "QCOM"
+  ]
+}
